@@ -21,7 +21,25 @@ begin
 end
 $$;
 
-alter role curator_api with login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+alter role curator_api with login noinherit;
+
+-- Supabase's `postgres` is not a superuser, and Postgres refuses to even name
+-- SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE from a non-superuser
+-- (42501), so the role cannot be stripped of them here. They are off for any
+-- role `create role` makes, and a non-superuser could never have granted them;
+-- this asserts it instead, so a pre-existing over-powered role fails the
+-- script rather than serving the API.
+do $$
+declare
+	r pg_roles%rowtype;
+begin
+	select * into r from pg_roles where rolname = 'curator_api';
+	if r.rolsuper or r.rolreplication or r.rolbypassrls or r.rolcreaterole or r.rolcreatedb or r.rolinherit or not r.rolcanlogin then
+		raise exception 'curator_api has unexpected attributes (super %, replication %, bypassrls %, createrole %, createdb %, inherit %, login %); drop and recreate it',
+			r.rolsuper, r.rolreplication, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolinherit, r.rolcanlogin;
+	end if;
+end
+$$;
 
 -- Membership is what lets the API `set role authenticated`; with NOINHERIT it confers nothing
 -- until that switch happens.
