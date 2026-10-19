@@ -140,8 +140,16 @@ async function main() {
 	console.log(`${tag} -> ${sha}, on origin/main`);
 
 	const flyEnv = { ...process.env, FLY_API_TOKEN: token };
-	const secrets = run(flyctl, ['secrets', 'list', '--app', app], { capture: true, env: flyEnv }).stdout;
-	for (const name of ['DATABASE_URL', 'SUPABASE_URL']) if (!new RegExp(`^\\s*${name}\\b`, 'm').test(secrets)) fail(`Fly secret ${name} is not set on ${app} (apps/cloud/README.md, "Database setup")`);
+	// JSON, not the table: the table's box-drawing borders and colours make
+	// line matching unreliable.
+	let secretNames;
+	try {
+		const raw = run(flyctl, ['secrets', 'list', '--app', app, '--json'], { capture: true, env: flyEnv }).stdout;
+		secretNames = new Set(JSON.parse(raw).map((s) => s.name ?? s.Name));
+	} catch (e) {
+		fail(`could not read the Fly secrets of ${app}: ${e instanceof Error ? e.message : e}`);
+	}
+	for (const name of ['DATABASE_URL', 'SUPABASE_URL']) if (!secretNames.has(name)) fail(`Fly secret ${name} is not set on ${app} (apps/cloud/README.md, "Database setup")`);
 
 	const dir = mkdtempSync(join(tmpdir(), 'curator-release-'));
 	try {

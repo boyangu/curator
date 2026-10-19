@@ -134,8 +134,8 @@ export type AuditWriterOptions = {
 type Kind = 'request' | 'audit';
 
 const WRITER_SQL: Record<Kind, string> = {
-	request: 'select curator.log_requests($1::jsonb)',
-	audit: 'select curator.log_audit_events($1::jsonb)',
+	request: 'select curator.log_requests($1::text::jsonb)',
+	audit: 'select curator.log_audit_events($1::text::jsonb)',
 };
 
 // The stdout line a row becomes when it cannot reach the database.

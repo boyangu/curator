@@ -181,7 +181,7 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 				`insert into curator.library_op (op_id, device_id, client_ts, schema_version, entity, entity_id, kind, payload)
 				select (e.op ->> 'op_id')::uuid, e.op ->> 'device_id', (e.op ->> 'client_ts')::bigint,
 					(e.op ->> 'schema_version')::int, e.op ->> 'entity', e.op ->> 'entity_id', e.op ->> 'kind', e.op -> 'payload'
-				from jsonb_array_elements($1::jsonb) with ordinality as e(op, ord)
+				from jsonb_array_elements($1::text::jsonb) with ordinality as e(op, ord)
 				order by e.ord
 				on conflict (op_id) do nothing
 				returning op_id::text as op_id`,
@@ -200,7 +200,7 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 						await tx.query<{ op_id: string }>(
 							`select op_id::text as op_id from curator.library_op
 							where user_id = (select auth.uid())
-								and op_id in (select jsonb_array_elements_text($1::jsonb)::uuid)`,
+								and op_id in (select jsonb_array_elements_text($1::text::jsonb)::uuid)`,
 							[JSON.stringify(conflicted)],
 						)
 					).map((r) => r.op_id),

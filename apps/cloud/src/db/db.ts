@@ -5,10 +5,19 @@
 // query builder sits between the reader and the SQL that RLS judges.
 //
 // Parameters are strings (or null) only, cast in SQL (`$1::bigint`,
-// `$2::jsonb`, `decode($3, 'base64')`). The two drivers infer types for JS
+// `$2::text::jsonb`, `decode($3, 'base64')`). The two drivers infer types for JS
 // numbers, arrays and buffers differently; a string with an explicit cast
 // means the same thing to both, so a test on PGlite exercises the production
-// query. Results are normalised the same way at the call sites: `num()` on
+// query.
+//
+// jsonb is the exception that needs two casts, `$1::text::jsonb`: postgres.js
+// learns the parameter's type from the server and runs its json serializer
+// (JSON.stringify) over a jsonb parameter, so an already-encoded string would
+// arrive as one JSON string scalar ("cannot extract elements from a scalar").
+// Typing the parameter as text keeps the driver's hands off it. PGlite does
+// not do this, so only db.test.ts guards it.
+//
+// Results are normalised the same way at the call sites: `num()` on
 // bigint columns, epoch-ms columns computed in SQL, jsonb read as text.
 
 import postgres from 'postgres';
