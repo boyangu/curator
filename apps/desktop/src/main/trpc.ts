@@ -186,6 +186,7 @@ export function buildAppRouter(h: Handlers) {
 		cloudSync: t.router({
 			status: proc('cloud-sync:status'),
 			now: proc('cloud-sync:now'),
+			setPollPolicy: proc('cloud-sync:set-poll-policy'),
 		}),
 		dialog: t.router({
 			pickFolder: proc('dialog:pick-folder'),

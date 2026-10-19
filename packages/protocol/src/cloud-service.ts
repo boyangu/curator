@@ -23,31 +23,74 @@ export type PushInput = {
 	ops: Op[];
 };
 
+// Optional server behaviours. A client uses one only after the server has
+// named it in `features` (on every PushResult and PullResult, and in the
+// health probe): the server's inputs are `.strict()`, so an older server
+// refuses a field it does not know, and a client that sends it blind would
+// stop syncing against it. Additive by construction: a server that omits
+// `features` simply has none of them.
+//   - 'pull_skip_own': sync.pull takes `deviceId` + `ownThroughSeq` and
+//     leaves out the caller's own ops it already holds; PushResult carries
+//     `clamped`, `batchMaxSeq` and `priorOwnMaxSeq`.
+export const SYNC_FEATURES = ['pull_skip_own'] as const;
+export type SyncFeature = (typeof SYNC_FEATURES)[number];
+
 export type PushResult = {
 	// Count of ops now in the log, including re-pushed duplicates (a duplicate
 	// `op_id` is accepted and ignored, scenario 10). Everything not listed in
 	// `rejected` was accepted, so the outbox marks the rest `acked`.
 	accepted: number;
+	// The account's head seq after this push (every device's ops).
 	maxSeq: number;
 	rejected: { opId: string; reason: RejectReason }[];
+	// The rest is 'pull_skip_own' and absent from older servers.
+	//
+	// Accepted ops whose stored `client_ts` differs from the one sent: the
+	// server clamped a stamp too far in the future (scenario 9), now or on
+	// the push that first stored a re-pushed op. `clientTs` is what the log
+	// holds. The device re-stamps its own records to it, which it used to
+	// learn only from the op's echo on pull.
+	clamped?: { opId: string; clientTs: number }[];
+	// The highest seq the log holds for any op this call accepted (new or
+	// re-pushed); 0 when none was.
+	batchMaxSeq?: number;
+	// The highest seq of this device's ops other than this call's; 0 when
+	// there are none, absent when the call accepted nothing. Above what the
+	// device knows it holds, it means ops stamped with its id that its
+	// database lacks (a restored backup, a copied database), so it must not
+	// ask pull to skip past them.
+	priorOwnMaxSeq?: number;
+	features?: SyncFeature[];
 };
 
 export type PullInput = {
 	afterSeq: number;
 	// At most MAX_PULL_OPS; the server caps it.
 	limit?: number;
+	// 'pull_skip_own', both or neither: leave out this device's ops with
+	// `seq <= ownThroughSeq`, which the caller vouches it already holds. Its
+	// later ops still come (and are skipped by `op_id` as before), so a
+	// restored or copied database gets back what it lost. Without these the
+	// page is every op after the cursor, own ones included. A filter on the
+	// caller's own rows only: it decides nothing about access.
+	deviceId?: string;
+	ownThroughSeq?: number;
 };
 
 export type PullResult = {
-	// Ordered by `seq`; includes the caller's own ops, which it skips by
-	// `op_id` (and learns their `seq` from).
+	// Ordered by `seq`. Includes the caller's own ops unless it asked to skip
+	// them (above); it skips the rest by `op_id` and learns their `seq`.
 	ops: StoredOp[];
-	// The seq of the last op returned, or `afterSeq` when the page is empty.
-	// Pull again from it until a page comes back empty.
+	// Where to pull from next: the seq of the last op returned, or `afterSeq`
+	// when the page is empty. With the own-op skip it can be further on: past
+	// own ops left out of the page, up to the head when the page reached it,
+	// so a run of own ops never stalls the cursor. Pull again from it until a
+	// page comes back empty, and keep `nextSeq` from that empty page too.
 	nextSeq: number;
 	// Present when the caller is too far behind to replay (more than 50k ops,
 	// or a cursor older than tombstone compaction): bootstrap instead.
 	snapshotSeq?: number;
+	features?: SyncFeature[];
 };
 
 export type BootstrapResult = {

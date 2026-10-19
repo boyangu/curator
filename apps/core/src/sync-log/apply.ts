@@ -103,11 +103,14 @@ export function applyOps(raw: Raw, input: readonly unknown[]): ApplyOutcome {
 	const ops: Op[] = input.map((o) => parseOp(o));
 	return raw.transaction((): ApplyOutcome => {
 		if (!recordsComplete(raw)) throw new SyncRecordsIncompleteError();
-		// Own ops come back on every pull; they are already applied, so skip
-		// them — unless the server stored a different client_ts. Then this
-		// device holds the op's effect under a clock no other device has, and
-		// would keep beating (or losing to) the wrong writes: re-stamp its
-		// records to the server's clock, then apply it like any remote op.
+		// Own ops come back on a pull unless the server left them out (the
+		// own-op skip); they are already applied, so skip them — unless the
+		// server stored a different client_ts. Then this device holds the
+		// op's effect under a clock no other device has, and would keep
+		// beating (or losing to) the wrong writes: re-stamp its records to the
+		// server's clock, then apply it like any remote op. The push path
+		// feeds a clamped op through here too, with the stamp the push result
+		// named (client.ts pushOnce).
 		const ownStmt = raw.prepare(`SELECT client_ts FROM sync_outbox WHERE op_id = ?`);
 		const restampStmt = raw.prepare(`UPDATE sync_outbox SET client_ts = ? WHERE op_id = ?`);
 		const incoming: Op[] = [];

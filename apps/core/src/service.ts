@@ -65,6 +65,7 @@ import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/sp
 import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
 import { createSyncClient, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type WakeReason } from './sync-log/client.js';
+import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
 
@@ -393,10 +394,20 @@ export interface CoreServiceOptions {
 	cloud?: {
 		transport: CloudTransport;
 		subscribeWakeups?: (onWake: (reason?: WakeReason) => void) => () => void;
+		// Whether the user is using the app, decided by the host (desktop
+		// main: window focus + OS idle time). Started with startCloudSync;
+		// `idleAfterMs` is pushed whenever the poll setting changes. Omitted ⇒
+		// always "in use" (the active cadence), as in tests and the CLI.
+		watchActivity?: (onChange: (active: boolean) => void) => CloudActivityWatcher;
 		// Sent with account.registerDevice on first sign-in.
 		device?: { name: string; platform: DevicePlatform };
 	};
 }
+
+export type CloudActivityWatcher = {
+	setIdleAfterMs(ms: number): void;
+	stop(): void;
+};
 
 // What getCloudSyncStatus answers: the client's status, or `enabled: false`
 // (with neutral values) when the build has no cloud transport.
@@ -1173,7 +1184,14 @@ export interface CoreService {
 	// Status changes and `applied` batches (changed local track / playlist
 	// ids) — the renderer refreshes the affected rows.
 	subscribeCloudSync(cb: (e: CloudSyncEvent) => void): () => void;
-	// Arms the scheduler (wake-ups, 60 s fallback, push on local write).
+	// The fallback poll cadence (app_setting 'sync.poll', per device — never
+	// synced): every activeSec while the app is in use, every idleSec once
+	// it has not been used for idleAfterSec. Readable and settable with sync
+	// disabled; a change applies to the running client at once. A patch is
+	// merged over the current value and clamped; null restores the defaults.
+	getCloudSyncPollSettings(): Promise<SyncPollSettings>;
+	setCloudSyncPollPolicy(patch: Partial<SyncPollPolicy> | null): Promise<SyncPollSettings>;
+	// Arms the scheduler (wake-ups, the fallback poll, push on local write).
 	// Called by the desktop main after the renderer's first load, like
 	// startBackupScheduler: the first-sign-in push must not compete with boot.
 	startCloudSync(): void;
@@ -2003,16 +2021,19 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			db: sqlite,
 			transport: opts.cloud.transport,
 			device: opts.cloud.device,
+			pollPolicy: readPollPolicy(sqlite),
 			onApplied: (a) => { if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks); },
 		})
 		: null;
 	let cloudWakeUnsub: (() => void) | null = null;
+	let cloudActivity: CloudActivityWatcher | null = null;
 	const cloudStatusReport = (): CloudSyncStatusReport => cloudClient
 		? { ...cloudClient.status(), enabled: true }
 		: {
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
 			lastPushAt: null, lastPullAt: null, lastSeq: 0, lastError: null, needsUpdate: false, initialPushDone: false,
 			initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
+			poll: { policy: readPollPolicy(sqlite), active: true, nextPollAt: null },
 		};
 
 	// Shared body of deleteTracks (soft == every source; hard == row DELETE)
@@ -5128,16 +5149,27 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		subscribeCloudSync(cb) {
 			return cloudClient ? cloudClient.subscribe(cb) : () => { /* sync disabled */ };
 		},
+		async getCloudSyncPollSettings() { return readPollSettings(sqlite); },
+		async setCloudSyncPollPolicy(patch) {
+			const next = writePollPolicy(sqlite, patch);
+			cloudClient?.setPollPolicy(next.policy);
+			cloudActivity?.setIdleAfterMs(next.policy.idleAfterSec * 1000);
+			return next;
+		},
 		startCloudSync() {
 			if (!cloudClient || cloudWakeUnsub) return;
 			cloudClient.start();
 			cloudWakeUnsub = opts.cloud?.subscribeWakeups?.((reason) => cloudClient.wake(reason)) ?? (() => { /* no wake source */ });
+			cloudActivity = opts.cloud?.watchActivity?.((active) => cloudClient.setActive(active)) ?? null;
+			cloudActivity?.setIdleAfterMs(readPollPolicy(sqlite).idleAfterSec * 1000);
 		},
 
 		close() {
 			// Stop cloud sync before the DB closes: a cycle mid-apply would
 			// otherwise write into a closed handle.
 			cloudWakeUnsub?.();
+			cloudActivity?.stop();
+			cloudActivity = null;
 			cloudClient?.stop();
 			// Stop the backup scheduler + engine host first: a run mid-upload
 			// must not outlive the DB it snapshotted.

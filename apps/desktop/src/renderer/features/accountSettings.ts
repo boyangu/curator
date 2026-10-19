@@ -9,8 +9,10 @@
 // write through accountApi / cloudSyncApi, re-render on cloud-sync:status
 // while the host is in the DOM. While signed out a status tick does NOT
 // re-render (it would wipe a half-typed password); only a sign-in does.
+// Signed in, a tick while one of this panel's inputs has focus only patches
+// the live lines in place, for the same reason (the check-cadence inputs).
 
-import type { CloudSyncStatusReport } from '@curator/core';
+import type { CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings } from '@curator/core';
 import { accountApi, cloudSyncApi } from '../data/api.js';
 import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
@@ -25,6 +27,9 @@ let unsubscribe: (() => void) | null = null;
 let account: AccountStatus | null = null;
 let sync: CloudSyncStatusReport | null = null;
 let devices: AccountDevice[] | null = null;
+// Defaults + limits for the check-cadence inputs (the policy in force rides
+// every status as `poll`).
+let pollSettings: SyncPollSettings | null = null;
 // Signed-out form state that survives a re-render.
 let draftEmail = '';
 let codeSentTo: string | null = null;
@@ -50,6 +55,83 @@ function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null): { text: st
 	const last = Math.max(s.lastPushAt ?? 0, s.lastPullAt ?? 0) || null;
 	if (s.pending > 0) return { text: `${s.pending.toLocaleString()} changes waiting to sync · last synced ${fmtWhen(last)}`, tone: 'ok' };
 	return { text: `Up to date · last synced ${fmtWhen(last)}`, tone: 'ok' };
+}
+
+// The fallback check cadence, shown in the units people think in: seconds
+// while in use, minutes when idle.
+const POLL_FIELDS: ReadonlyArray<{ key: keyof SyncPollPolicy; label: string; scale: number; suffix: string }> = [
+	{ key: 'activeSec', label: 'While in use', scale: 1, suffix: 'seconds between checks' },
+	{ key: 'idleSec', label: 'When idle', scale: 60, suffix: 'minutes between checks' },
+	{ key: 'idleAfterSec', label: 'Idle after', scale: 60, suffix: 'minutes in the background or without keyboard/mouse input' },
+];
+
+const fmtMin = (sec: number): string => `${sec % 60 === 0 ? sec / 60 : Math.round(sec / 6) / 10} min`;
+
+function pollLine(s: CloudSyncStatusReport): string {
+	const p = s.poll.policy;
+	return `Checking every ${p.activeSec} s · every ${fmtMin(p.idleSec)} after ${fmtMin(p.idleAfterSec)} idle · ${s.poll.active ? 'in use now' : 'idle now'}`;
+}
+
+function pollFieldValue(p: SyncPollPolicy, f: (typeof POLL_FIELDS)[number]): number {
+	return Math.round((p[f.key] / f.scale) * 10) / 10;
+}
+
+function renderPollSection(s: CloudSyncStatusReport): string {
+	const lim = pollSettings?.limits;
+	const fields = POLL_FIELDS.map((f) => {
+		const [min, max] = lim?.[f.key] ?? [1, 7200];
+		return `
+			<label class="settings-ui__field"><span class="settings-ui__field-label">${f.label}</span>
+				<input type="number" class="settings-ui__number" data-ac-poll="${f.key}" min="${Math.ceil(min / f.scale)}" max="${Math.floor(max / f.scale)}" step="1" value="${pollFieldValue(s.poll.policy, f)}" />
+				<span class="settings-ui__field-suffix">${f.suffix}</span>
+			</label>`;
+	}).join('');
+	return `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Background checks</div>
+			<div class="settings-toggle__hint">Changes from your other computers normally arrive within seconds. These checks catch anything that notification missed, and slow down while you are away. This computer only.</div>
+			<div class="settings-toggle__hint" data-ac-poll-status>${escapeHtml(pollLine(s))}</div>
+			${fields}
+			<div class="settings-rekordbox__path-row backup__row">
+				<span class="settings-ui__field-label"></span>
+				<button class="btn-secondary" data-ac-poll-reset ${pollSettings && !pollSettings.stored ? 'disabled' : ''}>Reset to defaults</button>
+			</div>
+		</div>`;
+}
+
+// Writes the policy in force into the inputs (after a save: the stored
+// value may have been clamped).
+function syncPollInputs(host: HTMLElement, p: SyncPollPolicy): void {
+	for (const f of POLL_FIELDS) {
+		const el = host.querySelector<HTMLInputElement>(`[data-ac-poll="${f.key}"]`);
+		if (el) el.value = String(pollFieldValue(p, f));
+	}
+}
+
+function wirePollSection(host: HTMLElement): void {
+	const apply = (res: SyncPollSettings): void => {
+		pollSettings = res;
+		if (sync) sync = { ...sync, poll: { ...sync.poll, policy: res.policy } };
+		syncPollInputs(host, res.policy);
+		const line = host.querySelector<HTMLElement>('[data-ac-poll-status]');
+		if (line && sync) line.textContent = pollLine(sync);
+		host.querySelector<HTMLButtonElement>('[data-ac-poll-reset]')?.toggleAttribute('disabled', !res.stored);
+	};
+	const save = (patch: Partial<SyncPollPolicy> | null): void => {
+		void cloudSyncApi.setPollPolicy(patch).then(apply).catch((err) => {
+			showToast('Could not save the check interval', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+			if (sync) syncPollInputs(host, sync.poll.policy);
+		});
+	};
+	// 'change', not 'input': commit on Enter / blur / the spinner, never
+	// half-way through typing "120".
+	host.querySelectorAll<HTMLInputElement>('[data-ac-poll]').forEach((el) => el.addEventListener('change', () => {
+		const f = POLL_FIELDS.find((x) => x.key === el.dataset.acPoll);
+		const n = Number(el.value);
+		if (!f || el.value.trim() === '' || !Number.isFinite(n)) { if (sync) syncPollInputs(host, sync.poll.policy); return; }
+		save({ [f.key]: Math.round(n * f.scale) });
+	}));
+	host.querySelector<HTMLButtonElement>('[data-ac-poll-reset]')?.addEventListener('click', () => save(null));
 }
 
 function renderSignedOut(host: HTMLElement, a: AccountStatus): void {
@@ -137,7 +219,7 @@ function renderSignedOut(host: HTMLElement, a: AccountStatus): void {
 
 function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusReport | null): void {
 	const line = syncLine(a, s);
-	const canSync = a.syncAvailable && !!s?.enabled && !s.running && !s.initialPush && !s.bootstrap;
+	const canSync = canSyncNow(a, s);
 	const deviceRows = devices === null
 		? `<div class="settings-toggle__hint">${a.syncAvailable ? 'Loading devices…' : 'Devices appear here once sync is on.'}</div>`
 		: devices.length === 0
@@ -165,12 +247,14 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 			</div>
 			${s && s.rejected > 0 ? `<div class="settings-toggle__hint">${s.rejected.toLocaleString()} ${s.rejected === 1 ? 'change was' : 'changes were'} refused by the server and will not be retried; see the log for details.</div>` : ''}
 		</div>
+		${a.syncAvailable && s?.enabled ? renderPollSection(s) : ''}
 		<div class="settings-ui__section">
 			<div class="settings-ui__section-label">Devices</div>
 			${deviceRows}
 		</div>`;
 
 	const q = <T extends Element>(sel: string): T | null => host.querySelector<T>(sel);
+	wirePollSection(host);
 	q<HTMLButtonElement>('[data-ac-sync-now]')?.addEventListener('click', () => {
 		void cloudSyncApi.syncNow().then((st) => { sync = st; render(host); }).catch((err) => {
 			showToast('Sync failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
@@ -197,6 +281,23 @@ function renderNotConfigured(host: HTMLElement): void {
 		</div>`;
 }
 
+const canSyncNow = (a: AccountStatus, s: CloudSyncStatusReport | null): boolean =>
+	a.syncAvailable && !!s?.enabled && !s.running && !s.initialPush && !s.bootstrap;
+
+// A status tick while the user is typing in this panel: refresh the live
+// lines only, leaving the inputs (and the caret) alone.
+function patchSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusReport | null): void {
+	const line = syncLine(a, s);
+	const el = host.querySelector<HTMLElement>('[data-ac-sync-line]');
+	if (el) {
+		el.textContent = line.text;
+		el.className = line.tone === 'ok' ? 'settings-toggle__hint' : `backup__banner backup__banner--${line.tone}`;
+	}
+	host.querySelector<HTMLButtonElement>('[data-ac-sync-now]')?.toggleAttribute('disabled', !canSyncNow(a, s));
+	const poll = host.querySelector<HTMLElement>('[data-ac-poll-status]');
+	if (poll && s) poll.textContent = pollLine(s);
+}
+
 function render(host: HTMLElement): void {
 	if (!host.isConnected || !account) return;
 	if (!account.configured) renderNotConfigured(host);
@@ -206,9 +307,14 @@ function render(host: HTMLElement): void {
 
 async function refresh(host: HTMLElement): Promise<void> {
 	try {
-		const [a, s] = await Promise.all([accountApi.status(), cloudSyncApi.status()]);
+		const [a, s, ps] = await Promise.all([
+			accountApi.status(),
+			cloudSyncApi.status(),
+			cloudSyncApi.pollSettings().catch((err) => { alog.warn('poll settings failed', { err: String(err) }); return pollSettings; }),
+		]);
 		account = a;
 		sync = s;
+		pollSettings = ps;
 		render(host);
 		if (a.signedIn && a.syncAvailable) {
 			devices = await accountApi.devices().catch((err) => { alog.warn('devices failed', { err: String(err) }); return devices ?? []; });
@@ -230,7 +336,11 @@ export function mountAccountSettings(host: HTMLElement): void {
 		// A sign-in / sign-out arrives as a status change: refetch the account
 		// then. Otherwise only the signed-in view repaints (see header).
 		if (s.signedIn !== wasSignedIn) void refresh(host);
-		else if (wasSignedIn) render(host);
+		else if (wasSignedIn && account) {
+			const typing = document.activeElement instanceof HTMLInputElement && host.contains(document.activeElement);
+			if (typing) patchSignedIn(host, account, s);
+			else render(host);
+		}
 	});
 	void refresh(host);
 }

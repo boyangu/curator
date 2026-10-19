@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { MAX_PUSH_OPS, MAX_PULL_OPS, SCHEMA_VERSION, trackTagEntityId } from '@curator/protocol';
+import { MAX_PUSH_OPS, MAX_PULL_OPS, SCHEMA_VERSION, SYNC_FEATURES, trackTagEntityId } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestApp, errorReason, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
 import { hasUnstorableText } from './push.js';
@@ -45,7 +45,7 @@ describe('sync.push / sync.pull', () => {
 		const rest = await api.sync.pull.query({ afterSeq: first.nextSeq, limit: 1_000_000 });
 		expect([...first.ops, ...rest.ops].map((o) => o.op_id)).toEqual(ops.map((o) => o.op_id));
 		const empty = await api.sync.pull.query({ afterSeq: rest.nextSeq });
-		expect(empty).toEqual({ ops: [], nextSeq: rest.nextSeq });
+		expect(empty).toEqual({ ops: [], nextSeq: rest.nextSeq, features: [...SYNC_FEATURES] });
 		expect(MAX_PULL_OPS).toBe(1000);
 	});
 
@@ -57,7 +57,9 @@ describe('sync.push / sync.pull', () => {
 		const wakes = (await wakeups(app.pg, userId)).length;
 
 		const again = await api.sync.push.mutate({ deviceId, ops });
-		expect(again).toEqual({ accepted: ops.length, maxSeq: first.maxSeq, rejected: [] });
+		// Nothing outside the batch is this device's: priorOwnMaxSeq 0.
+		expect(again).toEqual({ accepted: ops.length, maxSeq: first.maxSeq, rejected: [], clamped: [], batchMaxSeq: first.batchMaxSeq, priorOwnMaxSeq: 0, features: [...SYNC_FEATURES] });
+		expect(first.batchMaxSeq).toBe(first.maxSeq);
 		expect(await rowCount(userId)).toBe(rows);
 		expect((await wakeups(app.pg, userId)).length).toBe(wakes);
 
@@ -93,7 +95,7 @@ describe('sync.push / sync.pull', () => {
 
 	it('does not write or wake for an empty or all-rejected push', async () => {
 		const { userId, deviceId, api } = await app.signIn();
-		expect(await api.sync.push.mutate({ deviceId, ops: [] })).toEqual({ accepted: 0, maxSeq: 0, rejected: [] });
+		expect(await api.sync.push.mutate({ deviceId, ops: [] })).toEqual({ accepted: 0, maxSeq: 0, rejected: [], clamped: [], batchMaxSeq: 0, features: [...SYNC_FEATURES] });
 		const bad = await api.sync.push.mutate({ deviceId, ops: [{ nope: true }] });
 		expect(bad.rejected).toEqual([{ opId: '', reason: 'malformed' }]);
 		expect(await rowCount(userId)).toBe(0);

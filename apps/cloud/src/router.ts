@@ -5,7 +5,7 @@
 //
 // `catalogue.*` (workstream D) is not here yet.
 
-import { MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION, type DeviceInfo, type PullResult, type PushResult } from '@curator/protocol';
+import { MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION, SYNC_FEATURES, ZDeviceId, ZPullInput, type DeviceInfo, type PullResult, type PushResult } from '@curator/protocol';
 import { z } from 'zod';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import { CloudError } from './errors.js';
@@ -15,21 +15,13 @@ import { push } from './sync/push.js';
 import { authedProcedure, publicProcedure, rateLimit, router } from './trpc.js';
 import type { BootstrapResult, HealthResult } from './wire.js';
 
-const ZDeviceId = z.string().min(1).max(128);
-
 // `ops` is unknown[] on purpose: each op is validated on its own with
 // `parseOp` so one malformed op is rejected alone while the rest land. The
 // 500-op / 1 MB caps are checked in push() so they answer `batch_too_large`.
 const ZPushInput = z.object({ deviceId: ZDeviceId, ops: z.array(z.unknown()) }).strict();
 
-const ZPullInput = z
-	.object({
-		afterSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-		// Capped at MAX_PULL_OPS by pull(), not refused: asking for more is not
-		// an error, the client just gets a page.
-		limit: z.number().int().positive().optional(),
-	})
-	.strict();
+// sync.pull's input lives in the protocol (sync-input.ts), next to the
+// 'pull_skip_own' contract it carries.
 
 const ZRegisterDeviceInput = z
 	.object({
@@ -39,8 +31,9 @@ const ZRegisterDeviceInput = z
 	})
 	.strict();
 
-// Pulls carry no device id (protocol PullInput), so the bucket is per
-// Supabase session, which is one per signed-in install.
+// A pull's optional device id is a filter, not an identity (nothing checks
+// it is registered, and a client could rotate it at will), so the bucket is
+// per Supabase session, which is one per signed-in install.
 const pullKey = (user: { id: string; sessionId: string | null }) => `${user.id}:${user.sessionId ?? '-'}`;
 
 export const appRouter = router({
@@ -48,6 +41,7 @@ export const appRouter = router({
 		ok: true,
 		schemaVersion: SCHEMA_VERSION,
 		minSupportedSchemaVersion: MIN_SUPPORTED_SCHEMA_VERSION,
+		features: [...SYNC_FEATURES],
 		// Baked into the image by the deploy workflow (Dockerfile ARG GIT_SHA);
 		// the workflow polls this until it shows the commit it deployed. `||`
 		// rather than `??`: an image built without the arg carries an empty
@@ -66,9 +60,12 @@ export const appRouter = router({
 		}),
 		pull: authedProcedure.input(ZPullInput).query(async ({ ctx, input }): Promise<PullResult> => {
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
-			const r = await pull(ctx.deps.db, ctx.user.id, input, ctx.deps.pull);
-			ctx.call.opsOut = r.ops.length;
-			return r;
+			const { result, skippedOwn } = await pull(ctx.deps.db, ctx.user.id, input, ctx.deps.pull);
+			// What was actually sent; the own ops left out go to the stdout
+			// line only (request_log has no column for them).
+			ctx.call.opsOut = result.ops.length;
+			if (input.deviceId !== undefined) ctx.call.opsSkippedOwn = skippedOwn;
+			return result;
 		}),
 		// Shares the pull bucket: it is the heaviest read there is. Audited
 		// because it hands out the whole library in one response.

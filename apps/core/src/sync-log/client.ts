@@ -15,8 +15,14 @@
 //   - Pull reads pages after `sync_cursor.last_seq`; each page is applied and
 //     the cursor advanced in ONE transaction, so a crash mid-page leaves both
 //     untouched and the page is simply pulled again (apply is idempotent).
-//     Own ops come back too; applyOps skips them by op_id. A `snapshotSeq`
-//     hint means "too far behind": bootstrap from the snapshot instead.
+//     A `snapshotSeq` hint means "too far behind": bootstrap from the
+//     snapshot instead.
+//   - Own ops: a server with 'pull_skip_own' leaves out this device's ops up
+//     to `ownThroughSeq`, the seq through which this database provably holds
+//     every op stamped with its device id (see ClientState). Anything else of
+//     its own still comes back and applyOps skips it by op_id — the only path
+//     against an older server. A clamped stamp is learnt from the push result
+//     (or, from an older server, from the echo) and repaired the same way.
 //   - An op from a newer protocol version stops apply at its seq (order must
 //     hold) and reports `needsUpdate`; local reads keep working.
 //   - A library is bound to the first account that syncs it. Signing in as
@@ -37,8 +43,11 @@ import {
 	type DevicePlatform,
 	type EntityRef,
 	type Op,
+	type PullInput,
+	type PullResult,
 	type RejectReason,
 	type StoredOp,
+	type SyncFeature,
 } from '@curator/protocol';
 import type { AreaLogger } from '@curator/shared/log';
 import { log } from '../log.js';
@@ -47,6 +56,7 @@ import { applyOps, INITIAL_PUSH_KEY, SyncRecordsIncompleteError, type ApplyOutco
 import { getDeviceId } from './device.js';
 import { initialPushAsync, type InitialPushProgress } from './initial-push.js';
 import { observeServerTs, onOutboxAppend } from './outbox.js';
+import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
 
 type Raw = Database.Database;
@@ -108,6 +118,9 @@ export type CloudSyncStatus = {
 	running: boolean;
 	// When the next retry fires after a transient failure.
 	nextRetryAt: number | null;
+	// The fallback poll: the cadence in force, whether the host reports the
+	// app in use (false = the idle cadence applies), and when it next fires.
+	poll: { policy: SyncPollPolicy; active: boolean; nextPollAt: number | null };
 };
 
 export type CloudSyncApplied = {
@@ -123,7 +136,11 @@ export type CloudSyncEvent =
 	| { kind: 'status'; status: CloudSyncStatus }
 	| { kind: 'applied'; applied: CloudSyncApplied };
 
-export type WakeReason = 'realtime' | 'focus' | 'network' | 'session' | 'local' | 'interval' | 'manual';
+// 'resume': the host reported the app back in use after an idle spell.
+export type WakeReason = 'realtime' | 'focus' | 'network' | 'session' | 'local' | 'interval' | 'resume' | 'manual';
+// What a cycle's summary line names as its cause: the wake reasons it
+// coalesced, or the backoff timer.
+type CycleReason = WakeReason | 'retry';
 
 // ── options ─────────────────────────────────────────────────────────────────
 
@@ -136,9 +153,11 @@ export type SyncClientOptions = {
 	// After a pull or bootstrap changed local rows (the service recomputes
 	// the membership tier for them).
 	onApplied?: (applied: CloudSyncApplied) => void;
+	// The fallback poll cadence to start with (normalised; defaults
+	// otherwise). setPollPolicy changes it later.
+	pollPolicy?: Partial<SyncPollPolicy>;
 	// Scheduling knobs (tests shorten them).
 	debounceMs?: number;
-	intervalMs?: number;
 	backoffBaseMs?: number;
 	backoffCapMs?: number;
 	initialPushChunk?: number;
@@ -165,8 +184,14 @@ export interface SyncClient {
 	// until drained. Resets any backoff. Resolves when the cycle is done.
 	syncNow(): Promise<void>;
 	// Debounced cycle trigger for wake-ups (Realtime, focus, network, local
-	// writes, the interval).
+	// writes, the fallback poll).
 	wake(reason?: WakeReason): void;
+	// The fallback poll's cadence. Applies at once: the next poll is due one
+	// (new) interval after the previous one, or now if that has passed.
+	setPollPolicy(policy: Partial<SyncPollPolicy>): void;
+	// The host's verdict on whether the app is in use. Idle → in use syncs
+	// once right away ('resume') and returns to the active cadence.
+	setActive(active: boolean): void;
 	start(): void;
 	stop(): void;
 	status(): CloudSyncStatus;
@@ -187,15 +212,26 @@ type ClientState = {
 	registeredFor: string | null;
 	lastPushAt: number | null;
 	lastPullAt: number | null;
-	// Set when a pulled own op came back re-stamped (server clock clamp):
-	// remote writes applied before it may have lost locally to the
-	// unclamped stamp, and an LWW cell keeps only its winner, so the next
-	// pull reloads the snapshot and replays from its seq.
+	// Set when an own op was re-stamped by the server's clock clamp (named
+	// in a push result, or seen in its echo from an older server): remote
+	// writes applied before it may have lost locally to the unclamped stamp,
+	// and an LWW cell keeps only its winner, so the next pull reloads the
+	// snapshot and replays from its seq.
 	needsRepair?: boolean;
+	// Every op stamped with this device id at or below this seq is held here
+	// (in the outbox, or applied from a pull). What the pull asks the server
+	// to leave out. Kept in this database, so a restored backup rewinds it
+	// with the outbox it describes. It moves:
+	//   - to a drained pull's cursor: everything up to it has been seen;
+	//   - to a push's `batchMaxSeq`, but only when the server's
+	//     `priorOwnMaxSeq` is not above it — otherwise ops with this id exist
+	//     that this database never pushed (a restored or copied database),
+	//     and they must come back on the pull.
+	ownThroughSeq?: number;
 };
 
 function readClientState(raw: Raw): ClientState {
-	const blank: ClientState = { userId: null, registeredFor: null, lastPushAt: null, lastPullAt: null, needsRepair: false };
+	const blank: ClientState = { userId: null, registeredFor: null, lastPushAt: null, lastPullAt: null, needsRepair: false, ownThroughSeq: 0 };
 	const row = raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).get(CLIENT_STATE_KEY) as { value: string } | undefined;
 	if (!row) return blank;
 	try { return { ...blank, ...(JSON.parse(row.value) as Partial<ClientState>) }; } catch { return blank; }
@@ -236,7 +272,6 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const transport = opts.transport;
 	const slog = opts.logger ?? log.for('cloud-sync');
 	const debounceMs = opts.debounceMs ?? 250;
-	const intervalMs = opts.intervalMs ?? 60_000;
 	const backoffBase = opts.backoffBaseMs ?? 1_000;
 	const backoffCap = opts.backoffCapMs ?? 60_000;
 	const random = opts.random ?? Math.random;
@@ -258,12 +293,30 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	let nextRetryAt: number | null = null;
 	let retryTimer: ReturnType<typeof setTimeout> | null = null;
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-	let intervalTimer: ReturnType<typeof setInterval> | null = null;
+	// The fallback poll is a self-rescheduling timeout, not an interval, so a
+	// cadence change takes effect without waiting out the old period.
+	let pollPolicy = normalizePollPolicy(opts.pollPolicy);
+	let active = true;
+	let pollTimer: ReturnType<typeof setTimeout> | null = null;
+	// When the current poll period started counting (start, last poll, or a
+	// return to use).
+	let pollBase = 0;
+	let nextPollAt: number | null = null;
+	// Why the next cycle runs; taken (and cleared) when a cycle starts.
+	const reasons = new Set<CycleReason>();
 	let unsubOutbox: (() => void) | null = null;
 	let inflight: Promise<void> | null = null;
 	let lastStatusEmit = 0;
 	// Set while runOnce() runs; push/pull/bootstrap add to it.
 	let tally: CycleTally | null = null;
+	// Whether the server last said it offers the own-op skip. Learnt from
+	// every push and pull result rather than kept: an older (or rolled back)
+	// server refuses the extra pull fields, and one that omits `features`
+	// simply has none. Until the first answer, pulls go without it.
+	let serverSkipsOwn = false;
+	const learnFeatures = (features: readonly SyncFeature[] | undefined): void => {
+		serverSkipsOwn = features?.includes('pull_skip_own') ?? false;
+	};
 
 	const counts = raw.prepare(`SELECT state, count(*) AS n FROM sync_outbox WHERE state IN ('pending', 'rejected') GROUP BY state`);
 
@@ -289,6 +342,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			bootstrap: bootstrapProgress,
 			running,
 			nextRetryAt,
+			poll: { policy: { ...pollPolicy }, active, nextPollAt },
 		};
 	};
 
@@ -361,22 +415,54 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			bytes += size;
 		}
 		const res = await transport.sync.push({ deviceId, ops });
+		learnFeatures(res.features);
 		const rejected = new Map<string, RejectReason>(res.rejected.map((r) => [r.opId, r.reason]));
+		const clampedTs = new Map((res.clamped ?? []).map((c) => [c.opId, c.clientTs]));
 		let held: PushOutcome['stopped'] = null;
 		let nAcked = 0;
 		let nRejected = 0;
 		let nHeld = 0;
+		let restamp: ApplyOutcome | null = null;
 		raw.transaction(() => {
+			const restamped: Op[] = [];
 			for (const op of ops) {
 				const reason = rejected.get(op.op_id);
-				if (reason === undefined) { markAcked.run(op.op_id); nAcked++; continue; }
+				if (reason === undefined) {
+					markAcked.run(op.op_id);
+					nAcked++;
+					const ts = clampedTs.get(op.op_id);
+					if (ts !== undefined && ts !== op.client_ts) restamped.push({ ...op, client_ts: ts } as Op);
+					continue;
+				}
 				// Not the op's fault: keep it pending for after the update /
 				// for a device that is re-admitted.
 				if (reason === 'update_required' || reason === 'device_revoked') { held = reason; nHeld++; continue; }
 				markRejected.run(reason, op.op_id);
 				nRejected++;
 			}
+			// The server stored these under its clock, not ours: the re-stamp a
+			// clamped op's echo triggers in applyOps (it finds the op in the
+			// outbox under another client_ts), done now with the acks, because
+			// with the own-op skip the echo never comes.
+			if (restamped.length > 0) restamp = applyOps(raw, restamped);
+			const st = readClientState(raw);
+			const next = { ...st };
+			// In the same commit as the re-stamp, so a crash cannot keep one
+			// without the other.
+			if ((restamp as ApplyOutcome | null)?.restamped) next.needsRepair = true;
+			// ownThroughSeq follows the batch only when nothing stamped with
+			// this device id lies above it outside the batch (ClientState).
+			const through = st.ownThroughSeq ?? 0;
+			if (res.batchMaxSeq !== undefined && res.priorOwnMaxSeq !== undefined && res.priorOwnMaxSeq <= through && res.batchMaxSeq > through) {
+				next.ownThroughSeq = res.batchMaxSeq;
+			}
+			if (next.needsRepair !== st.needsRepair || next.ownThroughSeq !== st.ownThroughSeq) writeClientState(raw, next);
 		})();
+		const r = restamp as ApplyOutcome | null;
+		if (r && r.restamped > 0) {
+			slog.warn('push: the server clamped own ops (clock skew) — re-stamped; the next pull reloads the snapshot to repair', { count: r.restamped });
+			emitApplied(r.tracksTouched, r.playlistsTouched, r.changed);
+		}
 		if (tally) { tally.pushed += nAcked; tally.rejected += nRejected; tally.held += nHeld; }
 		if (nRejected > 0) slog.warn('push: ops rejected', { count: nRejected, sample: res.rejected.slice(0, 5) });
 		patchClientState({ lastPushAt: Date.now() });
@@ -388,6 +474,28 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	// ── pull ────────────────────────────────────────────────────────────
 
+	// One page, without this device's held ops when the server offers that.
+	// A server that advertised the skip and then refuses its fields (rolled
+	// back mid-session) gets the same pull without them, so sync carries on.
+	const pullPage = async (afterSeq: number): Promise<PullResult> => {
+		const base: PullInput = { afterSeq, limit: MAX_PULL_OPS };
+		const through = readClientState(raw).ownThroughSeq ?? 0;
+		if (serverSkipsOwn && through > 0) {
+			try {
+				const res = await transport.sync.pull({ ...base, deviceId, ownThroughSeq: through });
+				learnFeatures(res.features);
+				return res;
+			} catch (err) {
+				if (!(err instanceof CloudTransportError && err.kind === 'bad_request')) throw err;
+				slog.warn('pull: the server refused the own-op skip; pulling without it', { reason: err.message });
+				serverSkipsOwn = false;
+			}
+		}
+		const res = await transport.sync.pull(base);
+		learnFeatures(res.features);
+		return res;
+	};
+
 	const pullOnce = async (): Promise<PullOutcome> => {
 		const out: PullOutcome = { applied: 0, received: 0, pages: 0, bootstrapped: false, stopped: null };
 		const tracks = new Set<string>();
@@ -397,7 +505,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		try {
 			for (;;) {
 				const cursor = readCursor(raw);
-				const res = await transport.sync.pull({ afterSeq: cursor.lastSeq, limit: MAX_PULL_OPS });
+				const res = await pullPage(cursor.lastSeq);
 				out.received += res.ops.length;
 				if (tally) tally.pulled += res.ops.length;
 				// Bootstrap at most once per pull: a second hint after loading
@@ -409,12 +517,21 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				}
 				if (res.ops.length === 0) {
 					if (readClientState(raw).needsRepair && !out.bootstrapped) {
-						slog.warn('own ops came back re-stamped by the server (clock skew) — reloading the snapshot to repair');
+						slog.warn('own ops were re-stamped by the server (clock skew) — reloading the snapshot to repair');
 						await bootstrap({ resetCursor: true });
 						patchClientState({ needsRepair: false });
 						out.bootstrapped = true;
 						continue;
 					}
+					// Drained. An empty page can still move the cursor (a run of
+					// own ops the server left out), and everything up to the
+					// cursor is now held here, so ownThroughSeq follows it.
+					raw.transaction(() => {
+						const at = Math.max(res.nextSeq, cursor.lastSeq);
+						if (at > cursor.lastSeq) writeCursor(raw, at);
+						const st = readClientState(raw);
+						if (at > (st.ownThroughSeq ?? 0)) writeClientState(raw, { ...st, ownThroughSeq: at });
+					})();
 					break;
 				}
 				out.pages++;
@@ -428,7 +545,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 						raw.transaction(() => {
 							outcome = applyOps(raw, page.map(wireOp));
 							opts.beforeCursorAdvance?.(page);
-							writeCursor(raw, Math.max(lastSeq, cursor.lastSeq));
+							// The whole page applied: the cursor may pass its last op,
+							// over own ops the server left out. Held at an op from a
+							// newer version: no further than the last one applied.
+							writeCursor(raw, Math.max(lastSeq, cursor.lastSeq, aheadAt < 0 ? res.nextSeq : 0));
 						})();
 					} catch (err) {
 						if (err instanceof OpValidationError) {
@@ -547,6 +667,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			retryTimer = setTimeout(() => {
 				retryTimer = null;
 				nextRetryAt = null;
+				reasons.add('retry');
 				void cycle();
 			}, delay);
 			retryTimer.unref?.();
@@ -569,7 +690,14 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		return err instanceof Error ? err.message : String(err);
 	};
 
+	const takeReason = (): string => {
+		const r = [...reasons].join('+') || 'unknown';
+		reasons.clear();
+		return r;
+	};
+
 	const runOnce = async (): Promise<void> => {
+		const reason = takeReason();
 		const session = transport.session();
 		if (!session) {
 			clearRetry();
@@ -616,7 +744,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// debug: at the 60 s interval it would be ~1,440 info lines a day
 			// saying nothing. Anything that moved or failed is info.
 			const moved = t.pushed + t.rejected + t.held + t.pulled > 0 || t.bootstrapped;
-			const fields = { outcome, pushed: t.pushed, rejected: t.rejected, held: t.held, pulled: t.pulled, applied: t.applied, bootstrapped: t.bootstrapped, snapshotRecords: t.snapshotRecords, needsUpdate: pushRefused || pullHeld, ms: Date.now() - started };
+			const fields = { reason, outcome, pushed: t.pushed, rejected: t.rejected, held: t.held, pulled: t.pulled, applied: t.applied, bootstrapped: t.bootstrapped, snapshotRecords: t.snapshotRecords, needsUpdate: pushRefused || pullHeld, ms: Date.now() - started };
 			if (moved || outcome !== 'ok') slog.info('sync cycle', fields);
 			else slog.debug('sync cycle', fields);
 		}
@@ -647,6 +775,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		// it is likely still there, and the retry timer will run anyway).
 		if (reason === 'network' || reason === 'session' || reason === 'manual') { attempt = 0; clearRetry(); }
 		if (nextRetryAt !== null) return;
+		reasons.add(reason);
 		// Coalesce into the pending timer rather than restarting it: a long
 		// burst of local writes (an import) must not postpone the push for as
 		// long as it lasts. Wakes during a running cycle rerun it (`again`).
@@ -662,6 +791,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		attempt = 0;
 		clearRetry();
 		pushRefused = false;
+		reasons.add('manual');
 		if (running) {
 			again = true;
 			await inflight;
@@ -671,6 +801,58 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		await cycle();
 	};
 
+	const pollPeriodMs = (): number => (active ? pollPolicy.activeSec : pollPolicy.idleSec) * 1000;
+
+	const clearPoll = (): void => {
+		if (pollTimer) clearTimeout(pollTimer);
+		pollTimer = null;
+		nextPollAt = null;
+	};
+
+	// (Re)arms the fallback poll for one period after `pollBase`. A due time
+	// already past (the period was just shortened) polls now rather than
+	// waiting out the old timer.
+	const armPoll = (): void => {
+		clearPoll();
+		if (stopped) return;
+		const now = Date.now();
+		const due = Math.max(now, pollBase + pollPeriodMs());
+		nextPollAt = due;
+		pollTimer = setTimeout(() => {
+			pollTimer = null;
+			pollBase = Date.now();
+			wake('interval');
+			armPoll();
+		}, due - now);
+		pollTimer.unref?.();
+	};
+
+	const cadenceFields = (): Record<string, unknown> => ({ everySec: active ? pollPolicy.activeSec : pollPolicy.idleSec, ...pollPolicy });
+
+	const setPollPolicy = (p: Partial<SyncPollPolicy>): void => {
+		const next = normalizePollPolicy({ ...pollPolicy, ...Object.fromEntries(Object.entries(p).filter(([, v]) => v !== undefined)) });
+		if (samePollPolicy(next, pollPolicy)) return;
+		pollPolicy = next;
+		slog.info('poll cadence changed', { active, ...cadenceFields() });
+		armPoll();
+		emitStatus();
+	};
+
+	const setActive = (next: boolean): void => {
+		if (next === active) return;
+		active = next;
+		// One line per switch, never per tick.
+		slog.info(next ? 'poll cadence: in use' : 'poll cadence: idle', cadenceFields());
+		if (next) {
+			// Back in use: whatever arrived while idle is fetched now, and
+			// the active period counts from here.
+			pollBase = Date.now();
+			if (!stopped) wake('resume');
+		}
+		armPoll();
+		emitStatus();
+	};
+
 	return {
 		pushOnce,
 		pullOnce,
@@ -678,20 +860,21 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		runInitialPush,
 		syncNow,
 		wake,
+		setPollPolicy,
+		setActive,
 		start() {
 			if (!stopped) return;
 			stopped = false;
 			unsubOutbox = onOutboxAppend(raw, () => wake('local'));
-			intervalTimer = setInterval(() => wake('interval'), intervalMs);
-			intervalTimer.unref?.();
+			pollBase = Date.now();
+			armPoll();
 			wake('session');
 		},
 		stop() {
 			stopped = true;
 			unsubOutbox?.();
 			unsubOutbox = null;
-			if (intervalTimer) clearInterval(intervalTimer);
-			intervalTimer = null;
+			clearPoll();
 			if (debounceTimer) clearTimeout(debounceTimer);
 			debounceTimer = null;
 			clearRetry();

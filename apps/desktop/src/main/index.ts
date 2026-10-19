@@ -29,6 +29,7 @@ import { CoreSidecarHost } from './core-sidecar/host.js';
 import { AudioSidecarHost } from './audio-sidecar.js';
 import { SpotifySidecarHost } from './spotify-sidecar.js';
 import { CloudAccount } from './cloud/account.js';
+import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport } from './cloud/transport.js';
 import { cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import type { CloudTransport } from '@curator/core';
@@ -1059,6 +1060,8 @@ app.whenReady().then(async () => {
 			? {
 				transport: cloudTransport,
 				subscribeWakeups: (onWake) => accountForCore.subscribeWakeups(onWake),
+				// Focus + OS idle time decide the fallback poll's cadence.
+				watchActivity: (onChange) => watchAppActivity(() => mainWindow, onChange),
 				device: { name: hostname(), platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32' },
 			}
 			: undefined,

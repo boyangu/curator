@@ -335,6 +335,8 @@ export const accountApi = {
 export const cloudSyncApi = {
 	status: () => api()['cloud-sync:status'](),
 	syncNow: () => trpc.cloudSync.now.mutate([]),
+	pollSettings: () => api()['cloud-sync:get-poll-settings'](),
+	setPollPolicy: (patch: Parameters<typeof window.api['cloud-sync:set-poll-policy']>[0]) => trpc.cloudSync.setPollPolicy.mutate([patch]),
 	onStatus: (cb: Parameters<typeof window.api.onCloudSyncStatus>[0]) => api().onCloudSyncStatus(cb),
 	onApplied: (cb: Parameters<typeof window.api.onSyncApplied>[0]) => api().onSyncApplied(cb),
 };

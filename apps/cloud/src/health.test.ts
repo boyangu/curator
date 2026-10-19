@@ -1,4 +1,4 @@
-import { MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION } from '@curator/protocol';
+import { MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION, SYNC_FEATURES } from '@curator/protocol';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createTestApp, type TestApp } from './test/harness.js';
 
@@ -19,6 +19,7 @@ describe('health', () => {
 			ok: true,
 			schemaVersion: SCHEMA_VERSION,
 			minSupportedSchemaVersion: MIN_SUPPORTED_SCHEMA_VERSION,
+			features: [...SYNC_FEATURES],
 			commit: '0123456789abcdef0123456789abcdef01234567',
 		});
 	});

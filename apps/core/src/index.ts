@@ -23,6 +23,7 @@ export type { TargetDeps as BackupTargetDeps } from './backup/targets/index.js';
 export { applyPendingRestore, readPendingRestore, readRestoreApplied, clearRestoreApplied, remapLocalPathsAt, PENDING_RENDERER_SETTINGS_FILE, type RestoreApplied } from './backup/apply.js';
 export { CloudTransportError, type CloudTransport, type CloudSession, type CloudErrorKind, type CloudSyncStatus, type CloudSyncEvent, type CloudSyncApplied, type WakeReason } from './sync-log/client.js';
 export { decodeLibraryStateSnapshot, type SnapshotRecord } from './sync-log/snapshot.js';
+export type { SyncPollPolicy, SyncPollSettings } from './sync-log/poll-policy.js';
 export type { CreatePhaseSummary as RekordboxCreateSummary } from './rekordbox/create-phase.js';
 export { config } from './config.js';
 export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/index.js';

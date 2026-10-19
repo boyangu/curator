@@ -2,7 +2,9 @@
 // server's rules (design: "Server API"): one seq per user, duplicate op ids
 // accepted and ignored, per-op rejection without failing the batch,
 // materialisation with the protocol reducer, a `snapshotSeq` hint for a
-// far-behind cursor, and injectable transport failures.
+// far-behind cursor, the 'pull_skip_own' feature (or, with `legacy`, a
+// server from before it, strict about its pull input), and injectable
+// transport failures.
 //
 // Generated DBs only (CLAUDE.md): mkdtempSync + migrate(); the services get
 // a throwing Spotify adapter and no remote-write policy, and no transport
@@ -34,6 +36,7 @@ import {
 	type PushResult,
 	type RejectReason,
 	type StoredOp,
+	SYNC_FEATURES,
 } from '@curator/protocol';
 import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
@@ -54,7 +57,13 @@ import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '../library
 
 class FakeCloud {
 	readonly log: StoredOp[] = [];
-	private readonly byId = new Set<string>();
+	private readonly byId = new Map<string, StoredOp>();
+	// A server from before 'pull_skip_own': no features, no clamp report,
+	// and a pull input with the skip fields is refused (zod `.strict()`).
+	legacy = false;
+	readonly pullInputs: PullInput[] = [];
+	// Ops sent back on pulls, all callers together.
+	opsSent = 0;
 	readonly state = createLibraryState();
 	readonly devices = new Map<string, DeviceInfo>();
 	// Ops the server refuses (as a malformed/unauthorised op would be).
@@ -77,6 +86,9 @@ class FakeCloud {
 		this.pushSizes.push(input.ops.length);
 		if (input.ops.length > MAX_PUSH_OPS) throw new CloudTransportError('bad_request', 'batch too large');
 		const rejected: PushResult['rejected'] = [];
+		const clamped: NonNullable<PushResult['clamped']> = [];
+		const batchIds = new Set<string>();
+		let batchMaxSeq = 0;
 		let accepted = 0;
 		for (const raw of input.ops) {
 			const v = safeParseOp(raw);
@@ -86,24 +98,47 @@ class FakeCloud {
 			const refused = this.rejectIds.get(opId);
 			if (refused) { rejected.push({ opId, reason: refused }); continue; }
 			accepted++;
-			if (this.byId.has(opId)) continue; // re-push: accepted and ignored
-			this.byId.add(opId);
-			const now = Date.now();
-			const op = { ...v.op, client_ts: clampClientTs(v.op.client_ts, now).clientTs } as Op;
-			this.log.push({ ...op, seq: this.maxSeq + 1, user_id: userId, received_at: now } as StoredOp);
-			applyOp(this.state, op);
+			batchIds.add(opId);
+			let stored = this.byId.get(opId); // a re-push: accepted and ignored
+			if (!stored) {
+				const now = Date.now();
+				const op = { ...v.op, client_ts: clampClientTs(v.op.client_ts, now).clientTs } as Op;
+				stored = { ...op, seq: this.maxSeq + 1, user_id: userId, received_at: now } as StoredOp;
+				this.byId.set(opId, stored);
+				this.log.push(stored);
+				applyOp(this.state, op);
+			}
+			batchMaxSeq = Math.max(batchMaxSeq, stored.seq);
+			if (stored.client_ts !== v.op.client_ts && !clamped.some((c) => c.opId === opId)) clamped.push({ opId, clientTs: stored.client_ts });
 		}
-		return { accepted, maxSeq: this.maxSeq, rejected };
+		if (this.legacy) return { accepted, maxSeq: this.maxSeq, rejected };
+		const prior = this.log.filter((o) => o.device_id === input.deviceId && !batchIds.has(o.op_id)).reduce((m, o) => Math.max(m, o.seq), 0);
+		return {
+			accepted, maxSeq: this.maxSeq, rejected, clamped, batchMaxSeq,
+			...(accepted > 0 ? { priorOwnMaxSeq: prior } : {}),
+			features: [...SYNC_FEATURES],
+		};
 	}
 
 	pull(input: PullInput): PullResult {
 		this.calls.pull++;
+		this.pullInputs.push({ ...input });
 		const f = this.fail.pull.shift();
 		if (f) throw f;
-		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq };
+		const skip = input.deviceId !== undefined || input.ownThroughSeq !== undefined;
+		if (skip && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
+		const features = this.legacy ? {} : { features: [...SYNC_FEATURES] };
+		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq, ...features };
 		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
-		const ops = this.log.filter((o) => o.seq > input.afterSeq).slice(0, limit);
-		return { ops, nextSeq: ops.length ? ops[ops.length - 1]!.seq : input.afterSeq };
+		const ops = this.log
+			.filter((o) => o.seq > input.afterSeq && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!))
+			.slice(0, limit);
+		// The real server's cursor rule (cloud sync/pull.ts): a full page stops
+		// at its last op; a short one reached the head.
+		const nextSeq = !skip ? (ops.length ? ops[ops.length - 1]!.seq : input.afterSeq)
+			: ops.length === limit ? ops[ops.length - 1]!.seq : Math.max(input.afterSeq, this.maxSeq);
+		this.opsSent += ops.length;
+		return { ops, nextSeq, ...features };
 	}
 
 	takeSnapshot(): number {
@@ -219,6 +254,19 @@ async function until(cond: () => boolean, ms = 3_000): Promise<void> {
 }
 
 const diffs = (a: Database.Database, b: Database.Database) => compareDumps(dumpLibrary(a), dumpLibrary(b)).filter((r) => !r.equal);
+
+// Sets this device's op clock `aheadMs` ahead of real time, as a fast system
+// clock would leave it.
+function skewClock(raw: Database.Database, aheadMs: number): void {
+	const row = raw.prepare(`SELECT value FROM app_setting WHERE key = 'sync.clock'`).pluck().get() as string | undefined;
+	const seq = raw.prepare(`SELECT COALESCE(MAX(seq_local), 0) FROM sync_outbox`).pluck().get() as number;
+	const c = row ? JSON.parse(row) as Record<string, number> : { lastServerTs: 0, lastSeqLocal: seq };
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES ('sync.clock', ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(JSON.stringify({ ...c, lastIssuedTs: Date.now() + aheadMs }), Date.now());
+}
+
+const clientState = (raw: Database.Database): { needsRepair?: boolean; ownThroughSeq?: number } =>
+	JSON.parse(raw.prepare(`SELECT value FROM app_setting WHERE key = 'sync.client'`).pluck().get() as string) as { needsRepair?: boolean; ownThroughSeq?: number };
 
 // ── push ────────────────────────────────────────────────────────────────────
 
@@ -398,19 +446,16 @@ describe('pull', () => {
 		expect(cb.status().needsUpdate).toBe(true);
 	});
 
-	it('re-stamps an own op the server clamped, and repairs a write it shadowed', async () => {
+	// From the push result (current server) or the op's echo (older server):
+	// the same repair either way.
+	it.each([['the push result', false], ['the echo from an older server', true]])('re-stamps an own op the server clamped, and repairs a write it shadowed (learnt from %s)', async (_how, legacy) => {
 		const cloud = new FakeCloud();
+		cloud.legacy = legacy;
 		const a = desktop('a', cloud);
 		const b = desktop('b', cloud);
 		await a.svc.cloudSyncNow();
 		await b.svc.cloudSyncNow();
-		const skew = (raw: Database.Database, aheadMs: number): void => {
-			const row = raw.prepare(`SELECT value FROM app_setting WHERE key = 'sync.clock'`).pluck().get() as string | undefined;
-			const seq = raw.prepare(`SELECT COALESCE(MAX(seq_local), 0) FROM sync_outbox`).pluck().get() as number;
-			const c = row ? JSON.parse(row) as Record<string, number> : { lastServerTs: 0, lastSeqLocal: seq };
-			raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES ('sync.clock', ?, ?)
-				ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(JSON.stringify({ ...c, lastIssuedTs: Date.now() + aheadMs }), Date.now());
-		};
+		const skew = skewClock;
 		// B's clock a minute fast (inside the server's tolerance): kept as is.
 		skew(b.raw, 60_000);
 		await b.svc.setRating(['trk-3'], 2);
@@ -446,6 +491,127 @@ describe('pull', () => {
 		expect(applied).toHaveLength(1);
 		expect(applied[0]!.kind === 'applied' && applied[0]!.applied.tracks).toEqual(['trk-1']);
 		expect(b.raw.prepare(`SELECT rating FROM track WHERE id = 'trk-1'`).pluck().get()).toBe(5);
+	});
+});
+
+// ── own-op skip ─────────────────────────────────────────────────────────────
+
+describe('own ops on pull', () => {
+	const ownTags = (raw: Database.Database, prefix: string, n: number): void => {
+		const db = drizzle(raw, { schema });
+		for (let i = 0; i < n; i++) mut.createTag(db, { id: `${prefix}-${i}`, name: `${prefix} ${i}` });
+	};
+
+	it('a first sign-in never pulls back the ops it pushed; an older server echoes them all', async () => {
+		for (const legacy of [false, true]) {
+			const cloud = new FakeCloud();
+			cloud.legacy = legacy;
+			const { raw } = freshDb(legacy ? 'old' : 'new');
+			const c = client(raw, cloud.transport('u'));
+			makeTags(raw, 1_200);
+			await c.syncNow();
+			expect(outboxStates(raw)).toEqual({ acked: cloud.log.length });
+			expect(readCursor(raw).lastSeq).toBe(cloud.maxSeq);
+			expect(cloud.opsSent).toBe(legacy ? cloud.log.length : 0);
+			// The skip fields go only to a server that offers them.
+			const skipping = cloud.pullInputs.filter((i) => i.deviceId !== undefined);
+			expect(skipping.length > 0).toBe(!legacy);
+			for (const i of skipping) expect(i).toMatchObject({ deviceId: c.status().deviceId, ownThroughSeq: cloud.maxSeq });
+		}
+	});
+
+	it('day to day: a push is not echoed, another device’s ops still arrive, and the cursor ends at the head', async () => {
+		const cloud = new FakeCloud();
+		cloud.pageLimit = 3;
+		const a = freshDb('a');
+		const b = freshDb('b');
+		const ca = client(a.raw, cloud.transport('u'));
+		const cb = client(b.raw, cloud.transport('u'));
+		await ca.syncNow();
+		await cb.syncNow();
+		ownTags(a.raw, 'a1', 4);
+		await ca.syncNow();
+		ownTags(b.raw, 'b1', 2);
+		await cb.syncNow();
+		ownTags(a.raw, 'a2', 5);
+		await ca.pushOnce();
+		const sent = cloud.opsSent;
+		const r = await ca.pullOnce();
+		// B's two creates, nothing of A's own.
+		expect(cloud.opsSent - sent).toBe(r.received);
+		expect(r.received).toBe(cloud.log.filter((o) => o.entity_id.startsWith('b1-')).length);
+		expect(readCursor(a.raw).lastSeq).toBe(cloud.maxSeq);
+		await cb.syncNow();
+		expect(diffs(a.raw, b.raw)).toEqual([]);
+	});
+
+	it('re-stamps a clamped op from the push result, before any pull, then repairs on the pull', async () => {
+		const cloud = new FakeCloud();
+		const { raw } = freshDb('a');
+		const c = client(raw, cloud.transport('u'));
+		await c.syncNow();
+		skewClock(raw, 3_600_000);
+		ownTags(raw, 'fast', 1);
+		const pulls = cloud.calls.pull;
+		await c.pushOnce();
+		expect(cloud.calls.pull).toBe(pulls);
+		const stored = cloud.log.find((o) => o.entity_id === 'fast-0')!;
+		expect(raw.prepare(`SELECT client_ts FROM sync_outbox WHERE op_id = ?`).pluck().get(stored.op_id)).toBe(stored.client_ts);
+		expect(clientState(raw).needsRepair).toBe(true);
+		const r = await c.pullOnce();
+		expect(r.bootstrapped).toBe(true);
+		expect(clientState(raw).needsRepair).toBe(false);
+	});
+
+	it('a server rolled back mid-session: the refused skip falls back to a plain pull', async () => {
+		const cloud = new FakeCloud();
+		const { raw } = freshDb('a');
+		const c = client(raw, cloud.transport('u'));
+		await c.syncNow();
+		ownTags(raw, 'x', 2);
+		await c.pushOnce();
+		cloud.legacy = true;
+		const r = await c.pullOnce();
+		expect(r.stopped).toBeNull();
+		// The refused attempt, then the same page without the skip (and the
+		// pages after it, with own ops back to being skipped by op_id).
+		const refused = cloud.pullInputs.findLastIndex((i) => i.deviceId !== undefined);
+		expect(refused).toBeGreaterThanOrEqual(0);
+		expect(cloud.pullInputs[refused + 1]).toEqual({ afterSeq: cloud.pullInputs[refused]!.afterSeq, limit: MAX_PULL_OPS });
+		expect(r.applied).toBe(0);
+		expect(readCursor(raw).lastSeq).toBe(cloud.maxSeq);
+		// From here on it does not ask again until a server offers it.
+		await c.pullOnce();
+		expect(cloud.pullInputs.at(-1)!.deviceId).toBeUndefined();
+	});
+
+	it('a restored database gets back the own ops it lost, even when it pushes first', async () => {
+		const cloud = new FakeCloud();
+		const a = freshDb('a');
+		const ca = client(a.raw, cloud.transport('u'));
+		ownTags(a.raw, 'before', 2);
+		await ca.syncNow();
+		ownTags(a.raw, 'pending', 1); // in the backup, not yet pushed
+		const backup = join(dir, 'a-backup.db');
+		a.raw.prepare(`VACUUM INTO ?`).run(backup);
+		await ca.syncNow();
+		ownTags(a.raw, 'after', 3); // pushed after the backup: the restore loses them
+		await ca.syncNow();
+		ca.stop();
+
+		const { sqlite: restored } = createDb(backup);
+		handles.push(restored);
+		const cr = client(restored, cloud.transport('u'));
+		expect(cr.status().deviceId).toBe(ca.status().deviceId);
+		ownTags(restored, 'restored', 1); // new work before the first pull
+		await cr.syncNow();
+		const tagIds = (raw: Database.Database) => (raw.prepare(`SELECT id FROM tag WHERE kind = 'user' ORDER BY id`).pluck().all() as string[]);
+		expect(tagIds(restored)).toEqual(expect.arrayContaining(['after-0', 'after-1', 'after-2', 'pending-0', 'restored-0']));
+		// The restored push saw ops with its id above what it holds, so the
+		// pull did not skip past them.
+		expect(clientState(restored).ownThroughSeq).toBe(cloud.maxSeq);
+		await ca.syncNow();
+		expect(diffs(a.raw, restored)).toEqual([]);
 	});
 });
 

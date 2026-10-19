@@ -18,6 +18,9 @@ export class CallState {
 	deviceId: string | null = null;
 	opsIn: number | null = null;
 	opsOut: number | null = null;
+	// A pull that asked to skip its own ops: how many it left out. Stdout
+	// only; request_log has no column for it.
+	opsSkippedOwn: number | null = null;
 	// The stable reason a failed call answered with.
 	reason: string | null = null;
 

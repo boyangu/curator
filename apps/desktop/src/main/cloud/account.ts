@@ -304,10 +304,10 @@ export class CloudAccount {
 					const userId = s.user.id;
 					if (status === 'SUBSCRIBED') alog.info('realtime wake channel joined', { userId });
 					else if (status === 'CLOSED') alog.info('realtime wake channel closed', { userId });
-					else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') alog.warn('realtime wake channel unavailable — falling back to focus/60 s pulls', { status, userId }, err);
+					else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') alog.warn('realtime wake channel unavailable — falling back to focus/periodic pulls', { status, userId }, err);
 				});
 		} catch (err) {
-			alog.warn('realtime setup failed — falling back to focus/60 s pulls', undefined, err);
+			alog.warn('realtime setup failed — falling back to focus/periodic pulls', undefined, err);
 		}
 	}
 

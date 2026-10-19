@@ -52,8 +52,10 @@ export function requestRow(
 }
 
 // The stdout `request` line: the same row in camelCase, minus nothing (the
-// row holds no secret by construction).
-export function logRequest(deps: Pick<AppDeps, 'log' | 'audit'>, row: RequestRow): void {
+// row holds no secret by construction), plus `opsSkippedOwn` when a pull
+// skipped the caller's own ops (stdout only: no schema change for a count
+// that is diagnostic, not audit).
+export function logRequest(deps: Pick<AppDeps, 'log' | 'audit'>, row: RequestRow, extra: { opsSkippedOwn?: number | null } = {}): void {
 	deps.log.info('request', {
 		requestId: row.request_id,
 		procedure: row.procedure,
@@ -64,6 +66,7 @@ export function logRequest(deps: Pick<AppDeps, 'log' | 'audit'>, row: RequestRow
 		deviceId: row.device_id,
 		opsIn: row.ops_in,
 		opsOut: row.ops_out,
+		...(extra.opsSkippedOwn != null ? { opsSkippedOwn: extra.opsSkippedOwn } : {}),
 		bytesIn: row.bytes_in,
 		bytesOut: row.bytes_out,
 		ip: row.client_ip,
@@ -132,7 +135,7 @@ export function createFetchHandler(deps: AppDeps): FetchHandler {
 		}
 		headers.set(REQUEST_ID_HEADER, call.requestId);
 		try {
-			logRequest(deps, requestRow(req.headers, call, { status, startedAt, bytesIn: sizes.bytesIn, bytesOut: out?.byteLength ?? 0 }));
+			logRequest(deps, requestRow(req.headers, call, { status, startedAt, bytesIn: sizes.bytesIn, bytesOut: out?.byteLength ?? 0 }), { opsSkippedOwn: call.opsSkippedOwn });
 		} catch (e) {
 			// The log must never cost the caller their response.
 			deps.log.error('request_log_failed', { requestId: call.requestId, error: e });

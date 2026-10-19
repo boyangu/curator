@@ -15,6 +15,7 @@ import {
 	MAX_PUSH_OPS,
 	safeParseOp,
 	schemaVersionStatus,
+	SYNC_FEATURES,
 	utf8ByteLength,
 	type Op,
 	type PushResult,
@@ -60,7 +61,9 @@ export function assertBatchSize(ops: readonly unknown[]): void {
 	}
 }
 
-type Validated = { valid: Op[]; rejected: Rejection[]; clamped: { opId: string; aheadMs: number }[] };
+// `sentTs`: each valid op's `client_ts` as the device sent it, by lower-case
+// op id, so the result can name every op the log holds differently.
+type Validated = { valid: Op[]; rejected: Rejection[]; clamped: { opId: string; aheadMs: number }[]; sentTs: Map<string, number> };
 
 // Pure: everything that needs no database. `nowMs` is the clamp reference.
 export function validatePush(call: PushCall, nowMs: number): Validated {
@@ -68,6 +71,7 @@ export function validatePush(call: PushCall, nowMs: number): Validated {
 	const valid: Op[] = [];
 	const rejected: Rejection[] = [];
 	const clamped: Validated['clamped'] = [];
+	const sentTs = new Map<string, number>();
 	let ahead = false;
 	const reject = (raw: unknown, reason: RejectReason) => rejected.push({ opId: rawOpId(raw), reason });
 
@@ -107,8 +111,10 @@ export function validatePush(call: PushCall, nowMs: number): Validated {
 		// Scenario 9: a clock far in the future would win every LWW race
 		// until real time caught up with it. The stored op then differs from
 		// the one the pushing device applied locally, so that device must
-		// re-apply its own op from the pull when `client_ts` differs instead
-		// of skipping it by `op_id` (client-side rule, workstream C desktop).
+		// re-stamp its own op: from `PushResult.clamped`, or, with a server
+		// or client that predates it, from the op's echo on pull, where
+		// `client_ts` differs (client-side rule, workstream C desktop).
+		sentTs.set(op.op_id.toLowerCase(), op.client_ts);
 		const c = clampClientTs(op.client_ts, nowMs);
 		if (c.clamped) {
 			clamped.push({ opId: op.op_id, aheadMs: op.client_ts - nowMs });
@@ -118,7 +124,7 @@ export function validatePush(call: PushCall, nowMs: number): Validated {
 		}
 	}
 	if (ahead) throw new CloudError('PRECONDITION_FAILED', 'server_outdated');
-	return { valid, rejected, clamped };
+	return { valid, rejected, clamped, sentTs };
 }
 
 async function headSeq(tx: Queryable): Promise<number> {
@@ -136,7 +142,7 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 	// describes a push that then rolled back.
 	const events: Parameters<AuditEmit>[] = [];
 	const result = await withUserTx(db, userId, async (tx): Promise<PushResult> => {
-		const { valid, rejected, clamped } = validatePush(call, tx.nowMs);
+		const { valid, rejected, clamped, sentTs } = validatePush(call, tx.nowMs);
 
 		// `last_seen_at` moves for a revoked device too: "still trying" is what
 		// the account's device list should show for it.
@@ -153,8 +159,16 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 				accepted: 0,
 				maxSeq: await headSeq(tx),
 				rejected: call.ops.map((raw) => ({ opId: rawOpId(raw), reason: 'device_revoked' as const })),
+				clamped: [],
+				batchMaxSeq: 0,
+				features: [...SYNC_FEATURES],
 			};
 		}
+
+		// What the log holds for each accepted op, by lower-case op id: the
+		// new rows from the INSERT, re-pushed ones from the lookup below.
+		const stored = new Map<string, { seq: number; clientTs: number }>();
+		let priorOwnMaxSeq: number | undefined;
 
 		if (valid.length > 0) {
 			// Serialise one user's pushes so seq order equals commit order:
@@ -177,16 +191,17 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 				kind: op.kind,
 				payload: op.payload,
 			}));
-			const inserted = await tx.query<{ op_id: string }>(
+			const inserted = await tx.query<{ op_id: string; seq: unknown; client_ts: unknown }>(
 				`insert into curator.library_op (op_id, device_id, client_ts, schema_version, entity, entity_id, kind, payload)
 				select (e.op ->> 'op_id')::uuid, e.op ->> 'device_id', (e.op ->> 'client_ts')::bigint,
 					(e.op ->> 'schema_version')::int, e.op ->> 'entity', e.op ->> 'entity_id', e.op ->> 'kind', e.op -> 'payload'
 				from jsonb_array_elements($1::text::jsonb) with ordinality as e(op, ord)
 				order by e.ord
 				on conflict (op_id) do nothing
-				returning op_id::text as op_id`,
+				returning op_id::text as op_id, seq::float8 as seq, client_ts::float8 as client_ts`,
 				[JSON.stringify(rows)],
 			);
+			for (const r of inserted) stored.set(r.op_id, { seq: num(r.seq), clientTs: num(r.client_ts) });
 
 			// Not inserted means the op id already exists. If this user can see it
 			// (RLS), it is a re-push of their own op: accepted, a no-op (scenario
@@ -195,16 +210,14 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 			const insertedIds = new Set(inserted.map((r) => r.op_id));
 			const conflicted = [...new Set(valid.map((op) => op.op_id.toLowerCase()))].filter((id) => !insertedIds.has(id));
 			if (conflicted.length > 0) {
-				const mine = new Set(
-					(
-						await tx.query<{ op_id: string }>(
-							`select op_id::text as op_id from curator.library_op
-							where user_id = (select auth.uid())
-								and op_id in (select jsonb_array_elements_text($1::text::jsonb)::uuid)`,
-							[JSON.stringify(conflicted)],
-						)
-					).map((r) => r.op_id),
+				const mineRows = await tx.query<{ op_id: string; seq: unknown; client_ts: unknown }>(
+					`select op_id::text as op_id, seq::float8 as seq, client_ts::float8 as client_ts from curator.library_op
+					where user_id = (select auth.uid())
+						and op_id in (select jsonb_array_elements_text($1::text::jsonb)::uuid)`,
+					[JSON.stringify(conflicted)],
 				);
+				for (const r of mineRows) stored.set(r.op_id, { seq: num(r.seq), clientTs: num(r.client_ts) });
+				const mine = new Set(mineRows.map((r) => r.op_id));
 				const foreign = new Set(conflicted.filter((id) => !mine.has(id)));
 				if (foreign.size > 0) {
 					for (let i = valid.length - 1; i >= 0; i--) {
@@ -217,6 +230,24 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 			}
 		}
 
+		if (valid.length > 0) {
+			// Still under the lock, so exact: no other push of this user can
+			// commit between the INSERT and this read. A backward walk of the
+			// (user_id, seq) index that stops at this device's latest other
+			// op: short for a device that pushes, the whole log once for a
+			// device's first push. The client compares it with what it knows
+			// it pushed (PushResult.priorOwnMaxSeq).
+			const [prior] = await tx.query<{ seq: unknown }>(
+				`select seq::float8 as seq from curator.library_op
+				where user_id = (select auth.uid()) and device_id = $1
+					and op_id not in (select jsonb_array_elements_text($2::text::jsonb)::uuid)
+				order by seq desc
+				limit 1`,
+				[call.deviceId, JSON.stringify([...new Set(valid.map((op) => op.op_id.toLowerCase()))])],
+			);
+			priorOwnMaxSeq = prior ? num(prior.seq) : 0;
+		}
+
 		if (clamped.length > 0) {
 			events.push(['client_ts_clamped', { count: clamped.length, maxSkewMs: Math.max(...clamped.map((c) => c.aheadMs)) }]);
 		}
@@ -226,7 +257,32 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 			events.push(['ops_rejected', { byReason }]);
 		}
 
-		return { accepted: valid.length, maxSeq: await headSeq(tx), rejected };
+		// Every accepted op whose stored stamp is not the one sent: clamped
+		// now, or clamped when a re-pushed op was first stored (a push whose
+		// answer was lost), which this call's own clamp list cannot know.
+		const restamped: NonNullable<PushResult['clamped']> = [];
+		const reported = new Set<string>();
+		let batchMaxSeq = 0;
+		for (const op of valid) {
+			const id = op.op_id.toLowerCase();
+			const row = stored.get(id);
+			if (!row) continue;
+			batchMaxSeq = Math.max(batchMaxSeq, row.seq);
+			if (row.clientTs !== sentTs.get(id) && !reported.has(id)) {
+				reported.add(id);
+				restamped.push({ opId: op.op_id, clientTs: row.clientTs });
+			}
+		}
+
+		return {
+			accepted: valid.length,
+			maxSeq: await headSeq(tx),
+			rejected,
+			clamped: restamped,
+			batchMaxSeq,
+			...(priorOwnMaxSeq !== undefined ? { priorOwnMaxSeq } : {}),
+			features: [...SYNC_FEATURES],
+		};
 	});
 	for (const e of events) audit(...e);
 	return result;

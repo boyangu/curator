@@ -15,4 +15,5 @@ export * from './clock.js';
 export * from './state.js';
 export * from './reduce.js';
 export * from './cloud-service.js';
+export * from './sync-input.js';
 export * from './snapshot.js';
