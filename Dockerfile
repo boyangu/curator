@@ -10,8 +10,9 @@
 #
 #   docker build -t curator-api .
 #
-# Production images are built by .github/workflows/deploy-cloud.yml only
-# (apps/cloud/README.md "Release"), which passes GIT_SHA.
+# Production images are built only by scripts/release-cloud.mjs, from a
+# `git archive` of a tagged commit on main (apps/cloud/README.md "Release"),
+# which passes GIT_SHA.
 #
 # .dockerignore whitelists what the build needs; anything new the cloud build
 # reads has to be added there.

@@ -65,7 +65,6 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
               - '.github/actions/cloud-check/**'
-              - '.github/workflows/deploy-cloud.yml'
 
   # The cloud API on its own: install only it and its workspace deps, then
   # typecheck (incl. the boundary rule), test and bundle
@@ -78,7 +77,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      # The same steps gate every release (deploy-cloud.yml).
+      # The same steps gate every release (scripts/release-cloud.mjs).
       - uses: ./.github/actions/cloud-check
 
   rust-audio:

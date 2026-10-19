@@ -55,3 +55,6 @@ apps/mcp/dist-mcpb/
 .env.*
 !.env.example
 !**/.env.example
+
+# Claude Design exports (design work stays private, like briefs).
+*.dc.html

@@ -1,7 +1,7 @@
 # @curator/core
 
 The backend. Everything that isn't UI or a sidecar process lives here: the library
-database, streaming sync, enrichment, downloads, the analyzer/rekordbox queues, and the
+database, streaming sync, enrichment, the analyzer/rekordbox queues, and the
 Discover feed. The desktop app talks to core over IPC; core talks to SQLite, the provider
 clients, and the sidecars.
 
@@ -17,7 +17,6 @@ Capability groups on `CoreService`:
 - **Playlists** — `getPlaylistsWithFolders`, `addTracksToPlaylist`, `reorderPlaylistTracks`, `setPlaylistFavorite`
 - **Streaming sync** — `runSpotifySync`, `planSpotifySync`, `runSpotifyPlaylistSync`, `getSyncStatus`
 - **Enrichment** — `enrichBeatportTracks`, `matchTidalForTracks`, `setPlaylistHybridTidal`
-- **Downloads (Tidal)** — `enqueueTidalDownloads`, `getDownloadQueue`, `verifyDownloads`
 - **Analyzer** — `enqueueAnalysis`, `getTrackAnalysis`, `getTrackCues`, `upsertCue` (cues)
 - **Rekordbox** — `runRekordboxImport`, `getRekordboxTree`, `syncToRekordbox`, `resolveSyncConflicts`, backups
 - **Feed (Discover)** — `getFeedPage`, `feedAction`, `runFeedRefresh`, `loadMoreFeed`
@@ -31,7 +30,7 @@ Capability groups on `CoreService`:
 | Dir | Owns |
 |---|---|
 | `db/` | Drizzle + `better-sqlite3` client, `migrate.ts`, `seed.ts` (schema lives in `@curator/shared`) |
-| `sync/` | Spotify pull/merge, Tidal hybrid matching, download orchestrator + queue |
+| `sync/` | Spotify pull/merge, Tidal hybrid matching |
 | `sources/` | Streaming source adapters + auto-poll scheduler |
 | `enrich/` | Beatport/Traxsource enrichers + library sink (the relocatable enrichment boundary) |
 | `feed/` | Discover feed engine — `SqliteFeedStore`, `FeedService`, producers, promotion pipeline |

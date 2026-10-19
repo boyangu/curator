@@ -1,9 +1,8 @@
-# Fly.io config for the cloud API. No `app =` here on purpose: the app name
-# is the FLY_APP repository variable, passed as `--app` by
-# .github/workflows/deploy-cloud.yml (the only place deploys run from, on a
-# cloud-v* tag; apps/cloud/README.md "Release"). Set the region before the
-# first deploy, and the secrets with `fly secrets set` (never here):
-#   fly secrets set --app "$FLY_APP" --config apps/cloud/fly.toml DATABASE_URL=... SUPABASE_URL=...
+# Fly.io config for the cloud API. No `app =` here on purpose: the app name is
+# a hosting identifier, kept out of the tree. scripts/release-cloud.mjs passes
+# it as `--app` from CURATOR_FLY_APP in the maintainer's git-ignored .env
+# (apps/cloud/README.md "Release"). Secrets go in with `fly secrets set`, never
+# here.
 
 # The region closest to the Supabase project: every request is a few
 # Postgres round trips, which dominate latency.

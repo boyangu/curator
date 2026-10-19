@@ -1,6 +1,6 @@
-# The cloud API's gate, shared by ci.yml (every push/PR that touches it) and
-# deploy-cloud.yml (every release), so a release is checked by exactly the
-# steps CI runs: install only the cloud package and its workspace deps, then
+# The cloud API's gate in CI (every push/PR that touches it). The release
+# script (scripts/release-cloud.mjs) runs the same steps on the commit it
+# ships: install only the cloud package and its workspace deps, then
 # typecheck (incl. the import-boundary rule), test and bundle. The tests run
 # Postgres in-process (PGlite), so no service container. The caller checks
 # out the commit first.

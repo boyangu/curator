@@ -27,7 +27,7 @@ Curator is smart, AI is everywhere - Discover, enrichment, automatic Cues, curat
 ## Sources
 
 - **Spotify** — playlists, Liked Songs, listening history. OAuth (PKCE).
-- **Tidal** — playlists + downloads. OAuth for catalogue; sniffed session for the lossless streaming endpoints.
+- **Tidal** — playlists. OAuth.
 - **SoundCloud** — Coming soon
 - **Apple** - Coming soon
 - **Google** - Coming soon
@@ -58,8 +58,6 @@ This repo is in active build-out. Working today:
 - ISRC-based deduplication across sources
 - Beatport / Traxsource enrichment (BPM / key / label / genre / release date)
 - Tidal track-id resolution against Spotify tracks (hybrid playlists)
-- Lossless FLAC downloads via DASH manifest decoding
-- Persistent download queue with retry / verify / re-download
 - Spotify in-app playback via Web Playback SDK (Widevine via castlabs Electron)
 - Native audio engine — Rust sidecar (Symphonia + cpal) for local file playback
 - Virtualised tracks list, per-playlist anchor + search persistence
@@ -81,7 +79,7 @@ Not yet:
 
 ```
 apps/
-  core/            backend: sync, enrichment, download, feed service, SQLite (CoreService)
+  core/            backend: sync, enrichment, feed service, SQLite (CoreService)
   desktop/         Electron main + renderer; UI, IPC, custom protocols, sidecar hosting
   analyzer/        Python sidecar — Essentia audio analysis + peaks (JSON-RPC/stdio, WSL)
   audio/           Rust sidecar — native decode/playback (Symphonia + cpal)
@@ -112,7 +110,7 @@ No key, vendor credential or project identifier lives in the code; everything co
 
 Without them the app runs **local-only**: no streaming sources, no cloud sync, no Drive backup — each shows "not configured" in Settings, and local files, rekordbox, analysis and playback work as before. `pnpm dev` and `pnpm --filter @curator/desktop build` / `package*` read `.env` (then `apps/desktop/.env`, then the shell) and bake the values into the main bundle at build time; a packaged app never reads the end user's shell. A build with any credential or project id unset fails with a message naming them, unless `CURATOR_ALLOW_UNCONFIGURED_BUILD=1` is set; an empty `CURATOR_CLOUD_API_URL` only warns (sign-in works, library sync off). Tests and the headless CLI need none of them.
 
-The cloud API (`apps/cloud`) has its own `.env.example`; its Fly app name is the `FLY_APP` GitHub repository variable (see its README).
+The cloud API (`apps/cloud`) has its own `.env.example`. Releasing it needs `CURATOR_FLY_TOKEN` and `CURATOR_FLY_APP` in the maintainer's `.env` (see its README); GitHub holds no production credential.
 
 To test Spotify playback specifically (requires the castlabs Widevine signing flow):
 

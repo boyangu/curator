@@ -24,7 +24,7 @@ entities:
   brightness/power, structural `segments`) and hot/memory cues.
 - **`tag` / `track_tag`** — user labels.
 - **`token`** — OAuth credentials.
-- **Queues & observability** — `sync_job`, `analysis_job`, `download_job`,
+- **Queues & observability** — `sync_job`, `analysis_job`,
   `sync_conflict` / `playlist_conflict`.
 - **Rekordbox state** — `rekordbox_link`, `rekordbox_membership_baseline`,
   `rekordbox_sync_watermark`, `rekordbox_deleted_content`.

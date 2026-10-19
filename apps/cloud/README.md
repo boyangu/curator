@@ -55,127 +55,74 @@ Once, in this order. Before you start, delete the spike's objects from `public` 
 
 ## Release (Fly.io)
 
-Production deploys come only from CI, from a tagged commit on `main`: never `fly deploy` from a laptop or a working tree (security review, risk 3). [`.github/workflows/deploy-cloud.yml`](../../.github/workflows/deploy-cloud.yml) does it:
+Production deploys run **from the maintainer's machine only**, through [`scripts/release-cloud.mjs`](../../scripts/release-cloud.mjs). GitHub holds no Fly token, no environment and no other access to production; CI only checks code. The script keeps the guarantees a CI deploy would give:
 
-1. **Merge to `main`** through a PR, with `node` and `cloud` green.
-2. **Run the migrations first** if the release adds a `sql/` file (below).
-3. **Tag the merge commit** and push the tag:
+1. **Only a pushed tag on `main` ships.** Tag the commit and push the tag, then run the release:
 
    ```
    git tag cloud-v0.2.0 <commit on main>
    git push origin cloud-v0.2.0
+   pnpm release:cloud cloud-v0.2.0
    ```
 
-   The workflow resolves the tag, fails unless its commit is an ancestor of `main` (`git merge-base --is-ancestor`), then runs the same install / typecheck / test / build as CI ([`.github/actions/cloud-check`](../../.github/actions/cloud-check/action.yml)). A tag that was pushed by mistake can be re-run by hand: Actions → deploy-cloud → Run workflow, from `main`, with `ref` = the tag.
-4. **Approve** the `production` deployment: Actions → the run → Review deployments → production → Approve. (Only where required reviewers are available, see the plan note below; otherwise the job starts on its own.)
-5. The deploy job builds the image on Fly's remote builder from that commit, with `--build-arg GIT_SHA=<commit>` and `--image-label <tag>`, passing `--app` from the `FLY_APP` repository variable (the workflow fails at once if it is unset; `fly.toml` carries no app name), and **polls `https://<FLY_APP>.fly.dev/trpc/health` until `commit` is the deployed SHA**; it fails after 3 minutes otherwise. Check it yourself with `curl -s https://<FLY_APP>.fly.dev/trpc/health`.
+   The script reads the tag from origin (a local-only or moved tag does not count), fetches `main`, and refuses unless the commit is an ancestor of `origin/main`.
+2. **Built from the commit, never the working tree.** It `git archive`s that commit into a temporary directory, so uncommitted edits, `.env`, the live library database and git-ignored private files cannot reach the image.
+3. **The CI checks run on that export**: install with the frozen lockfile, typecheck (including the boundary rule), test and build, the same steps as the `cloud` CI job ([`.github/actions/cloud-check`](../../.github/actions/cloud-check/action.yml)).
+4. **Deploy and verify.** `flyctl deploy --remote-only` builds on Fly's builder with `--build-arg GIT_SHA=<commit>` and `--image-label <tag>`, then the script polls `https://<app>.fly.dev/trpc/health` until `commit` is that SHA, failing after 3 minutes. Check it yourself with `curl -s https://<app>.fly.dev/trpc/health`.
 
-Concurrent releases queue: one deploy at a time, none cancelled midway. Rolling back is a release too: tag the older commit (it is on `main`) as a new `cloud-v*` version.
+Before deploying it also refuses when the Fly secrets `DATABASE_URL` / `SUPABASE_URL` are missing or `primary_region` is still a placeholder. Rolling back is a release too: tag the older commit (it is on `main`) as a new `cloud-v*` version.
 
-**Migrations come before the tag**, in this order:
+**Configuration**, in the git-ignored root `.env` (or the shell), never in the tree:
+
+| Variable | Value |
+| --- | --- |
+| `CURATOR_FLY_TOKEN` | A deploy token scoped to the one app: `fly tokens create deploy -a <app> --expiry 8760h`. Rotate with `fly tokens list -a <app>` / `fly tokens revoke <id>`. |
+| `CURATOR_FLY_APP` | The Fly app name. |
+
+The token reaches flyctl through its environment only; it is never printed or written. The desktop build bakes only its own named keys, so neither variable can end up in the app.
+
+**Migrations come before the release**, in this order:
 
 1. The owner runs the new migrations from their machine (Database setup, step 1): `DATABASE_URL='<owner connection>' pnpm --filter @curator/cloud db:migrate`.
 2. The owner re-runs `sql/roles.sql` (step 2), always: it is idempotent, and a migration that adds a function the API calls (`0002_audit.sql`, `0003_migration_check.sql`) needs its grant.
-3. Then tag the release.
+3. Then release.
 
-The server enforces the order. At boot it compares the migration files it ships (`sql/NNNN_*.sql`, not `roles.sql`) with `curator.applied_migrations()` (0003, executable by `curator_api` only, which has no read on `curator.schema_migration` itself) and, if any is missing, logs `schema_behind` with the missing files and a hint, and exits. The new machine never passes the health check, the deploy fails, and the previous release keeps serving. A database *ahead* of the image (a rollback onto a newer schema) starts with a `schema_ahead` warning, since migrations are additive. The release that introduces the gate needs 0003 applied and `roles.sql` re-run before it can boot (`reason: no_check_function` or `no_grant` otherwise).
+The server enforces the order. At boot it compares the migration files it ships (`sql/NNNN_*.sql`, not `roles.sql`) with `curator.applied_migrations()` (0003, executable by `curator_api` only, which has no read on `curator.schema_migration` itself) and, if any is missing, logs `schema_behind` with the missing files and a hint, and exits. The new machine never passes the health check, the deploy fails, and the previous release keeps serving. A database *ahead* of the image (a rollback onto a newer schema) starts with a `schema_ahead` warning, since migrations are additive.
 
 **One-time Fly setup**, from the repo root (none of this deploys code):
 
 ```
-fly apps create <app>            # the name goes into the FLY_APP repository variable (below), never into the tree
-# set primary_region in apps/cloud/fly.toml to the region nearest the Supabase project, and merge that
-fly secrets set --stage --app <app> --config apps/cloud/fly.toml DATABASE_URL='...' SUPABASE_URL='https://<ref>.supabase.co'
+fly apps create <app>
+# set primary_region in apps/cloud/fly.toml to the region nearest the Supabase project, and commit that
+fly secrets set --stage --app <app> DATABASE_URL='...' SUPABASE_URL='https://<ref>.supabase.co'
 ```
 
 `--stage` stores the secrets without restarting machines; the next release picks them up. The health check is `GET /trpc/health` (`{ ok, schemaVersion, minSupportedSchemaVersion, commit }`). Snapshots build inside the running machine every 15 minutes for users with 10k new ops or a day-old snapshot; `node dist/snapshot.js [--user <uuid>]` in `fly ssh console` runs one on demand.
 
-## One-time GitHub settings
+## Repository settings
 
-Applied by hand, once, by the repo admin. Each has the click-path and the equivalent `gh` command (run as `boyangu`, `gh auth switch -u boyangu`).
+Applied on `boyangu/curator` (public) on 2026-10-19; none of them grants access to production:
 
-> **Plan note (checked against GitHub's docs, 2026-10-19).** `boyangu/curator` is a private, user-owned repo, which limits what is available:
-> - Environment **secrets**, environment **deployment branch/tag policies** and **branch protection** need GitHub **Pro** (or Team) on a private repo. On Free, `FLY_API_TOKEN` can only be a repository secret, readable by any workflow on any branch, and `main` cannot be protected. Pro is the minimum this pipeline assumes.
-> - Environment **required reviewers** on a private repo need GitHub **Enterprise**; on Free, Pro and Team they exist for public repos only, so step 1's `reviewers` is refused (or ignored) and the deploy job starts without an approval. What still gates production then: a tag only deploys a commit on `main`, `main` only takes green PRs, and the environment only accepts runs from `cloud-v*` tags or `main`.
-> - **Secret scanning and push protection** are not offered for private user-owned repos on any GitHub.com personal plan (they need GitHub Secret Protection on an organization with Team or Enterprise). Step 5 is refused until the repo moves to such an organization; meanwhile `.env` files stay git-ignored and the image never reads one.
-> - **Dependabot alerts** and security updates work on every plan.
+- Secret scanning with push protection.
+- Dependabot alerts and security updates (version updates come from `.github/dependabot.yml`).
+- `main` refuses force-pushes and deletion. No status check is required yet; to require `node` and `cloud` once work goes through PRs:
 
-1. **`production` environment** with a required reviewer, and deployments allowed only from `cloud-v*` tags and `main` (manual re-runs start from `main`).
-   Settings → Environments → New environment → `production` → Required reviewers: `boyangu` (leave "Prevent self-review" off: you are the one tagging) → Deployment branches and tags: Selected branches and tags → Add rule → Tag, `cloud-v*` → Add rule → Branch, `main` → Save protection rules.
-
-   ```
-   gh api -X PUT repos/boyangu/curator/environments/production --input - <<'EOF'
-   {
-     "reviewers": [{ "type": "User", "id": 2485062 }],
-     "prevent_self_review": false,
-     "deployment_branch_policy": { "protected_branches": false, "custom_branch_policies": true }
-   }
-   EOF
-   gh api -X POST repos/boyangu/curator/environments/production/deployment-branch-policies -f name='cloud-v*' -f type=tag
-   gh api -X POST repos/boyangu/curator/environments/production/deployment-branch-policies -f name=main -f type=branch
-   ```
-
-   (`2485062` is `boyangu`'s user id, `gh api users/boyangu --jq .id`.)
-
-2. **`FLY_APP` as a repository variable**: the Fly app name. The workflow passes it as `--app` and builds the health URL from it; it refuses to deploy while the variable is unset. Variables are not secrets (an app name is a hosting identifier, kept out of the tree, not a credential).
-   Settings → Secrets and variables → Actions → Variables → New repository variable → `FLY_APP`.
-
-   ```
-   gh variable set FLY_APP --body <app> --repo boyangu/curator
-   ```
-
-3. **`FLY_API_TOKEN` as an environment secret** of `production`, a deploy token scoped to this one app (the workflow references no other secret). Mint it and hand it straight to GitHub without it touching the clipboard or a file:
-   Settings → Environments → production → Environment secrets → Add environment secret → `FLY_API_TOKEN`, value from `fly tokens create deploy -a <app>`.
-
-   ```
-   fly tokens create deploy -a <app> | gh secret set FLY_API_TOKEN --env production --repo boyangu/curator
-   ```
-
-   Add `--expiry 8760h` to the `fly tokens create` for a token that lapses after a year; `fly tokens list -a <app>` and `fly tokens revoke <id>` rotate it. Delete any older repository-level `FLY_API_TOKEN` (`gh secret delete FLY_API_TOKEN --repo boyangu/curator`) so only the environment holds one.
-
-4. **Branch protection on `main`**: require the `node` and `cloud` checks from GitHub Actions, up to date before merging, through a PR, no force-push or deletion, admins included.
-   Settings → Branches → Add branch protection rule → Branch name pattern `main` → Require a pull request before merging (required approvals: 0, a solo repo cannot approve its own PRs) → Require status checks to pass before merging → Require branches to be up to date → add `node` and `cloud` → Do not allow bypassing the above settings → Create. (`cloud` is skipped when no cloud file changed; a skipped job counts as passed. The checks appear in the picker once they have run on a PR.)
-
-   ```
-   gh api -X PUT repos/boyangu/curator/branches/main/protection --input - <<'EOF'
-   {
-     "required_status_checks": {
-       "strict": true,
-       "checks": [{ "context": "node", "app_id": 15368 }, { "context": "cloud", "app_id": 15368 }]
-     },
-     "enforce_admins": true,
-     "required_pull_request_reviews": { "required_approving_review_count": 0 },
-     "restrictions": null,
-     "allow_force_pushes": false,
-     "allow_deletions": false
-   }
-   EOF
-   ```
-
-   (`15368` is the GitHub Actions app, so only Actions can satisfy the checks.) This ends direct pushes to `main`, admin included; set `enforce_admins` to `false` to keep an emergency bypass.
-
-5. **Secret scanning and push protection** (see the plan note).
-   Settings → Advanced Security (older UI: Code security and analysis) → Secret Protection: Enable → Push protection: Enable.
-
-   ```
-   gh api -X PATCH repos/boyangu/curator --input - <<'EOF'
-   { "security_and_analysis": { "secret_scanning": { "status": "enabled" }, "secret_scanning_push_protection": { "status": "enabled" } } }
-   EOF
-   ```
-
-6. **Dependabot alerts and security updates** (version updates come from `.github/dependabot.yml` on their own).
-   Settings → Advanced Security → Dependency graph: Enable → Dependabot alerts: Enable → Dependabot security updates: Enable.
-
-   ```
-   gh api -X PUT repos/boyangu/curator/vulnerability-alerts
-   gh api -X PUT repos/boyangu/curator/automated-security-fixes
-   ```
-
-Check what took: `gh api repos/boyangu/curator/environments/production`, `gh api repos/boyangu/curator/branches/main/protection`, `gh api repos/boyangu/curator/vulnerability-alerts` (204 = on).
+  ```
+  gh api -X PUT repos/boyangu/curator/branches/main/protection --input - <<'EOF'
+  {
+    "required_status_checks": { "strict": true, "checks": [{ "context": "node", "app_id": 15368 }, { "context": "cloud", "app_id": 15368 }] },
+    "enforce_admins": false,
+    "required_pull_request_reviews": null,
+    "restrictions": null,
+    "allow_force_pushes": false,
+    "allow_deletions": false
+  }
+  EOF
+  ```
 
 ## Supply chain
 
-- Every third-party action in `.github/` is pinned by full commit SHA with the release in a trailing comment (`@<sha> # v4.4.0`); `dtolnay/rust-toolchain` has no releases, so its pin names the `stable` branch and is bumped by hand. flyctl is pinned in the deploy workflow (`version:`), also by hand.
+- Every third-party action in `.github/` is pinned by full commit SHA with the release in a trailing comment (`@<sha> # v4.4.0`); `dtolnay/rust-toolchain` has no releases, so its pin names the `stable` branch and is bumped by hand. flyctl is whatever the maintainer has installed; the release script uses it as found.
 - The Dockerfile pins `node:22-slim` (Dependabot bumps it) and the BuildKit `# syntax` frontend (bumped by hand) by digest.
 - Dependabot (`.github/dependabot.yml`) opens weekly PRs for npm (minor + patch grouped, Electron majors ignored), the actions and the base image.
 
