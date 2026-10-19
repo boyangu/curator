@@ -1,0 +1,23 @@
+{
+  "name": "curator",
+  "version": "0.1.0",
+  "description": "Library curation app for DJs — Spotify + Tidal unified with cross-source matching",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @curator/desktop dev",
+    "build": "pnpm -r --filter='./packages/**' build && pnpm --filter @curator/mcp build && pnpm --filter @curator/desktop build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "db:migrate": "pnpm rebuild:node && pnpm --filter @curator/core db:migrate",
+    "db:seed": "pnpm rebuild:node && pnpm --filter @curator/core db:seed",
+    "rebuild:node": "node scripts/rebuild-node.mjs",
+    "rebuild:electron": "pnpm --filter @curator/desktop rebuild:electron",
+    "build:sidecars": "node scripts/build-sidecars.mjs"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "packageManager": "pnpm@9.15.0"
+}

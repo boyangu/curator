@@ -1,0 +1,111 @@
+[package]
+name = "curator-audio"
+version = "0.1.0"
+edition = "2021"
+authors = ["Curator"]
+description = "Native local-audio engine for the Curator desktop app. JSON-RPC over stdio."
+publish = false
+
+[[bin]]
+name = "curator-audio"
+path = "src/main.rs"
+
+[dependencies]
+# Error type for ?-propagating operational errors out of the audio layer.
+# Lighter than thiserror for an internal binary; we don't need typed error
+# enums at module boundaries.
+anyhow = "1"
+
+# JSON-RPC wire format. serde_json is the standard; line-delimited frames
+# match the Python sidecars (apps/analyzer, apps/rekordbox).
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# Audio decode. Pure-Rust, no system libs. Handles FLAC, MP3, WAV, AAC, OGG,
+# and more. Decode rate is 30-50× realtime on modern x86_64 for FLAC.
+symphonia = { version = "0.5", features = [
+    # Explicit codec feature flags — defaults exclude proprietary codecs.
+    # FLAC + MP3 + WAV + AAC + Vorbis covers the local-library reality.
+    "flac",
+    "mp3",
+    "wav",
+    "aac",
+    "isomp4",   # MP4/M4A container
+    "vorbis",
+    "ogg",
+    "pcm",
+] }
+
+# Cross-platform audio output. WASAPI on Windows (low-latency mode), CoreAudio
+# on macOS, ALSA on Linux. We target the "interactive" / shared-mode buffer
+# size — typical 5-15ms vs Chromium's 41ms in the renderer.
+cpal = "0.15"
+
+# Lock-free atomic pointer swap. Used to hand the audio callback a new
+# decoded buffer on track change without rebuilding the cpal stream
+# (WASAPI stream rebuild = ~250ms; arc-swap swap = microseconds).
+arc-swap = "1"
+
+# Logging to stderr. Stdout is the JSON-RPC channel; anything that prints
+# there breaks the protocol. tracing_subscriber sends to stderr by default.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Thread sync — we have an audio callback thread (driven by cpal) and a
+# control thread (driven by stdin). They share decoded buffers + transport
+# state via a SyncCell pattern.
+parking_lot = "0.12"
+
+# Atomic operations for the audio thread (lock-free reads from control thread).
+crossbeam = "0.8"
+
+# ─── Controller layer (PRD: controllers-pioneer) ──────────────────────────
+# USB-MIDI only for v1. The DDJ/FLX/XDJ family's HID input protocol is
+# not publicly documented; community resources (Mixxx, swiftb0y's spec)
+# cover MIDI for these and HID only for the legacy CDJ-850/900/2000.
+# Picking broad family compatibility over high-resolution jog scratch
+# for v1; HID jog is a per-device P2 follow-up (see PRD Roadmap).
+#
+# midir handles port discovery, hot-plug (via periodic ports() polling)
+# and Note/CC parsing. Cross-platform: CoreMIDI on macOS, WinMM on
+# Windows, ALSA on Linux. Switch to the `winrt` feature on Windows if
+# WinMM jitter measurements demand it.
+midir = "0.10"
+
+# ─── Convert mode (`curator-audio convert`) ───────────────────────────────
+# FLAC→WAV for older Pioneer CDJs, which cap at 48 kHz. Band-limited
+# fixed-ratio resampling (rubato's Fft) for hi-res sources; only used when
+# the source rate exceeds the target.
+rubato = "5"
+
+# ID3v2.3 tag bytes for the WAV `id3 ` chunk, written alongside LIST/INFO.
+# INFO has no fields for BPM, key or artwork; the ID3 chunk carries them for
+# taggers and DJ software that read it.
+id3 = "1"
+
+[dev-dependencies]
+# Test fixtures are generated at test time (no binary files committed):
+# flacenc encodes synthetic PCM to FLAC, hound reads the WAVs back with an
+# implementation independent of our writer.
+flacenc = "0.5"
+hound   = "3"
+tempfile = "3"
+
+[profile.release]
+# DJ-grade decode wants the fastest possible release build. LTO + single
+# codegen unit + opt-level=3 are the standard "I care about runtime speed"
+# Rust settings. Builds take longer; we don't care for a single binary.
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+# Dev builds with some optimisation — pure-debug symphonia is slow enough
+# to misrepresent decode latency during iteration. opt-level=1 on deps
+# keeps debug for our own code while letting symphonia run at reasonable
+# speed for local testing.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2

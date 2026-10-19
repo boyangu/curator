@@ -1,0 +1,37 @@
+# Dependency watch (security review, risk 8). Alerts and security updates are
+# turned on in the repository settings (apps/cloud/README.md "One-time GitHub
+# settings"); this file adds the weekly version-update PRs.
+
+version: 2
+updates:
+  # One pnpm workspace, one lockfile at the root.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Minor and patch bumps arrive as one PR a week; majors stay separate.
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Electron majors move the castlabs fork, the V8 ABI the native modules
+      # are rebuilt for, and the Widevine signing; they are done by hand.
+      - dependency-name: electron
+        update-types: [version-update:semver-major]
+
+  # The SHA-pinned actions: Dependabot reads the `# vX.Y.Z` comment and
+  # bumps the SHA and the comment together. The composite action is listed
+  # because Dependabot only scans .github/workflows by default.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/cloud-check
+    schedule:
+      interval: weekly
+
+  # The Dockerfile's digest-pinned base image (node:22-slim@sha256:...).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,86 @@
+appId: com.curator.desktop
+productName: Curator
+copyright: Copyright © 2026 Curator
+
+directories:
+  output: dist
+  buildResources: resources
+
+# We don't manually filter node_modules. electron-builder's default behavior
+# already does the right thing: it walks `dependencies` in package.json (with
+# transitive closure) and copies just those, skipping devDependencies. Trying
+# to over-prune here last time excluded drizzle-orm + @tidal-music/* and the
+# main bundle threw at boot — out/main/index.cjs requires them at runtime
+# because electron-vite externalizes (rather than bundles) packages outside
+# the workspace.
+files:
+  - 'out/**/*'
+  - 'package.json'
+
+# better-sqlite3 has a native .node binding; asar archives can't dlopen
+# native modules, so we unpack just that one. Everything else stays in
+# app.asar where it loads faster and bundles tighter.
+asarUnpack:
+  - 'node_modules/better-sqlite3/**/*'
+
+# Sidecar bundles staged by `pnpm build:sidecars` (scripts/build-sidecars.mjs)
+# land under process.resourcesPath/{analyzer,rekordbox,audio} — exactly where
+# the production branch of getAnalyzerSpec/getRekordboxSpec/getAudioSpec
+# looks. An empty dir (sidecar not built on this platform) packages fine;
+# the app's existsSync gate just disables that sidecar. The dirs must exist
+# though — `prepackage` runs build-sidecars.mjs --ensure-dirs to guarantee it.
+extraResources:
+  - from: resources/analyzer
+    to: analyzer
+  - from: resources/rekordbox
+    to: rekordbox
+  - from: resources/audio
+    to: audio
+  # Headless Spotify playback sidecar (its own signed Electron app). Staged by
+  # build-sidecars.mjs; getSpotifySpec()'s production branch resolves
+  # process.resourcesPath/spotify-player/curator-spotify(.exe).
+  - from: resources/spotify-player
+    to: spotify-player
+  # AI audio engine project (source + uv.lock + uv), staged by build-sidecars;
+  # the env itself is provisioned into userData on demand (getMirSpec).
+  - from: resources/mir
+    to: mir
+
+win:
+  # 'dir' target produces dist/win-unpacked/<exe> without making an installer.
+  # That's exactly what EVS sign-pkg expects to operate on — anything that
+  # later mutates the exe (msi/squirrel/nsis) would invalidate the VMP signature.
+  target:
+    - dir
+  icon: resources/icon.png
+
+# Skip code-signing for now (Windows Authenticode). VMP signing is separate
+# and happens via the `sign` script after this package step.
+forceCodeSigning: false
+
+# Don't let electron-builder rebuild better-sqlite3 from source — the
+# `prepackage` hook already fetched the Electron-ABI prebuild via
+# scripts/rebuild-sqlite.mjs before this step runs. (predev/prebuild do the
+# same for dev/build, but `package` calls electron-vite directly and skips
+# them — so prepackage is the one that guards the packaged binary.)
+# Rebuilding here would invoke node-gyp and fail on machines without MSVC.
+# The prebuilt .node is bundled as-is.
+npmRebuild: false
+
+# Use the Electron binary already in node_modules instead of letting
+# electron-builder fetch one from github.com/electron/electron/releases.
+# The castlabs fork (#vXX.X.X+wvcus) isn't published to the official
+# release host, so the default download path 404s. Pointing at the local
+# dist also guarantees Widevine is bundled (we'd lose that if the official
+# binary was substituted in).
+electronDist: node_modules/electron/dist
+
+# Auto-update feed. The main process only calls checkForUpdatesAndNotify in
+# packaged builds AND only when this publish block is uncommented and points
+# at a real repo — until then the updater is wired but inert. GitHub releases
+# is the simplest feed: `electron-builder --publish always` uploads artifacts
+# + the latest.yml manifest the updater polls.
+# publish:
+#   provider: github
+#   owner: <github-owner>
+#   repo: curator

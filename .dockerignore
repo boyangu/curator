@@ -1,0 +1,23 @@
+# Whitelist: the cloud image needs the workspace manifests, the shared packages
+# and apps/cloud, nothing else. The repo root also holds a live curator.db,
+# planning docs and research data that must never reach a build context.
+*
+
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!tsconfig.base.json
+
+# Every workspace manifest, so pnpm sees the same workspace the lockfile
+# describes; only apps/cloud and its dependencies are installed.
+!apps/*/package.json
+!packages/
+
+!apps/cloud/
+
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+!**/.env.example
+**/*.db

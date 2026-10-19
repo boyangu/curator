@@ -1,0 +1,45 @@
+{
+  "name": "@curator/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./ingest": "./src/ingest/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit && node scripts/check-console.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "db:seed": "tsx src/db/seed.ts"
+  },
+  "dependencies": {
+    "@curator/beatport": "workspace:*",
+    "@curator/google-drive": "workspace:*",
+    "@curator/library-logic": "workspace:*",
+    "@curator/matcher": "workspace:*",
+    "@curator/musicbrainz": "workspace:*",
+    "@curator/protocol": "workspace:*",
+    "@curator/shared": "workspace:*",
+    "@curator/spotify": "workspace:*",
+    "@curator/tidal": "workspace:*",
+    "@curator/traxsource": "workspace:*",
+    "better-sqlite3": "^12.10.0",
+    "chokidar": "^5.0.0",
+    "drizzle-orm": "^0.36.4",
+    "music-metadata": "^11.12.3",
+    "nanoid": "^5.0.9",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.28.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.6"
+  }
+}

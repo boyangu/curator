@@ -1,0 +1,13 @@
+{
+	// Keep VS Code's watcher/search out of build output — its indexer holds
+	// long-lived handles on big binaries (app.asar) which makes
+	// electron-builder's unlink fail with EBUSY on repackage.
+	"files.watcherExclude": {
+		"**/apps/desktop/dist/**": true,
+		"**/apps/desktop/out/**": true
+	},
+	"search.exclude": {
+		"**/apps/desktop/dist": true,
+		"**/apps/desktop/out": true
+	}
+}

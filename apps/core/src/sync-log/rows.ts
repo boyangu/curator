@@ -1,0 +1,353 @@
+// Local rows → ops. One place that knows how a desktop row reads on the wire,
+// shared by the mutators, emitOps' prerequisites (a pre-sync container gets
+// its create recorded the first time an op references it) and the D10
+// initial push. Every builder returns ops that pass `parseOp`: values the
+// schemas would refuse but the local tables tolerate (an empty name, a
+// negative cue position from an old import) are coerced here, because a
+// refused op throws and rolls the user's write back with it.
+//
+// Device-local rows yield nothing (cloud decisions 2026-10-17):
+//   - derived tracks (derived_from_track_id: the "Convert to WAV" copies) and
+//     derived playlists (derived_from_playlist_id: their "[WAV]" playlist);
+//   - rekordbox smart playlists (is_smart): the op has no smart flag, and an
+//     empty plain playlist on another desktop would be pushed into that
+//     machine's rekordbox by its exporter.
+
+import type Database from 'better-sqlite3';
+import { cueEntityId, trackTagEntityId, TRACK_STATES as WIRE_TRACK_STATES, type NewOp, type PayloadOf, type TrackStateValue } from '@curator/protocol';
+import { TRACK_STATES, type TrackState } from '@curator/shared';
+import type { TrackOverrides } from '@curator/shared/schema';
+import { recordingIdForTrack } from './recording-id.js';
+
+type Raw = Database.Database;
+
+type Stmts = {
+	track: Database.Statement<[string], { recording_id: string | null; derived_from_track_id: string | null }>;
+	healRecording: Database.Statement<[string, string]>;
+	tag: Database.Statement<[string], { name: string; kind: string; color: string | null }>;
+	playlist: Database.Statement<[string], PlaylistRow>;
+	folder: Database.Statement<[string], FolderRow>;
+	pinned: Database.Statement<[string], PinnedRow>;
+	member: Database.Statement<[string], { playlist_id: string; track_id: string; order_key: string; added_at: number | null }>;
+	trackState: Database.Statement<[string], TrackStateRow>;
+	cuesOf: Database.Statement<[string], CueRow>;
+	tagsOf: Database.Statement<[string], { tag_id: string; added_at: number }>;
+};
+
+type PlaylistRow = {
+	name: string;
+	source: string;
+	source_id: string;
+	url: string | null;
+	parent_folder_id: string | null;
+	is_favorite: number;
+	is_smart: number;
+	derived_from_playlist_id: string | null;
+	created_at: number;
+};
+type FolderRow = { name: string; source: string; source_id: string; parent_folder_id: string | null; created_at: number };
+type PinnedRow = { name: string; query: string; sort_column: string | null; sort_dir: string | null; created_at: number };
+export type TrackStateRow = { rating: number | null; state: string; overrides: string | null; deleted_at: number | null };
+export type CueRow = { slot: number; kind: 'hot' | 'memory'; position_sec: number; length_sec: number | null; color: string | null; name: string | null };
+
+const STMTS = new WeakMap<Raw, Stmts>();
+
+function stmts(raw: Raw): Stmts {
+	let s = STMTS.get(raw);
+	if (!s) {
+		s = {
+			track: raw.prepare(`SELECT recording_id, derived_from_track_id FROM track WHERE id = ?`),
+			healRecording: raw.prepare(`UPDATE track SET recording_id = ? WHERE id = ? AND recording_id IS NULL`),
+			tag: raw.prepare(`SELECT name, kind, color FROM tag WHERE id = ?`),
+			playlist: raw.prepare(`SELECT name, source, source_id, url, parent_folder_id, is_favorite, is_smart, derived_from_playlist_id, created_at FROM playlist WHERE id = ?`),
+			folder: raw.prepare(`SELECT name, source, source_id, parent_folder_id, created_at FROM playlist_folder WHERE id = ?`),
+			pinned: raw.prepare(`SELECT name, query, sort_column, sort_dir, created_at FROM pinned_search WHERE id = ?`),
+			member: raw.prepare(`SELECT playlist_id, track_id, order_key, added_at FROM playlist_track WHERE id = ?`),
+			trackState: raw.prepare(`SELECT rating, state, overrides, deleted_at FROM track WHERE id = ?`),
+			cuesOf: raw.prepare(`SELECT slot, kind, position_sec, length_sec, color, name FROM cue WHERE track_id = ? ORDER BY kind, slot`),
+			tagsOf: raw.prepare(`SELECT tag_id, added_at FROM track_tag WHERE track_id = ?`),
+		};
+		STMTS.set(raw, s);
+	}
+	return s;
+}
+
+// ── identity ────────────────────────────────────────────────────────────────
+
+// The recording a local track row speaks for on the wire, or null when the
+// row is device-local (a derived WAV copy) or gone. A row an older writer left
+// without a recording id is healed to the deterministic fallback — the same
+// value migrate() would give it on the next boot.
+export function recordingOf(raw: Raw, trackId: string): string | null {
+	const s = stmts(raw);
+	const row = s.track.get(trackId);
+	if (!row || row.derived_from_track_id) return null;
+	if (row.recording_id) return row.recording_id;
+	const minted = recordingIdForTrack(trackId);
+	s.healRecording.run(minted, trackId);
+	return minted;
+}
+
+// Batch form with a per-call cache, for the bulk writers. `preload` reads
+// those ids in a few IN (...) queries up front instead of one lookup each.
+export function recordingResolver(raw: Raw, preload: readonly string[] = []): (trackId: string) => string | null {
+	const cache = new Map<string, string | null>();
+	for (let i = 0; i < preload.length; i += 400) {
+		const chunk = preload.slice(i, i + 400);
+		const rows = raw.prepare(`SELECT id, recording_id, derived_from_track_id FROM track WHERE id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as Array<{ id: string; recording_id: string | null; derived_from_track_id: string | null }>;
+		for (const r of rows) if (r.recording_id || r.derived_from_track_id) cache.set(r.id, r.derived_from_track_id ? null : r.recording_id);
+	}
+	return (trackId) => {
+		let v = cache.get(trackId);
+		if (v === undefined) {
+			v = recordingOf(raw, trackId);
+			cache.set(trackId, v);
+		}
+		return v;
+	};
+}
+
+export function isDeviceLocalPlaylist(raw: Raw, playlistId: string): boolean {
+	const row = stmts(raw).playlist.get(playlistId);
+	return !row || !!row.is_smart || !!row.derived_from_playlist_id;
+}
+
+const nonEmpty = (s: string | null | undefined, fallback: string): string => (s && s.trim() ? s : fallback);
+
+// ── containers ──────────────────────────────────────────────────────────────
+
+export function tagCreateOp(raw: Raw, tagId: string): NewOp | null {
+	const row = stmts(raw).tag.get(tagId);
+	if (!row) return null;
+	return {
+		entity: 'tag',
+		entity_id: tagId,
+		kind: 'create',
+		payload: { name: nonEmpty(row.name, 'Untitled'), kind: row.kind === 'system' ? 'system' : 'user', color: row.color ?? null },
+	};
+}
+
+function playlistSourceLink(row: { source: string; source_id: string; url?: string | null }): PayloadOf<'playlist', 'create'>['source_link'] {
+	if (!row.source_id) return null;
+	const source = row.source as 'spotify' | 'tidal' | 'rekordbox' | 'local';
+	return 'url' in row ? { source, source_id: row.source_id, url: row.url ?? null } : { source, source_id: row.source_id };
+}
+
+// The create plus the favourite flag when set: together they are the
+// playlist as this device holds it.
+export function playlistCreateOps(raw: Raw, playlistId: string): NewOp[] {
+	const row = stmts(raw).playlist.get(playlistId);
+	if (!row || row.is_smart || row.derived_from_playlist_id) return [];
+	const ops: NewOp[] = [{
+		entity: 'playlist',
+		entity_id: playlistId,
+		kind: 'create',
+		payload: { name: nonEmpty(row.name, 'Untitled'), folder_id: row.parent_folder_id ?? null, source_link: playlistSourceLink(row) },
+	}];
+	if (row.is_favorite) ops.push({ entity: 'playlist', entity_id: playlistId, kind: 'set-favourite', payload: { favourite: true } });
+	return ops;
+}
+
+export function folderCreateOp(raw: Raw, folderId: string): NewOp | null {
+	const row = stmts(raw).folder.get(folderId);
+	if (!row) return null;
+	return {
+		entity: 'playlist_folder',
+		entity_id: folderId,
+		kind: 'create',
+		payload: { name: nonEmpty(row.name, 'Untitled'), parent_folder_id: row.parent_folder_id ?? null, source_link: playlistSourceLink({ source: row.source, source_id: row.source_id }) },
+	};
+}
+
+export function pinnedCreateOp(raw: Raw, id: string): NewOp | null {
+	const row = stmts(raw).pinned.get(id);
+	if (!row) return null;
+	return {
+		entity: 'pinned_search',
+		entity_id: id,
+		kind: 'create',
+		payload: {
+			name: nonEmpty(row.name, 'Untitled'),
+			query: row.query ?? '',
+			sort_column: row.sort_column ?? null,
+			sort_dir: row.sort_dir === 'asc' || row.sort_dir === 'desc' ? row.sort_dir : null,
+		},
+	};
+}
+
+// The add for an existing membership row, at its current key.
+export function memberAddOp(raw: Raw, rowId: string, recording: (trackId: string) => string | null = (t) => recordingOf(raw, t)): NewOp | null {
+	const row = stmts(raw).member.get(rowId);
+	if (!row) return null;
+	const rec = recording(row.track_id);
+	if (!rec) return null;
+	return { entity: 'playlist_track', entity_id: rowId, kind: 'add', payload: { playlist_id: row.playlist_id, recording_id: rec, order_key: row.order_key } };
+}
+
+// ── track state ─────────────────────────────────────────────────────────────
+
+// TrackOverrides key ↔ op field.
+export const OVERRIDE_FIELD_OF = {
+	title: 'title',
+	artists: 'artists',
+	albumTitle: 'album_title',
+	label: 'label',
+	genre: 'genre',
+	bpm: 'bpm',
+	keyCamelot: 'key_camelot',
+	releaseDate: 'release_date',
+} as const satisfies Record<keyof TrackOverrides, string>;
+export type OverrideKey = keyof typeof OVERRIDE_FIELD_OF;
+export const OVERRIDE_KEYS = Object.keys(OVERRIDE_FIELD_OF) as OverrideKey[];
+export const OVERRIDE_KEY_OF: Record<string, OverrideKey> = Object.fromEntries(OVERRIDE_KEYS.map((k) => [OVERRIDE_FIELD_OF[k], k]));
+
+export function parseOverrides(json: string | null): TrackOverrides {
+	if (!json) return {};
+	try {
+		const v = JSON.parse(json) as unknown;
+		return v && typeof v === 'object' ? (v as TrackOverrides) : {};
+	} catch {
+		return {};
+	}
+}
+
+export function readTrackState(raw: Raw, trackId: string): TrackStateRow | null {
+	return stmts(raw).trackState.get(trackId) ?? null;
+}
+
+// The op value of one override field, or null (cleared) when the stored
+// value is missing or not in the wire shape.
+function overrideValue(key: OverrideKey, v: unknown): unknown {
+	if (v === undefined || v === null) return null;
+	switch (key) {
+		case 'artists': {
+			if (!Array.isArray(v)) return null;
+			const list = v
+				.filter((a): a is { name: string; role?: unknown } => !!a && typeof (a as { name?: unknown }).name === 'string' && (a as { name: string }).name.length > 0)
+				.map((a) => (a.role === 'main' || a.role === 'featured' || a.role === 'remixer' ? { name: a.name, role: a.role } : { name: a.name }));
+			return list;
+		}
+		case 'bpm':
+			return typeof v === 'number' && Number.isFinite(v) ? v : null;
+		default:
+			return typeof v === 'string' ? v : null;
+	}
+}
+
+export function overrideOp(recordingId: string, key: OverrideKey, value: unknown): NewOp {
+	return {
+		entity: 'library_track',
+		entity_id: recordingId,
+		kind: 'set-override',
+		payload: { field: OVERRIDE_FIELD_OF[key], value: overrideValue(key, value) } as PayloadOf<'library_track', 'set-override'>,
+	};
+}
+
+export function ratingOp(recordingId: string, rating: number | null): NewOp {
+	const r = rating == null || !Number.isFinite(rating) ? null : Math.max(0, Math.min(5, Math.round(rating)));
+	return { entity: 'library_track', entity_id: recordingId, kind: 'set-rating', payload: { rating: r } };
+}
+
+// The protocol keeps its own copy of the curation stages (it may import only
+// zod); these two lines fail the build if the lists drift apart.
+const _wireCoversLocal: readonly TrackStateValue[] = TRACK_STATES;
+const _localCoversWire: readonly TrackState[] = WIRE_TRACK_STATES;
+void _wireCoversLocal;
+void _localCoversWire;
+
+const isTrackState = (v: string): v is TrackStateValue => (WIRE_TRACK_STATES as readonly string[]).includes(v);
+
+// Null for a value the wire refuses (a hand-edited row): nothing is emitted
+// rather than rolling the user's write back.
+export function stateOp(recordingId: string, state: string): NewOp | null {
+	return isTrackState(state) ? { entity: 'library_track', entity_id: recordingId, kind: 'set-state', payload: { state } } : null;
+}
+
+export function deletedOp(recordingId: string, deleted: boolean): NewOp {
+	return deleted
+		? { entity: 'library_track', entity_id: recordingId, kind: 'delete', payload: {} }
+		: { entity: 'library_track', entity_id: recordingId, kind: 'undelete', payload: {} };
+}
+
+// Ops that move a track's synced fields from `before` to `after`: one per
+// changed field. Used by every writer that patches rating / overrides /
+// deleted_at, so a writer cannot change one without the other devices
+// hearing about it.
+export function trackStateDiffOps(recordingId: string, before: TrackStateRow, after: TrackStateRow): NewOp[] {
+	const ops: NewOp[] = [];
+	if ((before.rating ?? null) !== (after.rating ?? null)) ops.push(ratingOp(recordingId, after.rating));
+	if (before.state !== after.state) { const op = stateOp(recordingId, after.state); if (op) ops.push(op); }
+	const a = parseOverrides(before.overrides);
+	const b = parseOverrides(after.overrides);
+	for (const key of OVERRIDE_KEYS) {
+		const va = overrideValue(key, a[key]);
+		const vb = overrideValue(key, b[key]);
+		if (JSON.stringify(va) !== JSON.stringify(vb)) ops.push(overrideOp(recordingId, key, b[key]));
+	}
+	if ((before.deleted_at == null) !== (after.deleted_at == null)) ops.push(deletedOp(recordingId, after.deleted_at != null));
+	return ops;
+}
+
+// The track's whole synced state as ops — for the merge re-assert and the
+// initial push. Every override field is stated, cleared ones as null, so the
+// set wins over whatever the other side of a merge carried; so is the
+// state, even the default, for the same reason.
+export function trackStateOps(recordingId: string, row: TrackStateRow, opts: { allOverrides: boolean; deleted: boolean }): NewOp[] {
+	const ops: NewOp[] = [ratingOp(recordingId, row.rating)];
+	const st = stateOp(recordingId, row.state);
+	if (st) ops.push(st);
+	const ov = parseOverrides(row.overrides);
+	for (const key of OVERRIDE_KEYS) {
+		if (opts.allOverrides || ov[key] !== undefined) ops.push(overrideOp(recordingId, key, ov[key]));
+	}
+	if (opts.deleted || row.deleted_at != null) ops.push(deletedOp(recordingId, row.deleted_at != null));
+	return ops;
+}
+
+// ── cues ────────────────────────────────────────────────────────────────────
+
+export function readCues(raw: Raw, trackId: string): CueRow[] {
+	return stmts(raw).cuesOf.all(trackId);
+}
+
+export function cueUpsertOp(recordingId: string, c: CueRow): NewOp {
+	const pos = Number.isFinite(c.position_sec) ? Math.max(0, c.position_sec) : 0;
+	const len = c.length_sec != null && Number.isFinite(c.length_sec) && c.length_sec >= 0 ? c.length_sec : null;
+	return {
+		entity: 'cue',
+		entity_id: cueEntityId(recordingId, c.slot, c.kind),
+		kind: 'upsert',
+		payload: { slot: c.slot, kind: c.kind, position_sec: pos, length_sec: len, color: c.color ?? null, name: c.name ?? null },
+	};
+}
+
+export function cueDeleteOp(recordingId: string, slot: number, kind: 'hot' | 'memory'): NewOp {
+	return { entity: 'cue', entity_id: cueEntityId(recordingId, slot, kind), kind: 'delete', payload: {} };
+}
+
+const cueSlotKey = (c: { slot: number; kind: string }): string => `${c.kind}:${c.slot}`;
+
+// Whole-cue LWW: a changed cue is one upsert, a vanished one one delete.
+export function cueDiffOps(recordingId: string, before: readonly CueRow[], after: readonly CueRow[]): NewOp[] {
+	const ops: NewOp[] = [];
+	const was = new Map(before.filter((c) => c.slot >= 0).map((c) => [cueSlotKey(c), c]));
+	const now = new Map(after.filter((c) => c.slot >= 0).map((c) => [cueSlotKey(c), c]));
+	for (const [k, c] of now) {
+		const p = was.get(k);
+		if (!p || p.position_sec !== c.position_sec || (p.length_sec ?? null) !== (c.length_sec ?? null) || (p.color ?? null) !== (c.color ?? null) || (p.name ?? null) !== (c.name ?? null)) {
+			ops.push(cueUpsertOp(recordingId, c));
+		}
+	}
+	for (const [k, c] of was) if (!now.has(k)) ops.push(cueDeleteOp(recordingId, c.slot, c.kind));
+	return ops;
+}
+
+// ── tags ────────────────────────────────────────────────────────────────────
+
+export function readTrackTags(raw: Raw, trackId: string): Array<{ tag_id: string; added_at: number }> {
+	return stmts(raw).tagsOf.all(trackId);
+}
+
+export function trackTagOp(recordingId: string, tagId: string, add: boolean): NewOp {
+	return { entity: 'track_tag', entity_id: trackTagEntityId(recordingId, tagId), kind: add ? 'add' : 'remove', payload: {} };
+}

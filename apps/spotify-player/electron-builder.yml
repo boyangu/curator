@@ -1,0 +1,25 @@
+appId: com.curator.spotify
+productName: curator-spotify
+copyright: Copyright © 2026 Curator
+
+directories:
+  output: dist
+
+files:
+  - 'out/**/*'
+  - 'package.json'
+
+win:
+  # 'dir' target only — the unpacked tree is what EVS sign-pkg signs, and what
+  # the desktop app spawns as resources/spotify-player/curator-spotify.exe.
+  # Any installer step (nsis/squirrel) would mutate the exe and invalidate the
+  # VMP signature.
+  target:
+    - dir
+
+forceCodeSigning: false
+
+# Use the castlabs Electron already in node_modules — the #wvcus fork isn't on
+# the official release host, and it's the one that bundles the Widevine CDM the
+# Spotify SDK needs.
+electronDist: node_modules/electron/dist

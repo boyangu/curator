@@ -1,0 +1,3 @@
+# Generated dump of curator.db — re-create with `pnpm export`. Can be tens of MB.
+public/graph-data.json
+dist/

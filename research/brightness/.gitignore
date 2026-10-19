@@ -1,0 +1,3 @@
+.venv-research/
+__pycache__/
+*.pyc

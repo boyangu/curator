@@ -1,0 +1,57 @@
+node_modules
+dist
+out
+build
+*.tsbuildinfo
+# Packed tarballs (pnpm/npm pack output)
+*.tgz
+# Staged sidecar bundles (pnpm build:sidecars) — build artifacts, not source.
+apps/desktop/resources/analyzer/
+apps/desktop/resources/rekordbox/
+apps/desktop/resources/audio/
+apps/desktop/resources/spotify-player/
+apps/desktop/resources/mir/
+# Rust build output (cargo)
+target/
+# Python virtualenvs (incl. .venv-wsl, .venv-wsl-tf, .venv-research) + build artifacts
+.venv*/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+# PyInstaller work dirs
+apps/analyzer/build/
+apps/analyzer/dist/
+apps/analyzer/*.spec
+apps/rekordbox/build/
+apps/rekordbox/dist/
+apps/rekordbox/*.spec
+.env
+.env.local
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Internal planning — PRDs, tech designs, roadmap/backlog, UX mocks (personal, local-only)
+planning/
+.DS_Store
+Thumbs.db
+.vite
+apps/desktop/dist-release/
+
+# Claude Code working files — instructions, skills, permissions, session
+# memory and design briefs are private to the maintainer, not part of the
+# open-source tree.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.remember/
+*.local.md
+
+# Build output that was once tracked by mistake.
+apps/mcp/dist-mcpb/
+
+# Local-only env files (the committed *.example files hold placeholders).
+.env.*
+!.env.example
+!**/.env.example

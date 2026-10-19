@@ -1,0 +1,31 @@
+[project]
+name = "curator-analyzer"
+version = "0.1.0"
+description = "Offline Essentia-based music analysis sidecar for the Curator desktop app."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # Essentia: native C++ DSP / MIR. Wheels for Linux + macOS published; on
+    # Windows we pin the unofficial wheel from MTG's CI builds — see README.
+    "essentia >=2.1b6.dev1110",
+    # Audio decode via ffmpeg + librosa-free read path. We bundle a static
+    # ffmpeg binary alongside the sidecar (see scripts/), so soundfile is
+    # only the fallback for WAV/AIFF.
+    "numpy >=1.26,<3",
+    "scipy >=1.11",
+    "soundfile >=0.12",
+]
+
+[tool.uv]
+# Use `uv pip install -e .` for local dev; CI builds the PyInstaller bundle
+# off this same lock.
+managed = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["src/**/*.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curator_analyzer"]

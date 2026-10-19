@@ -1,0 +1,4 @@
+# Normalise line endings: LF in the repo and in every working copy, so a
+# Windows contributor with core.autocrlf=true and a macOS one produce the
+# same blobs. Binaries are detected by content.
+* text=auto eol=lf

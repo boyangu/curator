@@ -1,0 +1,36 @@
+{
+	"name": "@curator/cloud",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"files": [
+		"dist",
+		"sql"
+	],
+	"scripts": {
+		"dev": "tsx watch src/server.ts",
+		"build": "node scripts/build.mjs",
+		"start": "node dist/server.js",
+		"db:migrate": "tsx src/cli/migrate.ts",
+		"snapshot": "tsx src/cli/snapshot.ts",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"typecheck": "tsc --noEmit && node ../../scripts/check-package-boundaries.mjs cloud"
+	},
+	"dependencies": {
+		"@trpc/server": "^11",
+		"jose": "^6.2.12",
+		"postgres": "^3.4.9",
+		"zod": "^3.23.8"
+	},
+	"devDependencies": {
+		"@curator/protocol": "workspace:*",
+		"@electric-sql/pglite": "^0.5.10",
+		"@trpc/client": "^11",
+		"@types/node": "^22.10.0",
+		"esbuild": "^0.28.2",
+		"tsx": "^4.19.2",
+		"typescript": "^5.6.3",
+		"vitest": "^2.1.6"
+	}
+}

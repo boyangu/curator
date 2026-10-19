@@ -1,0 +1,80 @@
+[project]
+name = "curator-mir"
+version = "0.1.0"
+description = "AI audio analysis engine (music foundation-model embeddings, later stems/structure/transcription) for the Curator desktop app."
+# 3.11 matches the other sidecars; torch/transformers/muq all ship cp311 wheels.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy >=1.26,<3",
+    "soundfile >=0.12",      # FLAC/WAV/OGG/MP3 decode (libsndfile 1.2)
+    "av >=12",               # PyAV fallback for AAC/M4A/ALAC that libsndfile can't open
+    "soxr >=0.4",            # high-quality resampling to each model's native rate
+    "huggingface-hub >=0.30",
+    "safetensors >=0.4",
+    # MERT-v2 ships remote code tested on 4.53.2; MuQ-MuLan's text tower and
+    # CLAP also load through transformers. Pin the minor so a transformers
+    # API break can't silently change embeddings under a stored model_version.
+    "transformers ==4.53.2",
+    # muq declares its deps only in setup.py's install_requires (its PyPI
+    # metadata is empty), so they're listed here explicitly.
+    "muq ==0.1.0",
+    "einops", "librosa", "nnAudio", "tqdm", "easydict", "x-clip",
+]
+
+[project.optional-dependencies]
+# torchaudio is frozen at 2.11 (its last release) and pins the matching torch,
+# so torch stays at 2.11 too. Exactly one torch flavour per environment: CPU everywhere, or Intel XPU
+# (Arc / Core Ultra iGPU) on machines that have one. CUDA lives only in the
+# cloud image (modal_app.py), never in the desktop env.
+cpu = ["torch ==2.11.0", "torchaudio ==2.11.0"]
+xpu = ["torch ==2.11.0", "torchaudio ==2.11.0", "triton-xpu ==3.7.0"]
+dev = ["pytest >=8"]
+# Cloud GPU executor (modal_app.py). Optional: only needed to deploy or to run
+# the cloud lane; credentials live in Modal's own ~/.modal.toml.
+cloud = ["modal >=1.0"]
+
+[project.scripts]
+curator-mir = "curator_mir.cli:main"
+
+[tool.uv]
+managed = true
+# The desktop env is Windows-only (the cloud image installs its own CUDA torch
+# in modal_app.py), so the lockfile only has to resolve for win32. This also
+# keeps Linux-only XPU deps (triton-xpu) out of the resolution.
+environments = ["sys_platform == 'win32'"]
+conflicts = [[{ extra = "cpu" }, { extra = "xpu" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-xpu", extra = "xpu" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-xpu", extra = "xpu" },
+]
+# torch+xpu hard-depends on a matching triton-xpu that only the XPU index hosts.
+triton-xpu = [{ index = "pytorch-xpu", extra = "xpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["src/**/*.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curator_mir"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

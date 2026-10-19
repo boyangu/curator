@@ -1,0 +1,30 @@
+# The cloud API's gate, shared by ci.yml (every push/PR that touches it) and
+# deploy-cloud.yml (every release), so a release is checked by exactly the
+# steps CI runs: install only the cloud package and its workspace deps, then
+# typecheck (incl. the import-boundary rule), test and bundle. The tests run
+# Postgres in-process (PGlite), so no service container. The caller checks
+# out the commit first.
+#
+# Third-party actions are pinned by full commit SHA; Dependabot
+# (.github/dependabot.yml) watches this directory as well as the workflows.
+
+name: cloud-check
+description: Install, typecheck, test and build @curator/cloud
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      with:
+        version: 9.15.0
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: 22
+        cache: pnpm
+    - run: pnpm install --frozen-lockfile --filter @curator/cloud...
+      shell: bash
+    - run: pnpm --filter @curator/cloud typecheck
+      shell: bash
+    - run: pnpm --filter @curator/cloud test
+      shell: bash
+    - run: pnpm --filter @curator/cloud build
+      shell: bash

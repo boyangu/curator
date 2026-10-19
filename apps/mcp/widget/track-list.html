@@ -1,0 +1,118 @@
+<!doctype html>
+<!--
+	Curator MCP Apps widget — PROTOTYPE, served only when CURATOR_MCP_UI=1.
+
+	Renders query_library / get_library_favorites / get_playlist_tracks
+	results as a track table inside the Claude client's sandboxed iframe
+	(MCP Apps extension, io.modelcontextprotocol/ui). Hand-rolled postMessage
+	JSON-RPC per the 2026-01-26 apps spec rather than the ext-apps view SDK —
+	single-file, zero build step. Claude Desktop's stdio widget rendering has
+	open bugs (claude-ai-mcp #165); the message-shape handling below is
+	deliberately tolerant so live testing can converge on the host's exact
+	dialect without a rebuild. Fallback everywhere: the same tool results are
+	plain JSON text, so nothing depends on this rendering.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+	:root { color-scheme: dark; }
+	* { box-sizing: border-box; margin: 0; }
+	body {
+		font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+		background: transparent; color: var(--fg, #ddd);
+		padding: 8px 4px;
+	}
+	table { width: 100%; border-collapse: collapse; }
+	th, td { text-align: left; padding: 5px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.55; border-bottom: 1px solid rgba(128,128,128,0.3); }
+	tr + tr td { border-top: 1px solid rgba(128,128,128,0.12); }
+	td.title { max-width: 220px; font-weight: 600; }
+	td.artists { max-width: 180px; opacity: 0.85; }
+	td.num { font-variant-numeric: tabular-nums; }
+	.rating { color: #e7b93c; letter-spacing: 1px; }
+	#status { opacity: 0.6; padding: 12px 8px; }
+</style>
+</head>
+<body>
+<div id="status">Waiting for track data…</div>
+<div id="root"></div>
+<script>
+(function () {
+	'use strict';
+	let nextId = 1;
+
+	function post(msg) { window.parent.postMessage(msg, '*'); }
+	function request(method, params) {
+		post({ jsonrpc: '2.0', id: nextId++, method, params: params || {} });
+	}
+
+	// Handshake: announce ourselves; the host replies with context (theme,
+	// dimensions) and then streams the linked tool's input/result.
+	request('ui/initialize', { protocolVersion: '2026-01-26' });
+
+	// Pull a {tracks:[...]}-shaped payload out of whatever envelope the host
+	// uses for tool results (structuredContent, content[0].text JSON, or the
+	// raw result object).
+	function extractRows(obj) {
+		if (!obj || typeof obj !== 'object') return null;
+		if (Array.isArray(obj.tracks)) return obj.tracks;
+		if (Array.isArray(obj.favorites)) {
+			return obj.favorites.map(function (f) {
+				return { title: f.name || f[0], artists: [], bpm: null, rating: f.avgRating, label: null, genre: null };
+			});
+		}
+		if (obj.structuredContent) return extractRows(obj.structuredContent);
+		if (obj.result) return extractRows(obj.result);
+		if (Array.isArray(obj.content)) {
+			for (var i = 0; i < obj.content.length; i++) {
+				var c = obj.content[i];
+				if (c && c.type === 'text' && typeof c.text === 'string') {
+					try { var rows = extractRows(JSON.parse(c.text)); if (rows) return rows; } catch (e) { /* not JSON */ }
+				}
+			}
+		}
+		return null;
+	}
+
+	function esc(s) {
+		return String(s == null ? '' : s).replace(/[&<>"]/g, function (ch) {
+			return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch];
+		});
+	}
+
+	function render(rows) {
+		document.getElementById('status').style.display = 'none';
+		var html = '<table><thead><tr>'
+			+ '<th>Title</th><th>Artists</th><th>BPM</th><th>Key</th><th>Genre</th><th>Label</th><th>Rating</th>'
+			+ '</tr></thead><tbody>';
+		for (var i = 0; i < rows.length; i++) {
+			var t = rows[i];
+			var artists = Array.isArray(t.artists) ? t.artists.join(', ') : (t.artists || '');
+			var stars = t.rating != null ? '★'.repeat(Math.round(t.rating)) : '';
+			html += '<tr>'
+				+ '<td class="title" title="' + esc(t.title) + '">' + esc(t.title) + '</td>'
+				+ '<td class="artists" title="' + esc(artists) + '">' + esc(artists) + '</td>'
+				+ '<td class="num">' + esc(t.bpm != null ? Math.round(t.bpm) : '') + '</td>'
+				+ '<td>' + esc(t.key || t.keyCamelot || '') + '</td>'
+				+ '<td>' + esc(t.genre || '') + '</td>'
+				+ '<td>' + esc(t.label || '') + '</td>'
+				+ '<td class="rating">' + stars + '</td>'
+				+ '</tr>';
+		}
+		html += '</tbody></table>';
+		document.getElementById('root').innerHTML = html;
+	}
+
+	window.addEventListener('message', function (evt) {
+		var msg = evt.data;
+		if (!msg || typeof msg !== 'object') return;
+		// Tolerant: any host message that carries something track-shaped —
+		// tool-result notifications, initialize replies with initial data, …
+		var rows = extractRows(msg.params) || extractRows(msg.result);
+		if (rows && rows.length) render(rows);
+	});
+})();
+</script>
+</body>
+</html>

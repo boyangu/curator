@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Curator</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://sdk.scdn.co; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https: curator-cover:; media-src 'self' blob: https: data: curator-local:; worker-src 'self' blob:; connect-src 'self' https: wss: curator-local: curator-peaks: curator-cover:; frame-src https://sdk.scdn.co; child-src https://sdk.scdn.co;" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Serif:ital,wght@1,400;1,500&display=swap" />
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<!-- The entire renderer DOM is mounted by layouts/AppShell.tsx into
+     this single root. AppShell renders the .app-shell wrapper, the
+     four primary region hosts (topframe / player-footer / sidebar /
+     main-pane), the toast stack, and the shared overlays (omnibar,
+     settings, track-edit). -->
+<div id="app-root"></div>
+<script type="module" src="./main.ts"></script>
+</body>
+</html>

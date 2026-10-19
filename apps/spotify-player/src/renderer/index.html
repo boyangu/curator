@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>Curator Spotify Player</title>
+	</head>
+	<body>
+		<!-- Headless host. This window is never shown (show:false); it exists
+		     only to give the Spotify Web Playback SDK a Chromium renderer with
+		     Widevine/EME. All control flows over IPC via the preload bridge. -->
+		<script type="module" src="./sdk.ts"></script>
+	</body>
+</html>

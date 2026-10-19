@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "out",
+    "types": ["node", "electron"],
+    // JSX handed off to vite-plugin-solid at build time. jsxImportSource
+    // points the typechecker at solid-js so JSX intrinsics + props
+    // typecheck against Solid's runtime (not React's). Affects .tsx files
+    // only — existing .ts code is unchanged.
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js"
+  },
+  "include": ["src/**/*", "electron.vite.config.ts"]
+}

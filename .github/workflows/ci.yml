@@ -1,0 +1,106 @@
+# CI floor: typecheck + unit tests + sidecar sanity on every push/PR.
+# Deliberately does NOT package or sign — the castlabs EVS step needs a
+# private key and packaging is exercised locally until a release pipeline
+# exists. ELECTRON_SKIP_BINARY_DOWNLOAD skips the ~100MB castlabs binary
+# fetch since nothing here launches Electron.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token for every job unless a job asks for more. Third-party
+# actions are pinned by full commit SHA (the comment names the release);
+# Dependabot (.github/dependabot.yml) proposes the bumps.
+permissions:
+  contents: read
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 9.15.0
+      # Node 22: the backup engine uses zlib's zstd streams (22.15+), the
+      # same Node line Electron 38 embeds. Node 20 typechecks (the typings
+      # are 22's) but the engine tests fail at the first compress.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      # Runs every package that defines a test script (matcher, core,
+      # desktop). The suites are pure-JS — no native rebuild needed.
+      - run: pnpm -r test
+
+  # Actions has no job-level `paths`, so this job computes the filter and
+  # `cloud` runs only when its inputs changed.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      cloud: ${{ steps.filter.outputs.cloud }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        id: filter
+        with:
+          filters: |
+            cloud:
+              - 'apps/cloud/**'
+              - 'packages/**'
+              - 'pnpm-lock.yaml'
+              - 'scripts/check-package-boundaries.mjs'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+              - '.github/actions/cloud-check/**'
+              - '.github/workflows/deploy-cloud.yml'
+
+  # The cloud API on its own: install only it and its workspace deps, then
+  # typecheck (incl. the boundary rule), test and bundle
+  # (.github/actions/cloud-check).
+  cloud:
+    needs: changes
+    if: needs.changes.outputs.cloud == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The same steps gate every release (deploy-cloud.yml).
+      - uses: ./.github/actions/cloud-check
+
+  rust-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head 2026-10-19; the action has no releases)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/audio
+      # ALSA headers for cpal's linux backend; check (not build) keeps CI fast.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo check --manifest-path apps/audio/Cargo.toml
+
+  python-sidecars:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      # Byte-compile both sidecars — catches syntax errors and most import-
+      # structure mistakes without installing essentia/pyrekordbox (whose
+      # native deps don't belong in this fast lane).
+      - run: python -m compileall -q apps/analyzer/src apps/rekordbox/src

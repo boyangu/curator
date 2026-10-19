@@ -1,0 +1,41 @@
+# Fly.io config for the cloud API. No `app =` here on purpose: the app name
+# is the FLY_APP repository variable, passed as `--app` by
+# .github/workflows/deploy-cloud.yml (the only place deploys run from, on a
+# cloud-v* tag; apps/cloud/README.md "Release"). Set the region before the
+# first deploy, and the secrets with `fly secrets set` (never here):
+#   fly secrets set --app "$FLY_APP" --config apps/cloud/fly.toml DATABASE_URL=... SUPABASE_URL=...
+
+# The region closest to the Supabase project: every request is a few
+# Postgres round trips, which dominate latency.
+primary_region = "<region>"
+kill_signal = "SIGTERM"
+kill_timeout = "15s"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "stop"
+  # One machine stays up: the snapshot sweep runs on a timer inside it, and
+  # a cold start would add seconds to the first push after idle.
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/trpc/health"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # A snapshot build holds one user's whole library state in memory.
+  memory = "512mb"
