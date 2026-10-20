@@ -91,14 +91,22 @@ describe('mapCredits', () => {
 });
 
 describe('pulled rules on the artist table', () => {
-	it('remove stops mapping new credits and does not un-rewrite existing ones', () => {
+	// Credits derive from the source spelling and the converged rules, so a
+	// device that saw the rule before its remove ends where one that pulled
+	// both in a batch (and never rewrote anything) does.
+	it('remove stops mapping new credits and withdraws the rewrite of existing ones', () => {
 		const r = freshDb('remove');
 		seed(r, [['t0', [{ name: 'Old' }]]]);
 		applyOps(r, [rule('Old', 'New', 1000)]);
 		expect(credits(r, 't0')).toEqual([{ name: 'New' }]);
 		expect(normalizeIncomingArtistsRaw(r, [{ name: 'Old' }])).toEqual([{ name: 'New' }]);
 		applyOps(r, [remove('Old', 2000)]);
-		expect(credits(r, 't0')).toEqual([{ name: 'New' }]);
+		expect(credits(r, 't0')).toEqual([{ name: 'Old' }]);
+		expect(r.prepare(`SELECT artists_base FROM track WHERE id = 't0'`).pluck().get()).toBeNull();
+		const batch = freshDb('remove-batch');
+		seed(batch, [['t0', [{ name: 'Old' }]]]);
+		applyOps(batch, [rule('Old', 'New', 1000), remove('Old', 2000)]);
+		expect(credits(batch, 't0')).toEqual([{ name: 'Old' }]);
 		expect(normalizeIncomingArtistsRaw(r, [{ name: 'Old' }])).toEqual([{ name: 'Old' }]);
 		expect(loadArtistAliasMap(r).size).toBe(0);
 		// A stale set (earlier than the remove) changes nothing.
@@ -209,6 +217,59 @@ describe('a 5,000-track rename on the pulling device', () => {
 		expect(drain.chunks).toBeGreaterThanOrEqual(LIBRARY / 1_000);
 		expect(drain.maxSliceMs).toBeLessThan(500);
 	}, 180_000);
+
+	// The size the derivation was sized against: a 5k library where one
+	// rename touches 1k tracks, then another device's later rename of the
+	// same artist winning on the device that renamed first (every one of
+	// those 1k rows re-derived from its recorded source credits).
+	it('5k library, 1k renamed: local rename, pulled apply, and a losing rename re-derived', async () => {
+		const LIBRARY = 5_000;
+		const RENAMED = 1_000;
+		const rows = Array.from({ length: LIBRARY }, (_, i) => {
+			const id = `t-${String(i).padStart(5, '0')}`;
+			return [id, i % (LIBRARY / RENAMED) === 0 ? [{ name: 'Big Artist' }, { name: `Guest ${i % 50}` }] : [{ name: `Other ${i % 2000}` }]] as const;
+		});
+		const p = join(dir, 'source5k.db');
+		migrate(p);
+		const source = new Database(p);
+		handles.push(source);
+		seed(source, rows);
+		initialPush(source);
+		const replicaPath = join(dir, 'replica5k.db');
+		source.exec(`VACUUM INTO '${replicaPath.replace(/'/g, "''")}'`);
+		const replica = new Database(replicaPath);
+		handles.push(replica);
+		const before = new Set(readOutbox(source).map((o) => o.op_id));
+
+		const svc = createCoreService(p, { peaksDir: join(dir, 'peaks5k'), sourceAdapters: { spotify: throwingAdapter() } });
+		services.push(svc);
+		const t0 = performance.now();
+		const res = await svc.renameArtist(source.prepare(`SELECT id FROM artist WHERE name = 'Big Artist'`).pluck().get() as string, 'Huge Artist');
+		const localMs = performance.now() - t0;
+		expect(res.tracksRewritten).toBe(RENAMED);
+		const ops = readOutbox(source).filter((o) => !before.has(o.op_id));
+		// Local projection only: the rename's rules, no op per track.
+		expect(ops.map((o) => `${o.entity}.${o.kind}`)).toEqual(['artist_alias.set', 'artist_alias.set']);
+
+		const a0 = performance.now();
+		applyOps(replica, ops);
+		const applyMs = performance.now() - a0;
+		const drain = await drainArtistCreditRewritesAsync(replica, { chunk: 1_000 });
+		expect(drain.tracksRewritten).toBe(RENAMED);
+
+		// Another device renamed "Big Artist" too, later: its rule wins the key.
+		const c0 = performance.now();
+		applyOps(source, [rule('Big Artist', 'Giant Artist', Date.now() + 60_000)]);
+		const contestApplyMs = performance.now() - c0;
+		const contest = await drainArtistCreditRewritesAsync(source, { chunk: 1_000 });
+		expect(contest.tracksRewritten).toBe(RENAMED);
+		expect(source.prepare(`SELECT count(*) FROM track WHERE artists LIKE '%Giant Artist%'`).pluck().get()).toBe(RENAMED);
+		expect(source.prepare(`SELECT count(*) FROM track WHERE artists LIKE '%Huge Artist%'`).pluck().get()).toBe(0);
+		console.log(`[artist-alias 5k] renamed=${RENAMED} localRename=${localMs.toFixed(0)}ms pulledApply=${applyMs.toFixed(0)}ms pulledDrain=${drain.chunks} chunks maxSlice=${drain.maxSliceMs.toFixed(1)}ms`
+			+ ` contestedApply=${contestApplyMs.toFixed(0)}ms contestedDrain=${contest.chunks} chunks maxSlice=${contest.maxSliceMs.toFixed(1)}ms`);
+		expect(drain.maxSliceMs).toBeLessThan(500);
+		expect(contest.maxSliceMs).toBeLessThan(500);
+	}, 120_000);
 
 	it('an interrupted drain resumes from its cursor', () => {
 		const r = freshDb('resume');

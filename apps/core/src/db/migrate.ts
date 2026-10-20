@@ -989,6 +989,11 @@ const ALTER_MIGRATIONS: string[] = [
 		seen_at INTEGER NOT NULL,
 		PRIMARY KEY (track_id, unit)
 	)`,
+	// Source credits under artist alias rules — see track.artistsBase in
+	// schema.ts. No backfill: a row a rule rewrote before this column keeps
+	// the spelling it has (its source spelling is gone), which is the
+	// behaviour it had before.
+	`ALTER TABLE track ADD COLUMN artists_base TEXT`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

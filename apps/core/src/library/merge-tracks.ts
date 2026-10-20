@@ -387,7 +387,10 @@ export function applyTrackMerge(db: Db, sqlite: Database.Database, keepId: strin
 			if (isEmpty(keep[f]) && !isEmpty(drop[f])) (patch as Record<string, unknown>)[f] = drop[f];
 		}
 		if (isEmpty(keep.title) && !isEmpty(drop.title)) patch.title = drop.title;
-		if ((keep.artists ?? []).length === 0 && (drop.artists ?? []).length > 0) patch.artists = drop.artists;
+		if ((keep.artists ?? []).length === 0 && (drop.artists ?? []).length > 0) {
+			patch.artists = drop.artists;
+			patch.artistsBase = drop.artistsBase ?? null;
+		}
 		patch.playCount = Math.max(keep.playCount ?? 0, drop.playCount ?? 0);
 		patch.lastPlayedAt = maxDate(keep.lastPlayedAt, drop.lastPlayedAt);
 		patch.cuesEditedAt = maxDate(keep.cuesEditedAt, drop.cuesEditedAt);

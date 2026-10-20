@@ -34,7 +34,7 @@ import {
 import type { Db } from '../db/client.js';
 import { curatorFieldsView } from '../sync/curator-view.js';
 import { applyCueOpsToTrack, buildPullPatch } from '../sync/apply.js';
-import { artistProtect, normalizeIncomingArtists, syncTrackArtistsById } from '../library/artists.js';
+import { artistProtect, creditsKey, normalizeIncomingCredits, syncTrackArtistsById } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import * as mut from '../library/mutators.js';
 
@@ -195,7 +195,11 @@ export function applyConflictResolutions(
 						const pull: FieldsSeen = { [field]: theirs };
 						const patch = buildPullPatch(pull, trackRow.overrides, { nullPreserve: false, clearOverrides: true, protect: artistProtect(db) });
 						if (Array.isArray(patch['artists'])) {
-							patch['artists'] = normalizeIncomingArtists(db, patch['artists'] as TrackArtist[], { title: trackRow.overrides?.title ?? trackRow.title });
+							const credits = normalizeIncomingCredits(db, patch['artists'] as TrackArtist[], { title: trackRow.overrides?.title ?? trackRow.title });
+							patch['artists'] = credits.artists;
+							// Unchanged credits keep the source spelling an alias
+							// rule recorded under them (track.artistsBase).
+							if (creditsKey(credits.artists) !== creditsKey(trackRow.artists)) patch['artistsBase'] = credits.artistsBase;
 						}
 						if (Object.keys(patch).length > 0) {
 							// Override clears / a pulled rating travel as ops.

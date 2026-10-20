@@ -444,9 +444,13 @@ export const ZUpstreamAck = defineOp(
 // whose `to_key` equals its `entity_id` is a spelling rule (a rename that
 // keeps the key, "Ben Bohmer" → "Ben Böhmer"); it ends a chain.
 //
-// Per-key LWW: the later of set/remove wins. `remove` stops the rule
-// applying to credits that arrive afterwards; it never un-rewrites the
-// credits it already rewrote (renaming back is a new rule).
+// Per-key LWW: the later of set/remove wins. A client's credits are a
+// function of the resolved rules and the credits as their source spelled
+// them, never of the order rules arrived in: when a key's resolution changes
+// (a later rule winning it, a cycle dropping one, a remove) the credits it
+// mapped are re-derived. So a removed rule stops applying to existing
+// credits as well as new ones; a device that saw the rule and its remove in
+// one pull never rewrote anything, and every device must end where it does.
 //
 // Keys are only as stable as the fold rules: a FOLD_VERSION bump that moves
 // a name to a new key leaves rules keyed the old way unmatched for it.

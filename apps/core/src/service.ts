@@ -48,7 +48,7 @@ import { parseInline } from './ingest/parser.js';
 import type { ParseFn } from './ingest/types.js';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, AlbumSummary } from '@curator/shared';
 import { DEFAULT_SOURCE_SYNC_SETTINGS, artistKey, asciify, asciifyArtists, searchFold, type ArtistCreditFormat } from '@curator/shared';
-import { mapCredits } from './library/artist-alias.js';
+import { loadArtistAliasMap, mapCredits, rederiveTrackCreditsRaw } from './library/artist-alias.js';
 import { lookupArtistRaw, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from './library/artists.js';
 import { healAlbumArtistAliasesRaw, liveAlbumIdRaw, syncTrackAlbumsById } from './library/albums.js';
 import { createAlbumEnricher } from './library/album-enrich.js';
@@ -4260,9 +4260,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				// key (a spelling rule: the curated name), the old one, and
 				// every alias merged in earlier — so a device that never saw
 				// those older merges still rewrites the same credits.
+				// Rules first: the canonical credits are derived from the
+				// converged map, which must already hold them.
 				const rules = artistFoldsOf(db, live.id).map((f) => ({ from: f.name, to: trimmed, key: f.nameAscii }));
-				tracksRewritten = rewriteArtistCredits(db, new Set([live.id]), new Map(rules.map((r) => [r.key, trimmed])), now);
 				mut.emitArtistAliases(db, rules);
+				tracksRewritten = rewriteArtistCredits(db, new Set([live.id]), new Map(rules.map((r) => [r.key, trimmed])), now);
 			})();
 			log.for('artists').info('artist renamed', { id: live.id, from: live.name, to: trimmed, tracksRewritten });
 			return { artist: (await svcRef!.getArtist(live.id))!, tracksRewritten };
@@ -4276,10 +4278,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			let tracksRewritten = 0;
 			rawOf(db).transaction(() => {
 				// Rules for every spelling key that resolved to drop (its own and
-				// its aliases'), read before drop is re-pointed.
+				// its aliases'), read before drop is re-pointed; emitted before
+				// the rewrite, which derives credits from the converged map.
 				const rules = artistFoldsOf(db, drop.id).map((f) => ({ from: f.name, to: keep.name, key: f.nameAscii }));
-				tracksRewritten = rewriteArtistCredits(db, new Set([drop.id]), new Map(rules.map((r) => [r.key, keep.name])), now);
 				mut.emitArtistAliases(db, rules);
+				tracksRewritten = rewriteArtistCredits(db, new Set([drop.id]), new Map(rules.map((r) => [r.key, keep.name])), now);
 				db.update(artist).set({ mergedInto: keep.id, updatedAt: now }).where(eq(artist.id, drop.id)).run();
 				// Flatten aliases that pointed at drop so lookups stay one hop.
 				db.update(artist).set({ mergedInto: keep.id, updatedAt: now })
@@ -5492,22 +5495,28 @@ function artistFoldsOf(db: Db, liveId: string): Array<{ name: string; nameAscii:
 		) SELECT name, name_ascii AS nameAscii FROM a ORDER BY name_ascii`).all(liveId) as Array<{ name: string; nameAscii: string }>;
 }
 
-// Rewrite every credit whose artist key `rules` maps — canonical list AND
-// override list — then re-mirror artists_ascii and re-derive the junction.
-// Bumps updatedAt: a rename/merge is a user edit the rekordbox push should
-// carry upstream.
+// Re-derive the canonical credits of every track a rename / merge reaches,
+// rewrite the override lists it names, then re-mirror artists_ascii and
+// re-derive the junction. Bumps updatedAt: a rename/merge is a user edit the
+// rekordbox push should carry upstream.
 //
-// The credit transform is `mapCredits`, the same one a device that pulls the
-// artist_alias rules runs over its library (library/artist-alias.ts), so the
-// two end with identical lists. Candidates are the tracks the junction links
-// to `artistIds` plus every track with an override list: a canonical list
-// hidden under an override is not in the junction but is still rewritten
-// (the pulling device's scan finds it, so this side must too).
+// Canonical credits are DERIVED (library/artist-alias.ts, consumer 2): the
+// track's source credits (artists_base) under the converged alias map, which
+// already holds this rename's rules (the caller emits them first). That is
+// the same function a device that pulls the rules runs, so the two end with
+// identical lists, and a concurrent rename of the same artist elsewhere that
+// later wins re-derives these rows from their source spelling rather than
+// from this device's rename of it. Candidates are the tracks the junction
+// links to `artistIds`, every track with an override list (a canonical list
+// hidden under an override is not in the junction) and every track with
+// recorded source credits (one a rename rewrote away is not either); only
+// those whose credits name a key of `rules` are touched.
 //
-// The override lists also travel as set-override ops (recordTrackStateChanges
-// diffs them): they are op-log records, and the pulling device does not
-// rewrite records itself — a record left naming the old artist would be
-// projected back onto the row by the next op for that track.
+// The override lists are mapped by `rules` and travel as set-override ops
+// (recordTrackStateChanges diffs them): they are op-log records, and the
+// pulling device does not rewrite records itself; a record left naming the
+// old artist would be projected back onto the row by the next op for that
+// track.
 function rewriteArtistCredits(db: Db, artistIds: Set<string>, rules: ReadonlyMap<string, string>, now: Date): number {
 	const raw = rawOf(db);
 	const linked = chunkedIn([...artistIds], (chunk) => db
@@ -5516,27 +5525,27 @@ function rewriteArtistCredits(db: Db, artistIds: Set<string>, rules: ReadonlyMap
 		.where(inArray(trackArtist.artistId, chunk))
 		.all()).map((r) => r.trackId);
 	const withOverrideArtists = (raw.prepare(`SELECT id FROM track WHERE json_extract(overrides, '$.artists') IS NOT NULL`).all() as Array<{ id: string }>).map((r) => r.id);
-	const trackIds = [...new Set([...linked, ...withOverrideArtists])];
+	const withBase = raw.prepare(`SELECT id FROM track WHERE artists_base IS NOT NULL`).pluck().all() as string[];
+	const trackIds = [...new Set([...linked, ...withOverrideArtists, ...withBase])];
 	const target = (key: string): string | undefined => rules.get(key);
-	let rewritten = 0;
+	const keys = new Set(rules.keys());
+	const alias = loadArtistAliasMap(raw);
 	const relink = new Set(linked);
+	let rewritten = 0;
 	mut.recordTrackStateChanges(db, trackIds, () => {
+		const canonChanged = new Set(rederiveTrackCreditsRaw(raw, trackIds, keys, alias, now.getTime()));
 		for (const id of trackIds) {
 			const row = db.select({ artists: track.artists, overrides: track.overrides }).from(track).where(eq(track.id, id)).get();
 			if (!row) continue;
-			const canon = mapCredits(row.artists, target);
 			const ov = row.overrides?.artists ? mapCredits(row.overrides.artists, target) : null;
-			if (!canon.changed && !ov?.changed) continue;
-			const nextOverrides = ov?.changed ? { ...row.overrides, artists: ov.list } as TrackOverrides : row.overrides;
-			db.update(track)
-				.set({
-					artists: canon.list,
-					overrides: nextOverrides,
-					artistsAscii: asciifyArtists(nextOverrides?.artists ?? canon.list),
-					updatedAt: now,
-				})
-				.where(eq(track.id, id))
-				.run();
+			if (!canonChanged.has(id) && !ov?.changed) continue;
+			if (ov?.changed) {
+				const nextOverrides = { ...row.overrides, artists: ov.list } as TrackOverrides;
+				db.update(track)
+					.set({ overrides: nextOverrides, artistsAscii: asciifyArtists(ov.list), updatedAt: now })
+					.where(eq(track.id, id))
+					.run();
+			}
 			relink.add(id);
 			rewritten++;
 		}

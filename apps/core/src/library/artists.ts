@@ -14,7 +14,7 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { applyRemixers, artistKey, normalizeArtistList, searchFold, type ArtistProtect } from '@curator/shared';
-import type { TrackArtist, TrackOverrides } from '@curator/shared/schema';
+import type { ArtistsBase, TrackArtist, TrackOverrides } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
 
 type Raw = Database.Database;
@@ -178,6 +178,32 @@ export interface NormalizeArtistsOptions {
 	split?: boolean;
 }
 
+// ── source credits (track.artists_base) ──────────────────────────────────────
+
+// A credit list's identity for the `of` check: names and roles in order.
+export function creditsKey(list: readonly TrackArtist[] | null | undefined): string {
+	return JSON.stringify((list ?? []).map((a) => (a?.role ? [a.name, a.role] : [a?.name ?? ''])));
+}
+
+// The cell to store for credits `artists` produced from source credits
+// `base`: NULL when no rule changed them.
+export function artistsBaseCell(base: readonly TrackArtist[], artists: readonly TrackArtist[]): ArtistsBase | null {
+	const of = creditsKey(artists);
+	return creditsKey(base) === of ? null : { list: base.map((a) => (a.role ? { name: a.name, role: a.role } : { name: a.name })), of };
+}
+
+// A row's source credits: its base cell while that cell still describes the
+// row's `artists` (see track.artistsBase), else `artists` itself.
+export function artistsBaseOf(row: { artists: ArtistsJson; artists_base?: ArtistsBase | string | null }): TrackArtist[] {
+	const artists = parseArtists(row.artists);
+	let cell = row.artists_base ?? null;
+	if (typeof cell === 'string') {
+		try { cell = JSON.parse(cell) as ArtistsBase; } catch { cell = null; }
+	}
+	if (cell && Array.isArray(cell.list) && cell.of === creditsKey(artists)) return cell.list;
+	return artists;
+}
+
 // Write-input normalisation for every path that accepts artists from
 // outside: split packed credits (protected by the artist table), then
 // substitute the curated spelling / merge target for names the user has
@@ -191,13 +217,32 @@ export interface NormalizeArtistsOptions {
 // substitution below maps it with no lookup of its own. Keep it the only
 // such place.
 export function normalizeIncomingArtistsRaw(raw: Raw, list: readonly TrackArtist[] | null | undefined, opts: NormalizeArtistsOptions = {}): TrackArtist[] {
+	return normalizeIncomingCreditsRaw(raw, list, opts).artists;
+}
+
+// The same normalisation, plus the source credits a canonical write stores
+// beside it (track.artists_base): the list as the source spelled it, split,
+// deduped and remixer-tagged the same way but with no rule substituted.
+// Callers that write canonical credits store both, so a rule that changes
+// later (another device's rename winning over this one's) re-derives these
+// credits from what the source said, not from this device's rename of it.
+// Write `artistsBase` only when `artists` itself changes: a re-ingest that
+// restates the same credits must not drop the base an earlier rule recorded.
+export function normalizeIncomingCreditsRaw(raw: Raw, list: readonly TrackArtist[] | null | undefined, opts: NormalizeArtistsOptions = {}): { artists: TrackArtist[]; artistsBase: ArtistsBase | null } {
 	const split = opts.split === false
 		? (list ?? []).filter((a) => a && typeof a.name === 'string' && a.name.trim()).map((a) => (a.role ? { name: a.name.trim(), role: a.role } : { name: a.name.trim() }))
 		: normalizeArtistList(list ?? [], { protect: artistProtectRaw(raw) });
 	const out: TrackArtist[] = [];
+	const base: TrackArtist[] = [];
 	const seen = new Set<string>();
+	const seenBase = new Set<string>();
 	const s = stmts(raw);
 	for (const a of split) {
+		const baseKey = searchFold(a.name);
+		if (baseKey && !seenBase.has(baseKey)) {
+			seenBase.add(baseKey);
+			base.push(a.role ? { name: a.name, role: a.role } : { name: a.name });
+		}
 		// Direct hit = the row for this exact fold; live = after aliases. Take
 		// the live spelling when the user curated it or when the direct row
 		// is an alias (its target is the name the library shows).
@@ -209,8 +254,14 @@ export function normalizeIncomingArtistsRaw(raw: Raw, list: readonly TrackArtist
 		seen.add(key);
 		out.push(a.role ? { name, role: a.role } : { name });
 	}
-	if (opts.title) return applyRemixers(out, opts.title, { known: (fold) => s.byFold.get(artistKey(fold)) != null });
-	return out;
+	if (!opts.title) return { artists: out, artistsBase: artistsBaseCell(base, out) };
+	const known = (fold: string): boolean => s.byFold.get(artistKey(fold)) != null;
+	const artists = applyRemixers(out, opts.title, { known });
+	return { artists, artistsBase: artistsBaseCell(applyRemixers(base, opts.title, { known }), artists) };
+}
+
+export function normalizeIncomingCredits(db: Db, list: readonly TrackArtist[] | null | undefined, opts: NormalizeArtistsOptions = {}): { artists: TrackArtist[]; artistsBase: ArtistsBase | null } {
+	return normalizeIncomingCreditsRaw(rawOf(db), list, opts);
 }
 
 export function normalizeIncomingArtists(db: Db, list: readonly TrackArtist[] | null | undefined, opts: NormalizeArtistsOptions = {}): TrackArtist[] {

@@ -54,7 +54,7 @@ import type { Db } from '../db/client.js';
 import { mergeCues, mergeTrackFields } from '@curator/library-logic';
 import { curatorFieldsView } from '../sync/curator-view.js';
 import { applyCueOpsToTrack, buildPullPatch } from '../sync/apply.js';
-import { artistProtect, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from '../library/artists.js';
+import { artistProtect, normalizeIncomingCredits, rawOf, syncTrackArtistsById } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import { RekordboxSidecar, type SidecarError, type RekordboxScope } from './sidecar.js';
 import { advanceRbBaselineAfterPull, eqArr, seqIn } from './order-util.js';
@@ -848,7 +848,9 @@ export class RekordboxImporter extends EventEmitter {
 		// remixer is read here where the row (and any pulled title) is known.
 		if (Array.isArray(patch['artists'])) {
 			const title = typeof patch['title'] === 'string' ? patch['title'] : (existing.overrides?.title ?? existing.title);
-			patch['artists'] = normalizeIncomingArtists(this.db, patch['artists'] as TrackArtist[], { title });
+			const credits = normalizeIncomingCredits(this.db, patch['artists'] as TrackArtist[], { title });
+			patch['artists'] = credits.artists;
+			patch['artistsBase'] = credits.artistsBase;
 		}
 		// The rb-authoritative fields above are restated on every delta (and a
 		// full read sends every row), so drop what the row already holds: an
@@ -857,6 +859,10 @@ export class RekordboxImporter extends EventEmitter {
 		// representation is written as before.
 		const current = existing as unknown as Record<string, unknown>;
 		for (const k of Object.keys(patch)) if (sameColumnValue(current[k], patch[k])) delete patch[k];
+		// Source credits ride with a credits change only: rekordbox restating
+		// the credits this device pushed must not drop the source spelling an
+		// alias rule recorded under them (track.artistsBase).
+		if (!('artists' in patch)) delete patch['artistsBase'];
 
 		if (Object.keys(patch).length > 0) {
 			// A pulled rating or a cleared override is library state: the diff

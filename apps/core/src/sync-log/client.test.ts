@@ -54,9 +54,12 @@ afterEach(() => {
 	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
 });
 
+// Catalogue rows as a write site leaves them: with their artist junction
+// (the dump compares it).
 function seedTracks(raw: Database.Database, ids: readonly string[] = TRACKS): void {
 	const ins = raw.prepare(`INSERT INTO track (id, recording_id, title, artists, state, duration) VALUES (?, ?, ?, '[{"name":"Artist"}]', 'unsorted', 300)`);
 	for (const id of ids) ins.run(id, recordingIdForTrack(id), `Title ${id}`);
+	syncTrackArtistsByIdRaw(raw, ids);
 }
 
 function freshDb(name: string, seed = true): { path: string; raw: Database.Database } {
@@ -644,7 +647,12 @@ describe('artist renames and track state across two desktops', () => {
 		expect(credits(b.raw, 'cr-b')).toEqual([{ name: 'New Name' }]);
 		const shared3 = (rows: unknown[]) => (rows as Array<{ recording_id: string }>).filter((r) => r.recording_id !== recordingIdForTrack('cr-b'));
 		expect(shared3(junction(b.raw))).toEqual(junction(a.raw));
-		expect(diffs(a.raw, b.raw)).toEqual([]);
+		// cr-b is B's catalogue row alone: its credits are not A's to hold.
+		const onA = (d: ReturnType<typeof dumpLibrary>) => {
+			const ok = (r: { recordingId: string }) => r.recordingId !== recordingIdForTrack('cr-b');
+			return { ...d, credits: d.credits!.filter(ok), trackArtists: d.trackArtists!.filter(ok) };
+		};
+		expect(compareDumps(dumpLibrary(a.raw), onA(dumpLibrary(b.raw))).filter((r) => !r.equal)).toEqual([]);
 
 		// And a track B ingests from now on maps through the rule.
 		expect(normalizeIncomingArtistsRaw(b.raw, [{ name: 'OLD NAME' }])).toEqual([{ name: 'New Name' }]);

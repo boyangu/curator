@@ -22,7 +22,6 @@ import { recordingIdForTrack } from './recording-id.js';
 import {
 	creditDump,
 	flacParse,
-	knownGap,
 	replicaDiff,
 	scanWaiter,
 	tick,
@@ -386,19 +385,143 @@ describe('scenario 12 — artist alias / rename rules on both', () => {
 		}
 	});
 
-	// The same artist renamed to two different names, one per device. The
-	// rule keyed "old name" resolves to the later one on both (per-key LWW),
-	// but each device already rewrote its own credits to its own new name,
-	// and the winning rule maps the OLD key only — so the loser's rewrite is
-	// never undone: A keeps "New A" credits, B has "New B".
-	knownGap('the same artist renamed differently on each side ends with one name on both', async () => {
-		const [a, b] = await pair({ artists });
-		await a.svc.renameArtist(artistId(a, 'Old Name'), 'New A');
-		await tick();
-		await b.svc.renameArtist(artistId(b, 'Old Name'), 'New B');
-		await rig.settle();
+	const credits = (d: Desktop, id: string): unknown => JSON.parse(d.one(`SELECT artists FROM track WHERE id = ?`, id));
+	const converged = (a: Desktop, b: Desktop): void => {
+		expect(replicaDiff(a, b)).toEqual([]);
 		expect(creditDump(a, TRACKS)).toEqual(creditDump(b, TRACKS));
-		expect(JSON.parse(a.one(`SELECT artists FROM track WHERE id = 'trk-0'`))).toEqual([{ name: 'New B' }]);
+	};
+	// Which device writes last (and so wins the contested rule keys).
+	const LAST = [['A renames last', 'a'], ['B renames last', 'b']] as const;
+
+	// The same artist renamed to two different names, one per device. The
+	// rule keyed "old name" resolves to the later one on both (per-key LWW).
+	// Each device rewrote its own credits to its own name first; credits are
+	// derived from the source spelling under the converged rules, so the
+	// losing rewrite does not survive on the device that made it.
+	describe.each(LAST)('the same artist renamed differently on each side — %s', (_l, last) => {
+		it.each(ORDERS)('ends with one name on both — %s', async (_label, order) => {
+			const [a, b] = await pair({ artists });
+			const [first, second] = last === 'b' ? [a, b] : [b, a];
+			await first.svc.renameArtist(artistId(first, 'Old Name'), `New ${first.name.toUpperCase()}`);
+			await tick();
+			await second.svc.renameArtist(artistId(second, 'Old Name'), `New ${second.name.toUpperCase()}`);
+			await rig.settle(both(a, b, order));
+
+			const winner = `New ${second.name.toUpperCase()}`;
+			converged(a, b);
+			for (const d of [a, b]) {
+				expect(credits(d, 'trk-0'), d.name).toEqual([{ name: winner }]);
+				expect(credits(d, 'trk-1'), d.name).toEqual([{ name: winner }, { name: 'Friend' }]);
+				expect(d.one(`SELECT count(*) FROM track_artist ta JOIN artist ar ON ar.id = ta.artist_id WHERE ar.name = ?`, `New ${first.name.toUpperCase()}`), d.name).toBe(0);
+				// The losing rename's own spelling rule still stands (its key is
+				// its own), so a credit spelled that way keeps it.
+				expect(maps(d, ['Old Name', 'New A', 'New B']), d.name).toEqual([winner, 'New A', 'New B']);
+			}
+		});
+	});
+
+	// A → B on one device, then B → C on the other once it has seen the
+	// first: every credit and every later ingest lands on C.
+	it.each(ORDERS)('a rename chain built across devices — %s', async (_label, order) => {
+		const [a, b] = await pair({ artists });
+		await a.svc.renameArtist(artistId(a, 'Old Name'), 'Mid');
+		await rig.settle();
+		await b.svc.renameArtist(artistId(b, 'Mid'), 'Final');
+		await rig.settle(both(a, b, order));
+
+		converged(a, b);
+		for (const d of [a, b]) {
+			expect(credits(d, 'trk-0'), d.name).toEqual([{ name: 'Final' }]);
+			expect(credits(d, 'trk-1'), d.name).toEqual([{ name: 'Final' }, { name: 'Friend' }]);
+			expect(maps(d, ['Old Name', 'Mid', 'final']), d.name).toEqual(['Final', 'Final', 'Final']);
+		}
+	});
+
+	// After a shared A → Mid, the chain's middle is contested: A renames it
+	// back to the old name while B renames it onward. The later device's
+	// rules win every key they name, cycle included (old ↔ mid).
+	describe.each(LAST)('a chain whose middle is renamed concurrently (back on A, onward on B) — %s', (_l, last) => {
+		it.each(ORDERS)('%s', async (_label, order) => {
+			const [a, b] = await pair({ artists });
+			await a.svc.renameArtist(artistId(a, 'Old Name'), 'Mid');
+			await rig.settle();
+			const back = async () => { await a.svc.renameArtist(artistId(a, 'Mid'), 'Old Name'); };
+			const onward = async () => { await b.svc.renameArtist(artistId(b, 'Mid'), 'Other'); };
+			if (last === 'b') { await back(); await tick(); await onward(); }
+			else { await onward(); await tick(); await back(); }
+			await rig.settle(both(a, b, order));
+
+			const winner = last === 'b' ? 'Other' : 'Old Name';
+			converged(a, b);
+			for (const d of [a, b]) {
+				expect(credits(d, 'trk-0'), d.name).toEqual([{ name: winner }]);
+				expect(credits(d, 'trk-1'), d.name).toEqual([{ name: winner }, { name: 'Friend' }]);
+				expect(maps(d, ['Old Name', 'Mid']), d.name).toEqual([winner, winner]);
+			}
+		});
+	});
+
+	// A renames the artist while B merges it into another one. One rule key
+	// ("old name") is contested; the later write wins it, and the credits
+	// follow on both, including the one B's merge had deduped away.
+	describe.each(LAST)('a rename on A vs a merge of the same artist on B — %s', (_l, last) => {
+		it.each(ORDERS)('%s', async (_label, order) => {
+			const [a, b] = await pair({ artists });
+			const rename = async () => { await a.svc.renameArtist(artistId(a, 'Old Name'), 'New A'); };
+			const merge = async () => { await b.svc.mergeArtists(artistId(b, 'Friend'), artistId(b, 'Old Name')); };
+			if (last === 'b') { await rename(); await tick(); await merge(); }
+			else { await merge(); await tick(); await rename(); }
+			await rig.settle(both(a, b, order));
+
+			converged(a, b);
+			for (const d of [a, b]) {
+				if (last === 'b') {
+					expect(credits(d, 'trk-0'), d.name).toEqual([{ name: 'Friend' }]);
+					expect(credits(d, 'trk-1'), d.name).toEqual([{ name: 'Friend' }]);
+					expect(maps(d, ['Old Name']), d.name).toEqual(['Friend']);
+				} else {
+					expect(credits(d, 'trk-0'), d.name).toEqual([{ name: 'New A' }]);
+					expect(credits(d, 'trk-1'), d.name).toEqual([{ name: 'New A' }, { name: 'Friend' }]);
+					expect(maps(d, ['Old Name']), d.name).toEqual(['New A']);
+				}
+			}
+		});
+	});
+
+	// B is offline while both rename the artist. Meanwhile A's scanner
+	// ingests a file credited to the old name, which A's rename maps on the
+	// way in: its source spelling is recorded at ingest, so when B's rename
+	// turns out to win, the new track follows it too.
+	describe.each(LAST)('a rename made while the other device is offline — %s', (_l, last) => {
+		it.each(ORDERS)('%s', async (_label, order) => {
+			const [a, b] = await pair({ artists, parseAudio: flacParse });
+			b.transport.online = false;
+			const renameA = async () => { await a.svc.renameArtist(artistId(a, 'Old Name'), 'New A'); await a.sync(); };
+			const renameB = async () => { await b.svc.renameArtist(artistId(b, 'Old Name'), 'New B'); };
+			if (last === 'b') { await renameA(); await tick(); await renameB(); }
+			else { await renameB(); await tick(); await renameA(); }
+			// A's window: the rule it knows is its own.
+			writeFlac(join(a.musicDir, 'Old Name - Fresh Cut.flac'), 'abad1dea'.repeat(4), 'TITLE=Fresh Cut\nARTIST=Old Name\n');
+			const scan = scanWaiter(a, normalizePath(a.musicDir));
+			await a.svc.addLibraryFolder(a.musicDir);
+			await scan.done(1);
+			const fresh = a.one<string>(`SELECT id FROM track WHERE title = 'Fresh Cut'`);
+			expect(credits(a, fresh)).toEqual([{ name: 'New A' }]);
+			await tick();
+			b.transport.online = true;
+			await rig.settle(both(a, b, order));
+
+			const winner = last === 'b' ? 'New B' : 'New A';
+			// The scanned recording is A's alone.
+			expect(replicaDiff(a, b, { sharedOnly: true })).toEqual([]);
+			expect(creditDump(a, TRACKS)).toEqual(creditDump(b, TRACKS));
+			for (const d of [a, b]) {
+				expect(credits(d, 'trk-0'), d.name).toEqual([{ name: winner }]);
+				expect(credits(d, 'trk-1'), d.name).toEqual([{ name: winner }, { name: 'Friend' }]);
+				expect(maps(d, ['Old Name']), d.name).toEqual([winner]);
+			}
+			expect(credits(a, fresh)).toEqual([{ name: winner }]);
+		});
 	});
 });
 

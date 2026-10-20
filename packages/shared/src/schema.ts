@@ -27,6 +27,9 @@ export * from './enums.js';
 
 export type TrackArtist = { name: string; role?: 'main' | 'featured' | 'remixer' };
 
+// track.artists_base — see the column.
+export type ArtistsBase = { list: TrackArtist[]; of: string };
+
 // User-applied overrides. A field present here shadows the canonical value
 // on read; sync/enrichment writers keep updating the canonical columns
 // underneath. Field omitted (or `undefined` in JSON) means "no override —
@@ -66,6 +69,17 @@ export const track = sqliteTable(
 		mbid: text('mbid'),
 		title: text('title').notNull(),
 		artists: text('artists', { mode: 'json' }).$type<TrackArtist[]>().notNull(),
+		// The credits as their source spelled them, before any artist alias
+		// rule (a rename / merge, local or pulled) mapped them; NULL when no
+		// rule changed them. `artists` is then a function of this list and the
+		// converged rules (library/artist-alias.ts), so two devices that
+		// applied concurrent renames in different orders still land on the
+		// same credits. `of` is the credits key of the `artists` it produced:
+		// a writer that replaces `artists` without knowing about this column
+		// leaves a cell whose `of` no longer matches, and a stale cell reads
+		// as NULL (artists.ts `artistsBaseOf`) instead of resurrecting old
+		// credits. Device-local catalogue data, like `artists`: no op carries it.
+		artistsBase: text('artists_base', { mode: 'json' }).$type<ArtistsBase>(),
 		albumTitle: text('album_title'),
 		// Track release date (ISO string, e.g. "2021-03-15" or "2021"). Seeded
 		// from Spotify's album.release_date at sync; the Beatport enricher

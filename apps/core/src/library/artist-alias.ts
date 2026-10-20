@@ -20,34 +20,50 @@
 //      pull, the edit field), so a track ingested after a rule arrived gets
 //      the renamed credit without a second lookup.
 //   2. Existing canonical credits (`track.artists`, catalogue data that rides
-//      no op) are rewritten by `mapCredits` — the same transform the local
-//      rename runs — so both devices end with identical lists.
+//      no op) are DERIVED, not edited: a track's credits are its source
+//      credits (`track.artists_base`, or `artists` when no rule touched it)
+//      with every resolved rule applied by `mapCredits`. Whenever a rule's
+//      resolution changes (a local rename, a pulled rule, a later rule
+//      winning a key, a cycle withdrawing one, a remove) the tracks whose
+//      source or current credits name an affected key are re-derived from
+//      the converged map. So credits are a function of (source credits,
+//      converged rules), and two devices that applied concurrent renames of
+//      one artist in opposite orders land on the same names: the losing
+//      rename's rewrite is not "undone", it simply stops being what the map
+//      says. This is local projection: it emits no ops (every device holds
+//      the same rules and derives the same lists; ops would only echo).
 //   3. Override lists are NOT rewritten on apply: they are op-log records
 //      (set-override), and the renaming device emits set-override ops for
 //      every override list its rewrite changed, in the same transaction as
 //      the rule. Rewriting them here as well would leave the visible row
 //      ahead of its record, and the next projection of that record (a rating
-//      op, say) would put the old name back.
+//      op, say) would put the old name back. Records converge by their own
+//      LWW, so override lists agree across devices without derivation.
 //
-// The canonical rewrite on apply is a scan of every track (a credit hidden
-// under an override list is still rewritten, and the junction cannot find
-// those), so it is a persisted job drained in row-id chunks: a little inline
-// at apply (enough for a small library), the rest by the sync client between
-// pull pages with the event loop yielding between chunks. A crash mid-job
-// resumes from the stored cursor. Ingest is correct from the apply commit
-// on, because (1) happens inside the apply transaction.
+// The re-derivation on apply is a scan of every track (a credit hidden
+// under an override list is still re-derived, and the junction cannot find
+// those; nor can it find a source credit a rename rewrote away), so it is a
+// persisted job drained in row-id chunks: a little inline at apply (enough
+// for a small library), the rest by the sync client between pull pages with
+// the event loop yielding between chunks. Only rows naming a queued key are
+// written. A crash mid-job resumes from the stored cursor. Ingest is correct
+// from the apply commit on, because (1) happens inside the apply transaction.
 //
-// `remove` stops a rule applying to credits that arrive afterwards (its alias
-// row goes, a spelling rule's curated mark is cleared). It never un-rewrites
-// credits a rule already rewrote; renaming back is a new rule.
+// `remove` stops a rule applying, to new and existing credits alike: a
+// removed (or cycle-withdrawn) key is queued like a changed one, and its
+// tracks re-derive to their source spelling. A device that pulled the rule
+// and its remove in one batch never rewrote anything, so a remove that left
+// earlier rewrites in place would leave devices disagreeing by pull timing.
+// Rows a rule rewrote before track.artists_base existed have no recorded
+// source credits and keep the spelling they have.
 
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { createLibraryState, rebuildArtistAlias, type ArtistAliasRecord, type ArtistAliasTarget } from '@curator/protocol';
 import { artistKey, asciifyArtists, searchFold } from '@curator/shared';
-import type { TrackArtist, TrackOverrides } from '@curator/shared/schema';
+import type { ArtistsBase, TrackArtist, TrackOverrides } from '@curator/shared/schema';
 import { healAlbumArtistAliasesRaw } from './albums.js';
-import { syncTrackArtistsByIdRaw } from './artists.js';
+import { artistsBaseCell, artistsBaseOf, creditsKey, syncTrackArtistsByIdRaw } from './artists.js';
 
 type Raw = Database.Database;
 
@@ -80,6 +96,74 @@ export function mapCredits(list: readonly TrackArtist[] | null | undefined, targ
 		out.push(el);
 	}
 	return { list: changed ? out : [...list], changed };
+}
+
+// ── the derivation ──────────────────────────────────────────────────────────
+
+type CreditRow = { id: string; artists: string | null; artists_base: string | null; overrides: string | null };
+
+type Rederived = { artists: TrackArtist[]; artistsBase: ArtistsBase | null; changed: boolean; baseChanged: boolean };
+
+// A row's canonical credits under the resolved map: its source credits with
+// every rule applied. `changed`: `artists` differs from the row's.
+// `baseChanged`: the stored cell differs (a stale cell to clear, or a source
+// spelling to record under unchanged credits).
+function rederiveCredits(row: Pick<CreditRow, 'artists' | 'artists_base'>, alias: ReadonlyMap<string, ArtistAliasTarget>): Rederived {
+	const canon = parseJson<TrackArtist[]>(row.artists) ?? [];
+	const base = artistsBaseOf(row);
+	const artists = mapCredits(base, (k) => alias.get(k)?.name).list;
+	const artistsBase = artistsBaseCell(base, artists);
+	const stored = parseJson<ArtistsBase>(row.artists_base);
+	return {
+		artists,
+		artistsBase,
+		changed: creditsKey(artists) !== creditsKey(canon),
+		baseChanged: JSON.stringify(stored ?? null) !== JSON.stringify(artistsBase),
+	};
+}
+
+const namesKey = (list: readonly TrackArtist[] | null | undefined, keys: ReadonlySet<string>): boolean =>
+	Array.isArray(list) && list.some((a) => a && typeof a.name === 'string' && keys.has(artistKey(a.name)));
+
+// Re-derives the canonical credits of those `trackIds` whose source or
+// current credits name one of `keys`, writing `artists`, `artists_base` and
+// the effective `artists_ascii`. Returns the rows whose `artists` changed;
+// the caller re-derives the junction (it may have more rows to relink).
+export function rederiveTrackCreditsRaw(raw: Raw, trackIds: readonly string[], keys: ReadonlySet<string>, alias: ReadonlyMap<string, ArtistAliasTarget> = loadArtistAliasMap(raw), now = Date.now()): string[] {
+	const get = raw.prepare(`SELECT id, artists, artists_base, overrides FROM track WHERE id = ?`);
+	const w = writers(raw);
+	const out: string[] = [];
+	for (const id of trackIds) {
+		const r = get.get(id) as CreditRow | undefined;
+		if (r && rederiveRow(r, keys, alias, now, w) === 'artists') out.push(id);
+	}
+	return out;
+}
+
+type Writers = { full: Database.Statement; base: Database.Statement };
+function writers(raw: Raw): Writers {
+	return {
+		full: raw.prepare(`UPDATE track SET artists = ?, artists_base = ?, artists_ascii = ?, updated_at = ? WHERE id = ?`),
+		base: raw.prepare(`UPDATE track SET artists_base = ? WHERE id = ?`),
+	};
+}
+
+// 'artists' when the credits changed, 'base' when only the cell did, null
+// when the row names no queued key or nothing moved.
+function rederiveRow(r: CreditRow, keys: ReadonlySet<string>, alias: ReadonlyMap<string, ArtistAliasTarget>, now: number, w: Writers): 'artists' | 'base' | null {
+	if (!namesKey(parseJson<TrackArtist[]>(r.artists), keys) && !namesKey(artistsBaseOf(r), keys)) return null;
+	const d = rederiveCredits(r, alias);
+	const cell = d.artistsBase ? JSON.stringify(d.artistsBase) : null;
+	if (d.changed) {
+		const ov = parseJson<TrackOverrides>(r.overrides);
+		w.full.run(JSON.stringify(d.artists), cell, asciifyArtists(ov?.artists ?? d.artists), now, r.id);
+		return 'artists';
+	}
+	if (d.baseChanged) {
+		w.base.run(cell, r.id);
+		return 'base';
+	}
+	return null;
 }
 
 // ── resolved rules ──────────────────────────────────────────────────────────
@@ -116,8 +200,9 @@ export function diffArtistAlias(
 }
 
 // Applies changed rules to the artist table (see the header, consumer 1)
-// and queues the credit rewrite for them. Runs inside the apply transaction;
-// it touches a few artist rows per rule, never the tracks.
+// and queues the credit re-derivation for every key whose resolution moved.
+// Runs inside the apply transaction; it touches a few artist rows per rule,
+// never the tracks.
 export function projectArtistAliasChanges(raw: Raw, changes: readonly ArtistAliasChange[]): void {
 	if (changes.length === 0) return;
 	const now = Date.now();
@@ -146,6 +231,8 @@ export function projectArtistAliasChanges(raw: Raw, changes: readonly ArtistAlia
 	// one's alias row before the later rule reclaims that key.
 	for (const c of changes) {
 		if (c.after) continue;
+		// Its tracks re-derive to their source spelling (header, `remove`).
+		rewriteKeys.add(c.key);
 		const row = fold(c.key);
 		if (!row) continue;
 		if (row.merged_into) raw.prepare(`DELETE FROM artist WHERE id = ?`).run(row.id);
@@ -256,9 +343,11 @@ function parseJson<T>(v: string | null): T | null {
 	try { return JSON.parse(v) as T; } catch { return null; }
 }
 
-// Scans up to `maxRows` track rows (in id order) of the queued jobs, rewriting canonical
-// credits and re-deriving the junction of every track whose effective list
-// names a queued key. One transaction (a savepoint inside the caller's).
+// Scans up to `maxRows` track rows (in id order) of the queued jobs,
+// re-deriving the canonical credits of every track whose source or current
+// credits name a queued key (from the converged map, header consumer 2) and
+// re-linking every track whose effective list names one. One transaction (a
+// savepoint inside the caller's).
 export function drainArtistCreditRewrites(raw: Raw, opts: { maxRows?: number } = {}): DrainResult {
 	const budget = Math.max(1, opts.maxRows ?? Number.MAX_SAFE_INTEGER);
 	return raw.transaction((): DrainResult => {
@@ -266,26 +355,19 @@ export function drainArtistCreditRewrites(raw: Raw, opts: { maxRows?: number } =
 		const res: DrainResult = { rowsScanned: 0, tracksRewritten: 0, tracks: [], done: jobs.length === 0 };
 		if (jobs.length === 0) return res;
 		const alias = loadArtistAliasMap(raw);
-		const page = raw.prepare(`SELECT id, artists, overrides FROM track WHERE id > ? ORDER BY id LIMIT ?`);
-		const update = raw.prepare(`UPDATE track SET artists = ?, artists_ascii = ?, updated_at = ? WHERE id = ?`);
+		const page = raw.prepare(`SELECT id, artists, artists_base, overrides FROM track WHERE id > ? ORDER BY id LIMIT ?`);
+		const w = writers(raw);
 		const now = Date.now();
 		while (jobs.length > 0 && res.rowsScanned < budget) {
 			const job = jobs[0]!;
 			const keys = new Set(job.keys);
-			const target = (k: string): string | undefined => (keys.has(k) ? alias.get(k)?.name : undefined);
 			const limit = Math.min(1_000, budget - res.rowsScanned);
-			const rows = page.all(job.after, limit) as Array<{ id: string; artists: string | null; overrides: string | null }>;
+			const rows = page.all(job.after, limit) as CreditRow[];
 			const relink: string[] = [];
 			for (const r of rows) {
-				const canon = parseJson<TrackArtist[]>(r.artists) ?? [];
-				const ov = parseJson<TrackOverrides>(r.overrides);
-				const m = mapCredits(canon, target);
-				const effective = ov?.artists ?? (m.changed ? m.list : canon);
-				if (m.changed) {
-					update.run(JSON.stringify(m.list), asciifyArtists(effective), now, r.id);
-					res.tracksRewritten++;
-				}
-				if (m.changed || (Array.isArray(effective) && effective.some((a) => a && typeof a.name === 'string' && keys.has(artistKey(a.name))))) relink.push(r.id);
+				const done = rederiveRow(r, keys, alias, now, w);
+				if (done === 'artists') res.tracksRewritten++;
+				if (done === 'artists' || namesKey(parseJson<TrackOverrides>(r.overrides)?.artists, keys) || namesKey(parseJson<TrackArtist[]>(r.artists), keys)) relink.push(r.id);
 			}
 			if (relink.length > 0) {
 				syncTrackArtistsByIdRaw(raw, relink);

@@ -7,8 +7,10 @@
 //   2. migrate the copy and run the initial push (initial-push.ts) into the
 //      COPY's outbox;
 //   3. build an empty migrated replica holding only the copy's track rows
-//      (tracks are catalogue/scanner-side), apply the outbox onto it in
-//      pull-sized batches;
+//      (tracks are catalogue/scanner-side) and the artist junction every
+//      write of them derives, apply the outbox onto it in pull-sized
+//      batches, then drain the artist credit re-derivation the sync client
+//      would run between pages;
 //   4. report per-table equality of the copy, the replica and the protocol
 //      reducer's materialised view of the same ops.
 //
@@ -19,6 +21,8 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { applyOps as reduceOps, createLibraryState, materialize, MAX_PULL_OPS } from '@curator/protocol';
 import { migrate } from '../db/migrate.js';
+import { drainArtistCreditRewrites } from '../library/artist-alias.js';
+import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import { applyOps } from './apply.js';
 import { compareDumps, dumpLibrary, dumpView, type TableReport } from './dump.js';
 import { initialPush, type InitialPushResult } from './initial-push.js';
@@ -70,10 +74,15 @@ export function runReplayCheck(sourcePath: string, workDir: string, opts: { batc
 			replica.exec(`ATTACH DATABASE '${copyPath.replace(/'/g, "''").replace(/\\/g, '/')}' AS src`);
 			replica.exec(`INSERT INTO main.track (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM src.track`);
 			replica.exec(`DETACH DATABASE src`);
+			// A device's live catalogue rows never exist without their junction
+			// (artists.ts: every write runs the seam, and migrate heals a row
+			// that bypassed it); rows inserted after migrate need it here.
+			replica.transaction(() => { syncTrackArtistsByIdRaw(replica, replica.prepare(`SELECT id FROM track WHERE deleted_at IS NULL`).pluck().all() as string[]); })();
 
 			const batch = opts.batch ?? MAX_PULL_OPS;
 			const started = Date.now();
 			for (let i = 0; i < ops.length; i += batch) applyOps(replica, ops.slice(i, i + batch));
+			drainArtistCreditRewrites(replica);
 			const applyMs = Date.now() - started;
 
 			// 4. Compare.

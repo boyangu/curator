@@ -32,7 +32,7 @@ import {
 	type TrackArtist,
 } from '@curator/shared/schema';
 import { asciify, searchFold } from '@curator/shared';
-import { normalizeIncomingArtists, syncTrackArtists, syncTrackArtistsById } from '../library/artists.js';
+import { normalizeIncomingCredits, syncTrackArtists, syncTrackArtistsById } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import { upsertArtistLinks } from '../library/artist-links.js';
 import { findExistingByContent } from './match-existing.js';
@@ -480,7 +480,7 @@ export class TidalSync {
 		// id — and that is exactly the packing the credit rules undo.
 		const artists: TrackArtist[] = t.artists.map((a) => ({ name: a.name }));
 		const title = displayTitle(t);
-		const canonicalArtists = normalizeIncomingArtists(this.db, artists, { title });
+		const { artists: canonicalArtists, artistsBase } = normalizeIncomingCredits(this.db, artists, { title });
 		// Canonical form only; the verbatim provider value stays in `payload`.
 		const isrc = normalizeIsrc(t.isrc);
 
@@ -508,7 +508,7 @@ export class TidalSync {
 				const row = this.db.select({ artists: track.artists }).from(track).where(eq(track.id, existing.trackId)).get();
 				if (row && (row.artists ?? []).length === 0) {
 					this.db.update(track)
-						.set(asciify({ artists: canonicalArtists, updatedAt: new Date() }))
+						.set(asciify({ artists: canonicalArtists, artistsBase, updatedAt: new Date() }))
 						.where(eq(track.id, existing.trackId))
 						.run();
 					syncTrackArtistsById(this.db, [existing.trackId]);
@@ -583,6 +583,7 @@ export class TidalSync {
 			mbid: null,
 			title,
 			artists: canonicalArtists,
+			artistsBase,
 			albumTitle: t.album?.title ?? null,
 			releaseDate: null,
 			coverUrl: null,

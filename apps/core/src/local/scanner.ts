@@ -42,7 +42,7 @@ import { and, desc, eq, inArray, isNull, like, lt, sql } from 'drizzle-orm';
 import { track, sourceLink, libraryFolder, trackAnalysis } from '@curator/shared/schema';
 import type { LibraryFolder, NewTrack, NewSourceLink, TrackArtist } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
-import { normalizeIncomingArtists, rawOf, syncTrackArtists } from '../library/artists.js';
+import { normalizeIncomingCredits, rawOf, syncTrackArtists } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import type { Db } from '../db/client.js';
 import { log } from '../log.js';
@@ -738,12 +738,13 @@ export class LibraryScanner {
 		const id = randomUUID();
 		// Tag readers hand back one element per ARTIST frame; a single packed
 		// "A, B" frame is split here, "A & B" stays a duo.
-		const artists: TrackArtist[] = normalizeIncomingArtists(this.db, target.artists.map((name) => ({ name })), { title: target.title });
+		const { artists, artistsBase } = normalizeIncomingCredits(this.db, target.artists.map((name) => ({ name })), { title: target.title });
 		const newRow: NewTrack = {
 			id,
 			recordingId: recordingIdForTrack(id),
 			title: target.title || 'Unknown',
 			artists,
+			artistsBase,
 			isrc: target.isrc ?? null,
 			albumTitle: parsed.albumTitle,
 			duration: target.duration ?? null,

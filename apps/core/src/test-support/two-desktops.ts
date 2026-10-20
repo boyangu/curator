@@ -4,7 +4,8 @@
 // in-memory cloud (fake-cloud.ts). Scenarios drive the public CoreService
 // methods (mutators only where no service method exists), sync every device
 // until the cloud is quiet, and compare normalised replicas (sync-log/dump.ts)
-// plus what the dump does not cover: play history and artist credits.
+// plus what the dump does not cover: play history, and the display names of
+// the artists credits link to (the dump compares artist identity).
 //
 // Safety rails (CLAUDE.md): every database is mkdtempSync + migrate(), every
 // audio file is generated under the rig's temp dir; no service gets a
@@ -264,7 +265,11 @@ function heldRecordings(raw: Raw): Set<string> {
 // divergence.
 function restrict(d: LibraryDump, keep: Set<string>): LibraryDump {
 	const ok = (r: { recordingId: string }) => keep.has(r.recordingId);
-	return { ...d, trackTags: d.trackTags.filter(ok), playlistTracks: d.playlistTracks.filter(ok), cues: d.cues.filter(ok), tracks: d.tracks.filter(ok), rbAnalysis: d.rbAnalysis.filter(ok) };
+	return {
+		...d,
+		trackTags: d.trackTags.filter(ok), playlistTracks: d.playlistTracks.filter(ok), cues: d.cues.filter(ok), tracks: d.tracks.filter(ok), rbAnalysis: d.rbAnalysis.filter(ok),
+		credits: d.credits?.filter(ok) ?? null, trackArtists: d.trackArtists?.filter(ok) ?? null,
+	};
 }
 
 // The normalised replica diff: tables that differ, with sample rows.
@@ -294,8 +299,9 @@ export function historyDump(d: Desktop): { sessions: unknown[]; events: unknown[
 	return { sessions, events };
 }
 
-// Canonical credits and the artist junction for the given catalogue rows
-// (catalogue data no op carries; artist alias rules must leave it equal).
+// Canonical credits and the artist junction, by display name, for the given
+// catalogue rows (catalogue data no op carries; artist alias rules must
+// leave it equal).
 // Overrides are compared canonically: the JSON key order is each device's
 // own write history, not state.
 export function creditDump(d: Desktop, ids: readonly string[]): unknown {

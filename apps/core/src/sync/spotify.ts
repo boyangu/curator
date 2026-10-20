@@ -33,7 +33,7 @@ import {
 	type TrackArtist,
 } from '@curator/shared/schema';
 import { asciify, searchFold } from '@curator/shared';
-import { normalizeIncomingArtists, syncTrackArtists } from '../library/artists.js';
+import { normalizeIncomingCredits, syncTrackArtists } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import { upsertArtistLinks } from '../library/artist-links.js';
 import { findExistingByContent } from './match-existing.js';
@@ -611,7 +611,7 @@ export class SpotifySync {
 		// row gets the normalized list (packed credits split, curated
 		// spellings applied). Spotify reports no roles, so none are invented.
 		const artists: TrackArtist[] = (t.artists ?? []).map((a) => ({ name: a.name }));
-		const canonicalArtists = normalizeIncomingArtists(this.db, artists, { title: t.name, split: false });
+		const { artists: canonicalArtists, artistsBase } = normalizeIncomingCredits(this.db, artists, { title: t.name, split: false });
 		// Canonical form only; the verbatim provider value stays in `payload`.
 		const isrc = normalizeIsrc(t.external_ids?.isrc);
 		const duration = Math.round((t.duration_ms ?? 0) / 1000);
@@ -725,6 +725,7 @@ export class SpotifySync {
 			mbid: null,
 			title: t.name,
 			artists: canonicalArtists,
+			artistsBase,
 			albumTitle: t.album?.name ?? null,
 			releaseDate: t.album?.release_date ?? null,
 			coverUrl: t.album?.images?.[0]?.url ?? null,

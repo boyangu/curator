@@ -9,6 +9,15 @@
 // device-local rows are left out on both sides — derived WAV copies and their
 // playlist, rekordbox smart playlists, and the soft-deleted loser of a
 // recording merge (its recording is an alias; its state lives on the winner).
+//
+// Artist credits are in it too, though no op carries them: canonical credits
+// are catalogue data DERIVED from each row's source credits and the
+// converged artist alias rules (library/artist-alias.ts), so two devices
+// holding the same catalogue must hold the same credits, the same junction
+// and the same alias lookup. Leaving them out once let divergent renames
+// read as equal. The reducer holds no catalogue rows: its view carries the
+// alias lookup but not `credits` / `trackArtists`, which are then skipped
+// when one side is the reducer (`null` below).
 
 import type Database from 'better-sqlite3';
 import { isAccountSettingKey, type LibraryView } from '@curator/protocol';
@@ -31,9 +40,20 @@ export type LibraryDump = {
 	// device-local and left out, as the emitter leaves it out.
 	rbAnalysis: Array<{ recordingId: string; grid: number[] | null; key: string | null; segments: string | null }>;
 	settings: Record<string, unknown>;
+	// track.artists per recording, canonical JSON (names and roles, in order).
+	credits: Array<{ recordingId: string; artists: string }> | null;
+	// The junction of undeleted rows: the live artist each effective credit
+	// links to, by identity (name_ascii, schema.ts ARTIST). Not by display
+	// name: an uncurated artist's spelling is whichever this device saw
+	// first, by design, and a curated one is compared in `artistAliases`.
+	trackArtists: Array<{ recordingId: string; position: number; artist: string; role: string | null }> | null;
+	// The artist table as ingest substitution reads it: every key a rule
+	// projected (an alias row or a curated spelling) and the live name it
+	// resolves to. The reducer's resolved map in the same shape.
+	artistAliases: Array<{ key: string; name: string }>;
 };
 
-export const DUMP_TABLES = ['tags', 'trackTags', 'playlists', 'playlistFolders', 'playlistTracks', 'cues', 'pinnedSearches', 'tracks', 'rbAnalysis', 'settings'] as const;
+export const DUMP_TABLES = ['tags', 'trackTags', 'playlists', 'playlistFolders', 'playlistTracks', 'cues', 'pinnedSearches', 'tracks', 'rbAnalysis', 'settings', 'credits', 'trackArtists', 'artistAliases'] as const;
 
 // A row's schema default, and what a view without a state cell means.
 const DEFAULT_STATE = 'unsorted';
@@ -85,7 +105,41 @@ export function dumpLibrary(raw: Raw, opts: { includeSystemTags?: boolean } = {}
 	for (const r of raw.prepare(`SELECT key, value FROM app_setting ORDER BY key`).all() as Array<{ key: string; value: string }>) {
 		if (isAccountSettingKey(r.key)) settings[r.key] = JSON.parse(r.value);
 	}
-	return { tags, trackTags, playlists, playlistFolders, playlistTracks, cues, pinnedSearches, tracks, rbAnalysis, settings };
+	const credits = (raw.prepare(`SELECT t.recording_id AS recordingId, t.artists FROM track t WHERE ${liveTrack} ORDER BY recordingId`).all() as Array<{ recordingId: string; artists: string | null }>)
+		.map((r) => ({ recordingId: r.recordingId, artists: canonicalCredits(r.artists) }));
+	// Deleted rows' junction is left out: it is whatever the row had when it
+	// was deleted (or nothing, for a row deleted before the junction existed;
+	// migrate only heals live rows), and nothing reads it.
+	const trackArtists = raw.prepare(`SELECT t.recording_id AS recordingId, ta.position, a.name_ascii AS artist, ta.role FROM track_artist ta JOIN track t ON t.id = ta.track_id
+		JOIN artist a ON a.id = ta.artist_id WHERE ${liveTrack} AND t.deleted_at IS NULL ORDER BY recordingId, ta.position`).all() as NonNullable<LibraryDump['trackArtists']>;
+	const artistAliases = dumpArtistAliases(raw);
+	return { tags, trackTags, playlists, playlistFolders, playlistTracks, cues, pinnedSearches, tracks, rbAnalysis, settings, credits, trackArtists, artistAliases };
+}
+
+function canonicalCredits(v: string | null): string {
+	let list: unknown;
+	try { list = v ? JSON.parse(v) : []; } catch { list = []; }
+	if (!Array.isArray(list)) return '[]';
+	return JSON.stringify((list as Array<{ name?: unknown; role?: unknown }>).map((a) => (a?.role ? { name: a?.name, role: a.role } : { name: a?.name })));
+}
+
+// Alias rows and curated rows, each with the live name its chain ends on
+// (bounded like the seam's resolveAlias).
+function dumpArtistAliases(raw: Raw): LibraryDump['artistAliases'] {
+	const rows = raw.prepare(`SELECT id, name, name_ascii, merged_into, name_curated_at FROM artist`).all() as Array<{ id: string; name: string; name_ascii: string; merged_into: string | null; name_curated_at: number | null }>;
+	const byId = new Map(rows.map((r) => [r.id, r]));
+	const out: LibraryDump['artistAliases'] = [];
+	for (const r of rows) {
+		if (!r.merged_into && r.name_curated_at == null) continue;
+		let cur = r;
+		for (let hops = 0; cur.merged_into && hops < 8; hops++) {
+			const next = byId.get(cur.merged_into);
+			if (!next) break;
+			cur = next;
+		}
+		out.push({ key: r.name_ascii, name: cur.name });
+	}
+	return out.sort((a, b) => cmp(a.key, b.key));
 }
 
 function rbRow(recordingId: string, grid: unknown, key: unknown, segments: unknown): LibraryDump['rbAnalysis'][number] | null {
@@ -134,16 +188,21 @@ export function dumpView(view: LibraryView): LibraryDump {
 			.filter((r): r is LibraryDump['rbAnalysis'][number] => r !== null)
 			.sort((a, b) => cmp(a.recordingId, b.recordingId)),
 		settings: Object.fromEntries(Object.entries(view.settings).filter(([k]) => isAccountSettingKey(k))),
+		credits: null,
+		trackArtists: null,
+		artistAliases: Object.entries(view.artistAlias).map(([key, t]) => ({ key, name: t.name })).sort((a, b) => cmp(a.key, b.key)),
 	};
 }
 
 export type TableReport = { table: string; left: number; right: number; equal: boolean; onlyLeft: unknown[]; onlyRight: unknown[] };
 
 // Per-table set comparison (order is part of each row where it matters:
-// playlist rows carry order_key and position).
+// playlist rows carry order_key and position). A table one side cannot hold
+// (`null`: catalogue credits on the reducer's side) is left out.
 export function compareDumps(a: LibraryDump, b: LibraryDump, sample = 5): TableReport[] {
 	const out: TableReport[] = [];
 	for (const t of DUMP_TABLES) {
+		if (a[t] === null || b[t] === null) continue;
 		const left = t === 'settings' ? Object.entries(a.settings).map(([k, v]) => ({ k, v })) : (a[t] as unknown[]);
 		const right = t === 'settings' ? Object.entries(b.settings).map(([k, v]) => ({ k, v })) : (b[t] as unknown[]);
 		const ls = new Set(left.map((x) => JSON.stringify(x)));
