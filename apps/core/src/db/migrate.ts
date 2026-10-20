@@ -994,6 +994,15 @@ const ALTER_MIGRATIONS: string[] = [
 	// the spelling it has (its source spelling is gone), which is the
 	// behaviour it had before.
 	`ALTER TABLE track ADD COLUMN artists_base TEXT`,
+	// Newer-version ops set aside by the pull — see syncInboxHeld in
+	// schema.ts. Starts empty.
+	`CREATE TABLE IF NOT EXISTS sync_inbox_held (
+		seq INTEGER PRIMARY KEY,
+		op_id TEXT NOT NULL,
+		schema_version INTEGER NOT NULL,
+		op TEXT NOT NULL,
+		held_at INTEGER NOT NULL
+	)`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

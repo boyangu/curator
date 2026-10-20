@@ -44,7 +44,12 @@ describe('reconcileMembership at 2,000 rows', () => {
 		try {
 			const ins = sqlite.prepare(`INSERT INTO track (id, recording_id, title, artists, state) VALUES (?, ?, ?, '[{"name":"A"}]', 'unsorted')`);
 			sqlite.transaction(() => { for (let i = 0; i < N; i++) ins.run(`t${i}`, recordingIdForTrack(`t${i}`), `Song ${i}`); })();
-			sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES ('legacy', 'spotify', 'L', 'Legacy'), ('new', 'spotify', 'N', 'New')`).run();
+			sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES ('legacy', 'spotify', 'L', 'Legacy')`).run();
+			// A fresh playlist per run: a streaming import's row ids derive
+			// from the playlist (stable-ids.ts), so re-importing into one whose
+			// rows were deleted behind the op log's back would restate rows
+			// the records still hold and emit nothing for them.
+			const newPl = sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES (?, 'spotify', ?, 'New')`);
 			const list: DesiredMember[] = Array.from({ length: N }, (_, i) => ({ trackId: `t${i}`, sourceTrackId: `sp${i}`, addedAt: new Date(1_700_000_000_000 + i), addedBy: null }));
 			const reversed = [...list].reverse();
 
@@ -57,15 +62,15 @@ describe('reconcileMembership at 2,000 rows', () => {
 				})();
 				return performance.now() - t;
 			};
-			const fresh = (): number => {
-				sqlite.prepare(`DELETE FROM playlist_track WHERE playlist_id = 'new'`).run();
+			const fresh = (pid: string): number => {
+				newPl.run(pid, pid);
 				const t = performance.now();
-				reconcileMembership(db, 'new', list, 'spotify');
+				reconcileMembership(db, pid, list, 'spotify');
 				return performance.now() - t;
 			};
-			const timed = (order: DesiredMember[]): number => {
+			const timed = (pid: string, order: DesiredMember[]): number => {
 				const t = performance.now();
-				reconcileMembership(db, 'new', order, 'spotify');
+				reconcileMembership(db, pid, order, 'spotify');
 				return performance.now() - t;
 			};
 
@@ -75,9 +80,9 @@ describe('reconcileMembership at 2,000 rows', () => {
 			const unchangedRuns: number[] = [];
 			for (let r = 0; r < RUNS; r++) {
 				legacyRuns.push(legacy(r % 2 ? reversed : list));
-				freshRuns.push(fresh());
-				unchangedRuns.push(timed(list));
-				reverseRuns.push(timed(reversed));
+				freshRuns.push(fresh(`new-${r}`));
+				unchangedRuns.push(timed(`new-${r}`, list));
+				reverseRuns.push(timed(`new-${r}`, reversed));
 			}
 			const base = best(legacyRuns);
 			const res = { legacy: base, fresh: best(freshRuns), unchanged: best(unchangedRuns), reverse: best(reverseRuns) };

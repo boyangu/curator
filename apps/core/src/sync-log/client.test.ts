@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '@curator/shared/schema';
-import { MAX_PULL_OPS, MAX_PUSH_OPS, rebalance, type StoredOp } from '@curator/protocol';
+import { MAX_PULL_OPS, MAX_PUSH_OPS, rebalance, SCHEMA_VERSION, type StoredOp } from '@curator/protocol';
 import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
 import { migrate } from '../db/migrate.js';
@@ -27,6 +27,7 @@ import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import { CloudTransportError, createSyncClient, readCursor, type CloudSyncEvent, type CloudTransport, type SyncClient } from './client.js';
 import { compareDumps, dumpLibrary } from './dump.js';
 import { INITIAL_PUSH_KEY } from './apply.js';
+import { heldCount, replayHeldOps } from './held.js';
 import { initialPushAsync } from './initial-push.js';
 import { recordingIdForTrack } from './recording-id.js';
 import { remintDeviceIdentity } from './remint.js';
@@ -290,7 +291,10 @@ describe('pull', () => {
 		expect(diffs(a.raw, b.raw)).toEqual([]);
 	});
 
-	it('stops at an op from a newer protocol version and reports needsUpdate', async () => {
+	// Held aside, not a stop (held.ts): the rest of the log keeps applying
+	// and the cursor reaches the head; the held op replays once a build
+	// that reads its version pulls.
+	it('holds an op from a newer protocol version aside, applies the rest, and replays it after an update', async () => {
 		const cloud = new FakeCloud();
 		const a = freshDb('a');
 		const b = freshDb('b');
@@ -298,13 +302,27 @@ describe('pull', () => {
 		await ca.runInitialPush();
 		makeTags(a.raw, 2);
 		await ca.syncNow();
-		const held = cloud.maxSeq;
-		cloud.appendRaw({ op_id: 'future-op', device_id: 'dev-x', client_ts: Date.now(), schema_version: 99, entity: 'tag', entity_id: 'tag-0', kind: 'rename', payload: { name: 'x' }, seq: held + 1, user_id: 'u', received_at: Date.now() } as StoredOp);
+		const before = cloud.maxSeq;
+		// A newer client's rename of tag-0, then an ordinary op after it.
+		cloud.appendRaw({ op_id: '7d1e0c52-3a8b-4f6e-9c21-5b0a4d3e2f10', device_id: '0b9c8d7e-6f5a-4b3c-8d2e-1f0a9b8c7d6e', client_ts: Date.now() + 5, schema_version: SCHEMA_VERSION + 1, entity: 'tag', entity_id: 'tag-0', kind: 'rename', payload: { name: 'From the future' }, seq: before + 1, user_id: 'u', received_at: Date.now() } as StoredOp);
+		mut.createTag(drizzle(a.raw, { schema }), { id: 'tag-later', name: 'Later' });
+		await ca.syncNow();
 		const cb = client(b.raw, cloud.transport('u'));
 		const r = await cb.pullOnce();
-		expect(r.stopped).toBe('ahead');
-		expect(readCursor(b.raw).lastSeq).toBe(held);
+		expect(r).toMatchObject({ stopped: null, held: 1 });
+		expect(readCursor(b.raw).lastSeq).toBe(cloud.maxSeq);
 		expect(cb.status().needsUpdate).toBe(true);
+		// Everything but the held op applied, including what came after it.
+		expect(b.raw.prepare(`SELECT name FROM tag WHERE id = 'tag-later'`).pluck().get()).toBe('Later');
+		expect(b.raw.prepare(`SELECT name FROM tag WHERE id = 'tag-0'`).pluck().get()).toBe('Tag 0');
+		// A re-pull holds nothing twice.
+		await cb.pullOnce();
+		expect(heldCount(b.raw)).toBe(1);
+		// The same build replays nothing; an updated one applies it.
+		expect(replayHeldOps(b.raw).applied).toBe(0);
+		expect(replayHeldOps(b.raw, SCHEMA_VERSION + 1)).toMatchObject({ applied: 1, remaining: 0, error: null });
+		expect(b.raw.prepare(`SELECT name FROM tag WHERE id = 'tag-0'`).pluck().get()).toBe('From the future');
+		expect(cb.status().needsUpdate).toBe(false);
 	});
 
 	// From the push result (current server) or the op's echo (older server):

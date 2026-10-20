@@ -12,21 +12,12 @@
 // Only the mint is derived. After a catalogue alias rewrites the column the
 // value is whatever the alias says; nothing may recompute it from the id.
 
-import { createHash } from 'node:crypto';
+import { uuidv5 } from './stable-ids.js';
 
 // Fixed namespace for Curator recording ids. Changing it would re-mint every
 // recording a device has not yet stored, so it never changes.
 const RECORDING_NAMESPACE = '6f1c2b7e-3d4a-5e8f-9a0b-c1d2e3f4a5b6';
 
-function uuidBytes(uuid: string): Buffer {
-	return Buffer.from(uuid.replace(/-/g, ''), 'hex');
-}
-
 export function recordingIdForTrack(trackId: string): string {
-	const hash = createHash('sha1').update(uuidBytes(RECORDING_NAMESPACE)).update(trackId, 'utf8').digest();
-	const b = hash.subarray(0, 16);
-	b[6] = (b[6]! & 0x0f) | 0x50; // version 5
-	b[8] = (b[8]! & 0x3f) | 0x80; // RFC 4122 variant
-	const hex = b.toString('hex');
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+	return uuidv5(RECORDING_NAMESPACE, trackId);
 }

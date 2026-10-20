@@ -37,6 +37,7 @@ import { existsSync, promises as fsp } from 'node:fs';
 import { extname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { bindByClaim, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { and, desc, eq, inArray, isNull, like, lt, sql } from 'drizzle-orm';
 import { track, sourceLink, libraryFolder, trackAnalysis } from '@curator/shared/schema';
@@ -513,6 +514,28 @@ export class LibraryScanner {
 				return { outcome: 'deleted', trackId: deleted };
 			}
 
+			// Not here at all: does another desktop's recording claim this audio?
+			// Then this file is that recording, not a new one — bind to it
+			// (claim-bind.ts, live claimants only: a deleted one was
+			// deletedOwnerOf's above) instead of minting a recording the
+			// identity resolver would merge back afterwards.
+			const claimed = !byHash && parsed.audioHash ? this.claimedRecordingOf(parsed.audioHash) : null;
+			if (claimed) {
+				const result = this.bindClaimed(claimed, toTarget(parsed, p), norm, stat, parsed);
+				if (result.created) totals.created++;
+				else totals.matched++;
+				this.emit({
+					stage: 'ingesting',
+					folderId: folder.id,
+					folderPath: folder.path,
+					current: { path: norm, index: totals.scanned },
+					totals,
+				});
+				const outcome = result.created ? 'created' : 'matched';
+				this.emitIngest({ outcome, trackId: result.trackId, filePath: norm });
+				return { outcome, trackId: result.trackId };
+			}
+
 			const target = toTarget(parsed, p);
 			// A byte-identical copy of a file that is still present elsewhere
 			// gets its own row rather than a second link on that track: a track
@@ -651,6 +674,44 @@ export class LibraryScanner {
 		return this.deletedClaims().get(hash) ?? null;
 	}
 
+	// The live recording another device's claim names for this audio, when
+	// this device can take the file onto it: its row here (a streaming row
+	// with no file yet) or a new row. A row of it that already has a file of
+	// its own here is left alone — a track holds one file (see the copy rule
+	// in ingestPath) — and the file goes through the normal match.
+	private claimedRecordingOf(hash: string): { recordingId: string; trackId: string | null } | null {
+		const raw = rawOf(this.db);
+		const bound = bindByClaim(raw, 'audio_hash', hash, { liveOnly: true });
+		if (!bound) return null;
+		if (bound.trackId) {
+			const hasFile = raw.prepare(`SELECT 1 FROM source_link WHERE track_id = ? AND source = 'local' AND missing_at IS NULL LIMIT 1`).get(bound.trackId);
+			if (hasFile) return null;
+		}
+		return { recordingId: bound.recordingId, trackId: bound.trackId };
+	}
+
+	// Attach the file to the claimed recording. A new row carries the
+	// recording's id and emits no create (the recording exists; its claim is
+	// already on record, so restating it is suppressed); the records another
+	// device holds for it — tags, rating, cues, playlist rows — are projected
+	// onto the row in the same transaction.
+	private bindClaimed(claimed: { recordingId: string; trackId: string | null }, target: Target, norm: string, stat: { size: number; mtimeMs: number }, parsed: ParseResult): { trackId: string; created: boolean } {
+		const raw = rawOf(this.db);
+		return raw.transaction(() => {
+			if (claimed.trackId) {
+				this.upsertLocalSourceLink(claimed.trackId, norm, stat, parsed);
+				this.promoteFileFields(claimed.trackId, parsed);
+				addClaims(this.db, claimed.trackId, [{ kind: 'audio_hash', value: parsed.audioHash! }]);
+				return { trackId: claimed.trackId, created: false };
+			}
+			const id = this.createTrack(target, parsed, claimed.recordingId);
+			this.upsertLocalSourceLink(id, norm, stat, parsed);
+			projectAdoptedRecordings(raw, [claimed.recordingId]);
+			syncTrackAlbumsById(this.db, [id]);
+			return { trackId: id, created: true };
+		})();
+	}
+
 	// audio hash → deleted track, from the claims of every deleted row's
 	// recording. Claims have no index by value (their key leads with the
 	// recording), so the map is built once and rebuilt only when the
@@ -733,15 +794,16 @@ export class LibraryScanner {
 		return { trackId: this.createTrack(target, parsed), created: true };
 	}
 
-	// Mint a canonical row from file metadata. Returns the new id.
-	private createTrack(target: Target, parsed: ParseResult): string {
+	// Mint a canonical row from file metadata (a new recording, or the first
+	// row here of `recordingId`). Returns the new id.
+	private createTrack(target: Target, parsed: ParseResult, recordingId?: string): string {
 		const id = randomUUID();
 		// Tag readers hand back one element per ARTIST frame; a single packed
 		// "A, B" frame is split here, "A & B" stays a duo.
 		const { artists, artistsBase } = normalizeIncomingCredits(this.db, target.artists.map((name) => ({ name })), { title: target.title });
 		const newRow: NewTrack = {
 			id,
-			recordingId: recordingIdForTrack(id),
+			recordingId: recordingId ?? recordingIdForTrack(id),
 			title: target.title || 'Unknown',
 			artists,
 			artistsBase,

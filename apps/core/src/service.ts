@@ -64,7 +64,7 @@ import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
 import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
-import { createSyncClient, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
+import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
@@ -1272,6 +1272,20 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	});
 	const tidalSync = new TidalSync(db, auth);
 	const tidalHybrid = new TidalHybrid(db, auth, { cancelToken });
+	// A streaming read-sync on a signed-in device waits for its first cloud
+	// pull (sync-log/client.ts FIRST_PULL_KEY). Until then this device's
+	// records lack the account's provider-id claims, so every track another
+	// desktop already holds would be minted again as a new recording — the
+	// 2026-10-20 second-desktop incident, ~3.5k duplicates. Signed out (or
+	// sync disabled) there is nothing to wait for.
+	const streamingReadWait = (source: 'Spotify' | 'Tidal'): string | null => {
+		if (!opts.cloud || !opts.cloud.transport.session() || firstPullDone(sqlite)) return null;
+		return `Curator is still loading your library from your account on this computer. ${source} sync starts once that finishes.`;
+	};
+	const assertStreamingReadOpen = (source: 'Spotify' | 'Tidal'): void => {
+		const why = streamingReadWait(source);
+		if (why) throw new Error(why);
+	};
 
 	// ─── Streaming-source adapters + auto-poll scheduler ──────────────
 	// Adapters are constructed eagerly; they hold no token state (resolved
@@ -1420,6 +1434,8 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// disconnected session from stamping a failed sync_job row every tick.
 	sourceScheduler.registerRunner('spotify', async () => {
 		if (!(await auth.getSpotifyAccessToken())) return;
+		// The next tick tries again; the first pull is seconds away.
+		if (streamingReadWait('Spotify')) return;
 		await spotifySync.run();
 		albumEnricher.kick();
 	});
@@ -1430,6 +1446,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// instead of stamping a failed sync_job row every tick.
 	sourceScheduler.registerRunner('tidal', async () => {
 		if (!(await auth.getTidalAccessToken())) return;
+		if (streamingReadWait('Tidal')) return;
 		await tidalSync.run();
 	});
 
@@ -2414,25 +2431,33 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		//   • The next auto-tick is N minutes from THIS run's completion,
 		//     not from the previous scheduled boundary — so clicking
 		//     "Sync now" at 4:59 doesn't trigger another sync at 5:00.
-		runSpotifySync: (progress, opts) =>
+		runSpotifySync: async (progress, opts) => {
+			assertStreamingReadOpen('Spotify');
 			// A sync rewrites owned/followed playlists + Liked Songs + their
 			// playlist_track rows — the biggest membership-churn site. Recompute
 			// the whole table once at the tail (one indexed pass; also self-heals
 			// any drift) rather than tracking per-playlist deltas.
-			sourceScheduler.aroundExternalRun('spotify', () => spotifySync.run(progress, opts))
-				.then((r) => { membership.recomputeAll(); albumEnricher.kick(); return r; }),
+			return sourceScheduler.aroundExternalRun('spotify', () => spotifySync.run(progress, opts))
+				.then((r) => { membership.recomputeAll(); albumEnricher.kick(); return r; });
+		},
 		planSpotifySync: () => spotifySync.planRun(),
-		runSpotifyPlaylistSync: (playlistId, progress, opts) =>
-			sourceScheduler.aroundExternalRun('spotify', () => spotifySync.runSinglePlaylist(playlistId, progress, opts))
-				.then((r) => { membership.recomputeAll(); return r; }),
+		runSpotifyPlaylistSync: async (playlistId, progress, opts) => {
+			assertStreamingReadOpen('Spotify');
+			return sourceScheduler.aroundExternalRun('spotify', () => spotifySync.runSinglePlaylist(playlistId, progress, opts))
+				.then((r) => { membership.recomputeAll(); return r; });
+		},
 		// Same scheduler mutex + membership recompute shape as the Spotify
 		// pair above — Tidal is just another membership-churn site.
-		runTidalSync: (progress, opts) =>
-			sourceScheduler.aroundExternalRun('tidal', () => tidalSync.run(progress, opts))
-				.then((r) => { membership.recomputeAll(); return r; }),
-		runTidalPlaylistSync: (playlistId, progress, opts) =>
-			sourceScheduler.aroundExternalRun('tidal', () => tidalSync.runSinglePlaylist(playlistId, progress, opts))
-				.then((r) => { membership.recomputeAll(); return r; }),
+		runTidalSync: async (progress, opts) => {
+			assertStreamingReadOpen('Tidal');
+			return sourceScheduler.aroundExternalRun('tidal', () => tidalSync.run(progress, opts))
+				.then((r) => { membership.recomputeAll(); return r; });
+		},
+		runTidalPlaylistSync: async (playlistId, progress, opts) => {
+			assertStreamingReadOpen('Tidal');
+			return sourceScheduler.aroundExternalRun('tidal', () => tidalSync.runSinglePlaylist(playlistId, progress, opts))
+				.then((r) => { membership.recomputeAll(); return r; });
+		},
 		enrichBeatportPlaylist: (playlistId, progress, sort) => spotifySync.enrichBeatportPlaylist(playlistId, progress, sort),
 		enrichBeatportTrack: (trackId, progress) => spotifySync.enrichBeatportTrack(trackId, progress),
 		enrichBeatportTracks: (trackIds, progress) => spotifySync.enrichBeatportTracks(trackIds, progress),
@@ -4131,9 +4156,14 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return db.select().from(tag).orderBy(asc(tag.sortOrder), asc(tag.name)).all();
 		},
 		async getTagCounts() {
+			// Soft-deleted tracks keep their track_tag rows (undelete restores
+			// them), so count only live tracks — otherwise the tab badges disagree
+			// with the lists, which getTracks already filters by deletedAt.
 			const rows = db
 				.select({ tagId: trackTag.tagId, n: count() })
 				.from(trackTag)
+				.innerJoin(track, eq(track.id, trackTag.trackId))
+				.where(isNull(track.deletedAt))
 				.groupBy(trackTag.tagId)
 				.all();
 			const out: Record<string, number> = {};

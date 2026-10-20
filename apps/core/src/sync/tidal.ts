@@ -14,6 +14,8 @@
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { ClaimBinder, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
+import { nextStreamingPlaylistId } from '../sync-log/stable-ids.js';
 import * as mut from '../library/mutators.js';
 import { rawOf } from '../library/artists.js';
 import { TidalApiClient, type TidalPlaylist, type TidalPlaylistItem, type TidalTrackV2 } from '@curator/tidal';
@@ -369,7 +371,9 @@ export class TidalSync {
 			return existing.id;
 		}
 
-		const id = randomUUID();
+		// Derived from the provider playlist (stable-ids.ts): two desktops
+		// importing it before either pulled the other's create agree on it.
+		const id = nextStreamingPlaylistId(rawOf(this.db), 'tidal', pl.id);
 		const row: NewPlaylist = {
 			id,
 			source: 'tidal',
@@ -437,10 +441,16 @@ export class TidalSync {
 			if (r.sourceTrackId && r.addedAt) priorAddedAt.set(r.sourceTrackId, r.addedAt.getTime());
 		}
 
+		// Claimed provider ids in batched reads; recordings bound without a
+		// row here are projected before the reconcile (see SpotifySync).
+		const binder = new ClaimBinder(rawOf(this.db));
+		binder.prefetch('tidal', items.map((it) => it.track.id));
+		const adopted = new Set<string>();
+
 		const desired: mut.DesiredMember[] = [];
 		for (const item of items) {
 			const t = item.track;
-			const trackId = this.upsertTrack(t);
+			const trackId = this.upsertTrack(t, binder, adopted);
 			upsertArtistLinks(this.db, 'tidal', t.artists);
 			const remoteMs = item.addedAt ? new Date(item.addedAt).getTime() : null;
 			const priorMs = priorAddedAt.get(t.id) ?? null;
@@ -454,6 +464,7 @@ export class TidalSync {
 				sourceTrackId: t.id,
 			});
 		}
+		if (adopted.size > 0) projectAdoptedRecordings(rawOf(this.db), adopted);
 		mut.reconcileMembership(this.db, playlistRowId, desired, 'tidal');
 		return items.length;
 	}
@@ -461,11 +472,12 @@ export class TidalSync {
 	// ─── Track upsert ────────────────────────────────────────────────────
 	// Identity resolution identical to SpotifySync.upsertTrack:
 	//   1. (source='tidal', source_track_id) — already ingested; refresh link.
+	//   1b. The exact provider-id claim on the op log (claim-bind.ts).
 	//   2. track.isrc — same recording known via another provider (typically
 	//      Spotify ingest or the hybrid matcher); attach a link beside it.
 	//   3. Create canonical track + link.
 
-	private upsertTrack(t: TidalTrackV2): string {
+	private upsertTrack(t: TidalTrackV2, binder: ClaimBinder, adopted: Set<string>): string {
 		const existing = this.db
 			.select({ trackId: sourceLink.trackId })
 			.from(sourceLink)
@@ -535,6 +547,23 @@ export class TidalSync {
 			fetchedAt: new Date(),
 		});
 
+		// Exact claim; no claim op (see SpotifySync.upsertTrack).
+		const bound = binder.bind('tidal', t.id);
+		if (bound) {
+			if (bound.trackId) {
+				this.db.insert(sourceLink).values(newLinkFor(bound.trackId)).run();
+				syncTrackAlbumsById(this.db, [bound.trackId]);
+				return bound.trackId;
+			}
+			const trackId = randomUUID();
+			this.db.insert(track).values(asciify(this.newTrackRow(t, title, trackId, bound.recordingId, isrc, canonicalArtists, artistsBase))).run();
+			syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
+			this.db.insert(sourceLink).values(newLinkFor(trackId)).run();
+			syncTrackAlbumsById(this.db, [trackId]);
+			adopted.add(bound.recordingId);
+			return trackId;
+		}
+
 		if (isrc) {
 			// Live row first — see SpotifySync.upsertTrack (merge losers keep
 			// the survivor's ISRC).
@@ -546,7 +575,7 @@ export class TidalSync {
 				.get();
 			if (byIsrc) {
 				this.db.insert(sourceLink).values(newLinkFor(byIsrc.id)).run();
-				mut.addClaims(this.db, byIsrc.id, [{ kind: 'tidal', value: t.id }]);
+				mut.addClaims(this.db, byIsrc.id, [{ kind: 'tidal', value: t.id, confidence: 0.9 }]);
 				syncTrackAlbumsById(this.db, [byIsrc.id]);
 				return byIsrc.id;
 			}
@@ -570,19 +599,32 @@ export class TidalSync {
 					.run();
 			}
 			this.db.insert(sourceLink).values(newLinkFor(byContent.trackId)).run();
-			mut.addClaims(this.db, byContent.trackId, [{ kind: 'tidal', value: t.id }, ...(byContent.seedIsrc ? [{ kind: 'isrc' as const, value: byContent.seedIsrc, confidence: 0.9 }] : [])]);
+			mut.addClaims(this.db, byContent.trackId, [{ kind: 'tidal', value: t.id, confidence: 0.7 }, ...(byContent.seedIsrc ? [{ kind: 'isrc' as const, value: byContent.seedIsrc, confidence: 0.9 }] : [])]);
 			syncTrackAlbumsById(this.db, [byContent.trackId]);
 			return byContent.trackId;
 		}
 
 		const trackId = randomUUID();
-		const newTrack: NewTrack = {
+		const newTrack = this.newTrackRow(t, title, trackId, recordingIdForTrack(trackId), isrc, canonicalArtists, artistsBase);
+		this.db.insert(track).values(asciify(newTrack)).run();
+		syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
+		this.db.insert(sourceLink).values(newLinkFor(trackId)).run();
+		// A new recording: library_track create + provider id / ISRC claims.
+		mut.recordTrackCreated(this.db, trackId, [{ kind: 'tidal', value: t.id, confidence: 1 }, ...(isrc ? [{ kind: 'isrc' as const, value: isrc, confidence: 0.9 }] : [])]);
+		syncTrackAlbumsById(this.db, [trackId]);
+		return trackId;
+	}
+
+	// A canonical row from the provider's metadata (a mint, or the first row
+	// here for a recording another device holds).
+	private newTrackRow(t: TidalTrackV2, title: string, trackId: string, recordingId: string, isrc: string | null, artists: TrackArtist[], artistsBase: NewTrack['artistsBase']): NewTrack {
+		return {
 			id: trackId,
-			recordingId: recordingIdForTrack(trackId),
+			recordingId,
 			isrc,
 			mbid: null,
 			title,
-			artists: canonicalArtists,
+			artists,
 			artistsBase,
 			albumTitle: t.album?.title ?? null,
 			releaseDate: null,
@@ -601,12 +643,5 @@ export class TidalSync {
 			createdAt: new Date(),
 			updatedAt: new Date(),
 		};
-		this.db.insert(track).values(asciify(newTrack)).run();
-		syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
-		this.db.insert(sourceLink).values(newLinkFor(trackId)).run();
-		// A new recording: library_track create + provider id / ISRC claims.
-		mut.recordTrackCreated(this.db, trackId, [{ kind: 'tidal', value: t.id }, ...(isrc ? [{ kind: 'isrc' as const, value: isrc, confidence: 0.9 }] : [])]);
-		syncTrackAlbumsById(this.db, [trackId]);
-		return trackId;
 	}
 }

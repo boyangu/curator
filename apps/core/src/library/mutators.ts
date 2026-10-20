@@ -34,6 +34,7 @@ import type { Db } from '../db/client.js';
 import { rawOf } from './artists.js';
 import { appendRows, planReorderKeys, recomputePositions, type MemberDraft } from './playlist-order.js';
 import { captureEmitted, emitOps, type EmitOp } from '../sync-log/outbox.js';
+import { memberIdAllocator } from '../sync-log/stable-ids.js';
 import {
 	claimOp,
 	cueDeleteOp,
@@ -749,7 +750,10 @@ function holdPending(current: readonly CurrentRow[], desired: readonly DesiredMe
 // `origin` 'remote' writes without emitting.
 //
 // A Spotify or Tidal read-sync merges around changes still pending upstream
-// (holdPending, F23) instead of reverting them.
+// (holdPending, F23) instead of reverting them, and gives the rows it adds
+// ids derived from the provider list (stable-ids.ts: playlist, provider
+// track id, which occurrence of it upstream), so two desktops importing the
+// same playlist add the same rows instead of one set each.
 export function reconcileMembership(db: Db, playlistId: string, providerList: readonly DesiredMember[], origin: MutationOrigin): ReconcileResult {
 	return tx(db, (raw) => {
 		type Cur = { id: string; track_id: string; order_key: string; position: number; source_track_id: string; added_at: number | null; added_by: string | null };
@@ -816,6 +820,21 @@ export function reconcileMembership(db: Db, playlistId: string, providerList: re
 		// inserts themselves.
 		const held = new Set(kept.map((r) => r.position));
 		let parked = -1_000_000;
+		// The k-th time the provider list holds a track id is its occurrence
+		// k, counted over the list as the provider sent it (holdPending keeps
+		// those entry objects; the rows it re-inserts from the local side are
+		// always matched, so they never need an id).
+		const streaming = origin === 'spotify' || origin === 'tidal';
+		const allocate = streaming ? memberIdAllocator(raw, playlistId) : null;
+		const occurrence = new Map<DesiredMember, number>();
+		if (streaming) {
+			const seen = new Map<string, number>();
+			for (const d of providerList) {
+				const k = seen.get(d.sourceTrackId) ?? 0;
+				seen.set(d.sourceTrackId, k + 1);
+				occurrence.set(d, k);
+			}
+		}
 		for (let k = 0; k < desired.length; k++) {
 			const d = desired[k]!;
 			const m = matched[k];
@@ -826,7 +845,8 @@ export function reconcileMembership(db: Db, playlistId: string, providerList: re
 					setMeta.run(d.sourceTrackId, addedAt, d.addedBy ?? null, m.id);
 				}
 			} else {
-				const id = randomUUID();
+				const occ = occurrence.get(d);
+				const id = allocate && occ !== undefined ? allocate(d.sourceTrackId, occ) : randomUUID();
 				ins.run(id, playlistId, d.trackId, keys[k]!, held.has(k) ? parked-- : k, addedAt, d.addedBy ?? null, d.sourceTrackId);
 				adds.push({ id, playlistId, trackId: d.trackId, orderKey: keys[k]! });
 			}

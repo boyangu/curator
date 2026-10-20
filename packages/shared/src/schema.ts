@@ -1344,6 +1344,19 @@ export const syncCursor = sqliteTable('sync_cursor', {
 	snapshotSeq: integer('snapshot_seq'),
 });
 
+// Pulled ops from a newer protocol version than this build reads (design:
+// `sync_inbox_held`): set aside so everything else keeps applying and the
+// cursor keeps moving, and replayed in `seq` order once an update can read
+// them. `op` is the stored op's wire JSON, kept verbatim — this build cannot
+// parse it.
+export const syncInboxHeld = sqliteTable('sync_inbox_held', {
+	seq: integer('seq').primaryKey(),
+	opId: text('op_id').notNull(),
+	schemaVersion: integer('schema_version').notNull(),
+	op: text('op').notNull(),
+	heldAt: integer('held_at').notNull(),
+});
+
 // Catalogue aliases applied locally: ops addressed to `loser` are redirected
 // to `winner`. Chains are flattened on write, so a lookup is one hop.
 export const recordingAlias = sqliteTable('recording_alias', {

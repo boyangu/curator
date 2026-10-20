@@ -11,6 +11,8 @@ import { sortColumn } from './sort.js';
 import type { ZTrackSortT } from '@curator/shared';
 import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { ClaimBinder, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
+import { nextStreamingPlaylistId } from '../sync-log/stable-ids.js';
 import * as mut from '../library/mutators.js';
 import { rawOf } from '../library/artists.js';
 import { SpotifyClient, type SpotifyPlaylist, type SpotifyPlaylistTrack, type SpotifyTrack } from '@curator/spotify';
@@ -469,7 +471,10 @@ export class SpotifySync {
 			return existing.id;
 		}
 
-		const id = randomUUID();
+		// Derived from the provider playlist, so a second desktop importing it
+		// before it has pulled this one's create lands on the same id
+		// (stable-ids.ts) instead of a second playlist.
+		const id = nextStreamingPlaylistId(rawOf(this.db), 'spotify', pl.id);
 		const row: NewPlaylist = {
 			id,
 			source: 'spotify',
@@ -555,10 +560,17 @@ export class SpotifySync {
 			if (r.sourceTrackId && r.addedAt) priorAddedAt.set(r.sourceTrackId, r.addedAt.getTime());
 		}
 
+		// The provider ids other devices already claimed, in a few batched
+		// reads (claim-bind.ts); recordings this import binds to without a
+		// row here are projected once, below, before membership reconciles.
+		const binder = new ClaimBinder(rawOf(this.db));
+		binder.prefetch('spotify', validItems.map((it) => it.track!.id));
+		const adopted = new Set<string>();
+
 		const desired: mut.DesiredMember[] = [];
 		for (const item of validItems) {
 			const t = item.track!;
-			const trackId = this.upsertTrack(t);
+			const trackId = this.upsertTrack(t, binder, adopted);
 			upsertArtistLinks(this.db, 'spotify', t.artists ?? []);
 			const remoteMs = item.added_at ? new Date(item.added_at).getTime() : null;
 			const priorMs = priorAddedAt.get(t.id) ?? null;
@@ -572,6 +584,10 @@ export class SpotifySync {
 				sourceTrackId: t.id,
 			});
 		}
+		// Before the reconcile: the rows another device added for these
+		// recordings become visible here and match by track, instead of each
+		// entry being added a second time (the incident's doubled rows).
+		if (adopted.size > 0) projectAdoptedRecordings(rawOf(this.db), adopted);
 		mut.reconcileMembership(this.db, playlistRowId, desired, 'spotify');
 		return validItems.length;
 	}
@@ -581,7 +597,13 @@ export class SpotifySync {
 	// rules as playlist sync (provider-id → ISRC → create). No parallel
 	// matching logic anywhere else.
 	ingestExternalTrack(t: SpotifyTrack): string {
-		return this.upsertTrack(t);
+		const raw = rawOf(this.db);
+		return raw.transaction(() => {
+			const adopted = new Set<string>();
+			const id = this.upsertTrack(t, new ClaimBinder(raw), adopted);
+			if (adopted.size > 0) projectAdoptedRecordings(raw, adopted);
+			return id;
+		})();
 	}
 
 	// ─── Track upsert ────────────────────────────────────────────────────
@@ -592,6 +614,11 @@ export class SpotifySync {
 	// Lookup order:
 	//   1. (source='spotify', source_track_id=t.id) — exact provider id we've
 	//      ingested before. Cheapest hit; refreshes the source_link payload.
+	//   1b. The exact provider-id claim on the op log (claim-bind.ts): the
+	//      recording another device (or this one, before its link went)
+	//      already holds this Spotify id under. Attach to this device's row
+	//      for it, or insert a row with that recording id and no create —
+	//      the recording exists — and let the caller project its records.
 	//   2. track.isrc = t.isrc — different Spotify ID, same recording. Spotify
 	//      often carries the same song under multiple track ids (re-releases,
 	//      regional variants). Without this lookup we'd create a duplicate
@@ -599,7 +626,7 @@ export class SpotifySync {
 	//      new playlist that happens to reference a different Spotify ID.
 	//      Attach a second source_link to the existing canonical track.
 	//   3. Fall through — brand-new recording, create both rows.
-	private upsertTrack(t: SpotifyTrack): string {
+	private upsertTrack(t: SpotifyTrack, binder: ClaimBinder, adopted: Set<string>): string {
 		const existing = this.db
 			.select({ trackId: sourceLink.trackId })
 			.from(sourceLink)
@@ -637,6 +664,42 @@ export class SpotifySync {
 			return existing.trackId;
 		}
 
+		const linkFor = (trackId: string): NewSourceLink => ({
+			id: randomUUID(),
+			trackId,
+			source: 'spotify',
+			sourceTrackId: t.id,
+			url: `https://open.spotify.com/track/${t.id}`,
+			isrcLocal: isrc,
+			titleLocal: t.name,
+			artistsLocal: artists,
+			albumLocal: t.album?.name ?? null,
+			durationLocal: duration,
+			bpmLocal: null,
+			keyLocal: null,
+			payload: t as unknown,
+			fetchedAt: new Date(),
+		});
+
+		// Exact claim. No claim op: the recording already claims this id
+		// (restating it could only raise another device's fuzzy 0.7 bind to
+		// the 1.0 the identity resolver anchors on).
+		const bound = binder.bind('spotify', t.id);
+		if (bound) {
+			if (bound.trackId) {
+				this.db.insert(sourceLink).values(linkFor(bound.trackId)).run();
+				syncTrackAlbumsById(this.db, [bound.trackId]);
+				return bound.trackId;
+			}
+			const trackId = randomUUID();
+			this.db.insert(track).values(asciify(this.newTrackRow(t, trackId, bound.recordingId, isrc, duration, canonicalArtists, artistsBase))).run();
+			syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
+			this.db.insert(sourceLink).values(linkFor(trackId)).run();
+			syncTrackAlbumsById(this.db, [trackId]);
+			adopted.add(bound.recordingId);
+			return trackId;
+		}
+
 		// Second-chance match — same recording (ISRC) under a different
 		// Spotify id. Reuse the existing canonical track, attach the new
 		// source_link beside the prior one(s). A live row wins over a
@@ -669,7 +732,8 @@ export class SpotifySync {
 					fetchedAt: new Date(),
 				};
 				this.db.insert(sourceLink).values(newLink).run();
-				mut.addClaims(this.db, byIsrc.id, [{ kind: 'spotify', value: t.id }]);
+				// 0.9: bound through the ISRC, not the provider's own id.
+				mut.addClaims(this.db, byIsrc.id, [{ kind: 'spotify', value: t.id, confidence: 0.9 }]);
 				syncTrackAlbumsById(this.db, [byIsrc.id]);
 				return byIsrc.id;
 			}
@@ -712,19 +776,37 @@ export class SpotifySync {
 					fetchedAt: new Date(),
 				})
 				.run();
-			mut.addClaims(this.db, byContent.trackId, [{ kind: 'spotify', value: t.id }, ...(byContent.seedIsrc ? [{ kind: 'isrc' as const, value: byContent.seedIsrc, confidence: 0.9 }] : [])]);
+			// 0.7: a title/artist/duration match, the fuzziest bind.
+			mut.addClaims(this.db, byContent.trackId, [{ kind: 'spotify', value: t.id, confidence: 0.7 }, ...(byContent.seedIsrc ? [{ kind: 'isrc' as const, value: byContent.seedIsrc, confidence: 0.9 }] : [])]);
 			syncTrackAlbumsById(this.db, [byContent.trackId]);
 			return byContent.trackId;
 		}
 
 		const trackId = randomUUID();
-		const newTrack: NewTrack = {
+		const newTrack = this.newTrackRow(t, trackId, recordingIdForTrack(trackId), isrc, duration, canonicalArtists, artistsBase);
+		this.db.insert(track).values(asciify(newTrack)).run();
+		syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
+
+		this.db.insert(sourceLink).values(linkFor(trackId)).run();
+		// A new recording: its library_track create plus the claims the
+		// catalogue resolver reads (provider id at 1.0 — this id minted it —
+		// and ISRC).
+		mut.recordTrackCreated(this.db, trackId, [{ kind: 'spotify', value: t.id, confidence: 1 }, ...(isrc ? [{ kind: 'isrc' as const, value: isrc, confidence: 0.9 }] : [])]);
+		// After the link: the album seam reads the album id off its payload.
+		syncTrackAlbumsById(this.db, [trackId]);
+		return trackId;
+	}
+
+	// A canonical row from the provider's metadata (a mint, or the first row
+	// here for a recording another device holds).
+	private newTrackRow(t: SpotifyTrack, trackId: string, recordingId: string, isrc: string | null, duration: number, artists: TrackArtist[], artistsBase: NewTrack['artistsBase']): NewTrack {
+		return {
 			id: trackId,
-			recordingId: recordingIdForTrack(trackId),
+			recordingId,
 			isrc,
 			mbid: null,
 			title: t.name,
-			artists: canonicalArtists,
+			artists,
 			artistsBase,
 			albumTitle: t.album?.name ?? null,
 			releaseDate: t.album?.release_date ?? null,
@@ -741,32 +823,6 @@ export class SpotifySync {
 			createdAt: new Date(),
 			updatedAt: new Date(),
 		};
-		this.db.insert(track).values(asciify(newTrack)).run();
-		syncTrackArtists(this.db, [{ id: trackId, artists: canonicalArtists, overrides: null }]);
-
-		const newLink: NewSourceLink = {
-			id: randomUUID(),
-			trackId,
-			source: 'spotify',
-			sourceTrackId: t.id,
-			url: `https://open.spotify.com/track/${t.id}`,
-			isrcLocal: isrc,
-			titleLocal: t.name,
-			artistsLocal: artists,
-			albumLocal: t.album?.name ?? null,
-			durationLocal: duration,
-			bpmLocal: null,
-			keyLocal: null,
-			payload: t as unknown,
-			fetchedAt: new Date(),
-		};
-		this.db.insert(sourceLink).values(newLink).run();
-		// A new recording: its library_track create plus the claims the
-		// catalogue resolver reads (provider id, ISRC).
-		mut.recordTrackCreated(this.db, trackId, [{ kind: 'spotify', value: t.id }, ...(isrc ? [{ kind: 'isrc' as const, value: isrc, confidence: 0.9 }] : [])]);
-		// After the link: the album seam reads the album id off its payload.
-		syncTrackAlbumsById(this.db, [trackId]);
-		return trackId;
 	}
 
 	// ─── Beatport enrichment ─────────────────────────────────────────────

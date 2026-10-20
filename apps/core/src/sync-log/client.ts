@@ -23,8 +23,14 @@
 //     its own still comes back and applyOps skips it by op_id — the only path
 //     against an older server. A clamped stamp is learnt from the push result
 //     (or, from an older server, from the echo) and repaired the same way.
-//   - An op from a newer protocol version stops apply at its seq (order must
-//     hold) and reports `needsUpdate`; local reads keep working.
+//   - An op from a newer protocol version is held aside (held.ts,
+//     `sync_inbox_held`): everything else applies, the cursor moves on, and
+//     `needsUpdate` reports it; the held ops replay once a build that reads
+//     them pulls.
+//   - A streaming read-sync waits for the first pull (FIRST_PULL_KEY): a
+//     device that has not seen the account's claims yet would mint a fresh
+//     recording for every track another desktop already holds (the
+//     2026-10-20 incident).
 //   - A library is bound to the first account that syncs it. Signing in as
 //     someone else does not merge two people's libraries; it reports an error.
 //   - Reads name the device when the server offers 'device_reads'. A
@@ -58,11 +64,13 @@ import {
 import type { AreaLogger } from '@curator/shared/log';
 import { log } from '../log.js';
 import { artistCreditRewritePending, drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
-import { applyOps, INITIAL_PUSH_KEY, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
+import { applyOps, INITIAL_PUSH_KEY, recordsComplete, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
 import { getDeviceId } from './device.js';
+import { heldCount, holdOps, replayHeldOps } from './held.js';
 import { claimsBackfillAsync, claimsBackfillPending, initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushAsyncResult, type InitialPushProgress } from './initial-push.js';
 import { resolveRecordingIdentitiesAsync } from './identity.js';
 import { CLOCK_KEY, observeServerTs, onOutboxAppend } from './outbox.js';
+import { healAfterApply, streamingDedupeSwept, type DedupeResult, sweepStreamingDuplicatesAsync } from './playlist-dedupe.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { remintDeviceForDetach } from './remint.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
@@ -196,7 +204,8 @@ export type PushOutcome = { pushed: number; rejected: number; more: boolean; sto
 export type UnlinkOutcome = { revokedOnServer: boolean; signedOut: boolean; oldDeviceId: string | null; newDeviceId: string; restamped: number };
 // `received`: ops the server sent; `applied`: how many changed local state
 // (own echoes and already-seen ops are skipped).
-export type PullOutcome = { applied: number; received: number; pages: number; bootstrapped: boolean; stopped: 'ahead' | 'unreadable' | null };
+// `held`: ops from a newer protocol version set aside this pull (held.ts).
+export type PullOutcome = { applied: number; received: number; pages: number; bootstrapped: boolean; held: number; stopped: 'unreadable' | null };
 
 // One cycle's totals for its summary log line: counts only, never an op.
 type CycleTally = { pushed: number; rejected: number; held: number; pulled: number; applied: number; bootstrapped: boolean; snapshotRecords: number };
@@ -244,6 +253,22 @@ export interface SyncClient {
 // ── persisted client state (device-local app_setting keys) ──────────────────
 
 const CURSOR_KEY = 'library';
+
+// Set when a pull first reached the head of the log (or a snapshot loaded):
+// from then on this device's records hold every claim the account had, so
+// a streaming import binds to the recordings other desktops hold instead of
+// minting its own (claim-bind.ts). Device-local; never an account key.
+export const FIRST_PULL_KEY = 'sync.first_pull_at';
+
+export function firstPullDone(raw: Raw): boolean {
+	return raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(FIRST_PULL_KEY) !== undefined;
+}
+
+function markFirstPull(raw: Raw): void {
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)
+		.run(FIRST_PULL_KEY, JSON.stringify(Date.now()), Date.now());
+}
+
 // Exported for migrate.ts, which must know whether this library was ever
 // bound to an account before it rewrites the outbox.
 export const CLIENT_STATE_KEY = 'sync.client';
@@ -328,10 +353,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const listeners = new Set<(e: CloudSyncEvent) => void>();
 	let lastError: string | null = null;
 	// The server refused this client's schema version on push (ops stay
-	// pending), or a pulled op is from a newer version (apply holds at its
-	// seq). Either reads "update required"; pull keeps polling while held.
+	// pending). Reads "update required", as do held newer-version ops
+	// (heldCount, read per status).
 	let pushRefused = false;
-	let pullHeld = false;
 	let initialPushProgress: InitialPushProgress | null = null;
 	let bootstrapProgress: { done: number; total: number } | null = null;
 	let running = false;
@@ -400,7 +424,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			lastPullAt: st.lastPullAt,
 			lastSeq: readCursor(raw).lastSeq,
 			lastError,
-			needsUpdate: pushRefused || pullHeld,
+			needsUpdate: pushRefused || heldCount(raw) > 0,
 			revoked: isRevoked(st),
 			boundUserId: st.userId,
 			initialPushDone: raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined,
@@ -580,12 +604,26 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	};
 
 	const pullOnce = async (): Promise<PullOutcome> => {
-		const out: PullOutcome = { applied: 0, received: 0, pages: 0, bootstrapped: false, stopped: null };
+		const out: PullOutcome = { applied: 0, received: 0, pages: 0, bootstrapped: false, held: 0, stopped: null };
 		const tracks = new Set<string>();
 		const playlists = new Set<string>();
 		const entities: EntityRef[] = [];
-		pullHeld = false;
+		const collect = (o: { tracksTouched: readonly string[]; playlistsTouched: readonly string[]; changed?: readonly EntityRef[] }): void => {
+			for (const t of o.tracksTouched) tracks.add(t);
+			for (const p of o.playlistsTouched) playlists.add(p);
+			if (o.changed && entities.length < ENTITY_CAP) entities.push(...o.changed.slice(0, ENTITY_CAP - entities.length));
+		};
 		try {
+			// Ops held by an older build that this one reads (an update just
+			// landed): applied before anything newer.
+			if (heldCount(raw) > 0 && recordsComplete(raw)) {
+				const replay = replayHeldOps(raw);
+				if (replay.outcome) {
+					collect(replay.outcome);
+					slog.info('pull: replayed ops held for an update', { applied: replay.applied, remaining: replay.remaining });
+				}
+				if (replay.error) slog.warn('pull: held ops this version should read do not parse; still held', { error: replay.error, remaining: replay.remaining });
+			}
 			for (;;) {
 				const cursor = readCursor(raw);
 				const res = await pullPage(cursor.lastSeq);
@@ -614,54 +652,59 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 						if (at > cursor.lastSeq) writeCursor(raw, at);
 						const st = readClientState(raw);
 						if (at > (st.ownThroughSeq ?? 0)) writeClientState(raw, { ...st, ownThroughSeq: at });
+						markFirstPull(raw);
 					})();
 					break;
 				}
 				out.pages++;
-				// Newer-protocol ops stop apply at their seq, in order.
-				const aheadAt = res.ops.findIndex((o) => schemaVersionStatus(o.schema_version) === 'ahead');
-				const page = aheadAt < 0 ? res.ops : res.ops.slice(0, aheadAt);
-				if (page.length > 0) {
-					const lastSeq = page[page.length - 1]!.seq;
-					let outcome: ApplyOutcome | null = null;
-					try {
-						raw.transaction(() => {
+				// Newer-protocol ops are set aside (held.ts); the rest of
+				// the page applies and the cursor passes both.
+				const ahead = res.ops.filter((o) => schemaVersionStatus(o.schema_version) === 'ahead');
+				const page = ahead.length === 0 ? res.ops : res.ops.filter((o) => schemaVersionStatus(o.schema_version) !== 'ahead');
+				const lastSeq = res.ops[res.ops.length - 1]!.seq;
+				let outcome: ApplyOutcome | null = null;
+				let healed: DedupeResult | null = null;
+				try {
+					raw.transaction(() => {
+						out.held += holdOps(raw, ahead);
+						if (page.length > 0) {
 							outcome = applyOps(raw, page.map(wireOp));
-							opts.beforeCursorAdvance?.(page);
-							// The whole page applied: the cursor may pass its last op,
-							// over own ops the server left out. Held at an op from a
-							// newer version: no further than the last one applied.
-							writeCursor(raw, Math.max(lastSeq, cursor.lastSeq, aheadAt < 0 ? res.nextSeq : 0));
-						})();
-					} catch (err) {
-						if (err instanceof OpValidationError) {
-							// An op this version should read but cannot: never skip
-							// it (it may matter), stop here and say so.
-							lastError = `The server sent a change this version cannot read (${err.message}).`;
-							slog.error('pull: unreadable op', err, { afterSeq: cursor.lastSeq });
-							out.stopped = 'unreadable';
-							break;
+							// Doubled streaming rows the page brought together fold
+							// in the same commit (playlist-dedupe.ts).
+							healed = healAfterApply(raw, page);
 						}
-						throw err;
+						opts.beforeCursorAdvance?.(page);
+						// The whole page applied: the cursor may pass its last op,
+						// over own ops the server left out.
+						writeCursor(raw, Math.max(lastSeq, cursor.lastSeq, res.nextSeq));
+					})();
+				} catch (err) {
+					if (err instanceof OpValidationError) {
+						// An op this version should read but cannot: never skip
+						// it (it may matter), stop here and say so.
+						lastError = `The server sent a change this version cannot read (${err.message}).`;
+						slog.error('pull: unreadable op', err, { afterSeq: cursor.lastSeq });
+						out.stopped = 'unreadable';
+						break;
 					}
-					const o = outcome as ApplyOutcome | null;
-					if (o && o.restamped > 0) patchClientState({ needsRepair: true });
-					if (o) {
-						out.applied += o.applied;
-						if (tally) tally.applied += o.applied;
-						for (const t of o.tracksTouched) tracks.add(t);
-						for (const p of o.playlistsTouched) playlists.add(p);
-						if (entities.length < ENTITY_CAP) entities.push(...o.changed.slice(0, ENTITY_CAP - entities.length));
-					}
-					// The server's receive stamps floor this device's next clock.
-					const serverTs = page.reduce((m, op) => Math.max(m, op.received_at), 0);
-					if (serverTs > 0) observeServerTs(raw, serverTs);
+					throw err;
 				}
-				if (aheadAt >= 0) {
-					pullHeld = true;
-					out.stopped = 'ahead';
-					break;
+				const o = outcome as ApplyOutcome | null;
+				if (o && o.restamped > 0) patchClientState({ needsRepair: true });
+				if (o) {
+					out.applied += o.applied;
+					if (tally) tally.applied += o.applied;
+					collect(o);
 				}
+				const h = healed as DedupeResult | null;
+				if (h && h.removed > 0) {
+					collect(h);
+					slog.info('pull: removed streaming playlist rows doubled by merges', { removed: h.removed, playlists: h.playlistsTouched.length });
+				}
+				// The server's receive stamps floor this device's next clock.
+				const serverTs = res.ops.reduce((m, op) => Math.max(m, op.received_at), 0);
+				if (serverTs > 0) observeServerTs(raw, serverTs);
+				if (ahead.length > 0) slog.warn('pull: ops from a newer version held aside until an update', { held: ahead.length, maxVersion: Math.max(...ahead.map((a) => a.schema_version)) });
 			}
 			// An artist alias rule pulled above (or left by an interrupted
 			// run) rewrites existing credits in yielding chunks; ingest
@@ -708,7 +751,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				onProgress: (p) => { bootstrapProgress = p; emitStatus({ progress: true }); },
 			});
 			const cursor = readCursor(raw);
-			writeCursor(raw, bopts.resetCursor ? b.snapshotSeq : Math.max(cursor.lastSeq, b.snapshotSeq), b.snapshotSeq);
+			raw.transaction(() => {
+				writeCursor(raw, bopts.resetCursor ? b.snapshotSeq : Math.max(cursor.lastSeq, b.snapshotSeq), b.snapshotSeq);
+				markFirstPull(raw);
+			})();
 			slog.info('bootstrap: done', { changed: res.changed, chunks: res.chunks, maxSliceMs: Math.round(res.maxSliceMs) });
 			emitApplied(res.tracksTouched, res.playlistsTouched, res.changedRefs);
 		} finally {
@@ -772,7 +818,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		try {
 			const r = await resolveRecordingIdentitiesAsync(raw);
 			if (r.merged > 0) {
-				slog.info('identity: merged recordings that share an audio hash', { merged: r.merged, planned: r.merges.length, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+				slog.info('identity: merged recordings that share an audio hash or a streaming id', {
+					merged: r.merged, planned: r.merges.length, streaming: r.merges.filter((m) => m.tier === 'streaming').length,
+					dedupeRemoved: r.dedupeRemoved, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs),
+				});
 				emitApplied(r.tracksTouched, r.playlistsTouched, []);
 			}
 			// Groups this device keeps apart (its own duplicate files, or a
@@ -789,6 +838,21 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		} catch (err) {
 			identitySig = null;
 			slog.warn('identity: resolver failed; retrying next cycle', undefined, err);
+		}
+	};
+
+	// ── streaming playlist doubles: the one-time sweep ──────────────────
+	// The merge chunks and alias-moving pulls fold the doubles they create;
+	// this catches those older merges left (playlist-dedupe.ts), once, after
+	// the first pull has brought every device's rows in.
+	const sweepStreamingDuplicates = async (): Promise<void> => {
+		if (streamingDedupeSwept(raw) || !firstPullDone(raw) || !recordsComplete(raw)) return;
+		try {
+			const r = await sweepStreamingDuplicatesAsync(raw);
+			slog.info('streaming playlists: one-time sweep for doubled rows done', { playlists: r.playlists, removed: r.removed, maxSliceMs: Math.round(r.maxSliceMs) });
+			if (r.removed > 0) emitApplied(r.tracksTouched, r.playlistsTouched, []);
+		} catch (err) {
+			slog.warn('streaming playlists: dedupe sweep failed; retrying next cycle', undefined, err);
 		}
 	};
 
@@ -878,6 +942,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// Claims from other devices; merges it emits wake the next cycle's
 			// push through the outbox listener.
 			await resolveIdentities();
+			await sweepStreamingDuplicates();
 			lastError = null;
 			attempt = 0;
 			clearRetry();
@@ -901,7 +966,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// debug: at the 60 s interval it would be ~1,440 info lines a day
 			// saying nothing. Anything that moved or failed is info.
 			const moved = t.pushed + t.rejected + t.held + t.pulled > 0 || t.bootstrapped;
-			const fields = { reason, outcome, pushed: t.pushed, rejected: t.rejected, held: t.held, pulled: t.pulled, applied: t.applied, bootstrapped: t.bootstrapped, snapshotRecords: t.snapshotRecords, needsUpdate: pushRefused || pullHeld, ms: Date.now() - started };
+			const fields = { reason, outcome, pushed: t.pushed, rejected: t.rejected, held: t.held, pulled: t.pulled, applied: t.applied, bootstrapped: t.bootstrapped, snapshotRecords: t.snapshotRecords, needsUpdate: pushRefused || heldCount(raw) > 0, ms: Date.now() - started };
 			if (moved || outcome !== 'ok') slog.info('sync cycle', fields);
 			else slog.debug('sync cycle', fields);
 		}

@@ -12,8 +12,9 @@
 //   - A container whose provider identity is already held by another local
 //     row (two desktops each minted a row for one Spotify playlist, or
 //     imported one rekordbox history) is skipped and logged rather than
-//     failing the batch: stable cross-device ids for provider rows are
-//     workstream E's.
+//     failing the batch. Streaming imports now derive the playlist id from
+//     the provider's (stable-ids.ts), so this is left to playlists two
+//     desktops created under random ids before that.
 //   - Derived columns are recomputed for the touched rows only: positions
 //     from order keys, track_count, artists_ascii and the artist/album seams.
 //     The membership tier is left to the caller (it needs the connected
