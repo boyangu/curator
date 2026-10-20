@@ -4,9 +4,12 @@
 // to a network service.
 
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { PGlite, type Transaction } from '@electric-sql/pglite';
 import {
 	keyBetween,
+	type CataloguePolicy,
 	parseOp,
 	SCHEMA_VERSION,
 	cueEntityId,
@@ -26,6 +29,7 @@ import { findSqlDir, migrate } from '../db/migrate.js';
 import { createLogger, type Logger } from '../log.js';
 import { TokenBucketLimiter, type RateLimits } from '../rate-limit.js';
 import type { AppRouter } from '../router.js';
+import { CATALOGUE_POLICY_D_A, parseCataloguePolicy } from '../catalogue/policy.js';
 import { DEFAULT_PULL_OPTIONS, type PullOptions } from '../sync/pull.js';
 import type { AppDeps } from '../trpc.js';
 import { SUPABASE_SHIM_SQL } from './supabase-shim.js';
@@ -63,11 +67,20 @@ export type TestDb = {
 	createUser(): Promise<string>;
 };
 
+// The unnumbered setup scripts the owner pastes into the SQL editor.
+export const ROLES_SQL = readFileSync(join(findSqlDir(), 'roles.sql'), 'utf8');
+export const STORAGE_SQL = readFileSync(join(findSqlDir(), 'storage.sql'), 'utf8');
+
+// `migrate: true` (the default) also runs sql/storage.sql, as the owner does
+// right after the migrations.
 export async function createTestDb(opts: { migrate?: boolean } = {}): Promise<TestDb> {
 	const pg = await PGlite.create();
 	await pg.exec(SUPABASE_SHIM_SQL);
 	const db = pgliteDb(pg);
-	if (opts.migrate !== false) await migrate(db, findSqlDir());
+	if (opts.migrate !== false) {
+		await migrate(db, findSqlDir());
+		await db.exec(STORAGE_SQL);
+	}
 	return {
 		pg,
 		db,
@@ -87,6 +100,28 @@ export async function asUser<T>(pg: PGlite, userId: string, fn: (tx: Transaction
 		]);
 		return fn(tx);
 	});
+}
+
+// The owner's step 4 (README "Database setup"): a catalogue account row.
+export async function entitle(pg: PGlite, userId: string, opts: { quotaBytes?: number; entitled?: boolean } = {}): Promise<void> {
+	await pg.query(
+		`insert into curator.catalogue_account (user_id, entitled, quota_bytes) values ($1, $2, coalesce($3::bigint, 943718400))
+		on conflict (user_id) do update set entitled = excluded.entitled, quota_bytes = excluded.quota_bytes`,
+		[userId, opts.entitled ?? true, opts.quotaBytes === undefined ? null : String(opts.quotaBytes)],
+	);
+}
+
+// A device's upload, as the storage service records it: an insert into
+// storage.objects as the user, judged by sql/storage.sql's insert policy,
+// with the size in `metadata` (the column the API's blob check reads).
+export async function uploadBlob(pg: PGlite, userId: string, path: string, size: number): Promise<void> {
+	await asUser(pg, userId, (tx) =>
+		tx.query(`insert into storage.objects (bucket_id, name, owner_id, metadata) values ('catalogue', $1, $2, jsonb_build_object('size', $3::bigint))`, [
+			path,
+			userId,
+			String(size),
+		]),
+	);
 }
 
 export async function wakeups(pg: PGlite, userId?: string): Promise<{ topic: string; event: string; payload: { seq: number } }[]> {
@@ -143,7 +178,14 @@ export type TestApp = TestDb &
 	};
 
 export async function createTestApp(
-	opts: { limits?: RateLimits; pull?: PullOptions; auditDb?: Queryable; auditOptions?: { maxBuffered?: number; flushAt?: number } } = {},
+	opts: {
+		limits?: RateLimits;
+		pull?: PullOptions;
+		auditDb?: Queryable;
+		auditOptions?: { maxBuffered?: number; flushAt?: number };
+		// Default: stage D-a, as production runs it. `null` = catalogue off.
+		catalogue?: CataloguePolicy | null;
+	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
 	const keys = await createKeys();
@@ -159,6 +201,7 @@ export async function createTestApp(
 		limits: opts.limits ?? defaultRateLimitsUnbounded(),
 		pull: opts.pull ?? DEFAULT_PULL_OPTIONS,
 		audit,
+		catalogue: opts.catalogue === undefined ? parseCataloguePolicy(CATALOGUE_POLICY_D_A) : opts.catalogue,
 	};
 	const handler = createFetchHandler(deps);
 	const client = (token?: string) =>
@@ -190,7 +233,7 @@ export async function createTestApp(
 }
 
 function defaultRateLimitsUnbounded(): RateLimits {
-	return { push: new TokenBucketLimiter(1e9, 1e9), pull: new TokenBucketLimiter(1e9, 1e9) };
+	return { push: new TokenBucketLimiter(1e9, 1e9), pull: new TokenBucketLimiter(1e9, 1e9), catalogue: new TokenBucketLimiter(1e9, 1e9) };
 }
 
 // The `reason` the server put in the error's data, for `expect(...).rejects`.

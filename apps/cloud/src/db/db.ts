@@ -38,7 +38,32 @@ export interface Db extends Queryable {
 	close(): Promise<void>;
 }
 
+export class ConnectionStringError extends Error {
+	override readonly name = 'ConnectionStringError';
+}
+
+// Checks the shape of a connection string WITHOUT ever putting it in an error.
+// postgres.js throws `new URL(input)`'s TypeError, whose `input` field carries
+// the whole string, password included, into whatever logs the error; a
+// mis-pasted secret (a bare password, a stray control character) then lands in
+// the host's log stream. Every message here names the problem, never the value.
+export function assertConnectionString(url: string): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw new ConnectionStringError('the database connection string is not a URL (expected postgresql://user:password@host:port/db; value not shown)');
+	}
+	if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') {
+		throw new ConnectionStringError(`the database connection string must start with postgresql:// (got ${parsed.protocol}//; value not shown)`);
+	}
+	if (!parsed.username || !parsed.hostname) {
+		throw new ConnectionStringError('the database connection string has no user or host (value not shown)');
+	}
+}
+
 export function createPostgresDb(url: string, opts: { max?: number } = {}): Db {
+	assertConnectionString(url);
 	const sql = postgres(url, {
 		// Unnamed statements only: Supabase's pooler (Supavisor in transaction
 		// mode) cannot keep prepared statements across transactions. Every

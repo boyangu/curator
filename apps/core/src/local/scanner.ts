@@ -29,7 +29,7 @@ import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { and, desc, eq, inArray, isNull, like, lt, sql } from 'drizzle-orm';
-import { track, sourceLink, libraryFolder } from '@curator/shared/schema';
+import { track, sourceLink, libraryFolder, trackAnalysis } from '@curator/shared/schema';
 import type { LibraryFolder, NewTrack, NewSourceLink, TrackArtist } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
 import { normalizeIncomingArtists, syncTrackArtists } from '../library/artists.js';
@@ -114,6 +114,11 @@ export interface IngestEvent {
 	outcome: IngestOutcome;
 	trackId: string;
 	filePath: string;
+	// 'matched' only: the known path now holds DIFFERENT audio (its audio
+	// hash changed — a re-encode or a replaced file, not a tag edit, which
+	// the hash ignores). The track's analysis no longer describes the file;
+	// its catalogue stamp is already cleared, and the service re-queues it.
+	audioChanged?: boolean;
 }
 export type IngestFn = (evt: IngestEvent) => void;
 
@@ -416,7 +421,18 @@ export class LibraryScanner {
 			// (2026-06-25 incident; scripts/repair-scanner-dedup.py). Identity
 			// of a known path is the link itself, not the tags inside it.
 			if (existing) {
-				this.upsertLocalSourceLink(existing.trackId, norm, stat, parsed);
+				// The audio itself changed under a known path. The link keeps its
+				// track (above), but the analysis was computed from the old audio:
+				// drop its catalogue stamp in the same breath as the new hash, so
+				// the old analysis is never shared or topped up under the new key.
+				const audioChanged = existing.audioHash != null && parsed.audioHash != null && existing.audioHash !== parsed.audioHash;
+				this.db.transaction((tx) => {
+					this.upsertLocalSourceLink(existing.trackId, norm, stat, parsed);
+					if (audioChanged) {
+						tx.update(trackAnalysis).set({ audioHash: null }).where(eq(trackAnalysis.trackId, existing.trackId)).run();
+					}
+				});
+				if (audioChanged) slog.info('audio changed under a known path — analysis stamp cleared, re-analysis queued', { trackId: existing.trackId });
 				this.promoteFileFields(existing.trackId, parsed);
 				totals.matched++;
 				this.emit({
@@ -426,7 +442,7 @@ export class LibraryScanner {
 					current: { path: norm, index: totals.scanned },
 					totals,
 				});
-				this.emitIngest({ outcome: 'matched', trackId: existing.trackId, filePath: norm });
+				this.emitIngest({ outcome: 'matched', trackId: existing.trackId, filePath: norm, ...(audioChanged ? { audioChanged } : {}) });
 				return { outcome: 'matched', trackId: existing.trackId };
 			}
 

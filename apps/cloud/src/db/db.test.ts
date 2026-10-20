@@ -47,3 +47,42 @@ describe('jsonb parameters', () => {
 		void sql.end({ timeout: 0 });
 	});
 });
+
+describe('connection string errors', () => {
+	// A Fly secret holding only the password crashed cloud-v0.1.2 at boot and
+	// postgres.js printed the whole value into the log stream. Neither path may
+	// echo the value again.
+	const SECRET = '0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF';
+	const bad = [SECRET, `\x16${SECRET}`, `mysql://u:${SECRET}@h/db`, `postgresql://:${SECRET}@/db`];
+
+	it('never puts the value in the error', async () => {
+		const { assertConnectionString, createPostgresDb } = await import('./db.js');
+		for (const v of bad) {
+			for (const fn of [() => assertConnectionString(v), () => createPostgresDb(v)]) {
+				let message = '';
+				try {
+					fn();
+				} catch (e) {
+					message = `${String(e)} ${JSON.stringify(e)} ${(e as Error).stack ?? ''}`;
+				}
+				expect(message).not.toBe('');
+				expect(message).not.toContain(SECRET);
+			}
+		}
+	});
+
+	it('loadConfig reports DATABASE_URL without the value', async () => {
+		const { loadConfig } = await import('../config.js');
+		expect(() => loadConfig({ DATABASE_URL: SECRET, SUPABASE_URL: 'https://x.supabase.co' })).toThrow(/DATABASE_URL: .*value not shown/);
+		try {
+			loadConfig({ DATABASE_URL: SECRET, SUPABASE_URL: 'https://x.supabase.co' });
+		} catch (e) {
+			expect(String(e)).not.toContain(SECRET);
+		}
+	});
+
+	it('accepts a real-shaped connection string', async () => {
+		const { assertConnectionString } = await import('./db.js');
+		expect(() => assertConnectionString('postgresql://curator_api.ref:pw@aws-0-x.pooler.supabase.com:6543/postgres')).not.toThrow();
+	});
+});

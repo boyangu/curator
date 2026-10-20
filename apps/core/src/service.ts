@@ -242,6 +242,10 @@ import { createInlineBackupHost } from './backup/host.js';
 import { remapLocalPaths } from './backup/apply.js';
 import type { BackupEngineConfig, BackupEvent, BackupHost, BackupRestorePreview, BackupRestoreRequest, BackupSettings, BackupSnapshotSummary, BackupStatus, BackupTargetStat, GoogleAuthStatus } from './backup/types.js';
 import { createMirLayer } from './mir/layer.js';
+import { createCatalogueLayer, type CatalogueLayer } from './catalogue/layer.js';
+import { readCatalogueSettings, writeCatalogueSettings, clampKbps } from './catalogue/mirror.js';
+import type { CatalogueBackfillAction, CatalogueBlobStore, CatalogueEvent, CatalogueSettingsPatch, CatalogueStatus } from './catalogue/types.js';
+import { getDeviceId } from './sync-log/device.js';
 import { sqliteLibraryPort } from './mir/library-port.js';
 import type { MirSidecarSpec } from './mir/sidecar.js';
 import type { MirProvisionSpec } from './mir/provision.js';
@@ -401,6 +405,11 @@ export interface CoreServiceOptions {
 		watchActivity?: (onChange: (active: boolean) => void) => CloudActivityWatcher;
 		// Sent with account.registerDevice on first sign-in.
 		device?: { name: string; platform: DevicePlatform };
+		// The shared analysis catalogue's Storage objects (lo/hi .cpk), moved
+		// by the device with its own session. With `transport.catalogue`, this
+		// builds the catalogue layer (apps/core/src/catalogue/); without
+		// either, there is none and analysis behaves exactly as before.
+		blobs?: CatalogueBlobStore;
 	};
 }
 
@@ -1196,6 +1205,17 @@ export interface CoreService {
 	// startBackupScheduler: the first-sign-in push must not compete with boot.
 	startCloudSync(): void;
 
+	// ─── Shared analysis catalogue (apps/core/src/catalogue/) ───────────
+	// Analysis one of the account's devices computed, reused by the others
+	// (inline units + waveforms by audio hash). Settings are device-local
+	// (app_setting 'catalogue.settings', never synced). `available: false`
+	// when the build has no cloud transport / blob store.
+	getCatalogueStatus(): Promise<CatalogueStatus>;
+	setCatalogueSettings(patch: CatalogueSettingsPatch): Promise<CatalogueStatus>;
+	// The "upload existing analysis" run: only ever started from here.
+	setCatalogueBackfill(action: CatalogueBackfillAction): Promise<CatalogueStatus>;
+	subscribeCatalogue(cb: (e: CatalogueEvent) => void): () => void;
+
 	close(): void;
 }
 
@@ -1825,10 +1845,18 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// worker only runs the stages the user wants. The queue's
 		// enqueue() dedupes already-done tracks so re-matched files don't
 		// re-analyze.
+		// The audio under a known path changed (scanner.ts audioChanged): the
+		// old analysis describes other audio — re-queued in full (queue.ts
+		// requeueChangedAudio). Not gated on auto-analyze: it is queued as
+		// background work, which waits for auto-analyze like any other.
+		libraryScanner.onIngest((evt) => {
+			if (evt.audioChanged) analysisQueue!.requeueChangedAudio(evt.trackId);
+		});
 		libraryScanner.onIngest((evt) => {
 			// Only freshly created/re-matched files have new audio to analyze —
 			// skipped (already known), failed, and orphaned (file removed) don't.
 			if (evt.outcome !== 'created' && evt.outcome !== 'matched') return;
+			if (evt.audioChanged) return;
 			if (!autoAnalyzeSettings.enabled) return;
 			const analyzeOptions = analysisFlagsToOptions(autoAnalyzeSettings.flags);
 			analysisQueue!.enqueue([evt.trackId], { priority: 0, analyzeOptions });
@@ -1965,6 +1993,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		if (sourceScheduler.anyInFlight()) return 'playlist sync';
 		if (mirLayer.isBusy()) return 'AI analysis';
 		if (downloadQueue.hasActive()) return 'downloads';
+		if (catalogue?.isUploading()) return 'shared analysis upload';
 		return null;
 	};
 	const backupEngineConfig = (): BackupEngineConfig => {
@@ -2027,6 +2056,57 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		: null;
 	let cloudWakeUnsub: (() => void) | null = null;
 	let cloudActivity: CloudActivityWatcher | null = null;
+
+	// ─── Shared analysis catalogue ─────────────────────────────────────
+	// Built only with a sync client, the transport's catalogue procedures
+	// and a blob store. It plugs into the analyzer queue (pull-before-compute
+	// for background jobs, upload after persist) and fills tracks in on its
+	// own from the account's inventory — which needs no analyzer at all.
+	const catalogueTransport = opts.cloud?.transport.catalogue;
+	const catalogue: CatalogueLayer | null = cloudClient && opts.cloud && catalogueTransport && opts.cloud.blobs
+		? createCatalogueLayer({
+			db,
+			raw: sqlite,
+			transport: { catalogue: catalogueTransport, session: () => opts.cloud!.transport.session() },
+			blobs: opts.cloud.blobs,
+			deviceId: getDeviceId(sqlite),
+			peaksDir: opts.peaksDir ?? null,
+			serverFeatures: () => cloudClient.serverFeatures(),
+			busyElsewhere: () => (analysisQueue?.busy ? 'audio analysis' : mirLayer.isBusy() ? 'AI analysis' : null),
+			onHydrated: (trackIds) => {
+				// A queued background job whose work just arrived is done.
+				analysisQueue?.settleSatisfied(trackIds, (id, o) => catalogue!.remaining(id, o));
+				cutoffStore.scheduleRecompute();
+			},
+		})
+		: null;
+	if (catalogue) {
+		analysisQueue?.setCatalogue(catalogue.queueHook);
+		// New or re-bound files may be the audio the account already holds.
+		libraryScanner.onIngest((evt) => {
+			if (evt.outcome === 'created' || evt.outcome === 'matched' || evt.outcome === 'rebound') catalogue.wake('ingest');
+		});
+		// The sync client learns the server's features on every push/pull:
+		// the first answer listing 'catalogue' starts the catalogue's work.
+		let offered: boolean | null = null;
+		cloudClient!.subscribe((e) => {
+			if (e.kind !== 'status') return;
+			const now = cloudClient!.serverFeatures()?.includes('catalogue') ?? null;
+			if (now !== offered) {
+				offered = now;
+				if (now) catalogue.wake('features');
+			}
+		});
+	}
+	const catalogueStatusReport = (): CatalogueStatus => catalogue
+		? catalogue.status()
+		: {
+			available: false, settings: readCatalogueSettings(sqlite), signedIn: false, serverOffers: null, policy: null,
+			entitled: null, usage: null, account: { items: 0, bytes: 0 }, device: { reused: 0, uploaded: 0, pending: null },
+			backfill: { state: readCatalogueSettings(sqlite).backfill, uploadedItems: 0, uploadedBytes: 0, waitingFor: null },
+			activity: null, lastHydrateAt: null, lastUploadAt: null, lastError: null, nextRetryAt: null,
+		};
+
 	const cloudStatusReport = (): CloudSyncStatusReport => cloudClient
 		? { ...cloudClient.status(), enabled: true }
 		: {
@@ -5159,9 +5239,34 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		startCloudSync() {
 			if (!cloudClient || cloudWakeUnsub) return;
 			cloudClient.start();
-			cloudWakeUnsub = opts.cloud?.subscribeWakeups?.((reason) => cloudClient.wake(reason)) ?? (() => { /* no wake source */ });
+			catalogue?.start();
+			cloudWakeUnsub = opts.cloud?.subscribeWakeups?.((reason) => {
+				cloudClient.wake(reason);
+				if (reason) catalogue?.wake(reason);
+			}) ?? (() => { /* no wake source */ });
 			cloudActivity = opts.cloud?.watchActivity?.((active) => cloudClient.setActive(active)) ?? null;
 			cloudActivity?.setIdleAfterMs(readPollPolicy(sqlite).idleAfterSec * 1000);
+		},
+
+		async getCatalogueStatus() { return catalogueStatusReport(); },
+		async setCatalogueSettings(patch) {
+			if (catalogue) return catalogue.setSettings(patch);
+			// No layer: still a device setting the user may set ahead of time.
+			const cur = readCatalogueSettings(sqlite);
+			writeCatalogueSettings(sqlite, {
+				...cur,
+				...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
+				...(typeof patch.vectors === 'boolean' ? { vectors: patch.vectors } : {}),
+				...(typeof patch.maxKBps === 'number' && Number.isFinite(patch.maxKBps) ? { maxKBps: clampKbps(patch.maxKBps) } : {}),
+			});
+			return catalogueStatusReport();
+		},
+		async setCatalogueBackfill(action) {
+			if (!catalogue) throw new Error('Shared analysis is not available in this build.');
+			return catalogue.setBackfill(action);
+		},
+		subscribeCatalogue(cb) {
+			return catalogue ? catalogue.subscribe(cb) : () => { /* no catalogue */ };
 		},
 
 		close() {
@@ -5171,6 +5276,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			cloudActivity?.stop();
 			cloudActivity = null;
 			cloudClient?.stop();
+			catalogue?.stop();
 			// Stop the backup scheduler + engine host first: a run mid-upload
 			// must not outlive the DB it snapshotted.
 			backupService.stop();

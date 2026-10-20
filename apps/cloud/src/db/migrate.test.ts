@@ -1,11 +1,8 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestDb, type TestDb } from '../test/harness.js';
+import { createTestDb, ROLES_SQL as rolesSql, type TestDb } from '../test/harness.js';
 import { findSqlDir, listMigrations, migrate, MigrationDriftError } from './migrate.js';
 
 const sqlDir = findSqlDir();
-const rolesSql = readFileSync(join(sqlDir, 'roles.sql'), 'utf8');
 
 describe('migrations', () => {
 	let t: TestDb;
@@ -28,7 +25,16 @@ describe('migrations', () => {
 		const tables = await t.db.query<{ table_name: string }>(
 			`select table_name from information_schema.tables where table_schema = 'curator' order by table_name`,
 		);
-		expect(tables.map((r) => r.table_name)).toEqual(['audit_event', 'device', 'library_op', 'library_snapshot', 'request_log', 'schema_migration']);
+		expect(tables.map((r) => r.table_name)).toEqual([
+			'audit_event',
+			'catalogue_account',
+			'catalogue_item',
+			'device',
+			'library_op',
+			'library_snapshot',
+			'request_log',
+			'schema_migration',
+		]);
 	});
 
 	it('refuses to run when an applied file changed', async () => {
@@ -45,6 +51,8 @@ describe('migrations', () => {
 		);
 		expect(rows).toEqual([
 			{ relname: 'audit_event', relrowsecurity: true },
+			{ relname: 'catalogue_account', relrowsecurity: true },
+			{ relname: 'catalogue_item', relrowsecurity: true },
 			{ relname: 'device', relrowsecurity: true },
 			{ relname: 'library_op', relrowsecurity: true },
 			{ relname: 'library_snapshot', relrowsecurity: true },
@@ -82,14 +90,26 @@ describe('sql/roles.sql', () => {
 	});
 
 	// SET ROLE is checked against the session user, so the session itself
-	// must be curator_api for these to mean anything (PGlite's is postgres).
-	const asSession = async (sql: string[]) =>
-		t.db.begin(async (tx) => {
-			await tx.exec('set local session authorization curator_api');
-			let last: unknown[] = [];
-			for (const s of sql) last = await tx.query(s);
-			return last;
-		});
+	// must be curator_api for these to mean anything (PGlite's is postgres,
+	// a superuser that may become anyone). PGlite keeps SET [LOCAL] SESSION
+	// AUTHORIZATION past the transaction and past RESET, so on the shared
+	// instance it would leave every later test here running as curator_api,
+	// and the permission-denied checks would pass for the wrong reason. Each
+	// call gets a throwaway instance instead, closed with the session in it.
+	const asSession = async (sql: string[]) => {
+		const fresh = await createTestDb();
+		try {
+			await fresh.db.exec(rolesSql);
+			return await fresh.db.begin(async (tx) => {
+				await tx.exec('set local session authorization curator_api');
+				let last: unknown[] = [];
+				for (const s of sql) last = await tx.query(s);
+				return last;
+			});
+		} finally {
+			await fresh.db.close();
+		}
+	};
 
 	it('lets the login role switch to authenticated, and only then reach the tables', async () => {
 		const rows = await asSession([`select set_config('role', 'authenticated', true)`, 'select count(*)::int as n from curator.library_op']);
@@ -110,5 +130,19 @@ describe('sql/roles.sql', () => {
 
 	it('gives anon nothing in the curator schema', async () => {
 		await expect(asRole('anon', 'select * from curator.library_op')).rejects.toThrow(/permission denied/);
+		await expect(asRole('anon', 'select * from curator.catalogue_item')).rejects.toThrow(/permission denied/);
+		await expect(asRole('anon', 'select * from curator.catalogue_account')).rejects.toThrow(/permission denied/);
+	});
+
+	it('gives the login role no catalogue access of its own', async () => {
+		await expect(asRole('curator_api', 'select * from curator.catalogue_item')).rejects.toThrow(/permission denied/);
+		await expect(asRole('curator_api', 'select curator.catalogue_entitled()')).rejects.toThrow(/permission denied/);
+	});
+
+	// Last on purpose, and the reason the asSession instances are throwaway:
+	// every check in this block ran as the role it names, on a session that
+	// is still the owner's.
+	it('leaves the shared instance in the owner session', async () => {
+		await expect(t.db.query('select session_user::text as s, current_user::text as c')).resolves.toEqual([{ s: 'postgres', c: 'postgres' }]);
 	});
 });

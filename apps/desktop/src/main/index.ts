@@ -31,6 +31,7 @@ import { SpotifySidecarHost } from './spotify-sidecar.js';
 import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport } from './cloud/transport.js';
+import { createCatalogueBlobStore } from './cloud/blobs.js';
 import { cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import type { CloudTransport } from '@curator/core';
 
@@ -883,6 +884,15 @@ function registerIpc(svc: CoreService): void {
 	});
 	cloudAccount?.onChange(() => {
 		void svc.getCloudSyncStatus().then((s) => broadcastEvent('cloud-sync:status', s), () => { /* closing */ });
+		void svc.getCatalogueStatus().then((s) => broadcastEvent('catalogue:status', s), () => { /* closing */ });
+	});
+	// Shared analysis: status (coalesced ≤ 4/s in core) for Settings →
+	// Account, and tracks filled in from the catalogue outside an analysis
+	// job, which the track list refreshes exactly like rows a sync pull
+	// changed.
+	svc.subscribeCatalogue((e) => {
+		if (e.kind === 'status') broadcastEvent('catalogue:status', e.status);
+		else broadcastEvent('sync:applied', { tracks: e.trackIds, playlists: [], entities: [] });
 	});
 }
 
@@ -1063,6 +1073,9 @@ app.whenReady().then(async () => {
 				// Focus + OS idle time decide the fallback poll's cadence.
 				watchActivity: (onChange) => watchAppActivity(() => mainWindow, onChange),
 				device: { name: hostname(), platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32' },
+				// Shared analysis: waveform blobs move directly between this
+				// device and Supabase Storage under the user's own session.
+				blobs: createCatalogueBlobStore(accountForCore),
 			}
 			: undefined,
 		peaksDir,

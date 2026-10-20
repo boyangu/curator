@@ -26,7 +26,24 @@ import { promisify } from 'node:util';
 import { app, net } from 'electron';
 import { createTRPCUntypedClient, httpLink, TRPCClientError } from '@trpc/client';
 import { CloudTransportError, decodeLibraryStateSnapshot, type CloudTransport } from '@curator/core';
-import { CALL_ERROR_REASONS, SNAPSHOT_ENCODING, type BootstrapResult, type CallErrorReason, type DeviceInfo, type PullInput, type PullResult, type PushInput, type PushResult, type RegisterDeviceInput } from '@curator/protocol';
+import {
+	CALL_ERROR_REASONS,
+	SNAPSHOT_ENCODING,
+	type BootstrapResult,
+	type CallErrorReason,
+	type CatalogueInventoryInput,
+	type CatalogueInventoryResult,
+	type CatalogueLookupInput,
+	type CatalogueLookupResult,
+	type CataloguePutInput,
+	type CataloguePutResult,
+	type DeviceInfo,
+	type PullInput,
+	type PullResult,
+	type PushInput,
+	type PushResult,
+	type RegisterDeviceInput,
+} from '@curator/protocol';
 import { mainLog } from '../log.js';
 import type { CloudAccount } from './account.js';
 
@@ -43,6 +60,12 @@ const PROCS = {
 	registerDevice: { path: 'account.registerDevice', type: 'mutation' },
 	devices: { path: 'account.devices', type: 'query' },
 	revokeDevice: { path: 'account.revokeDevice', type: 'mutation' },
+	// The shared analysis catalogue (apps/cloud src/catalogue). Lookup is a
+	// mutation only so 50 hashes and a want list ride in the body; it writes
+	// nothing. Inventory is a plain query (a rev and a device id).
+	catalogueLookup: { path: 'catalogue.lookup', type: 'mutation' },
+	cataloguePut: { path: 'catalogue.put', type: 'mutation' },
+	catalogueInventory: { path: 'catalogue.inventory', type: 'query' },
 } as const;
 
 // A snapshot of a 40k-track library inflates to tens of MB; cap what a
@@ -167,8 +190,22 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 	});
 
 	// What each procedure moved, for its log line: counts only, never content.
-	const opsSent = (proc: Proc, input: unknown): number | null => (proc === PROCS.push ? ((input as PushInput).ops?.length ?? 0) : null);
-	const opsReceived = (proc: Proc, out: unknown): number | null => (proc === PROCS.pull ? ((out as PullResult).ops?.length ?? 0) : null);
+	// The catalogue reuses the op columns as item counts, as the server's
+	// request_log does: hashes asked / items returned, items put / accepted,
+	// inventory entries.
+	const opsSent = (proc: Proc, input: unknown): number | null => {
+		if (proc === PROCS.push) return (input as PushInput).ops?.length ?? 0;
+		if (proc === PROCS.catalogueLookup) return (input as CatalogueLookupInput).audioHashes?.length ?? 0;
+		if (proc === PROCS.cataloguePut) return (input as CataloguePutInput).items?.length ?? 0;
+		return null;
+	};
+	const opsReceived = (proc: Proc, out: unknown): number | null => {
+		if (proc === PROCS.pull) return (out as PullResult).ops?.length ?? 0;
+		if (proc === PROCS.catalogueLookup) return (out as CatalogueLookupResult).items?.length ?? 0;
+		if (proc === PROCS.cataloguePut) return (out as CataloguePutResult).accepted?.length ?? 0;
+		if (proc === PROCS.catalogueInventory) return (out as CatalogueInventoryResult).entries?.length ?? 0;
+		return null;
+	};
 
 	const call = async <T>(proc: Proc, input?: unknown): Promise<T> => {
 		// No session: fail fast as auth instead of a guaranteed 401 round trip.
@@ -190,7 +227,11 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			const out = (proc.type === 'query' ? await client.query(proc.path, input, opts) : await client.mutation(proc.path, input, opts)) as T;
 			const received = opsReceived(proc, out);
 			const fields = { ...base(), outcome: 'ok', status: w.status, opsReceived: received };
-			if (proc === PROCS.pull && received === 0) clog.debug('call', fields);
+			// Empty pulls and inventories are the idle poll; a catalogue lookup
+			// runs per analysed track. At info they would crowd out the lines a
+			// support read needs (the catalogue logs its own batch summaries).
+			const quiet = (proc === PROCS.pull && received === 0) || (proc === PROCS.catalogueInventory && received === 0) || proc === PROCS.catalogueLookup;
+			if (quiet) clog.debug('call', fields);
 			else clog.info('call', fields);
 			return out;
 		} catch (err) {
@@ -229,6 +270,11 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			registerDevice: (input: RegisterDeviceInput) => call<{ ok: true }>(PROCS.registerDevice, input),
 			devices: () => call<DeviceInfo[]>(PROCS.devices),
 			revokeDevice: (input: { deviceId: string }) => call<{ ok: true }>(PROCS.revokeDevice, input),
+		},
+		catalogue: {
+			lookup: (input: CatalogueLookupInput) => call<CatalogueLookupResult>(PROCS.catalogueLookup, input),
+			put: (input: CataloguePutInput) => call<CataloguePutResult>(PROCS.cataloguePut, input),
+			inventory: (input: CatalogueInventoryInput) => call<CatalogueInventoryResult>(PROCS.catalogueInventory, input),
 		},
 	};
 }

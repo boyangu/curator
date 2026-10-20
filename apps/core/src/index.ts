@@ -24,6 +24,7 @@ export { applyPendingRestore, readPendingRestore, readRestoreApplied, clearResto
 export { CloudTransportError, type CloudTransport, type CloudSession, type CloudErrorKind, type CloudSyncStatus, type CloudSyncEvent, type CloudSyncApplied, type WakeReason } from './sync-log/client.js';
 export { decodeLibraryStateSnapshot, type SnapshotRecord } from './sync-log/snapshot.js';
 export type { SyncPollPolicy, SyncPollSettings } from './sync-log/poll-policy.js';
+export { CatalogueBlobError, DEFAULT_CATALOGUE_SETTINGS, CATALOGUE_KBPS_LIMITS, type CatalogueBlobStore, type CatalogueTransport, type CatalogueStatus, type CatalogueSettings, type CatalogueSettingsPatch, type CatalogueBackfillAction, type CatalogueBackfillState, type CatalogueEvent } from './catalogue/types.js';
 export type { CreatePhaseSummary as RekordboxCreateSummary } from './rekordbox/create-phase.js';
 export { config } from './config.js';
 export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/index.js';

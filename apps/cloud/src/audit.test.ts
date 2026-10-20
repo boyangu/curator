@@ -226,7 +226,7 @@ describe('request_log', () => {
 	});
 
 	it('logs a rate-limited call with its reason and raises rate_limited', async () => {
-		const limited = await createTestApp({ limits: { push: new TokenBucketLimiter(1, 0.001), pull: new TokenBucketLimiter(1, 0.001) } });
+		const limited = await createTestApp({ limits: { push: new TokenBucketLimiter(1, 0.001), pull: new TokenBucketLimiter(1, 0.001), catalogue: new TokenBucketLimiter(1, 0.001) } });
 		try {
 			const { userId, token, deviceId } = await limited.signIn();
 			const auth = { authorization: `Bearer ${token}` };

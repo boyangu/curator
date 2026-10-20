@@ -319,6 +319,7 @@ CREATE TABLE IF NOT EXISTS track_analysis (
 	duration REAL,
 	analyzer_version TEXT NOT NULL,
 	analyzed_at INTEGER NOT NULL,
+	audio_hash TEXT,
 	rb_beatgrid BLOB,
 	rb_downbeats BLOB,
 	rb_bpm REAL,
@@ -952,6 +953,24 @@ const ALTER_MIGRATIONS: string[] = [
 	// every run before) and a pending Curator-side rename can't be blessed as
 	// already-pushed.
 	`ALTER TABLE playlist ADD COLUMN rb_name_seen TEXT`,
+	// Shared analysis catalogue (apps/core/src/catalogue/) — see
+	// trackAnalysis.audioHash and catalogue_entry in schema.ts. The stamp on
+	// existing rows is filled by backfillAnalysisAudioHash (gated); the
+	// mirror starts empty and fills from the server's inventory.
+	`ALTER TABLE track_analysis ADD COLUMN audio_hash TEXT`,
+	`CREATE INDEX IF NOT EXISTS track_analysis_audio_hash_idx ON track_analysis(audio_hash)`,
+	`CREATE TABLE IF NOT EXISTS catalogue_entry (
+		audio_hash TEXT NOT NULL,
+		unit TEXT NOT NULL,
+		variant TEXT NOT NULL,
+		version_key TEXT NOT NULL,
+		remote_rev INTEGER NOT NULL DEFAULT 0,
+		bytes INTEGER NOT NULL DEFAULT 0,
+		local_state TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (audio_hash, unit, variant)
+	)`,
+	`CREATE INDEX IF NOT EXISTS catalogue_entry_state_idx ON catalogue_entry(local_state)`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.
@@ -1903,6 +1922,43 @@ function dedupeOutboxRestatements(sqlite: Database.Database, dbPath: string): vo
 	mlog.info('outbox restatements removed', { removed, outboxBefore: before, outboxAfter: before - removed });
 }
 
+// ─── track_analysis.audio_hash backfill ─────────────────────────────────────
+// One-shot, versioned in app_setting. Rows analysed before the stamp existed
+// get the hash of their track's single live local link: with one file there
+// is only one audio the Curator slot can have been computed from. A track
+// with two or more live local links (a duplicate copy, a WAV conversion
+// sharing the row) stays NULL — which file was analysed is unknown, so the
+// row is neither shared nor filled from the catalogue until a fresh analysis
+// stamps it. Writes only the new column, so no backup: nothing it touches
+// existed before this version.
+const CATALOGUE_HASH_VERSION = 1;
+const CATALOGUE_HASH_KEY = 'catalogue_hash_version';
+
+function backfillAnalysisAudioHash(sqlite: Database.Database): void {
+	if (readSettingInt(sqlite, CATALOGUE_HASH_KEY) >= CATALOGUE_HASH_VERSION) return;
+	const started = Date.now();
+	let stamped = 0;
+	sqlite.transaction(() => {
+		stamped = sqlite.prepare(`
+			UPDATE track_analysis SET audio_hash = (
+				SELECT sl.audio_hash FROM source_link sl
+				WHERE sl.track_id = track_analysis.track_id AND sl.source = 'local' AND sl.missing_at IS NULL
+			)
+			WHERE audio_hash IS NULL
+				AND (SELECT count(*) FROM source_link sl
+					WHERE sl.track_id = track_analysis.track_id AND sl.source = 'local' AND sl.missing_at IS NULL) = 1
+				AND EXISTS (SELECT 1 FROM source_link sl
+					WHERE sl.track_id = track_analysis.track_id AND sl.source = 'local' AND sl.missing_at IS NULL
+						AND sl.audio_hash IS NOT NULL)
+		`).run().changes;
+		sqlite.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+			.run(CATALOGUE_HASH_KEY, JSON.stringify(CATALOGUE_HASH_VERSION), Date.now());
+	})();
+	const total = (sqlite.prepare(`SELECT count(*) AS n FROM track_analysis`).get() as { n: number }).n;
+	mlog.info('stamped analysis rows with their audio hash', { stamped, rows: total, ms: Date.now() - started });
+}
+
 // Consistent snapshot next to the DB before a migration that rewrites
 // library content. VACUUM INTO works under WAL and needs no open
 // transaction. Keeps the newest 3 per tag so the folder doesn't fill up.
@@ -2009,6 +2065,9 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// Collapse play-history restatements a pre-fix rekordbox sync left in a
 	// never-synced outbox. One-shot, gated, backs up first.
 	dedupeOutboxRestatements(sqlite, dbPath);
+	// Stamp existing analysis rows with the audio they describe, so the
+	// catalogue can share them. One-shot, gated; touches only the new column.
+	backfillAnalysisAudioHash(sqlite);
 	sqlite.close();
 }
 

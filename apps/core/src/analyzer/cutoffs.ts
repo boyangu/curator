@@ -37,7 +37,7 @@ import type { Db } from '../db/client.js';
 
 // Map product-name metric → the matching column name on `track`. The columns
 // hold the canonical analyzer values (mirrored from track_analysis by
-// queue.persistResult); we percentile-rank over the `track` table so the
+// persist.ts persistAnalysisResult); we percentile-rank over the `track` table so the
 // cutoffs include any rows that were analyzed but lost their track_analysis
 // row through cascade-delete edge cases.
 const METRIC_TO_COLUMN: Record<MetricName, string> = {

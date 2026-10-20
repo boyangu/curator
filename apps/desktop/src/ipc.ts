@@ -1,6 +1,6 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings, CloudSyncApplied } from '@curator/core';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
 import type { DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
@@ -300,6 +300,11 @@ export interface IpcChannels {
 	// over the stored value and is clamped; null restores the defaults.
 	'cloud-sync:get-poll-settings': { args: []; ret: SyncPollSettings };
 	'cloud-sync:set-poll-policy':   { args: [patch: Partial<SyncPollPolicy> | null]; ret: SyncPollSettings };
+	// Shared analysis catalogue (core catalogue/): status, the device-local
+	// settings, and the "upload existing analysis" button.
+	'catalogue:status':       { args: []; ret: CatalogueStatus };
+	'catalogue:set-settings': { args: [patch: CatalogueSettingsPatch]; ret: CatalogueStatus };
+	'catalogue:backfill':     { args: [action: CatalogueBackfillAction]; ret: CatalogueStatus };
 
 	// ─── Discover feed ────────────────────────────────────────────────────
 	// Feed items live in feed.db behind the core FeedStore — see
@@ -452,6 +457,8 @@ export type EventChannels = {
 	// Cloud sync status snapshots (push/pull state, first-sign-in push
 	// progress, errors; progress coalesced ≤ 4/s) and sign-in changes.
 	'cloud-sync:status': CloudSyncStatusReport;
+	// Shared analysis status (coalesced ≤ 4/s), and on sign-in changes.
+	'catalogue:status': CatalogueStatus;
 	// A pull or bootstrap changed local rows: the track list patches these
 	// rows; container entities (tag / playlist / folder) refresh the sidebar.
 	'sync:applied': CloudSyncApplied;
@@ -492,6 +499,7 @@ export const EVENT_CATALOG = {
 	onMcpConfirm: 'mcp:confirm',
 	onMcpNotify: 'mcp:notify',
 	onCloudSyncStatus: 'cloud-sync:status',
+	onCatalogueStatus: 'catalogue:status',
 	onSyncApplied: 'sync:applied',
 } as const satisfies Record<string, keyof EventChannels>;
 
@@ -790,6 +798,9 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'cloud-sync:now': { description: 'Run one library cloud sync cycle now (push local changes, then pull remote ones). Returns the status after it.' },
 	'cloud-sync:get-poll-settings': { description: 'How often this device checks the cloud for changes when no push notification arrives: seconds between checks while the app is in use (activeSec), while idle (idleSec), and how long without use counts as idle (idleAfterSec); plus defaults and limits.' },
 	'cloud-sync:set-poll-policy': { description: 'Change this device\'s cloud check cadence (partial patch of activeSec / idleSec / idleAfterSec, clamped; null restores defaults). Applies to the running sync at once; not synced to other devices.' },
+	'catalogue:status': { description: 'Shared analysis status: whether this device reuses analysis from the account\'s other devices (setting, server stage/policy, entitlement), the account\'s holdings and quota, what this device reused / uploaded / has pending, the existing-library upload state, the last error.' },
+	'catalogue:set-settings': { description: 'Change this device\'s shared analysis settings (partial patch: enabled = reuse and share analysis, vectors, maxKBps upload throttle). Device-local, never synced.' },
+	'catalogue:backfill': { description: 'Control the upload of this device\'s existing analysis to the account (start | pause | resume | stop). Throttled; waits while analysis runs.' },
 	'analysis:status': { description: 'Snapshot of the analyzer queue: trackIds currently being analyzed, and the number of jobs still queued. Used by the renderer to backfill its in-memory state on first wire / HMR reload, since the event stream only delivers transitions from this point forward.' },
 	'feed:get-page': { description: 'Return a ranked page of Discover feed items (keyset cursor pagination). Items are recency-ordered, suppression-filtered, and exclude dismissed/archived/promoted rows. Also returns the total visible count for the Discover tab chip.' },
 	'feed:archived-page': { description: 'Return a page of archived feed items (state=archived), newest first, keyset-paginated. No suppression filter — archiving is an explicit per-item choice. Returns the total archived count.' },

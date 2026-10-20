@@ -47,7 +47,9 @@ const handler = createFetchHandler({
 	auth: createTokenVerifier({ supabaseUrl: config.supabaseUrl, keys: remoteKeys(config.supabaseUrl) }),
 	limits: defaultRateLimits(),
 	pull: DEFAULT_PULL_OPTIONS,
+	catalogue: config.catalogue,
 });
+log.info('catalogue_policy', { allow: config.catalogue?.allow.map((a) => (a.variants ? `${a.unit}:${a.variants.join('|')}` : a.unit)) ?? 'off' });
 
 const server = createServer(toNodeListener(handler, { log, audit }));
 // Longer than Fly's proxy idle timeout (60 s) so the proxy, not Node, closes

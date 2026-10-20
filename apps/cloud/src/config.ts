@@ -3,11 +3,20 @@
 // placeholders). Read once at startup: a missing or malformed value fails the
 // boot loudly instead of surfacing as a 500 on the first request.
 
+import type { CataloguePolicy } from '@curator/protocol';
+import { CataloguePolicyError, parseCataloguePolicy } from './catalogue/policy.js';
+import { assertConnectionString } from './db/db.js';
+
 export type Config = {
 	databaseUrl: string;
 	// Without a trailing slash; the issuer and the JWKS URL derive from it.
 	supabaseUrl: string;
 	port: number;
+	// CURATOR_CATALOGUE (src/catalogue/policy.ts): the catalogue units this
+	// server accepts, or null when the catalogue is off. Not a secret: it
+	// lives in fly.toml [env], so the stage (D-a / D-b) is versioned with the
+	// code.
+	catalogue: CataloguePolicy | null;
 };
 
 export class ConfigError extends Error {
@@ -22,6 +31,11 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 	const databaseUrl = required(env, 'DATABASE_URL');
+	try {
+		assertConnectionString(databaseUrl);
+	} catch (e) {
+		throw new ConfigError(`DATABASE_URL: ${e instanceof Error ? e.message : 'invalid'}`);
+	}
 	const supabaseUrl = required(env, 'SUPABASE_URL').replace(/\/+$/, '');
 	let parsed: URL;
 	try {
@@ -36,5 +50,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 	}
 	const port = Number(env.PORT ?? 8080);
 	if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new ConfigError(`PORT is not a port: ${env.PORT}`);
-	return { databaseUrl, supabaseUrl, port };
+	let catalogue: CataloguePolicy | null;
+	try {
+		catalogue = parseCataloguePolicy(env.CURATOR_CATALOGUE);
+	} catch (e) {
+		if (e instanceof CataloguePolicyError) throw new ConfigError(e.message);
+		throw e;
+	}
+	return { databaseUrl, supabaseUrl, port, catalogue };
 }

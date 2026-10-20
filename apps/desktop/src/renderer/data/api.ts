@@ -341,6 +341,15 @@ export const cloudSyncApi = {
 	onApplied: (cb: Parameters<typeof window.api.onSyncApplied>[0]) => api().onSyncApplied(cb),
 };
 
+// Shared analysis catalogue (Settings → Account). Status rides window.api,
+// actions ride tRPC, like cloudSyncApi.
+export const catalogueApi = {
+	status: () => api()['catalogue:status'](),
+	setSettings: (patch: Parameters<typeof window.api['catalogue:set-settings']>[0]) => trpc.catalogue.setSettings.mutate([patch]),
+	backfill: (action: Parameters<typeof window.api['catalogue:backfill']>[0]) => trpc.catalogue.backfill.mutate([action]),
+	onStatus: (cb: Parameters<typeof window.api.onCatalogueStatus>[0]) => api().onCatalogueStatus(cb),
+};
+
 export const dialogApi = {
 	pickFolder: () => trpc.dialog.pickFolder.mutate([]),
 };

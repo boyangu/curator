@@ -32,13 +32,12 @@ import {
 	sourceLink,
 	type AnalysisJob,
 	type NewAnalysisJob,
-	type NewTrackAnalysis,
 	type TrackArtist,
 } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
 import { log } from '../log.js';
-import { addClaims } from '../library/mutators.js';
-import { AnalyzerSidecar, type AnalyzeOptions, type AnalyzeResult, type ProgressEvent, type SidecarError } from './sidecar.js';
+import { persistAnalysisResult } from './persist.js';
+import { ADVANCED_FEATURES, AnalyzerSidecar, type AnalyzeOptions, type ProgressEvent, type SidecarError } from './sidecar.js';
 
 const qlog = log.for('analyzer-queue');
 
@@ -77,7 +76,7 @@ function parseVersion(v: string): number[] | null {
 // marker counts as stale (the old `!= expected` behaviour) except
 // 'rekordbox': that marker tags rows whose grid came from the rb importer;
 // running the analyzer over them would preserve the grid anyway
-// (persistResult writes only what the pass produced) and just restamp the
+// (persistAnalysisResult writes only what the pass produced) and just restamp the
 // marker, so the cycle would repeat on every boot until the user intervened.
 export function needsFullReanalysis(analyzerVersion: string): boolean {
 	if (analyzerVersion === 'rekordbox') return false;
@@ -143,6 +142,28 @@ export type AnalysisJobEvent =
 
 const DEFAULT_CONCURRENCY = 4;
 
+// The shared analysis catalogue's seam into the queue (apps/core/src/catalogue/
+// implements it; absent = the queue behaves exactly as without a catalogue).
+//
+//   prepare   pull-before-compute for a BACKGROUND job (priority below
+//             AUTO_PRIORITY_GATE), before prior-injection: fills what the
+//             account already holds for this file's audio through the same
+//             persist path, and returns the job's options with the satisfied
+//             stages turned into skips. `done` = nothing left for the
+//             analyzer. `keepLo` = the lo peaks tier came from the catalogue
+//             and the analyzer (still running for the hi tier) must not
+//             overwrite it. Resolves quickly when offline or disabled (it has
+//             its own timeout and breaker); null = proceed as usual.
+//   persisted a result landed for this track (kicks the uploader; in memory,
+//             no network inside the write).
+// Manual jobs (priority >= AUTO_PRIORITY_GATE) never call prepare: the user
+// asked for a fresh computation. Their results still upload.
+export interface AnalysisCatalogueHook {
+	prepare(job: { trackId: string; path: string; options: AnalyzeOptions | undefined; peaksLoPath: string; peaksHiPath: string }): Promise<CataloguePrepared | null>;
+	persisted(trackId: string): void;
+}
+export type CataloguePrepared = { options: AnalyzeOptions | undefined; done: boolean; keepLo: boolean };
+
 // Priority floor that gates background (auto) work when the user has
 // "Automatically analyze new tracks" turned off. Jobs at priority >= this
 // always dispatch (user-initiated paths); jobs below it wait. The Analyze
@@ -179,6 +200,7 @@ export class AnalysisQueue extends EventEmitter {
 	// triggers the stale-version backfill — that's the only place backfill
 	// runs now (formerly fired unconditionally in the constructor).
 	private autoEnabled = false;
+	private catalogue: AnalysisCatalogueHook | null = null;
 
 	constructor(
 		private readonly db: Db,
@@ -189,6 +211,69 @@ export class AnalysisQueue extends EventEmitter {
 		this.concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
 		this.hydrate();
 		this.wireSidecarEvents();
+	}
+
+	// The catalogue layer is built after the queue (it needs the cloud
+	// transport); null detaches it.
+	setCatalogue(hook: AnalysisCatalogueHook | null): void {
+		this.catalogue = hook;
+	}
+
+	// The catalogue hydrated these tracks outside a dispatch: a QUEUED
+	// background job whose work is now all present is finished without the
+	// analyzer. `remaining` answers, per track and the options the job was
+	// queued with, how many stages the analyzer would still have to run.
+	// Manual jobs are left alone (the user asked for a fresh run), as are
+	// running ones.
+	settleSatisfied(trackIds: readonly string[], remaining: (trackId: string, options: AnalyzeOptions | undefined) => number): number {
+		if (trackIds.length === 0) return 0;
+		const rows = this.db
+			.select({ trackId: analysisJob.trackId, priority: analysisJob.priority })
+			.from(analysisJob)
+			.where(and(inArray(analysisJob.trackId, [...trackIds]), eq(analysisJob.state, 'queued')))
+			.all();
+		let settled = 0;
+		for (const r of rows) {
+			if (r.priority >= AUTO_PRIORITY_GATE || this.inflight.has(r.trackId)) continue;
+			if (remaining(r.trackId, this.pendingOptions.get(r.trackId)) > 0) continue;
+			this.db.update(analysisJob)
+				.set({ state: 'done', startedAt: null, finishedAt: new Date(), error: null, errorKind: null })
+				.where(and(eq(analysisJob.trackId, r.trackId), eq(analysisJob.state, 'queued')))
+				.run();
+			this.pendingOptions.delete(r.trackId);
+			this.emitEvent({ kind: 'completed', trackId: r.trackId });
+			settled++;
+		}
+		return settled;
+	}
+
+	// The file under a known path now holds different audio (the scanner saw
+	// its audio hash change and already cleared the row's catalogue stamp):
+	// the Curator slot describes something else. Re-queued as background
+	// work that recomputes everything the row had — every override on, so
+	// nothing of the old row is injected, and the advanced stage too when
+	// the row carried advanced values — which is also what lets the result
+	// restamp the row (stampFor's fresh pass). Background priority: it waits
+	// for auto-analyze like the rest of the background lane.
+	requeueChangedAudio(trackId: string): void {
+		const had = this.db
+			.select({ brightness: trackAnalysis.brightness, power: trackAnalysis.power, dissonance: trackAnalysis.dissonance, density: trackAnalysis.density })
+			.from(trackAnalysis)
+			.where(eq(trackAnalysis.trackId, trackId))
+			.get();
+		const advanced = !!had && (had.brightness != null || had.power != null || had.dissonance != null || had.density != null);
+		this.enqueue([trackId], {
+			priority: 0,
+			force: true,
+			analyzeOptions: {
+				overrideBeatgrid: true,
+				overrideBpm: true,
+				overrideKey: true,
+				overrideSegments: true,
+				overridePeaks: true,
+				features: advanced ? [...ADVANCED_FEATURES] : [],
+			},
+		});
 	}
 
 	// Reset `running` rows back to `queued` on construction. A crash mid-
@@ -448,7 +533,7 @@ export class AnalysisQueue extends EventEmitter {
 			} else if ((cur.state === 'done' || cur.state === 'error' || cur.state === 'skipped') && opts.force) {
 				// Re-queue a terminal job. We deliberately do NOT delete the
 				// track_analysis row: the analyzer owns only the Curator slot
-				// (the rb_* slot is the importer's), and persistResult preserves
+				// (the rb_* slot is the importer's), and persistAnalysisResult preserves
 				// any field this pass doesn't recompute, so a re-analyze never
 				// drops a beatgrid/key/segments. (The old `done && force` branch
 				// wiped the whole row — that destroyed rb-imported grids and
@@ -556,7 +641,7 @@ export class AnalysisQueue extends EventEmitter {
 		}
 	}
 
-	private pickBatch(count: number): Array<{ trackId: string; path: string }> {
+	private pickBatch(count: number): Array<{ trackId: string; path: string; priority: number }> {
 		// One query: join analysis_job → source_link (source='local') so we
 		// only dispatch tracks that actually have a local file to analyze.
 		// Skip rows already in flight (claimed by an earlier loop iteration).
@@ -576,6 +661,7 @@ export class AnalysisQueue extends EventEmitter {
 			.select({
 				trackId: analysisJob.trackId,
 				path: sourceLink.filePath,
+				priority: analysisJob.priority,
 			})
 			.from(analysisJob)
 			.innerJoin(sourceLink, and(
@@ -593,7 +679,7 @@ export class AnalysisQueue extends EventEmitter {
 			.orderBy(desc(analysisJob.priority), asc(analysisJob.enqueuedAt))
 			.limit(this.inflight.size + count)
 			.all();
-		const out: Array<{ trackId: string; path: string }> = [];
+		const out: Array<{ trackId: string; path: string; priority: number }> = [];
 		const claimed = new Set<string>();
 		for (const r of rows) {
 			if (!r.path) continue;
@@ -601,13 +687,13 @@ export class AnalysisQueue extends EventEmitter {
 			// claim it once per batch.
 			if (this.inflight.has(r.trackId) || claimed.has(r.trackId)) continue;
 			claimed.add(r.trackId);
-			out.push({ trackId: r.trackId, path: r.path });
+			out.push({ trackId: r.trackId, path: r.path, priority: r.priority });
 			if (out.length >= count) break;
 		}
 		return out;
 	}
 
-	private async dispatchOne(target: { trackId: string; path: string }): Promise<void> {
+	private async dispatchOne(target: { trackId: string; path: string; priority: number }): Promise<void> {
 		const { trackId, path } = target;
 		this.inflight.add(trackId);
 		this.db.update(analysisJob)
@@ -659,7 +745,38 @@ export class AnalysisQueue extends EventEmitter {
 
 		const outPeaksLoPath = join(this.opts.peaksDir, 'lo', `${trackId}.cpk`);
 		const outPeaksHiPath = join(this.opts.peaksDir, 'hi', `${trackId}.cpk`);
-		const analyzeOptions = this.pendingOptions.get(trackId);
+		let analyzeOptions = this.pendingOptions.get(trackId);
+		// Pull-before-compute (background jobs only): whatever the account's
+		// catalogue already holds for this audio is filled in first, so the
+		// prior-injection below sees it and the analyzer skips those stages.
+		let keepLo = false;
+		if (this.catalogue && target.priority < AUTO_PRIORITY_GATE) {
+			let prepared: CataloguePrepared | null = null;
+			try {
+				prepared = await this.catalogue.prepare({ trackId, path, options: analyzeOptions, peaksLoPath: outPeaksLoPath, peaksHiPath: outPeaksHiPath });
+			} catch (err) {
+				qlog.warn('catalogue prepare failed — analysing locally', { trackId }, err);
+			}
+			if (prepared?.done) {
+				const cancelled = this.cancelled.delete(trackId);
+				this.db.update(analysisJob)
+					.set({ state: cancelled ? 'skipped' : 'done', finishedAt: new Date() })
+					.where(eq(analysisJob.trackId, trackId))
+					.run();
+				this.emitEvent(cancelled ? { kind: 'cancelled', trackId } : { kind: 'completed', trackId });
+				this.inflight.delete(trackId);
+				this.pendingOptions.delete(trackId);
+				this.drain();
+				return;
+			}
+			if (prepared) {
+				analyzeOptions = prepared.options;
+				keepLo = prepared.keepLo;
+			}
+		}
+		// Decided before the write: whether the row was already about this
+		// file's audio (see stampFor).
+		const stamp = this.stampFor(trackId, path, analyzeOptions);
 		// Prior-grid injection: when the track already has a beatgrid +
 		// bpm in track_analysis and the user hasn't ticked
 		// overrideBeatgrid, pass them to the worker so it can skip
@@ -674,12 +791,21 @@ export class AnalysisQueue extends EventEmitter {
 		// itself opted out (the fingerprint backfill sets skipPeaks up front;
 		// re-setting it here is a no-op). Clone the effective options so we
 		// never mutate the stored / pending ones.
+		//
+		// The skip keys on the HI tier only: the analyzer writes both tiers in
+		// one stage, and a lo .cpk alone (the catalogue ships lo first) must
+		// never stop the hi tier being computed.
 		let dispatchOptions = effectiveOptions;
 		if (!analyzeOptions?.overridePeaks && await fileExists(outPeaksHiPath)) {
 			dispatchOptions = { ...(effectiveOptions ?? {}), skipPeaks: true };
 		}
+		// A lo tier pulled from the catalogue stays byte-for-byte what the
+		// account holds: the analyzer, still running for the hi tier, writes
+		// its own lo strip beside it and that copy is thrown away.
+		const loDiscardPath = keepLo && !dispatchOptions?.skipPeaks ? join(this.opts.peaksDir, 'lo', `.${trackId}.discard.cpk`) : null;
 		try {
-			const result = await this.sidecar.analyze({ trackId, path, outPeaksLoPath, outPeaksHiPath, options: dispatchOptions });
+			const result = await this.sidecar.analyze({ trackId, path, outPeaksLoPath: loDiscardPath ?? outPeaksLoPath, outPeaksHiPath, options: dispatchOptions });
+			if (loDiscardPath) await fsp.rm(loDiscardPath, { force: true }).catch(() => { /* retried in finally */ });
 			if (this.cancelled.delete(trackId)) {
 				// Treat post-hoc cancel as success-but-discard — the file is
 				// already written. Marking it `done` would mislead the UI.
@@ -690,12 +816,13 @@ export class AnalysisQueue extends EventEmitter {
 				this.emitEvent({ kind: 'cancelled', trackId });
 				return;
 			}
-			this.persistResult(result, path);
+			persistAnalysisResult(this.db, result, path, { audioHash: stamp });
 			this.db.update(analysisJob)
 				.set({ state: 'done', finishedAt: new Date() })
 				.where(eq(analysisJob.trackId, trackId))
 				.run();
 			this.emitEvent({ kind: 'completed', trackId });
+			this.catalogue?.persisted(trackId);
 		} catch (err) {
 			const e = err as SidecarError;
 			const kind = e.kind ?? 'internal';
@@ -727,6 +854,7 @@ export class AnalysisQueue extends EventEmitter {
 				this.emitEvent({ kind: 'failed', trackId, errorKind: kind, message });
 			}
 		} finally {
+			if (loDiscardPath) await fsp.rm(loDiscardPath, { force: true }).catch(() => { /* best effort */ });
 			this.inflight.delete(trackId);
 			// Drop any per-track override now that the dispatch is finished.
 			// If the dispatch failed-transient (sidecar_unavailable, row left
@@ -739,6 +867,50 @@ export class AnalysisQueue extends EventEmitter {
 		}
 	}
 
+	// What `track_analysis.audio_hash` becomes when this dispatch's result
+	// lands (persist.ts PersistOptions). The stamp says "the Curator slot was
+	// computed from this audio", which the shared catalogue relies on, so it
+	// moves only when that is known:
+	//   - no row yet, or the row is already stamped with this file's hash:
+	//     everything in it is about this audio, the stamp stays/lands;
+	//   - a fresh pass (beatgrid, key and segments all overridden, so nothing
+	//     of the old row is injected) over an unstamped or differently
+	//     stamped row: e.g. the scanner's re-analysis after the file's audio
+	//     changed; the row is about this audio again;
+	//   - an unstamped row with no Curator values at all (rekordbox-only);
+	//   - otherwise (an unstamped row a partial pass tops up): left alone.
+	// A non-default rhythm method yields a grid the catalogue never shares,
+	// so it clears the stamp.
+	private stampFor(trackId: string, path: string, opts: AnalyzeOptions | undefined): string | null | undefined {
+		if (opts?.rhythmMethod && opts.rhythmMethod !== 'multifeature' && !opts.skipBeatgrid) return null;
+		const link = this.db
+			.select({ audioHash: sourceLink.audioHash })
+			.from(sourceLink)
+			.where(and(eq(sourceLink.source, 'local'), eq(sourceLink.filePath, path)))
+			.get();
+		const hash = link?.audioHash ?? null;
+		if (!hash) return undefined;
+		const row = this.db
+			.select({
+				audioHash: trackAnalysis.audioHash,
+				bpm: trackAnalysis.bpm,
+				keyCamelot: trackAnalysis.keyCamelot,
+				segmentsJson: trackAnalysis.segmentsJson,
+				brightness: trackAnalysis.brightness,
+				power: trackAnalysis.power,
+			})
+			.from(trackAnalysis)
+			.where(eq(trackAnalysis.trackId, trackId))
+			.get();
+		if (!row || row.audioHash === hash) return hash;
+		if (opts?.overrideBeatgrid && opts.overrideKey && opts.overrideSegments) return hash;
+		// An unstamped row with no Curator values (a rekordbox-only row): there
+		// is nothing in it that could describe other audio.
+		const empty = row.bpm == null && row.keyCamelot == null && row.segmentsJson == null && row.brightness == null && row.power == null;
+		if (row.audioHash === null && empty) return hash;
+		return undefined;
+	}
+
 	// Build the analyze() options for a dispatch by layering prior-value
 	// injection on top of any user-supplied options. For each of the four
 	// "respected" fields (beatgrid, bpm, key, segments) we inject the
@@ -748,7 +920,7 @@ export class AnalysisQueue extends EventEmitter {
 	//     (which means "yes, actually compute a fresh value this time")
 	// The worker then skips the matching detection stage, saving CPU and
 	// keeping the row's values stable. The TS-side preserve guards in
-	// persistResult are still load-bearing for the override path.
+	// persistAnalysisResult (persist.ts) are still load-bearing for the override path.
 	private buildEffectiveOptions(
 		trackId: string,
 		opts: AnalyzeOptions | undefined,
@@ -792,202 +964,6 @@ export class AnalysisQueue extends EventEmitter {
 		}
 
 		return anyInjection ? injected : opts;
-	}
-
-	// `filePath` is the local source_link path this result was computed from
-	// (the one pickBatch dispatched) — the fingerprint is a property of that
-	// file, not of the track, so it lands on that link row.
-	private persistResult(result: AnalyzeResult, filePath: string): void {
-		// Beatgrid + downbeats land as packed Float32LE BLOBs. Easier for the
-		// renderer to parse than a JSON array of doubles (less GC pressure,
-		// half the storage). Build them up-front and pass as Buffer.
-		const toFloat32Buffer = (vals: number[]): Buffer => {
-			const arr = new Float32Array(vals);
-			return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
-		};
-
-		// Write-when-produced guards. The analyzer owns ONLY the Curator slot
-		// (the existing columns); the Rekordbox slot (rb_*) is the importer's
-		// and is never touched here, so there's no rb grid to protect anymore.
-		// What we still must not do is clobber a good Curator value with an
-		// empty one when a stage was skipped this pass: a skipped beatgrid
-		// returns [] (skip_beatgrid, or auto-analyze with beatgrid off), a
-		// skipped key returns null, a skipped structure stage returns []. So
-		// each field is written only when THIS pass produced it; otherwise the
-		// prior Curator value stays. The override flags don't gate persist —
-		// they drive prior-injection in buildEffectiveOptions (reuse vs
-		// re-detect); whatever the worker returns is what we store.
-		const hasResultBeatgrid = result.beatgrid.length > 0;
-		const hasResultBpm = result.bpm != null;
-		const hasResultKey = result.key_camelot != null;
-		const row: NewTrackAnalysis = {
-			trackId: result.track_id,
-			bpm: result.bpm,
-			beatgrid: toFloat32Buffer(result.beatgrid),
-			downbeats: toFloat32Buffer(result.downbeats),
-			keyCamelot: result.key_camelot,
-			keyStrength: result.key_strength,
-			brightness: result.brightness,
-			power: result.power,
-			dynamicComplexity: result.dynamic_complexity,
-			loudnessRangeLu: result.loudness_range_lu,
-			dissonance: result.dissonance,
-			density: result.density,
-			// Phase 2A — segments + derived scalars. Always populated on the
-			// INSERT path (used for a brand-new row). The UPDATE path treats
-			// these as an atomic group (see segmentSet below) so a failed
-			// structure stage doesn't wipe a previously-good labelling.
-			// AnalyzerSegment from sidecar.ts has the same camelCase shape as
-			// SegmentRecord (startSec / endSec / label / confidence / energy),
-			// so the array passes through Drizzle's JSON column unchanged.
-			segmentsJson: result.segments,
-			introLengthSec: result.intro_length_sec,
-			outroLengthSec: result.outro_length_sec,
-			firstDropSec: result.first_drop_sec,
-			dropCount: result.drop_count,
-			breakdownCount: result.breakdown_count,
-			featuresJson: result.features,
-			duration: result.duration,
-			analyzerVersion: result.analyzer_version,
-			analyzedAt: new Date(),
-		};
-
-		// Basic analyses (MusicExtractor skipped — the new default) return
-		// null for every advanced scalar and {} for featuresJson. If we
-		// always-overwrote, a scanner-driven re-run would wipe advanced
-		// values the user previously computed via the Analyze window. So
-		// the UPDATE-on-conflict shape splits into:
-		//   • always-overwrite columns — bpm/key/beatgrid/duration/peaks/etc.
-		//     (the basic-pipeline outputs; every analyze pass refreshes them)
-		//   • conditional columns — the six ME-derived scalars + features
-		//     JSON; written only when non-null/non-empty, preserving the
-		//     prior value when this pass didn't compute them.
-		// INSERT path is untouched: a brand-new row gets null for whatever
-		// wasn't computed, which is the right starting state.
-		const featuresHasData = result.features && Object.keys(result.features).length > 0;
-		const advancedSet: Partial<NewTrackAnalysis> = {};
-		if (row.brightness !== null) advancedSet.brightness = row.brightness;
-		if (row.power !== null) advancedSet.power = row.power;
-		if (row.dynamicComplexity !== null) advancedSet.dynamicComplexity = row.dynamicComplexity;
-		if (row.loudnessRangeLu !== null) advancedSet.loudnessRangeLu = row.loudnessRangeLu;
-		if (row.dissonance !== null) advancedSet.dissonance = row.dissonance;
-		if (row.density !== null) advancedSet.density = row.density;
-		if (featuresHasData) advancedSet.featuresJson = row.featuresJson;
-
-		const trackAdvancedSet: Record<string, number | null> = {};
-		if (result.brightness !== null) trackAdvancedSet.brightness = result.brightness;
-		if (result.power !== null) trackAdvancedSet.power = result.power;
-		if (result.dynamic_complexity !== null) trackAdvancedSet.dynamicComplexity = result.dynamic_complexity;
-		if (result.loudness_range_lu !== null) trackAdvancedSet.loudnessRangeLu = result.loudness_range_lu;
-		if (result.dissonance !== null) trackAdvancedSet.dissonance = result.dissonance;
-		if (result.density !== null) trackAdvancedSet.density = result.density;
-
-		// Segment stage outputs are treated as an atomic group: either it ran
-		// (segments array OR scalar counts are non-null) and we overwrite the
-		// six fields together, or it failed (everything null/empty) and we
-		// preserve the previous labelling. Mixed updates would let a failed
-		// stage clear segments_json while leaving stale scalars in place —
-		// no thanks. The same rule is mirrored to the `track` row.
-		//
-		// Layered on top of the atomic-group rule: the preserveSegments
-		// guard (existing segments + no override flag) skips the write
-		// entirely so a re-run doesn't replace user-trusted segments with
-		// a fresh analyzer pass's labelling.
-		const segmentStageRan = result.segments.length > 0 || result.drop_count !== null;
-		const segmentSet: Partial<NewTrackAnalysis> = {};
-		const trackSegmentSet: Record<string, number | null> = {};
-		if (segmentStageRan) {
-			segmentSet.segmentsJson = result.segments as never;
-			segmentSet.introLengthSec = result.intro_length_sec;
-			segmentSet.outroLengthSec = result.outro_length_sec;
-			segmentSet.firstDropSec = result.first_drop_sec;
-			segmentSet.dropCount = result.drop_count;
-			segmentSet.breakdownCount = result.breakdown_count;
-			trackSegmentSet.introLengthSec = result.intro_length_sec;
-			trackSegmentSet.outroLengthSec = result.outro_length_sec;
-			trackSegmentSet.firstDropSec = result.first_drop_sec;
-			trackSegmentSet.dropCount = result.drop_count;
-			trackSegmentSet.breakdownCount = result.breakdown_count;
-		}
-
-		// Build the analysis-row UPDATE set, gated by the preserve flags.
-		// Each protected field is only written when no prior value exists
-		// or the user opted into overwrite via the Analyze modal. The
-		// always-overwrite columns (duration / analyzerVersion / analyzedAt)
-		// are housekeeping and never gated.
-		const analysisUpdateSet: Partial<NewTrackAnalysis> = {
-			duration: row.duration,
-			analyzerVersion: row.analyzerVersion,
-			analyzedAt: row.analyzedAt,
-			...advancedSet,
-			...segmentSet,
-		};
-		if (hasResultBpm) analysisUpdateSet.bpm = row.bpm;
-		if (hasResultBeatgrid) {
-			analysisUpdateSet.beatgrid = row.beatgrid;
-			analysisUpdateSet.downbeats = row.downbeats;
-		}
-		if (hasResultKey) {
-			analysisUpdateSet.keyCamelot = row.keyCamelot;
-			analysisUpdateSet.keyStrength = row.keyStrength;
-		}
-
-		// A fingerprint-only pass (backfillMissingFingerprints) over a track
-		// that was never analysed produces nothing for track_analysis. Don't
-		// mint a hollow row for it: one stamped with the current version but
-		// empty of grid/key/scalars would read as "analysed" everywhere the
-		// row's presence is the signal, and hide the track from a real pass.
-		// An existing row still gets its housekeeping columns refreshed.
-		const analysisStageRan = hasResultBpm || hasResultBeatgrid || hasResultKey
-			|| segmentStageRan || Object.keys(advancedSet).length > 0;
-
-		// All writes in one transaction so the track scalars never lag the
-		// track_analysis row (or vice versa) under crash mid-write. UPDATE on
-		// a missing track is a silent no-op — safe if the track was deleted
-		// between dispatch and result landing.
-		this.db.transaction((tx) => {
-			if (analysisStageRan) {
-				tx.insert(trackAnalysis)
-					.values(row)
-					.onConflictDoUpdate({
-						target: trackAnalysis.trackId,
-						set: analysisUpdateSet,
-					})
-					.run();
-			} else {
-				tx.update(trackAnalysis)
-					.set(analysisUpdateSet)
-					.where(eq(trackAnalysis.trackId, result.track_id))
-					.run();
-			}
-			// Write-when-produced, like every other column: a skipped or
-			// failed fingerprint stage returns null and leaves whatever the
-			// link already carries. Matched on the dispatched path (not the
-			// track) because a track with two local files has two prints.
-			if (result.fingerprint) {
-				tx.update(sourceLink)
-					.set({ fingerprint: result.fingerprint, fingerprintDurationSec: result.fingerprint_duration_sec })
-					.where(and(eq(sourceLink.source, 'local'), eq(sourceLink.filePath, filePath)))
-					.run();
-				// The print is a catalogue claim on the recording (design:
-				// recording_claim); the analysis itself never rides the op log.
-				addClaims(this.db, result.track_id, [{
-					kind: 'fingerprint',
-					value: result.fingerprint,
-					...(result.fingerprint_duration_sec != null ? { durationSec: result.fingerprint_duration_sec } : {}),
-				}]);
-			}
-			// Skip the track-mirror UPDATE entirely when this pass produced
-			// no advanced scalars AND no segment-stage outputs — there's
-			// nothing to write and an empty .set({}) throws at the Drizzle layer.
-			const combinedTrackSet = { ...trackAdvancedSet, ...trackSegmentSet };
-			if (Object.keys(combinedTrackSet).length > 0) {
-				tx.update(track)
-					.set(combinedTrackSet)
-					.where(eq(track.id, result.track_id))
-					.run();
-			}
-		});
 	}
 
 	private emitEvent(evt: AnalysisJobEvent): void {

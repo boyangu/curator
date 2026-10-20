@@ -1,9 +1,11 @@
 // Settings → Account: the Curator account (cloud) and library sync.
 //
 // Signed out: email + password, or "email me a code" (one-time code /
-// magic link). Signed in: the email, the sync status line, Sync now, the
-// account's devices, sign out. The session and every token live in main;
-// this panel only ever sees status (account:status, cloud-sync:status).
+// magic link). Signed in: the email, the sync status line, Sync now, shared
+// analysis (reuse toggle, holdings, the "upload existing analysis" button),
+// the account's devices, sign out. The session and every token live in main;
+// this panel only ever sees status (account:status, cloud-sync:status,
+// catalogue:status).
 //
 // Thin view, the backupSettings pattern: render from the two statuses,
 // write through accountApi / cloudSyncApi, re-render on cloud-sync:status
@@ -12,8 +14,8 @@
 // Signed in, a tick while one of this panel's inputs has focus only patches
 // the live lines in place, for the same reason (the check-cadence inputs).
 
-import type { CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings } from '@curator/core';
-import { accountApi, cloudSyncApi } from '../data/api.js';
+import type { CatalogueStatus, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings } from '@curator/core';
+import { accountApi, catalogueApi, cloudSyncApi } from '../data/api.js';
 import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
@@ -24,8 +26,10 @@ type AccountDevice = Awaited<ReturnType<typeof accountApi.devices>>[number];
 const alog = log.for('account-settings');
 
 let unsubscribe: (() => void) | null = null;
+let unsubscribeCatalogue: (() => void) | null = null;
 let account: AccountStatus | null = null;
 let sync: CloudSyncStatusReport | null = null;
+let catalogue: CatalogueStatus | null = null;
 let devices: AccountDevice[] | null = null;
 // Defaults + limits for the check-cadence inputs (the policy in force rides
 // every status as `poll`).
@@ -132,6 +136,152 @@ function wirePollSection(host: HTMLElement): void {
 		save({ [f.key]: Math.round(n * f.scale) });
 	}));
 	host.querySelector<HTMLButtonElement>('[data-ac-poll-reset]')?.addEventListener('click', () => save(null));
+}
+
+// ── Shared analysis ─────────────────────────────────────────────────────
+
+function fmtBytes(n: number): string {
+	if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
+	if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+	if (n >= 1e3) return `${Math.round(n / 1e3)} KB`;
+	return `${n} B`;
+}
+
+// One line on where shared analysis stands, most urgent first.
+function catalogueLine(c: CatalogueStatus): { text: string; tone: 'ok' | 'warn' | 'error' } {
+	if (!c.settings.enabled) return { text: 'Off on this computer — it analyses everything itself and shares nothing.', tone: 'ok' };
+	if (!c.signedIn) return { text: 'Sign in to reuse analysis from your other computers.', tone: 'ok' };
+	if (c.serverOffers === false) return { text: 'Your sync server does not offer shared analysis yet.', tone: 'warn' };
+	if (c.serverOffers === null) return { text: 'Waiting for the first sync to learn what the server offers…', tone: 'ok' };
+	if (c.lastError) return { text: c.lastError, tone: 'error' };
+	if (c.activity === 'inventory') return { text: 'Checking what your other computers analysed…', tone: 'ok' };
+	if (c.activity === 'hydrating') return { text: 'Taking analysis from your other computers…', tone: 'ok' };
+	if (c.activity === 'uploading') return { text: 'Uploading analysis…', tone: 'ok' };
+	if (c.entitled === false) return { text: 'Reusing analysis works; uploading needs your account to be enabled for shared analysis.', tone: 'warn' };
+	const last = Math.max(c.lastHydrateAt ?? 0, c.lastUploadAt ?? 0) || null;
+	return { text: last ? `Up to date · last change ${fmtWhen(last)}` : 'Up to date', tone: 'ok' };
+}
+
+function catalogueFacts(c: CatalogueStatus): { account: string; device: string; backfill: string | null } {
+	const quota = c.usage ? ` · ${fmtBytes(c.usage.usedBytes)} of ${fmtBytes(c.usage.quotaBytes)} used` : '';
+	const account = `${c.account.items.toLocaleString()} analysis items (${fmtBytes(c.account.bytes)})${quota}`;
+	const pending = c.device.pending
+		? `${c.device.pending.items.toLocaleString()} not shared yet${c.device.pending.items > 0 ? ` (≈ ${fmtBytes(c.device.pending.bytes)})` : ''}`
+		: 'counting what is not shared yet…';
+	const device = `${c.device.reused.toLocaleString()} reused from other computers · ${c.device.uploaded.toLocaleString()} uploaded · ${pending}`;
+	const b = c.backfill;
+	const backfill = b.state === 'running'
+		? `Uploading existing analysis… ${b.uploadedItems.toLocaleString()} items (${fmtBytes(b.uploadedBytes)}) so far${b.waitingFor ? ` · waiting for ${b.waitingFor} to finish` : ''}`
+		: b.state === 'paused'
+			? `Paused after ${b.uploadedItems.toLocaleString()} items (${fmtBytes(b.uploadedBytes)}).`
+			: b.state === 'done'
+				? 'Existing analysis uploaded.'
+				: null;
+	return { account, device, backfill };
+}
+
+function catalogueButton(c: CatalogueStatus): { label: string; action: 'start' | 'pause' | 'resume'; disabled: boolean } {
+	const off = !c.settings.enabled || !c.signedIn || c.serverOffers !== true || c.entitled === false;
+	if (c.backfill.state === 'running') return { label: 'Pause upload', action: 'pause', disabled: false };
+	if (c.backfill.state === 'paused') return { label: 'Resume upload', action: 'resume', disabled: off };
+	const n = c.device.pending;
+	const size = n && n.items > 0 ? ` (≈ ${fmtBytes(n.bytes)})` : '';
+	return { label: `Upload existing analysis${size}`, action: 'start', disabled: off || (!!n && n.items === 0) };
+}
+
+function renderCatalogueSection(c: CatalogueStatus | null): string {
+	if (!c) return '';
+	if (!c.available) {
+		return `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Shared analysis</div>
+			<div class="settings-toggle__hint">Not available in this build (it needs the sync server).</div>
+		</div>`;
+	}
+	const line = catalogueLine(c);
+	const facts = catalogueFacts(c);
+	const btn = catalogueButton(c);
+	return `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Shared analysis</div>
+			<label class="settings-toggle">
+				<input type="checkbox" data-ac-cat-enabled ${c.settings.enabled ? 'checked' : ''} />
+				<span class="settings-toggle__label">Reuse analysis from my other computers</span>
+				<span class="settings-toggle__hint">Beatgrid, key, structure, advanced scores, fingerprints and the overview waveform one of your computers computed are taken instead of computed again, by audio — tags may differ. What this computer analyses is shared the same way. This computer only.</span>
+			</label>
+			<div class="settings-rekordbox__path-row backup__row">
+				<span class="${line.tone === 'ok' ? 'settings-toggle__hint' : `backup__banner backup__banner--${line.tone}`}" data-ac-cat-line>${escapeHtml(line.text)}</span>
+			</div>
+			<div class="settings-toggle__hint">Your account: <span data-ac-cat-account>${escapeHtml(facts.account)}</span></div>
+			<div class="settings-toggle__hint">This computer: <span data-ac-cat-device>${escapeHtml(facts.device)}</span></div>
+			<div class="settings-rekordbox__path-row backup__row">
+				<span class="settings-ui__field-label"></span>
+				<button class="btn-secondary" data-ac-cat-backfill="${btn.action}" ${btn.disabled ? 'disabled' : ''}>${escapeHtml(btn.label)}</button>
+				<span class="settings-toggle__hint" data-ac-cat-backfill-line>${escapeHtml(facts.backfill ?? 'Only from this button; it waits while analysis runs.')}</span>
+			</div>
+			<label class="settings-ui__field"><span class="settings-ui__field-label">Upload speed</span>
+				<input type="number" class="settings-ui__number" data-ac-cat-kbps min="0.1" max="100" step="0.5" value="${Math.round((c.settings.maxKBps / 1024) * 10) / 10}" />
+				<span class="settings-ui__field-suffix">MB/s at most for waveform uploads</span>
+			</label>
+			<div class="settings-toggle__hint">Full-resolution waveforms and AI vectors are not shared yet; they arrive in a later stage. This computer still computes them itself.</div>
+		</div>`;
+}
+
+function wireCatalogueSection(host: HTMLElement): void {
+	const apply = (st: CatalogueStatus): void => { catalogue = st; patchCatalogue(host); };
+	host.querySelector<HTMLInputElement>('[data-ac-cat-enabled]')?.addEventListener('change', (e) => {
+		const enabled = (e.target as HTMLInputElement).checked;
+		void catalogueApi.setSettings({ enabled }).then(apply).catch((err) => {
+			showToast('Could not change shared analysis', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+			(e.target as HTMLInputElement).checked = !enabled;
+		});
+	});
+	host.querySelector<HTMLButtonElement>('[data-ac-cat-backfill]')?.addEventListener('click', (e) => {
+		const action = (e.currentTarget as HTMLButtonElement).dataset.acCatBackfill as 'start' | 'pause' | 'resume';
+		void catalogueApi.backfill(action).then(apply).catch((err) => {
+			showToast('Could not change the upload', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+		});
+	});
+	// 'change', not 'input': commit on Enter / blur / the spinner.
+	host.querySelector<HTMLInputElement>('[data-ac-cat-kbps]')?.addEventListener('change', (e) => {
+		const el = e.target as HTMLInputElement;
+		const mb = Number(el.value);
+		if (el.value.trim() === '' || !Number.isFinite(mb) || mb <= 0) { patchCatalogue(host, true); return; }
+		void catalogueApi.setSettings({ maxKBps: Math.round(mb * 1024) }).then((st) => { catalogue = st; patchCatalogue(host, true); }).catch((err) => {
+			showToast('Could not save the upload speed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+		});
+	});
+}
+
+// A status tick: the live lines and the button only, never the inputs the
+// user may be in (`inputs` = also write the stored values back, after a save).
+function patchCatalogue(host: HTMLElement, inputs = false): void {
+	const c = catalogue;
+	if (!c || !c.available) return;
+	const line = catalogueLine(c);
+	const el = host.querySelector<HTMLElement>('[data-ac-cat-line]');
+	if (el) {
+		el.textContent = line.text;
+		el.className = line.tone === 'ok' ? 'settings-toggle__hint' : `backup__banner backup__banner--${line.tone}`;
+	}
+	const facts = catalogueFacts(c);
+	const set = (sel: string, text: string): void => { const n = host.querySelector<HTMLElement>(sel); if (n) n.textContent = text; };
+	set('[data-ac-cat-account]', facts.account);
+	set('[data-ac-cat-device]', facts.device);
+	set('[data-ac-cat-backfill-line]', facts.backfill ?? 'Only from this button; it waits while analysis runs.');
+	const btn = catalogueButton(c);
+	const b = host.querySelector<HTMLButtonElement>('[data-ac-cat-backfill]');
+	if (b) {
+		b.textContent = btn.label;
+		b.dataset.acCatBackfill = btn.action;
+		b.toggleAttribute('disabled', btn.disabled);
+	}
+	const toggle = host.querySelector<HTMLInputElement>('[data-ac-cat-enabled]');
+	if (toggle && document.activeElement !== toggle) toggle.checked = c.settings.enabled;
+	if (inputs) {
+		const kbps = host.querySelector<HTMLInputElement>('[data-ac-cat-kbps]');
+		if (kbps) kbps.value = String(Math.round((c.settings.maxKBps / 1024) * 10) / 10);
+	}
 }
 
 function renderSignedOut(host: HTMLElement, a: AccountStatus): void {
@@ -247,6 +397,7 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 			</div>
 			${s && s.rejected > 0 ? `<div class="settings-toggle__hint">${s.rejected.toLocaleString()} ${s.rejected === 1 ? 'change was' : 'changes were'} refused by the server and will not be retried; see the log for details.</div>` : ''}
 		</div>
+		${renderCatalogueSection(catalogue)}
 		${a.syncAvailable && s?.enabled ? renderPollSection(s) : ''}
 		<div class="settings-ui__section">
 			<div class="settings-ui__section-label">Devices</div>
@@ -255,6 +406,7 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 
 	const q = <T extends Element>(sel: string): T | null => host.querySelector<T>(sel);
 	wirePollSection(host);
+	wireCatalogueSection(host);
 	q<HTMLButtonElement>('[data-ac-sync-now]')?.addEventListener('click', () => {
 		void cloudSyncApi.syncNow().then((st) => { sync = st; render(host); }).catch((err) => {
 			showToast('Sync failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
@@ -296,6 +448,7 @@ function patchSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusRe
 	host.querySelector<HTMLButtonElement>('[data-ac-sync-now]')?.toggleAttribute('disabled', !canSyncNow(a, s));
 	const poll = host.querySelector<HTMLElement>('[data-ac-poll-status]');
 	if (poll && s) poll.textContent = pollLine(s);
+	patchCatalogue(host);
 }
 
 function render(host: HTMLElement): void {
@@ -307,14 +460,16 @@ function render(host: HTMLElement): void {
 
 async function refresh(host: HTMLElement): Promise<void> {
 	try {
-		const [a, s, ps] = await Promise.all([
+		const [a, s, ps, cs] = await Promise.all([
 			accountApi.status(),
 			cloudSyncApi.status(),
 			cloudSyncApi.pollSettings().catch((err) => { alog.warn('poll settings failed', { err: String(err) }); return pollSettings; }),
+			catalogueApi.status().catch((err) => { alog.warn('catalogue status failed', { err: String(err) }); return catalogue; }),
 		]);
 		account = a;
 		sync = s;
 		pollSettings = ps;
+		catalogue = cs;
 		render(host);
 		if (a.signedIn && a.syncAvailable) {
 			devices = await accountApi.devices().catch((err) => { alog.warn('devices failed', { err: String(err) }); return devices ?? []; });
@@ -328,7 +483,22 @@ async function refresh(host: HTMLElement): Promise<void> {
 
 export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribe?.();
+	unsubscribeCatalogue?.();
 	formError = null;
+	// Shared analysis ticks patch their own lines in place (they arrive
+	// during a hydrate or an upload, often while the user is in this panel).
+	unsubscribeCatalogue = catalogueApi.onStatus((c) => {
+		if (!host.isConnected) { unsubscribeCatalogue?.(); unsubscribeCatalogue = null; return; }
+		const hadSection = !!catalogue;
+		catalogue = c;
+		if (!account?.signedIn) return;
+		if (!hadSection || !host.querySelector('[data-ac-cat-line]')) {
+			const typing = document.activeElement instanceof HTMLInputElement && host.contains(document.activeElement);
+			if (!typing) render(host);
+			return;
+		}
+		patchCatalogue(host);
+	});
 	unsubscribe = cloudSyncApi.onStatus((s) => {
 		if (!host.isConnected) { unsubscribe?.(); unsubscribe = null; return; }
 		const wasSignedIn = account?.signedIn ?? false;

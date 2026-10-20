@@ -6,8 +6,8 @@
 //
 // Mental model: a checked aspect means "compute Curator's value for this".
 // Curator analysis and any Rekordbox-imported values live in SEPARATE schema
-// slots (the analyzer only ever writes the Curator slot — see queue.ts
-// persistResult), so analysis never overwrites Rekordbox data. Which set the
+// slots (the analyzer only ever writes the Curator slot — see persist.ts
+// persistAnalysisResult), so analysis never overwrites Rekordbox data. Which set the
 // app *displays* is the global Settings → Analysis source toggle. That's why
 // there's no "overwrite" flag here: there's nothing to overwrite across
 // sources, only Curator's own slot to (re)compute.

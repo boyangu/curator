@@ -130,3 +130,28 @@ describe('migration gate before 0003', () => {
 		]);
 	});
 });
+
+// The catalogue release (0004) goes out like any other: an image that ships
+// it must not serve against a database that lacks it, even though nothing
+// else changed and roles.sql grants the gate's function.
+describe('migration gate before 0004', () => {
+	let t: TestDb;
+	beforeAll(async () => {
+		t = await createTestDb({ migrate: false });
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0004_')));
+		await t.db.exec(rolesSql);
+	});
+	afterAll(() => t.db.close());
+
+	it('refuses an image that ships 0004_catalogue.sql, naming it', async () => {
+		expect(shipped).toContain('0004_catalogue.sql');
+		const { log, lines } = capture();
+		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: ['0004_catalogue.sql'] })]);
+	});
+
+	it('lets it start once the owner has run the migration', async () => {
+		await migrate(t.db, sqlDir);
+		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
+	});
+});

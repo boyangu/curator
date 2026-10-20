@@ -75,6 +75,10 @@ export interface CloudTransport {
 	account: CloudService['account'];
 	bootstrap(): Promise<{ snapshotSeq: number; records: readonly SnapshotRecord[] }>;
 	session(): CloudSession | null;
+	// The shared analysis catalogue's procedures (apps/core/src/catalogue/).
+	// Optional: without them (or without a blob store beside them) the
+	// catalogue layer is simply not built.
+	catalogue?: CloudService['catalogue'];
 }
 
 // How a transport reports a failed call. Anything else thrown is treated as
@@ -195,6 +199,10 @@ export interface SyncClient {
 	start(): void;
 	stop(): void;
 	status(): CloudSyncStatus;
+	// The server's optional features as last answered on a push or pull
+	// (null until the first answer this session). The catalogue layer reads
+	// 'catalogue' here rather than probing the server itself.
+	serverFeatures(): readonly SyncFeature[] | null;
 	subscribe(cb: (e: CloudSyncEvent) => void): () => void;
 }
 
@@ -314,8 +322,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// server refuses the extra pull fields, and one that omits `features`
 	// simply has none. Until the first answer, pulls go without it.
 	let serverSkipsOwn = false;
-	const learnFeatures = (features: readonly SyncFeature[] | undefined): void => {
-		serverSkipsOwn = features?.includes('pull_skip_own') ?? false;
+	let features: SyncFeature[] | null = null;
+	const learnFeatures = (f: readonly SyncFeature[] | undefined): void => {
+		serverSkipsOwn = f?.includes('pull_skip_own') ?? false;
+		features = [...(f ?? [])];
 	};
 
 	const counts = raw.prepare(`SELECT state, count(*) AS n FROM sync_outbox WHERE state IN ('pending', 'rejected') GROUP BY state`);
@@ -880,6 +890,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			clearRetry();
 		},
 		status,
+		serverFeatures: () => features,
 		subscribe(cb) {
 			listeners.add(cb);
 			return () => { listeners.delete(cb); };

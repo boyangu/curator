@@ -188,6 +188,13 @@ export class CloudAccount {
 		return u ? { userId: u.id, email: u.email ?? null } : null;
 	}
 
+	// Supabase Storage as this session (the catalogue's blobs, blobs.ts).
+	// Requests carry the user's own token, so the bucket's RLS policies decide
+	// — the API holds no service key and never proxies object bytes.
+	storage(): SupabaseClient['storage'] {
+		return this.supabase.storage;
+	}
+
 	// A valid access token (Supabase refreshes it when due), or null.
 	async accessToken(): Promise<string | null> {
 		const { data } = await this.supabase.auth.getSession();

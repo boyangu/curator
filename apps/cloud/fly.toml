@@ -12,6 +12,11 @@ kill_timeout = "15s"
 
 [env]
   PORT = "8080"
+  # The catalogue stage (src/catalogue/policy.ts). D-a, sized for Supabase
+  # Free: inline analysis units + lo peaks. D-b, after the plan upgrade and a
+  # quota raise: "rhythm,key,structure,advanced,fingerprint,peaks:lo,peaks:hi,vectors".
+  # "off" (or removing the line) switches the catalogue off.
+  CURATOR_CATALOGUE = "rhythm,key,structure,advanced,fingerprint,peaks:lo"
 
 [http_service]
   internal_port = 8080

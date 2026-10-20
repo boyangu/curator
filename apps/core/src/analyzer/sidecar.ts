@@ -100,7 +100,7 @@ export const ADVANCED_FEATURES: readonly AdvancedFeature[] = [
 // fields because they're typically rb-sourced and the user has invested
 // effort matching cues to that grid. Set the corresponding override flag
 // from the Analyze modal to force overwrite on a per-field basis. These
-// are evaluated in queue.persistResult, not in the Python worker.
+// are evaluated in persist.ts persistAnalysisResult, not in the Python worker.
 export interface AnalyzeOptions {
 	// RhythmExtractor2013 method. 'multifeature' is the robust-but-slow
 	// default; 'degara' is ~2x faster with a small accuracy hit on
@@ -181,7 +181,7 @@ export interface AnalyzeParams {
 }
 
 // Phase 2A segment record on the JSON-RPC wire. Mirrors the Python dataclass
-// dict produced by worker._build_segments / _label_segments. queue.persistResult
+// dict produced by worker._build_segments / _label_segments. persist.ts persistAnalysisResult
 // re-maps to the canonical TS `SegmentRecord` from @curator/shared/schema.
 export interface AnalyzerSegment {
 	startSec: number;
@@ -525,7 +525,7 @@ export class AnalyzerSidecar extends EventEmitter {
 			// stays compact for the common default-options case.
 			//
 			// override* flags are deliberately NOT forwarded — they're
-			// consumed in queue.persistResult on the TS side to gate which
+			// consumed in persist.ts persistAnalysisResult on the TS side to gate which
 			// fields get written, not by the worker.
 			const wireOptions = params.options
 				? {

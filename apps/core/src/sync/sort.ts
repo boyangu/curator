@@ -35,7 +35,7 @@ export function sortColumn(name: ZTrackSortT['column']) {
 		// Rekordbox and re-sync. Null tracks (never imported from RB) sort to
 		// the bottom on desc via SQLite's NULLS-LAST default.
 		case 'rating':             return track.rating;
-		// Analyzer-only scalars — populated by queue.persistResult on
+		// Analyzer-only scalars — populated by persist.ts persistAnalysisResult on
 		// every analysis. No override layer for these.
 		case 'loudnessRangeLu':    return track.loudnessRangeLu;
 		case 'dissonance':         return track.dissonance;

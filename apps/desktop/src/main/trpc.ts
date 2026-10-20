@@ -188,6 +188,10 @@ export function buildAppRouter(h: Handlers) {
 			now: proc('cloud-sync:now'),
 			setPollPolicy: proc('cloud-sync:set-poll-policy'),
 		}),
+		catalogue: t.router({
+			setSettings: proc('catalogue:set-settings'),
+			backfill: proc('catalogue:backfill'),
+		}),
 		dialog: t.router({
 			pickFolder: proc('dialog:pick-folder'),
 		}),

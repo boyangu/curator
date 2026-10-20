@@ -821,6 +821,15 @@ export const trackAnalysis = sqliteTable('track_analysis', {
 	duration: real('duration'),
 	analyzerVersion: text('analyzer_version').notNull(),
 	analyzedAt: integer('analyzed_at', { mode: 'timestamp_ms' }).notNull(),
+	// The audio the Curator slot above was computed from: the analysed file's
+	// `source_link.audio_hash`. It is the key the shared catalogue files this
+	// row under (apps/core/src/catalogue/), so it is set only when the row is
+	// known to describe that audio — a fresh analysis of the file, a row
+	// already stamped with the same hash, or units pulled from the catalogue
+	// under it — and cleared by the scanner when a known path's audio
+	// changes. NULL = provenance unknown: never uploaded, never filled in from
+	// the catalogue. The rb_* slot below is not covered by it.
+	audioHash: text('audio_hash'),
 
 	// ── Rekordbox slot ───────────────────────────────────────────────────────
 	// Dual-source analysis: the columns above are Curator's own (the analyzer
@@ -837,7 +846,10 @@ export const trackAnalysis = sqliteTable('track_analysis', {
 	rbKeyCamelot: text('rb_key_camelot'),
 	rbKeyStrength: real('rb_key_strength'),
 	rbSegmentsJson: text('rb_segments_json', { mode: 'json' }).$type<SegmentRecord[] | null>(),
-});
+}, (t) => ({
+	// The uploader and the hydrator find rows by the audio they describe.
+	audioHashIdx: index('track_analysis_audio_hash_idx').on(t.audioHash),
+}));
 
 // Structural segments — stored as a JSON array on `track_analysis.segments_json`.
 // Two sources can write here, distinguished by the per-record `source` field:
@@ -1374,6 +1386,50 @@ export const syncState = sqliteTable(
 	})
 );
 
+// ─── CATALOGUE (device-local) ────────────────────────────────────────────────
+// This device's mirror of the account's shared analysis catalogue
+// (apps/core/src/catalogue/; protocol packages/protocol/src/catalogue.ts):
+// one row per (audio hash, unit, variant) the server holds — the newest
+// version it named, from `catalogue.inventory` pages or this device's own
+// puts — and what this device did with it. Never synced and never sent
+// anywhere: it is a cache of the server, rebuilt from rev 0 when the
+// signed-in account changes (`catalogue.account` in app_setting).
+//
+// `local_state`:
+//   remote    the server holds it; not applied here yet (or no live track
+//             with this hash existed when it was looked at)
+//   hydrated  applied to every live local track with the hash that lacked it
+//   uploaded  this device put it (its own analysis)
+//   skipped   looked at and refused (duration guard, unreadable blob, a
+//             schema or version this build cannot use); retried only when
+//             a newer version arrives
+//   rejected  this device's put of `version_key` was refused for good
+//             (invalid_item, unit_disabled, version_outdated…); not re-sent
+//             until the local analysis changes version
+// `version_key` is the version as dotted integers ('2.4.0'), `remote_rev`
+// the server's rev for it (0 while only known locally), `bytes` what a
+// hydrate of it costs (inline data + blob).
+export const CATALOGUE_LOCAL_STATES = ['remote', 'hydrated', 'uploaded', 'skipped', 'rejected'] as const;
+export type CatalogueLocalState = (typeof CATALOGUE_LOCAL_STATES)[number];
+export const catalogueEntry = sqliteTable(
+	'catalogue_entry',
+	{
+		audioHash: text('audio_hash').notNull(),
+		unit: text('unit').notNull(),
+		variant: text('variant').notNull(),
+		versionKey: text('version_key').notNull(),
+		remoteRev: integer('remote_rev').notNull().default(0),
+		bytes: integer('bytes').notNull().default(0),
+		localState: text('local_state', { enum: CATALOGUE_LOCAL_STATES }).notNull(),
+		updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+	},
+	(t) => ({
+		pk: primaryKey({ columns: [t.audioHash, t.unit, t.variant] }),
+		// The hydrator's "what is still to apply" scan.
+		stateIdx: index('catalogue_entry_state_idx').on(t.localState),
+	})
+);
+
 // Drizzle-inferred row types
 // The DB row, plus optional aggregated fields that some read paths attach:
 //   - `sources` — filled by getTracks via batched source_link + rekordbox_link
@@ -1462,6 +1518,7 @@ export type NewSyncOutboxRow = typeof syncOutbox.$inferInsert;
 export type SyncCursorRow = typeof syncCursor.$inferSelect;
 export type RecordingAliasRow = typeof recordingAlias.$inferSelect;
 export type TombstoneRow = typeof tombstone.$inferSelect;
+export type CatalogueEntryRow = typeof catalogueEntry.$inferSelect;
 
 // Track read-shape with derived bucket levels (1..5 per metric) decorated by
 // getTracksImpl using the in-memory cutoff store. Null when the underlying

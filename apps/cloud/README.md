@@ -1,6 +1,6 @@
 # @curator/cloud
 
-The cloud API: a per-user op log behind tRPC (`sync.push`, `sync.pull`, `sync.bootstrap`, `account.registerDevice` / `devices` / `revokeDevice`, `health`). It stores ops and periodic snapshots of the folded library state; it never writes to Spotify, Tidal, rekordbox or files. Design: `planning/tech/cloud.md` ("Server API", "Schema versioning and security", "Bootstrap, snapshots and history retention").
+The cloud API: a per-user op log behind tRPC (`sync.push`, `sync.pull`, `sync.bootstrap`, `account.registerDevice` / `devices` / `revokeDevice`, `health`), and the analysis catalogue (`catalogue.lookup` / `put` / `inventory`). It stores ops, periodic snapshots of the folded library state and analysis results devices computed; it never analyses, and it never writes to Spotify, Tidal, rekordbox or files. Design: `planning/tech/cloud.md` ("Server API", "Schema versioning and security", "Bootstrap, snapshots and history retention").
 
 ## Local development
 
@@ -22,6 +22,7 @@ Read from the environment only; `.env.example` lists them with placeholders. Nev
 | `DATABASE_URL` | Postgres connection as `curator_api` (below). Not `postgres`, not the service role. |
 | `SUPABASE_URL` | `https://<ref>.supabase.co`. Tokens are verified against `<SUPABASE_URL>/auth/v1/.well-known/jwks.json`; there is no JWT secret anywhere. |
 | `PORT` | Defaults to 8080. |
+| `CURATOR_CATALOGUE` | The catalogue units this server accepts, e.g. `rhythm,key,structure,advanced,fingerprint,peaks:lo` (stage D-a). Unset or `off`: no catalogue. Not a secret: production sets it in `fly.toml` `[env]`. See "Catalogue". |
 
 ## Database setup (Supabase project)
 
@@ -33,7 +34,7 @@ Once, in this order. Before you start, delete the spike's objects from `public` 
    DATABASE_URL='postgres://postgres.<ref>:<owner password>@<pooler host>:5432/postgres' pnpm --filter @curator/cloud db:migrate
    ```
 
-   It creates the `curator` schema and records each applied file in `curator.schema_migration` with a checksum. Re-running is a no-op; editing an applied file is refused. A fix goes in the next numbered file (`sql/0004_*.sql`). The SQL files are plain SQL, so pasting one into the SQL editor works too, but then the runner does not know it ran.
+   It creates the `curator` schema and records each applied file in `curator.schema_migration` with a checksum. Re-running is a no-op; editing an applied file is refused. A fix goes in the next numbered file (`sql/0005_*.sql`). `0004_catalogue.sql` adds the catalogue (`catalogue_item`, `catalogue_account`, the `catalogue_rev` sequence, `catalogue_entitled()`). The SQL files are plain SQL, so pasting one into the SQL editor works too, but then the runner does not know it ran.
 
 2. **The API role**: paste `sql/roles.sql` into the SQL editor and run it (as `postgres`). Then, separately and never in a file:
 
@@ -49,9 +50,26 @@ Once, in this order. Before you start, delete the spike's objects from `public` 
    postgres://curator_api.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
    ```
 
-4. **Data API exposed schemas.** Devices reach only Auth and Realtime; the library goes through this API. Dashboard → Project Settings → Data API → Exposed schemas: remove `public`, and do not add `curator`. Remove `graphql_public` too unless something uses GraphQL. With both gone, PostgREST serves no table to a device even with a valid token; RLS is the second wall, not the first.
+4. **Catalogue Storage**: paste `sql/storage.sql` into the SQL editor and run it (as `postgres`, after the migrations: it calls `curator.catalogue_entitled()` from 0004). Idempotent; the runner skips it like `roles.sql`. It creates the private bucket `catalogue` (16 MiB per object, `application/octet-stream`) and three policies on `storage.objects`: select / insert / delete under the caller's own `<uid>/` prefix, insert only as `<uid>/peaks/<sha256>.cpk` or `<uid>/vec/<sha256>.cvec` and only while the account is entitled and under quota. There is deliberately no update policy (objects are immutable). Check:
 
-5. **Realtime.** Nothing to toggle: the wake-up is a broadcast from a trigger on the private channel `user:<uid>` and the subscribe policy is created by 0001. Realtime Authorization must stay on (the default).
+   ```sql
+   select id, public, file_size_limit, allowed_mime_types from storage.buckets where id = 'catalogue';
+   select policyname, cmd from pg_policies where tablename = 'objects' and policyname like 'curator_catalogue%';
+   ```
+
+   **If the editor refuses it** (42501, "must be owner of table objects": Supabase owns the `storage` schema), create the bucket and the three policies in the dashboard instead (Storage → New bucket, then Storage → Policies), exactly as the comment at the top of `sql/storage.sql` spells out, and run only its `curator.catalogue_upload_allowed()` function and the two lines after it (revoke / grant) in the SQL editor.
+
+5. **Catalogue accounts.** Nobody may store analysis until the owner adds them (public sign-ups are off in Auth → Sign In / Providers, and this row is the second wall). In the SQL editor:
+
+   ```sql
+   insert into curator.catalogue_account (user_id) values ('<uid from Authentication → Users>');
+   ```
+
+   The default quota is 900 MiB (943718400 bytes), sized for Supabase Free during stage D-a. Raise it with `update curator.catalogue_account set quota_bytes = <bytes> where user_id = '<uid>'`; withdraw with `set entitled = false` (puts and uploads stop; what is stored stays readable).
+
+6. **Data API exposed schemas.** Devices reach Auth, Realtime and Storage (own prefix: insert / select / delete, ≤16 MiB, entitled only); the library and the catalogue's records go through this API. Dashboard → Project Settings → Data API → Exposed schemas: remove `public`, and do not add `curator`. Remove `graphql_public` too unless something uses GraphQL. With both gone, PostgREST serves no table to a device even with a valid token; RLS is the second wall, not the first.
+
+7. **Realtime.** Nothing to toggle: the wake-up is a broadcast from a trigger on the private channel `user:<uid>` and the subscribe policy is created by 0001. Realtime Authorization must stay on (the default).
 
 ## Release (Fly.io)
 
@@ -85,7 +103,8 @@ The token reaches flyctl through its environment only; it is never printed or wr
 
 1. The owner runs the new migrations from their machine (Database setup, step 1): `DATABASE_URL='<owner connection>' pnpm --filter @curator/cloud db:migrate`.
 2. The owner re-runs `sql/roles.sql` (step 2), always: it is idempotent, and a migration that adds a function the API calls (`0002_audit.sql`, `0003_migration_check.sql`) needs its grant.
-3. Then release.
+3. When `sql/storage.sql` changed (or on the catalogue's first release), the owner runs it too (step 4).
+4. Then release.
 
 The server enforces the order. At boot it compares the migration files it ships (`sql/NNNN_*.sql`, not `roles.sql`) with `curator.applied_migrations()` (0003, executable by `curator_api` only, which has no read on `curator.schema_migration` itself) and, if any is missing, logs `schema_behind` with the missing files and a hint, and exits. The new machine never passes the health check, the deploy fails, and the previous release keeps serving. A database *ahead* of the image (a rollback onto a newer schema) starts with a `schema_ahead` warning, since migrations are additive.
 
@@ -97,7 +116,7 @@ fly apps create <app>
 fly secrets set --stage --app <app> DATABASE_URL='...' SUPABASE_URL='https://<ref>.supabase.co'
 ```
 
-`--stage` stores the secrets without restarting machines; the next release picks them up. The health check is `GET /trpc/health` (`{ ok, schemaVersion, minSupportedSchemaVersion, commit }`). Snapshots build inside the running machine every 15 minutes for users with 10k new ops or a day-old snapshot; `node dist/snapshot.js [--user <uuid>]` in `fly ssh console` runs one on demand.
+`--stage` stores the secrets without restarting machines; the next release picks them up. The health check is `GET /trpc/health` (`{ ok, schemaVersion, minSupportedSchemaVersion, features, catalogue?, commit }`). Snapshots build inside the running machine every 15 minutes for users with 10k new ops or a day-old snapshot; `node dist/snapshot.js [--user <uuid>]` in `fly ssh console` runs one on demand.
 
 ## Repository settings
 
@@ -131,7 +150,9 @@ Applied on `boyangu/curator` (public) on 2026-10-19; none of them grants access 
 Two tables in the `curator` schema (`sql/0002_audit.sql`), written by the API and readable by nobody but the owner:
 
 - **`curator.request_log`**: one row per HTTP request, failures included (401, 404, 413, 429, 500): request id, procedure (the tRPC path, or `http:<status>` when tRPC never ran), status, reason, duration, ops pushed / pulled, bytes in / out, client IP (Fly's `Fly-Client-IP` only, never `X-Forwarded-For`), client (`x-curator-client`, e.g. `desktop/0.1.0 win32`). User and session ids come from the verified token only, the device id from a verified push only. **Kept 90 days**: the server prunes once a day from its snapshot timer; `node dist/snapshot.js --prune-logs [--older-than '90 days']` runs it by hand.
-- **`curator.audit_event`**: security events, **never pruned**: `auth_failed`, `rate_limited`, `device_registered`, `device_revoked`, `device_reregister_refused`, `push_from_revoked_device`, `ops_rejected`, `client_ts_clamped`, `bootstrap_served` (a full-library export). `request_id` joins an event to its request while that row exists.
+- **`curator.audit_event`**: security events, **never pruned**: `auth_failed`, `rate_limited`, `device_registered`, `device_revoked`, `device_reregister_refused`, `push_from_revoked_device`, `ops_rejected`, `client_ts_clamped`, `bootstrap_served` (a full-library export), `catalogue_rejected` (a put's per-item rejections as `{ procedure, byReason }`, or a catalogue call refused for a revoked device or a missing entitlement as `{ procedure, reason }`). `request_id` joins an event to its request while that row exists.
+
+The catalogue procedures log like the sync ones, reusing the op columns as item counts: `catalogue.lookup` has `ops_in` = hashes asked and `ops_out` = items returned, `catalogue.put` has `ops_in` = items sent and `ops_out` = items accepted, `catalogue.inventory` has `ops_out` = entries returned. `device_id` is the calling device on all three (from the input, trusted once the token verified, as for a push).
 
 Neither holds a token, an op payload, an email, a connection string or a query string. Every response carries `x-request-id` (the client's, when it sent a UUID), so a user's report can be matched to its row. Each request and event is also one JSON line on stdout (`fly logs`).
 
@@ -156,10 +177,34 @@ select at, kind, device_id, detail, request_id
 from curator.audit_event
 where user_id = '<uuid>'
 order by at desc;
+
+-- Catalogue traffic per device, last day
+select device_id, procedure, count(*) as calls, sum(ops_in) as items_in, sum(ops_out) as items_out
+from curator.request_log
+where user_id = '<uuid>' and procedure like 'catalogue.%' and at > now() - interval '1 day'
+group by device_id, procedure
+order by device_id, procedure;
+
+-- Catalogue holdings per account against quota
+select a.user_id, count(i.*) as items, coalesce(sum(i.data_bytes), 0) as inline_bytes,
+	coalesce(sum(i.blob_bytes), 0) as blob_bytes, a.quota_bytes, a.entitled
+from curator.catalogue_account a
+left join curator.catalogue_item i on i.user_id = a.user_id
+group by a.user_id, a.quota_bytes, a.entitled;
 ```
 
 ## Notes
 
 - **Snapshots in Postgres.** `curator.library_snapshot` holds the reducer's raw state, gzipped canonical JSON, three per user; `sync.bootstrap` returns the newest inline as base64. Moving them to R2 later changes only `bootstrap` and the job.
 - **Protocol drift to fix** (`src/wire.ts`): the protocol's `BootstrapResult` says `snapshotUrl`, this server returns `{ snapshot, snapshotSeq, encoding }`; the protocol's `listDevices` is `account.devices` here; the snapshot decoder (`src/snapshot/codec.ts`) has to move into `packages/protocol` before a client can bootstrap.
-- **Rate limits** are in-memory per machine (10 pushes/s per device, 100 pulls/min per session), answered with `TOO_MANY_REQUESTS`, `data.retryAfterSec` and a `Retry-After` header.
+- **Rate limits** are in-memory per machine (10 pushes/s per device, 100 pulls/min per session, catalogue calls 20 burst / 5 per s per device), answered with `TOO_MANY_REQUESTS`, `data.retryAfterSec` and a `Retry-After` header.
+
+## Catalogue
+
+Analysis one device computed, shared with the same user's other devices (workstream D, phase 1; the protocol is `packages/protocol/src/catalogue.ts`). Items are keyed by `(audio hash, unit, variant, version)`. Inline units (rhythm, key, structure, advanced, fingerprint) are jsonb in `curator.catalogue_item`; peaks (`.cpk`) and vector packs (`.cvec`, `catalogue-pack.ts`) are objects in the `catalogue` bucket that devices upload and download themselves with their own session, and a row names its object. The API holds no service key and never touches object bytes: `catalogue.put` checks each named object exists in `storage.objects` with the stated size, under the caller's RLS.
+
+- **`catalogue.lookup`** (POST): ≤50 hashes and a want list (unit, optional variant, `minVersion`, `maxSchema`); answers the newest acceptable version per hash / unit / variant.
+- **`catalogue.put`**: ≤100 items, ≤1 MiB. Per-item rejections (`invalid_item`, `unit_disabled`, `blob_path_invalid`, `blob_missing`, `blob_size_mismatch`, `quota_exceeded`, `version_outdated`, `duplicate_in_batch`); the rest is upserted, bumping `rev`. The newest two versions per key are kept; blob paths no item references any more come back as `superseded` for the device to delete. Whole-call refusals: `catalogue_not_entitled` (no `catalogue_account` row), `device_not_registered`, `device_revoked`, `batch_too_large`.
+- **`catalogue.inventory`**: the account's items after a rev (≤5000 a page), with the account's usage, quota, entitlement and the server's policy.
+
+**Stages (D-a / D-b)** are the `CURATOR_CATALOGUE` setting, not code. D-a (now, Supabase Free): `rhythm,key,structure,advanced,fingerprint,peaks:lo`; hi peaks and vectors are refused as `unit_disabled`. D-b (after a plan upgrade): add `peaks:hi,vectors` in `fly.toml`, raise the account's `quota_bytes`, release. The server advertises its policy in `health` (`features` lists `catalogue`, `catalogue.policy` names the units) and on every inventory page; the desktop uploads and hydrates only what it allows. With the setting off, `features` omits `catalogue` and the procedures answer `catalogue_disabled`.

@@ -51,6 +51,10 @@ export const AUDIT_KINDS = [
 	'ops_rejected',
 	'client_ts_clamped',
 	'bootstrap_served',
+	// catalogue.*: per-item rejections of a put ({ procedure, byReason }), or
+	// a whole call refused for a revoked device or a missing entitlement
+	// ({ procedure, reason }).
+	'catalogue_rejected',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -82,6 +86,7 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	ops_rejected: 'info',
 	client_ts_clamped: 'warn',
 	bootstrap_served: 'info',
+	catalogue_rejected: 'info',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

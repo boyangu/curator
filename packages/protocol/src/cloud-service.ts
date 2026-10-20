@@ -3,6 +3,14 @@
 // `CloudTransport` port and the phone call it. Transport may change, these
 // signatures should not — the same rule the desktop applies to `CoreService`.
 
+import type {
+	CatalogueInventoryInput,
+	CatalogueInventoryResult,
+	CatalogueLookupInput,
+	CatalogueLookupResult,
+	CataloguePutInput,
+	CataloguePutResult,
+} from './catalogue.js';
 import type { Op, RejectReason } from './ops.js';
 import type { SNAPSHOT_ENCODING } from './snapshot.js';
 
@@ -32,7 +40,11 @@ export type PushInput = {
 //   - 'pull_skip_own': sync.pull takes `deviceId` + `ownThroughSeq` and
 //     leaves out the caller's own ops it already holds; PushResult carries
 //     `clamped`, `batchMaxSeq` and `priorOwnMaxSeq`.
-export const SYNC_FEATURES = ['pull_skip_own'] as const;
+//   - 'catalogue': the `catalogue.*` procedures exist and are switched on
+//     (catalogue.ts). A server lists it only when it is configured with a
+//     catalogue policy, so this constant is what a server CAN offer, not
+//     what every server does; read `features` from the server.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -128,6 +140,12 @@ export const CALL_ERROR_REASONS = [
 	// The client's protocol is below the server's minimum: stop syncing and
 	// ask the user to update; local reads keep working.
 	'update_required',
+	// catalogue.*: this server runs without a catalogue policy (it did not
+	// list 'catalogue' in `features`). Stop calling until it does.
+	'catalogue_disabled',
+	// catalogue.put: the account has no catalogue entitlement (the owner
+	// adds it). Lookups still answer; do not upload.
+	'catalogue_not_entitled',
 ] as const;
 export type CallErrorReason = (typeof CALL_ERROR_REASONS)[number];
 
@@ -148,55 +166,6 @@ export type DeviceInfo = {
 	revokedAt: number | null;
 };
 
-// ── catalogue (workstream D) ────────────────────────────────────────────────
-// The identity + analysis exchange is a separate set of procedures; only the
-// signatures the plan names are pinned here. Shapes marked TODO D are open
-// until the catalogue schema (recording, recording_claim, recording_analysis,
-// file_analysis, recording_vector, model) lands.
-
-export type ClaimKind = 'isrc' | 'audio_hash' | 'fingerprint' | 'spotify' | 'tidal' | 'beatport';
-
-export type CatalogueLookupInput = {
-	recordingId?: string;
-	audioHash?: string;
-};
-
-export type CatalogueLookupResult = {
-	// The canonical recording after alias resolution, if the catalogue knows
-	// either key.
-	recordingId: string | null;
-	// Analyses available for that recording / audio hash, keyed by unit so the
-	// desktop can set the matching `skip*` options before computing.
-	// TODO D: unit list and per-unit provenance (analyzer version, model id).
-	available: { unit: string; version: string }[];
-};
-
-export type UploadClaimsInput = {
-	recordingId: string;
-	claims: { kind: ClaimKind; value: string; confidence: number; durationSec?: number }[];
-};
-
-export type UploadAnalysisInput = {
-	recordingId: string;
-	audioHash: string | null;
-	// TODO D: scalars per recording (bpm, key, brightness, power, ...), grid /
-	// downbeats / segments and the two `.cpk` files per audio hash as R2
-	// objects, vectors per model with the licence from `mir_model`; plus
-	// provenance (uploader device, analyzer and model versions).
-	payload: unknown;
-};
-
-export type PullAnalysisInput = {
-	recordingId: string;
-	audioHash: string | null;
-	units: string[];
-};
-
-export type PullAnalysisResult = {
-	// TODO D: per-unit rows + signed URLs for blob units.
-	units: { unit: string; version: string; data: unknown }[];
-};
-
 export interface CloudService {
 	sync: {
 		push(input: PushInput): Promise<PushResult>;
@@ -209,9 +178,10 @@ export interface CloudService {
 		revokeDevice(input: { deviceId: string }): Promise<{ ok: true }>;
 	};
 	catalogue: {
+		// 'catalogue' (catalogue.ts). Recording identity claims are not here:
+		// they ride the op log.
 		lookup(input: CatalogueLookupInput): Promise<CatalogueLookupResult>;
-		uploadClaims(input: UploadClaimsInput): Promise<{ ok: true }>;
-		uploadAnalysis(input: UploadAnalysisInput): Promise<{ ok: true }>;
-		pullAnalysis(input: PullAnalysisInput): Promise<PullAnalysisResult>;
+		put(input: CataloguePutInput): Promise<CataloguePutResult>;
+		inventory(input: CatalogueInventoryInput): Promise<CatalogueInventoryResult>;
 	};
 }

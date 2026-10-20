@@ -1,4 +1,5 @@
-// Per-device token buckets (design: "Limits": 10 pushes/s, 100 pulls/min).
+// Per-device token buckets (design: "Limits": 10 pushes/s, 100 pulls/min;
+// catalogue plan: 20 burst, 5/s per user + device for catalogue.*).
 // In memory on purpose: the limit protects this process and the database
 // behind it from a runaway client loop, not a billing quota, so a bucket
 // that resets on deploy or differs per machine is fine and costs no round
@@ -50,11 +51,15 @@ export class TokenBucketLimiter {
 	}
 }
 
-export type RateLimits = { push: TokenBucketLimiter; pull: TokenBucketLimiter };
+export type RateLimits = { push: TokenBucketLimiter; pull: TokenBucketLimiter; catalogue: TokenBucketLimiter };
 
 export function defaultRateLimits(now: () => number = Date.now): RateLimits {
 	return {
 		push: new TokenBucketLimiter(10, 10, now),
 		pull: new TokenBucketLimiter(100, 100 / 60, now),
+		// A hydrating device looks up 50 hashes per call and an uploader puts
+		// 100 items per call: 5 calls/s is ~250 tracks/s, far past what the
+		// desktop's own 2 MB/s blob budget lets it use.
+		catalogue: new TokenBucketLimiter(20, 5, now),
 	};
 }

@@ -7,6 +7,7 @@
 // error's message is replaced, because a Postgres error text names tables,
 // columns and constraint internals.
 
+import type { CataloguePolicy } from '@curator/protocol';
 import { initTRPC, TRPCError } from '@trpc/server';
 import type { AuditWriter } from './audit.js';
 import { AuthError, type AuthUser, type TokenVerifier } from './auth/jwt.js';
@@ -25,6 +26,9 @@ export type AppDeps = {
 	pull: PullOptions;
 	// The buffered request_log / audit_event writer (src/audit.ts).
 	audit: AuditWriter;
+	// The catalogue units this server accepts (src/catalogue/policy.ts), or
+	// null: catalogue off, procedures refuse, 'catalogue' not advertised.
+	catalogue: CataloguePolicy | null;
 };
 
 export type AppContext = {

@@ -484,6 +484,9 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'cloud-sync:now': () => svc.cloudSyncNow(),
 		'cloud-sync:get-poll-settings': () => svc.getCloudSyncPollSettings(),
 		'cloud-sync:set-poll-policy': (patch) => svc.setCloudSyncPollPolicy(patch),
+		'catalogue:status': () => svc.getCatalogueStatus(),
+		'catalogue:set-settings': (patch) => svc.setCatalogueSettings(patch),
+		'catalogue:backfill': (action) => svc.setCatalogueBackfill(action),
 		'backup:take-pending-renderer-settings': async () => {
 			const p = join(app.getPath('userData'), PENDING_RENDERER_SETTINGS_FILE);
 			if (!existsSync(p)) return null;
