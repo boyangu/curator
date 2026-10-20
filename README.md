@@ -121,3 +121,22 @@ pnpm start:packaged
 ```
 
 See `apps/desktop/scripts/rebuild-sqlite.mjs` for the native-rebuild contract if you change the Electron version.
+
+### A second instance on the same PC (profile mode)
+
+To try multi-device sync without a second machine, run another instance as a separate "desktop" next to `pnpm dev`:
+
+```bash
+pnpm desktop:profile second              # build into apps/desktop/out-profile-second/, then launch
+pnpm desktop:profile second --no-build   # relaunch the last build
+```
+
+`CURATOR_PROFILE=<name>` (lower-case letters, digits, `-`; up to 32) gives the instance its own data folder, `%APPDATA%\Curator-<name>`, so it starts with an empty library and its own DBs, logs, caches and sign-ins; the window title ends with "— profile: <name>". The launcher makes a production build in its own out dir (port 5173 and `out/` stay `pnpm dev`'s) and rebuilds `better-sqlite3` for Electron only when it isn't already (pass `--rebuild` to force it, with no Curator running). In a profile:
+
+- rekordbox is off (no sidecar, so no `master.db` access) unless `CURATOR_PROFILE_ALLOW_REKORDBOX=1`;
+- Spotify/Tidal remote writes are always denied (no override);
+- backup, its scheduler and Google Drive connect are off;
+- downloads go to the profile's own folder, and are refused if they would land anywhere else; `CURATOR_DB_URL` is ignored;
+- the MCP bridge and the Spotify sidecar use ephemeral loopback ports, as always.
+
+The startup log (`%APPDATA%\Curator-<name>\logs`) has one `profile mode` line listing every rail. Delete that folder to start the profile over.

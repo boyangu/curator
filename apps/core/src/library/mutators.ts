@@ -33,7 +33,7 @@ import { appSetting, playlist as playlistTable, pinnedSearch as pinnedSearchTabl
 import type { Db } from '../db/client.js';
 import { rawOf } from './artists.js';
 import { appendRows, planReorderKeys, recomputePositions, type MemberDraft } from './playlist-order.js';
-import { emitOps, type EmitOp } from '../sync-log/outbox.js';
+import { captureEmitted, emitOps, type EmitOp } from '../sync-log/outbox.js';
 import {
 	cueDeleteOp,
 	cueDiffOps,
@@ -53,12 +53,17 @@ import {
 	playlistCreateOps,
 	pinnedCreateOp,
 	rbAnalysisDiffOps,
+	rbUnitDigest,
+	rbUnitMirrors,
 	rbUnitOp,
+	rbUnitPatch,
 	rbUnitValue,
+	sameUnit,
 	RB_UNITS,
+	type RbUnit,
 	tagCreateOp,
 } from '../sync-log/rows.js';
-import { readRbSlot, type RbSlotRow } from '../rekordbox/rb-slot.js';
+import { readRbSlot, writeRbSlot, type RbSlotPatch, type RbSlotRow } from '../rekordbox/rb-slot.js';
 import { log } from '../log.js';
 
 type Raw = Database.Database;
@@ -559,6 +564,187 @@ export function reorderMembers(db: Db, playlistId: string, orderedIds: readonly 
 export type DesiredMember = { trackId: string; sourceTrackId: string; addedAt: Date | null; addedBy?: string | null };
 export type ReconcileResult = { added: number; removed: number; moved: number };
 
+// ── upstream acks (F23) ─────────────────────────────────────────────────────
+// A membership change a user makes on a Spotify or Tidal playlist implies a
+// write to that service. Until it lands there, the service's list does not
+// show it, and a streaming read-sync — on this desktop or on another one
+// that pulled the op — would read the difference as an upstream edit and
+// undo the user's change everywhere. So the op is marked pending upstream
+// with an `upstream.ack`, in the same transaction as the change, and
+// re-acked once the push settles:
+//   skipped 'awaiting push' — written with the change: nobody pushed it yet
+//                              (write-sync off, not the owner, the service
+//                              not connected here, or the push still in
+//                              flight);
+//   failed                   — the push was refused or errored;
+//   pushed                   — the service has it.
+// An op with an ack whose latest status is not 'pushed' is pending. An op
+// with no ack at all never implied a write (a read-sync's own ops, the
+// initial push, local playlists): the service's list stays authoritative
+// for those rows.
+export const UPSTREAM_AWAITING = 'awaiting push';
+type UpstreamProvider = 'spotify' | 'tidal';
+type UpstreamStatus = 'pushed' | 'failed' | 'skipped';
+
+export function ackUpstream(db: Db, opIds: readonly string[], provider: UpstreamProvider, status: UpstreamStatus, error?: string | null): void {
+	if (opIds.length === 0) return;
+	tx(db, (raw) => {
+		emitOps(raw, opIds.map((id) => ({
+			entity: 'upstream' as const, entity_id: id, kind: 'ack' as const,
+			payload: { provider, status, ...(error ? { error: error.slice(0, 500) } : {}) },
+		})));
+	});
+}
+
+// Run a membership write on a streaming playlist and mark the playlist_track
+// ops it emits as awaiting the push. Returns their op ids for the ack that
+// settles them.
+export function withUpstreamPending<T>(db: Db, provider: UpstreamProvider, write: () => T): { result: T; opIds: string[] } {
+	return tx(db, (raw) => {
+		const { result, ops } = captureEmitted(raw, write);
+		const opIds = ops.filter((o) => o.entity === 'playlist_track').map((o) => o.op_id);
+		ackUpstream(db, opIds, provider, 'skipped', UPSTREAM_AWAITING);
+		return { result, opIds };
+	});
+}
+
+// Op ids whose latest upstream ack is not 'pushed'. Acks exist only for
+// user edits on streaming playlists, so this set stays small.
+export function pendingUpstreamOps(raw: Raw): Set<string> {
+	const rows = raw.prepare(`SELECT key FROM sync_state WHERE map = 'upstreamAcks'
+		AND json_extract(value, '$.value.status') IS NOT 'pushed'`).pluck().all() as string[];
+	return new Set(rows);
+}
+
+// The pending add ops of these membership rows (push-local-only settles
+// them once the service has the rows).
+export function pendingAddOps(raw: Raw, rowIds: readonly string[]): string[] {
+	const pending = pendingUpstreamOps(raw);
+	if (pending.size === 0 || rowIds.length === 0) return [];
+	const get = raw.prepare(`SELECT json_extract(value, '$.added.op') FROM sync_state WHERE map = 'playlistTracks' AND key = ?`).pluck();
+	const out: string[] = [];
+	for (const id of rowIds) {
+		const op = get.get(id) as string | null | undefined;
+		if (op && pending.has(op)) out.push(op);
+	}
+	return out;
+}
+
+// The pending side of one playlist: present rows whose add or latest move is
+// pending, and the tracks of rows a pending remove took out. Null when
+// nothing in the playlist is pending.
+type PendingMembership = { rows: Set<string>; moves: boolean; removed: Map<string, number> };
+function pendingMembership(raw: Raw, playlistId: string): PendingMembership | null {
+	const pending = pendingUpstreamOps(raw);
+	if (pending.size === 0) return null;
+	const recs = raw.prepare(`SELECT key, value FROM sync_state WHERE map = 'playlistTracks' AND parent_id = ?`).all(playlistId) as Array<{ key: string; value: string }>;
+	const tombs = new Map((raw.prepare(`SELECT t.entity_id AS id, t.op_id AS op FROM tombstone t
+		JOIN sync_state s ON s.map = 'playlistTracks' AND s.key = t.entity_id
+		WHERE t.entity = 'playlist_track' AND s.parent_id = ?`).all(playlistId) as Array<{ id: string; op: string | null }>).map((t) => [t.id, t.op]));
+	const out: PendingMembership = { rows: new Set(), moves: false, removed: new Map() };
+	const present = new Set(raw.prepare(`SELECT id FROM playlist_track WHERE playlist_id = ?`).pluck().all(playlistId) as string[]);
+	const trackOf = raw.prepare(`SELECT id FROM track WHERE recording_id = ? ORDER BY deleted_at IS NOT NULL, created_at, id LIMIT 1`).pluck();
+	for (const r of recs) {
+		const rec = JSON.parse(r.value) as { added: { op: string } | null; orderKey: { clock: { op: string } } | null; recordingId: string | null };
+		if (present.has(r.key)) {
+			const add = !!rec.added && pending.has(rec.added.op);
+			const move = !!rec.orderKey && pending.has(rec.orderKey.clock.op) && rec.orderKey.clock.op !== rec.added?.op;
+			if (add || move) out.rows.add(r.key);
+			if (move) out.moves = true;
+			continue;
+		}
+		const op = tombs.get(r.key);
+		if (!op || !pending.has(op) || !rec.recordingId) continue;
+		const trackId = trackOf.get(rec.recordingId) as string | undefined;
+		if (trackId) out.removed.set(trackId, (out.removed.get(trackId) ?? 0) + 1);
+	}
+	return out.rows.size > 0 || out.removed.size > 0 ? out : null;
+}
+
+type CurrentRow = { id: string; track_id: string; source_track_id: string; added_at: number | null; added_by: string | null };
+
+// Fold the pending side into a read-sync's desired list (design: "pending
+// ops are on the local side of its three-way diff"):
+//   - a track a pending remove took out is not added back;
+//   - a row whose pending add the service does not show yet is kept where
+//     it is (after the nearest earlier row the service does show);
+//   - with a pending move in the playlist, the rows keep their local order
+//     and the service's new rows slot in after their service neighbour —
+//     the service's order is applied again once nothing is pending.
+// Everything else follows the service as before.
+function holdPending(current: readonly CurrentRow[], desired: readonly DesiredMember[], pending: PendingMembership): DesiredMember[] {
+	const count = (xs: Iterable<string>): Map<string, number> => {
+		const m = new Map<string, number>();
+		for (const x of xs) m.set(x, (m.get(x) ?? 0) + 1);
+		return m;
+	};
+	const want = count(desired.map((d) => d.trackId));
+	const have = count(current.map((r) => r.track_id));
+	const drop = new Map<string, number>();
+	for (const [trackId, n] of pending.removed) {
+		const k = Math.min(n, Math.max(0, (want.get(trackId) ?? 0) - (have.get(trackId) ?? 0)));
+		if (k > 0) drop.set(trackId, k);
+	}
+	const kept: DesiredMember[] = [];
+	for (let i = desired.length - 1; i >= 0; i--) {
+		const d = desired[i]!;
+		const k = drop.get(d.trackId) ?? 0;
+		if (k > 0) { drop.set(d.trackId, k - 1); continue; }
+		kept.unshift(d);
+	}
+
+	// Which current row each desired entry would match (k-th occurrence to
+	// k-th, as reconcileMembership does) and which rows nothing matches.
+	const queue = new Map<string, CurrentRow[]>();
+	for (const r of current) {
+		const q = queue.get(r.track_id);
+		if (q) q.push(r); else queue.set(r.track_id, [r]);
+	}
+	const matchOf = kept.map((d) => queue.get(d.trackId)?.shift() ?? null);
+	const matchedIds = new Set(matchOf.filter((m): m is CurrentRow => m !== null).map((m) => m.id));
+	const asDesired = (r: CurrentRow): DesiredMember => ({ trackId: r.track_id, sourceTrackId: r.source_track_id, addedAt: r.added_at != null ? new Date(r.added_at) : null, addedBy: r.added_by });
+
+	if (pending.moves) {
+		// Local order for every kept row; new entries after the row their
+		// service predecessor matched.
+		const after = new Map<string | null, DesiredMember[]>();
+		let anchor: string | null = null;
+		const entryOf = new Map<string, DesiredMember>();
+		kept.forEach((d, k) => {
+			const m = matchOf[k];
+			if (m) { anchor = m.id; entryOf.set(m.id, d); return; }
+			const list = after.get(anchor) ?? [];
+			list.push(d);
+			after.set(anchor, list);
+		});
+		const out: DesiredMember[] = [...(after.get(null) ?? [])];
+		for (const r of current) {
+			const d = entryOf.get(r.id) ?? (pending.rows.has(r.id) ? asDesired(r) : null);
+			if (!d) continue;
+			out.push(d, ...(after.get(r.id) ?? []));
+		}
+		return out;
+	}
+
+	// Service order; each unmatched pending row right after the nearest
+	// earlier current row the service still shows.
+	const slotOfRow = new Map<string, number>();
+	matchOf.forEach((m, k) => { if (m) slotOfRow.set(m.id, k); });
+	const extra = new Map<number, DesiredMember[]>();
+	let prev = -1;
+	for (const r of current) {
+		const k = slotOfRow.get(r.id);
+		if (k !== undefined) { prev = k; continue; }
+		if (matchedIds.has(r.id) || !pending.rows.has(r.id)) continue;
+		const list = extra.get(prev) ?? [];
+		list.push(asDesired(r));
+		extra.set(prev, list);
+	}
+	const out: DesiredMember[] = [...(extra.get(-1) ?? [])];
+	kept.forEach((d, k) => { out.push(d, ...(extra.get(k) ?? [])); });
+	return out;
+}
+
 // Make the playlist's rows equal `desired`, in order, by diff (design:
 // "External pulls"): rows are matched to desired entries by track, k-th
 // occurrence to k-th, so duplicates keep their identity; unmatched rows are
@@ -570,10 +756,15 @@ export type ReconcileResult = { added: number; removed: number; moved: number };
 // Per-row columns the provider owns (added_at, added_by, source_track_id)
 // follow `desired` on kept rows too; they are local columns, not op fields.
 // `origin` 'remote' writes without emitting.
-export function reconcileMembership(db: Db, playlistId: string, desired: readonly DesiredMember[], origin: MutationOrigin): ReconcileResult {
+//
+// A Spotify or Tidal read-sync merges around changes still pending upstream
+// (holdPending, F23) instead of reverting them.
+export function reconcileMembership(db: Db, playlistId: string, providerList: readonly DesiredMember[], origin: MutationOrigin): ReconcileResult {
 	return tx(db, (raw) => {
 		type Cur = { id: string; track_id: string; order_key: string; position: number; source_track_id: string; added_at: number | null; added_by: string | null };
 		const current = raw.prepare(`SELECT id, track_id, order_key, position, source_track_id, added_at, added_by FROM playlist_track WHERE playlist_id = ? ORDER BY order_key, id`).all(playlistId) as Cur[];
+		const pending = origin === 'spotify' || origin === 'tidal' ? pendingMembership(raw, playlistId) : null;
+		const desired = pending ? holdPending(current, providerList, pending) : providerList;
 		const queue = new Map<string, Cur[]>();
 		for (const r of current) {
 			const q = queue.get(r.track_id);
@@ -685,26 +876,74 @@ export function recordCueChanges<T>(db: Db, trackIds: readonly string[], write: 
 
 // ── rekordbox analysis ──────────────────────────────────────────────────────
 
-// Snapshot the rb slot of `trackIds`, run `write`, emit one set-rb-analysis
-// op per unit it changed (rows.ts rbAnalysisDiffOps). The importer's grid,
-// phrase and key writes go through here; a re-import that rewrites the same
-// grid compares equal byte for byte and emits nothing, before the
-// restatement check even runs. Units too large for an op stay device-local
-// and are logged.
-export function recordRbAnalysisChanges<T>(db: Db, trackIds: readonly string[], write: (raw: Raw) => T): T {
+// This device's rekordbox baseline for one unit (schema.ts
+// rekordboxUnitSeen): the digest of rekordbox's value as last imported here,
+// or undefined before the first import that wrote it.
+const SEEN_STMTS = new WeakMap<Raw, { get: Database.Statement<[string, string], { digest: string }>; put: Database.Statement<[string, string, string, number]> }>();
+function seenStmts(raw: Raw): { get: Database.Statement<[string, string], { digest: string }>; put: Database.Statement<[string, string, string, number]> } {
+	let s = SEEN_STMTS.get(raw);
+	if (!s) {
+		s = {
+			get: raw.prepare(`SELECT digest FROM rekordbox_unit_seen WHERE track_id = ? AND unit = ?`),
+			put: raw.prepare(`INSERT INTO rekordbox_unit_seen (track_id, unit, digest, seen_at) VALUES (?, ?, ?, ?)
+				ON CONFLICT(track_id, unit) DO UPDATE SET digest = excluded.digest, seen_at = excluded.seen_at`),
+		};
+		SEEN_STMTS.set(raw, s);
+	}
+	return s;
+}
+export function rbUnitSeen(raw: Raw, trackId: string, unit: RbUnit): string | undefined {
+	return seenStmts(raw).get.get(trackId, unit)?.digest;
+}
+
+// Snapshot the rb slot of the tracks in `written`, run `write` (the importer
+// putting rekordbox's values into the slot), then per unit it wrote:
+//   - rekordbox's value is the one this device read last time (baseline):
+//     rekordbox did not change it, so it has nothing to say — the slot is
+//     put back to what it held, which may be another desktop's newer value
+//     from the op log, and nothing is emitted. Without this, two desktops
+//     whose rekordbox libraries disagree flip the unit on every re-import;
+//   - otherwise rekordbox changed it (or this is its first reading here):
+//     the baseline moves, and a value that differs from the slot's previous
+//     one emits one set-rb-analysis op (rows.ts rbAnalysisDiffOps).
+// A re-import that rewrites the same grid compares equal byte for byte and
+// emits nothing, before the restatement check even runs. Units too large
+// for an op stay device-local and are logged.
+export function recordRbAnalysisChanges<T>(db: Db, written: ReadonlyMap<string, readonly RbUnit[]>, write: (raw: Raw) => T): T {
 	return tx(db, (raw) => {
-		const before = new Map<string, RbSlotRow | null>(trackIds.map((id) => [id, readRbSlot(raw, id)]));
+		const before = new Map<string, RbSlotRow | null>([...written.keys()].map((id) => [id, readRbSlot(raw, id)]));
 		const result = write(raw);
+		const seen = seenStmts(raw);
+		const now = Date.now();
 		const ops: EmitOp[] = [];
 		let skipped = 0;
+		let held = 0;
 		for (const [id, was] of before) {
+			let after = readRbSlot(raw, id);
+			const restore: RbSlotPatch = {};
+			const restored: RbUnit[] = [];
+			for (const unit of new Set(written.get(id) ?? [])) {
+				const digest = rbUnitDigest(after, unit);
+				if (seen.get.get(id, unit)?.digest === digest) {
+					if (!sameUnit(was, after, unit)) { Object.assign(restore, rbUnitPatch(was, unit)); restored.push(unit); }
+					continue;
+				}
+				seen.put.run(id, unit, digest, now);
+			}
+			if (restored.length > 0) {
+				writeRbSlot(raw, id, restore);
+				after = readRbSlot(raw, id);
+				for (const unit of restored) rbUnitMirrors(raw, id, after, unit);
+				held += restored.length;
+			}
 			const r = recordingOf(raw, id);
 			if (!r) continue;
-			const diff = rbAnalysisDiffOps(r, was, readRbSlot(raw, id));
+			const diff = rbAnalysisDiffOps(r, was, after);
 			ops.push(...diff.ops);
 			skipped += diff.skipped;
 		}
 		if (skipped > 0) mlog.info('rekordbox analysis units over the op size cap stay on this device', { units: skipped });
+		if (held > 0) mlog.debug('rekordbox analysis units unchanged in rekordbox since the last import; the synced value stands', { units: held });
 		emitOps(raw, ops);
 		return result;
 	});

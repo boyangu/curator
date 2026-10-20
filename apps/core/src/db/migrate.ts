@@ -977,6 +977,16 @@ const ALTER_MIGRATIONS: string[] = [
 		PRIMARY KEY (audio_hash, unit, variant)
 	)`,
 	`CREATE INDEX IF NOT EXISTS catalogue_entry_state_idx ON catalogue_entry(local_state)`,
+	// Per-device rekordbox baseline for the rb analysis units — see
+	// rekordboxUnitSeen in schema.ts. Starts empty: a unit's first import
+	// after upgrade behaves as before (emits if it differs), then holds.
+	`CREATE TABLE IF NOT EXISTS rekordbox_unit_seen (
+		track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		unit TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		seen_at INTEGER NOT NULL,
+		PRIMARY KEY (track_id, unit)
+	)`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

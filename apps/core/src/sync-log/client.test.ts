@@ -17,27 +17,7 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '@curator/shared/schema';
-import {
-	applyOp,
-	clampClientTs,
-	cloneLibraryState,
-	createLibraryState,
-	MAX_PULL_OPS,
-	MAX_PUSH_OPS,
-	rebalance,
-	safeParseOp,
-	schemaVersionStatus,
-	serializeLibraryState,
-	type DeviceInfo,
-	type Op,
-	type PullInput,
-	type PullResult,
-	type PushInput,
-	type PushResult,
-	type RejectReason,
-	type StoredOp,
-	SYNC_FEATURES,
-} from '@curator/protocol';
+import { MAX_PULL_OPS, MAX_PUSH_OPS, rebalance, type StoredOp } from '@curator/protocol';
 import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
 import { migrate } from '../db/migrate.js';
@@ -49,135 +29,13 @@ import { compareDumps, dumpLibrary } from './dump.js';
 import { INITIAL_PUSH_KEY } from './apply.js';
 import { initialPushAsync } from './initial-push.js';
 import { recordingIdForTrack } from './recording-id.js';
-import { decodeLibraryStateSnapshot } from './snapshot.js';
+import { remintDeviceIdentity } from './remint.js';
+import { FakeCloud } from '../test-support/fake-cloud.js';
 import * as mut from '../library/mutators.js';
 import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '../library/artists.js';
 
-// ── fake server ─────────────────────────────────────────────────────────────
-
-class FakeCloud {
-	readonly log: StoredOp[] = [];
-	private readonly byId = new Map<string, StoredOp>();
-	// A server from before 'pull_skip_own': no features, no clamp report,
-	// and a pull input with the skip fields is refused (zod `.strict()`).
-	legacy = false;
-	readonly pullInputs: PullInput[] = [];
-	// Ops sent back on pulls, all callers together.
-	opsSent = 0;
-	readonly state = createLibraryState();
-	readonly devices = new Map<string, DeviceInfo>();
-	// Ops the server refuses (as a malformed/unauthorised op would be).
-	readonly rejectIds = new Map<string, RejectReason>();
-	// Failures thrown by the next calls, in order, per procedure.
-	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[] } = { push: [], pull: [] };
-	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0 };
-	readonly pushSizes: number[] = [];
-	pageLimit = MAX_PULL_OPS;
-	private snapshot: { seq: number; json: string } | null = null;
-	// A pull with afterSeq below this gets the snapshot hint.
-	hintBelow = 0;
-
-	get maxSeq(): number { return this.log.length === 0 ? 0 : this.log[this.log.length - 1]!.seq; }
-
-	push(userId: string, input: PushInput): PushResult {
-		this.calls.push++;
-		const f = this.fail.push.shift();
-		if (f) throw f;
-		this.pushSizes.push(input.ops.length);
-		if (input.ops.length > MAX_PUSH_OPS) throw new CloudTransportError('bad_request', 'batch too large');
-		const rejected: PushResult['rejected'] = [];
-		const clamped: NonNullable<PushResult['clamped']> = [];
-		const batchIds = new Set<string>();
-		let batchMaxSeq = 0;
-		let accepted = 0;
-		for (const raw of input.ops) {
-			const v = safeParseOp(raw);
-			const opId = (raw as { op_id?: string }).op_id ?? '?';
-			if (!v.ok) { rejected.push({ opId, reason: v.error.reason }); continue; }
-			if (schemaVersionStatus(v.op.schema_version) === 'update_required') { rejected.push({ opId, reason: 'update_required' }); continue; }
-			const refused = this.rejectIds.get(opId);
-			if (refused) { rejected.push({ opId, reason: refused }); continue; }
-			accepted++;
-			batchIds.add(opId);
-			let stored = this.byId.get(opId); // a re-push: accepted and ignored
-			if (!stored) {
-				const now = Date.now();
-				const op = { ...v.op, client_ts: clampClientTs(v.op.client_ts, now).clientTs } as Op;
-				stored = { ...op, seq: this.maxSeq + 1, user_id: userId, received_at: now } as StoredOp;
-				this.byId.set(opId, stored);
-				this.log.push(stored);
-				applyOp(this.state, op);
-			}
-			batchMaxSeq = Math.max(batchMaxSeq, stored.seq);
-			if (stored.client_ts !== v.op.client_ts && !clamped.some((c) => c.opId === opId)) clamped.push({ opId, clientTs: stored.client_ts });
-		}
-		if (this.legacy) return { accepted, maxSeq: this.maxSeq, rejected };
-		const prior = this.log.filter((o) => o.device_id === input.deviceId && !batchIds.has(o.op_id)).reduce((m, o) => Math.max(m, o.seq), 0);
-		return {
-			accepted, maxSeq: this.maxSeq, rejected, clamped, batchMaxSeq,
-			...(accepted > 0 ? { priorOwnMaxSeq: prior } : {}),
-			features: [...SYNC_FEATURES],
-		};
-	}
-
-	pull(input: PullInput): PullResult {
-		this.calls.pull++;
-		this.pullInputs.push({ ...input });
-		const f = this.fail.pull.shift();
-		if (f) throw f;
-		const skip = input.deviceId !== undefined || input.ownThroughSeq !== undefined;
-		if (skip && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
-		const features = this.legacy ? {} : { features: [...SYNC_FEATURES] };
-		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq, ...features };
-		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
-		const ops = this.log
-			.filter((o) => o.seq > input.afterSeq && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!))
-			.slice(0, limit);
-		// The real server's cursor rule (cloud sync/pull.ts): a full page stops
-		// at its last op; a short one reached the head.
-		const nextSeq = !skip ? (ops.length ? ops[ops.length - 1]!.seq : input.afterSeq)
-			: ops.length === limit ? ops[ops.length - 1]!.seq : Math.max(input.afterSeq, this.maxSeq);
-		this.opsSent += ops.length;
-		return { ops, nextSeq, ...features };
-	}
-
-	takeSnapshot(): number {
-		this.snapshot = { seq: this.maxSeq, json: serializeLibraryState(cloneLibraryState(this.state)) };
-		return this.snapshot.seq;
-	}
-
-	// Test-only: an op stored as a newer client would have sent it.
-	appendRaw(op: StoredOp): void { this.log.push(op); }
-
-	transport(userId: string, email = `${userId}@example.test`): CloudTransport & { signedIn: boolean } {
-		const cloud = this;
-		const t = {
-			signedIn: true,
-			session: () => (t.signedIn ? { userId, email } : null),
-			sync: {
-				push: async (input: PushInput) => cloud.push(userId, input),
-				pull: async (input: PullInput) => cloud.pull(input),
-			},
-			// The protocol's serialised state (gzip + base64 are the HTTP
-			// transport's), decoded by the same function that transport uses.
-			bootstrap: async () => {
-				cloud.calls.bootstrap++;
-				if (!cloud.snapshot) return { snapshotSeq: 0, records: [] };
-				return { snapshotSeq: cloud.snapshot.seq, records: decodeLibraryStateSnapshot(cloud.snapshot.json) };
-			},
-			account: {
-				registerDevice: async (input: { deviceId: string; name: string; platform: DeviceInfo['platform'] }) => {
-					cloud.calls.register++;
-					cloud.devices.set(input.deviceId, { ...input, registeredAt: Date.now(), lastSeenAt: null, revokedAt: null });
-					return { ok: true as const };
-				},
-				devices: async () => [...cloud.devices.values()],
-				revokeDevice: async () => ({ ok: true as const }),
-			},
-		};
-		return t;
-	}
-}
+// The fake server lives in test-support/fake-cloud.ts (shared with the
+// two-desktop scenario suites).
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -612,6 +470,73 @@ describe('own ops on pull', () => {
 		expect(clientState(restored).ownThroughSeq).toBe(cloud.maxSeq);
 		await ca.syncNow();
 		expect(diffs(a.raw, restored)).toEqual([]);
+	});
+
+	// Workstream E: a backup restored onto a second machine while the first
+	// keeps syncing. Without the re-mint both would push as one device, and
+	// each one's own-op skip would hide the other's edits from it.
+	it('a restore re-mints the device: both machines keep syncing and nothing pushed after the backup is lost', async () => {
+		const cloud = new FakeCloud();
+		const a = freshDb('a');
+		const ca = client(a.raw, cloud.transport('u'));
+		ownTags(a.raw, 'before', 2);
+		await ca.syncNow();
+		ownTags(a.raw, 'pending', 1); // in the backup, not yet pushed
+		const backup = join(dir, 'a-backup.db');
+		a.raw.prepare(`VACUUM INTO ?`).run(backup);
+		await ca.syncNow(); // the old machine pushes it after the backup
+		ownTags(a.raw, 'after', 3);
+		await ca.syncNow();
+		const oldId = ca.status().deviceId;
+
+		const { sqlite: restored } = createDb(backup);
+		handles.push(restored);
+		const r = remintDeviceIdentity(restored, 'snap-1@1');
+		expect(r).toMatchObject({ reminted: true, oldDeviceId: oldId, restamped: 1 });
+		expect(r.newDeviceId).not.toBe(oldId);
+		// Pending ops move to the new id, records included; what the old id
+		// already pushed keeps its stamp.
+		expect(restored.prepare(`SELECT device_id FROM sync_outbox WHERE state = 'pending'`).pluck().all()).toEqual([r.newDeviceId]);
+		expect(new Set(restored.prepare(`SELECT device_id FROM sync_outbox WHERE state = 'acked'`).pluck().all())).toEqual(new Set([oldId]));
+		const rec = restored.prepare(`SELECT value FROM sync_state WHERE map = 'tags' AND key = 'pending-0'`).pluck().get() as string;
+		expect(rec).toContain(r.newDeviceId);
+		expect(rec).not.toContain(oldId);
+		expect(restored.prepare(`SELECT 1 FROM app_setting WHERE key = 'sync.clock'`).get()).toBeUndefined();
+		expect(clientState(restored).ownThroughSeq).toBe(0);
+		// Once per restore; the next restore re-mints again.
+		expect(remintDeviceIdentity(restored, 'snap-1@1')).toMatchObject({ reminted: false, newDeviceId: r.newDeviceId });
+
+		// The real server refuses an op whose device_id is not the pusher's
+		// (not_owner): watch for one on the wire.
+		const transport = cloud.transport('u');
+		const foreign: string[] = [];
+		const push = transport.sync.push;
+		transport.sync.push = async (input) => {
+			for (const o of input.ops as Array<{ op_id: string; device_id: string }>) if (o.device_id !== input.deviceId) foreign.push(o.op_id);
+			return push(input);
+		};
+		const cr = client(restored, transport);
+		expect(cr.status().deviceId).toBe(r.newDeviceId);
+		ownTags(restored, 'restored', 1);
+		await cr.syncNow();
+		expect(foreign).toEqual([]);
+		expect(cloud.devices.has(r.newDeviceId)).toBe(true);
+		expect(outboxStates(restored)).toEqual({ acked: restored.prepare(`SELECT count(*) FROM sync_outbox`).pluck().get() });
+		const tagIds = (raw: Database.Database) => (raw.prepare(`SELECT id FROM tag WHERE kind = 'user' ORDER BY id`).pluck().all() as string[]);
+		expect(tagIds(restored)).toEqual(expect.arrayContaining(['after-0', 'after-1', 'after-2', 'before-0', 'pending-0', 'restored-0']));
+		// A re-push of an op the old id already sent is a no-op, not a second copy.
+		expect(cloud.log.filter((o) => o.entity === 'tag' && o.entity_id === 'pending-0')).toHaveLength(1);
+
+		// Both keep going, and each sees the other's next edit.
+		ownTags(a.raw, 'a-later', 1);
+		ownTags(restored, 'r-later', 1);
+		await ca.syncNow();
+		await cr.syncNow();
+		await ca.syncNow();
+		expect(tagIds(a.raw)).toEqual(expect.arrayContaining(['r-later-0', 'restored-0']));
+		expect(tagIds(restored)).toContain('a-later-0');
+		expect(diffs(a.raw, restored)).toEqual([]);
+		expect(remintDeviceIdentity(restored, 'snap-2@2').reminted).toBe(true);
 	});
 });
 

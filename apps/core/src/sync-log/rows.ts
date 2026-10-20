@@ -14,6 +14,7 @@
 //     machine's rekordbox by its exporter.
 
 import type Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 import {
 	cueEntityId,
 	encodeRbGrid,
@@ -28,7 +29,7 @@ import {
 } from '@curator/protocol';
 import { TRACK_STATES, type TrackState } from '@curator/shared';
 import type { TrackOverrides } from '@curator/shared/schema';
-import { decodeFloat32, type RbSlotRow } from '../rekordbox/rb-slot.js';
+import { decodeFloat32, rbIntroOutro, type RbSlotPatch, type RbSlotRow } from '../rekordbox/rb-slot.js';
 import { recordingIdForTrack } from './recording-id.js';
 
 type Raw = Database.Database;
@@ -409,7 +410,7 @@ export function rbUnitOp(recordingId: string, unit: RbUnit, value: unknown): New
 
 // Whether two slot rows hold the same unit. The grid compares the stored
 // bytes (no encode for the common unchanged case).
-function sameUnit(a: RbSlotRow | null, b: RbSlotRow | null, unit: RbUnit): boolean {
+export function sameUnit(a: RbSlotRow | null, b: RbSlotRow | null, unit: RbUnit): boolean {
 	switch (unit) {
 		case 'grid': {
 			const eq = (x: Buffer | null | undefined, y: Buffer | null | undefined): boolean => (!x || x.byteLength === 0 ? !y || y.byteLength === 0 : !!y && x.equals(y));
@@ -417,6 +418,49 @@ function sameUnit(a: RbSlotRow | null, b: RbSlotRow | null, unit: RbUnit): boole
 		}
 		case 'key': return (a?.rb_key_camelot || null) === (b?.rb_key_camelot || null);
 		case 'segments': return (a?.rb_segments_json ?? null) === (b?.rb_segments_json ?? null) || JSON.stringify(rbSegmentsValue(a)) === JSON.stringify(rbSegmentsValue(b));
+	}
+}
+
+// A unit's fingerprint for the per-device rekordbox baseline
+// (rekordbox_unit_seen): cheap to compute on every import, equal exactly
+// when the stored unit is. The grid hashes its stored bytes rather than the
+// encoded grid, so an unchanged re-import costs no encode.
+export function rbUnitDigest(row: RbSlotRow | null, unit: RbUnit): string {
+	const h = createHash('sha1');
+	switch (unit) {
+		case 'grid':
+			h.update(row?.rb_beatgrid ?? Buffer.alloc(0));
+			h.update('|');
+			h.update(row?.rb_downbeats ?? Buffer.alloc(0));
+			return h.digest('hex');
+		case 'key':
+			return row?.rb_key_camelot || '';
+		case 'segments':
+			return h.update(JSON.stringify(rbSegmentsValue(row))).digest('hex');
+	}
+}
+
+// The slot patch that puts `row`'s value of one unit back.
+export function rbUnitPatch(row: RbSlotRow | null, unit: RbUnit): RbSlotPatch {
+	switch (unit) {
+		case 'grid': return { beatgrid: row?.rb_beatgrid ?? null, downbeats: row?.rb_downbeats ?? null };
+		case 'key': return { keyCamelot: row?.rb_key_camelot || null };
+		case 'segments': return { segmentsJson: row?.rb_segments_json ?? null };
+	}
+}
+
+// The track-row mirrors a unit carries (the importer and the projection
+// both write them): rb's key onto key_camelot, phrase intro/outro lengths.
+export function rbUnitMirrors(raw: Raw, trackId: string, row: RbSlotRow | null, unit: RbUnit): void {
+	if (unit === 'key') {
+		const v = row?.rb_key_camelot || null;
+		if (v !== null) raw.prepare(`UPDATE track SET key_camelot = ? WHERE id = ? AND key_camelot IS NOT ?`).run(v, trackId, v);
+	} else if (unit === 'segments') {
+		const segs = rbSegmentsValue(row);
+		if (segs) {
+			const { introLengthSec, outroLengthSec } = rbIntroOutro(segs as unknown as Parameters<typeof rbIntroOutro>[0]);
+			raw.prepare(`UPDATE track SET intro_length_sec = ?, outro_length_sec = ? WHERE id = ?`).run(introLengthSec, outroLengthSec, trackId);
+		}
 	}
 }
 

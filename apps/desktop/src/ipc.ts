@@ -111,6 +111,7 @@ export interface IpcChannels {
 	'tracks:set-rating':   { args: [trackIds: string[], rating: number | null]; ret: Track[] };
 	'tracks:delete':       { args: [trackIds: string[]]; ret: { deletedTracks: number; filesTrashed: number; peaksRemoved: number; playlistsTouched: number; errors: { kind: 'file' | 'peaks' | 'playlist'; message: string }[] } };
 	'tracks:remove-sources': { args: [trackIds: string[], sources: RemovableTrackSource[]]; ret: RemoveTrackSourcesResult };
+	'tracks:undelete':     { args: [trackIds: string[]]; ret: { restored: string[] } };
 	// PlayTracker upsert — same id flows insert → checkpoint → finalize.
 	'plays:record': { args: [e: PlayRecordUpsert]; ret: void };
 	'shell:open-external': { args: [url: string]; ret: void };
@@ -700,6 +701,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'plays:record': { description: 'Upsert one play-history event from the renderer PlayTracker. The same id is written repeatedly: first flush inserts, 30s checkpoints update playedMs/maxPositionMs, the finalize flush sets endedReason + played75. Session assignment (gap-based curator sessions) happens core-side.' },
 	'tracks:delete': { description: 'Soft-delete N tracks from the library (every source): trash any local files, remove from every playlist the user can modify (owned Spotify/Tidal playlists are PUSHED TO THE LIVE ACCOUNT regardless of writeSyncAuto; rekordbox is curator-side until Sync to Rekordbox), tombstone rekordbox content, unlink peaks (.cpk), drop the local + rekordbox links and stamp deletedAt. Streaming links and followed-playlist memberships survive so the track shows as deleted there. Returns granular counts + best-effort errors per file/peaks/playlist.' },
 	'tracks:remove-sources': { description: 'Remove chosen sources (local | spotify | tidal | rekordbox) from N tracks. local: trash the file(s) + drop the local link. spotify/tidal: remove from every playlist the user OWNS on that source (PUSHES TO THE LIVE ACCOUNT — confirm with the user first) + drop the link. rekordbox: tombstone the rb content (removed from rekordbox on the next Sync to Rekordbox) + drop rb playlist memberships and the link. A track whose every source was removed is soft-deleted (deletedAt). Returns per-source counts, decorated surviving tracks, and best-effort errors.' },
+	'tracks:undelete': { description: 'Restore soft-deleted tracks to the library (clears deletedAt; syncs to the user\'s other devices). Tags, cues, rating, history and streaming links were kept by the delete and come back; a local file the scanner found for a deleted track is already attached. Playlist memberships, trashed files and the rekordbox link are not restored. Returns the ids restored.' },
 	'shell:open-external': { description: 'Open an http/https URL in the user\'s default browser.' },
 	'tidal:match-track': { description: 'Run the Tidal matcher against a single track — returns the matched tidal id, or null.' },
 	'tidal:set-playlist-hybrid': { description: 'Toggle hybrid-tidal mode on a Spotify playlist. When enabled, every track is matched against Tidal on sync.' },

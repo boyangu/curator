@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join, normalize as normalizePath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { appendFile, existsSync, promises as fsp, statSync } from 'node:fs';
-import { applyPendingRestore, buildMcpWriteTools, createCoreService, migrate, remapLocalPathsAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
+import { applyPendingRestore, buildMcpWriteTools, createCoreService, migrate, readRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
 import { cpus, hostname } from 'node:os';
 import { mainLog, attachFileSink } from './log.js';
 import { isLogLevel } from '@curator/shared/log';
@@ -34,6 +34,7 @@ import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport } from './cloud/transport.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
 import { cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
+import { PROFILE_NAME_RE, decideRails, parseProfileEnv, profileAppUserModelId, profileDeviceName, profileRailsSummary, profileTitleSuffix, profileUserDataDir } from './profile.js';
 import type { CloudTransport } from '@curator/core';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -42,10 +43,41 @@ const __dirname = dirname(__filename);
 const bootLog = mainLog.for('boot');
 const shutdownLog = mainLog.for('shutdown');
 
+// Profile mode (CURATOR_PROFILE=<name>, see profile.ts): a second instance
+// with its own userData, acting as another desktop. The swap runs here, before
+// anything resolves a userData path — the log file sink, the DB, backup, the
+// cloud session file — and before requestSingleInstanceLock, which Electron
+// keys on userData (so the two instances don't hand off to each other).
+// Unset ⇒ PROFILE is null and every rail below is a no-op.
+const profileParse = parseProfileEnv(process.env['CURATOR_PROFILE']);
+if (profileParse.kind === 'invalid') {
+	mainLog.for('profile').error(`CURATOR_PROFILE="${profileParse.raw}" does not match ${PROFILE_NAME_RE} — refusing to start rather than fall back to the default library`);
+	process.exit(1);
+}
+const PROFILE = profileParse.kind === 'profile' ? profileParse.name : null;
+if (PROFILE) {
+	const dir = profileUserDataDir(app.getPath('userData'), PROFILE);
+	app.setPath('userData', dir);
+	// sessionData (localStorage, cookies, caches) defaults to userData; pinned
+	// explicitly so the renderer's settings can never resolve to the real one.
+	app.setPath('sessionData', dir);
+}
+const rails = decideRails(PROFILE, process.env, PROFILE ? app.getPath('userData') : null);
+
+// Dev resolves sidecars from the source tree. A profile instance runs the
+// built bundle (no Vite server, so ELECTRON_RENDERER_URL is unset) out of the
+// same checkout, and resolves them the same way — otherwise it would look in
+// Electron's own resources dir and come up with every sidecar disabled.
+// Packaged builds always use their staged bundles.
+function sidecarsFromSourceTree(): boolean {
+	return !!process.env.ELECTRON_RENDERER_URL || (PROFILE !== null && !app.isPackaged);
+}
+
 // DB lives in the user's app-data folder so it persists across reinstalls.
-// dev override: CURATOR_DB_URL env var.
+// dev override: CURATOR_DB_URL env var (ignored in a profile, where it could
+// point straight back at the live library).
 function getDbPath(): string {
-	if (process.env.CURATOR_DB_URL) return process.env.CURATOR_DB_URL;
+	if (rails.dbUrlOverride && process.env.CURATOR_DB_URL) return process.env.CURATOR_DB_URL;
 	return join(app.getPath('userData'), 'curator.db');
 }
 
@@ -96,7 +128,7 @@ function wslVenvAnalyzerSpec(analyzerDir: string): SidecarSpec {
 // scripts/build-sidecars.mjs (built inside WSL), falling back to the repo's
 // .venv-wsl when the packaged app runs out of the source tree (win-unpacked).
 function getAnalyzerSpec(): SidecarSpec | null {
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	if (isDev) {
 		const analyzerDir = join(__dirname, '..', '..', '..', 'analyzer');
 		// WSL path activated by the presence of apps/analyzer/.venv-wsl OR
@@ -159,7 +191,7 @@ function getAnalyzerSpec(): SidecarSpec | null {
 // then the engine reports "not set up". Weights download lazily into
 // userData/mir/hf in packaged builds (dev keeps the default HF cache).
 function getMirSpec(): { spec: MirSidecarSpec; provision?: MirProvisionSpec } | null {
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	const venvPy = (venv: string): string => join(venv, process.platform === 'win32' ? join('Scripts', 'python.exe') : join('bin', 'python'));
 	if (isDev) {
 		const mirDir = join(__dirname, '..', '..', '..', 'mir');
@@ -193,7 +225,7 @@ function getMirSpec(): { spec: MirSidecarSpec; provision?: MirProvisionSpec } | 
 // (apps/rekordbox/). Dev: python -m curator_rekordbox.main; prod: bundled
 // PyInstaller binary at resources/rekordbox/.
 function getRekordboxSpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	if (isDev) {
 		const cwd = join(__dirname, '..', '..', '..', 'rekordbox');
 		// Prefer the dedicated venv at apps/rekordbox/.venv if it exists —
@@ -236,7 +268,7 @@ function getResearcherSpec(): { executable: string; args?: string[]; cwd?: strin
 		mainLog.for('researcher').info('no ANTHROPIC_API_KEY — research sidecar disabled');
 		return null;
 	}
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	const entry = isDev
 		? join(__dirname, '..', '..', '..', 'researcher', 'dist', 'main.js')
 		: join(process.resourcesPath ?? __dirname, 'researcher', 'dist', 'main.js');
@@ -258,7 +290,7 @@ function getResearcherSpec(): { executable: string; args?: string[]; cwd?: strin
 // with the safeStorage-held BYOK key (agent-config.ts) — so key entry and
 // rotation never respawn the process. CURATOR_DISABLE_AGENT=1 disables.
 function getAgentSpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	const entry = isDev
 		? join(__dirname, '..', '..', '..', 'agent', 'dist', 'main.js')
 		: join(process.resourcesPath ?? __dirname, 'agent', 'dist', 'main.js');
@@ -285,7 +317,7 @@ function getAgentSpec(): { executable: string; args?: string[]; cwd?: string; en
 // CURATOR_AUDIO_DEBUG=1 overrides this when stepping through with a
 // debugger is needed (e.g. broken WASAPI device init).
 function getAudioSpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	if (isDev) {
 		const audioDir = join(__dirname, '..', '..', '..', 'audio');
 		const debugMode = process.env.CURATOR_AUDIO_DEBUG === '1';
@@ -367,8 +399,13 @@ function getAudioSpec(): { executable: string; args?: string[]; cwd?: string; en
 function getSpotifySpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
 	const childEnv: NodeJS.ProcessEnv = { ...process.env };
 	delete childEnv['ELECTRON_RUN_AS_NODE'];
-	const isDev = !!process.env.ELECTRON_RENDERER_URL;
+	const isDev = sidecarsFromSourceTree();
 	const exeName = process.platform === 'win32' ? 'curator-spotify.exe' : 'curator-spotify';
+	// Both instances spawn the same sidecar app, which would otherwise share
+	// one Chromium profile (%APPDATA%/curator-spotify): LevelDB locks on its
+	// storage, one Widevine CDM dir. A profile gives its sidecar its own via
+	// Chromium's --user-data-dir switch. The RPC socket is already ephemeral.
+	const profileArgs = PROFILE ? [`--user-data-dir=${join(app.getPath('userData'), 'spotify-player')}`] : [];
 
 	// 1. Signed staged bundle — preferred in dev AND prod.
 	const stagedDir = isDev
@@ -376,7 +413,7 @@ function getSpotifySpec(): { executable: string; args?: string[]; cwd?: string; 
 		: join(process.resourcesPath ?? __dirname, 'spotify-player');
 	const stagedExe = join(stagedDir, exeName);
 	if (existsSync(stagedExe)) {
-		return { executable: stagedExe, cwd: stagedDir, env: childEnv };
+		return { executable: stagedExe, ...(profileArgs.length ? { args: profileArgs } : {}), cwd: stagedDir, env: childEnv };
 	}
 
 	// 2. Dev-only fallback — unsigned JS build via our own castlabs Electron.
@@ -385,7 +422,7 @@ function getSpotifySpec(): { executable: string; args?: string[]; cwd?: string; 
 		const mainBundle = join(playerDir, 'out', 'main', 'index.cjs');
 		if (existsSync(mainBundle)) {
 			mainLog.for('spotify').warn('using UNSIGNED dev build — Widevine may refuse to provision in the hidden window. For reliable playback run `pnpm build:sidecars` to stage the signed bundle.');
-			return { executable: process.execPath, args: [mainBundle], cwd: playerDir, env: childEnv };
+			return { executable: process.execPath, args: [mainBundle, ...profileArgs], cwd: playerDir, env: childEnv };
 		}
 		mainLog.for('spotify').warn(`no signed bundle and no dev build (${mainBundle}) — Spotify playback disabled. Run \`pnpm build:sidecars\`.`);
 		return null;
@@ -712,6 +749,19 @@ function createWindow(): void {
 	// Wired before loadURL so a failure of the very first load is caught.
 	attachLoadRecovery(mainWindow);
 
+	// Profile instances say so in the title (taskbar / Alt-Tab — the window is
+	// frameless), including any env flag that loosened a rail. The page's own
+	// <title> would otherwise replace it on every load.
+	const titleSuffix = profileTitleSuffix(rails);
+	if (titleSuffix) {
+		const win = mainWindow;
+		win.setTitle(`Curator${titleSuffix}`);
+		win.on('page-title-updated', (e, title) => {
+			e.preventDefault();
+			win.setTitle(`${title}${titleSuffix}`);
+		});
+	}
+
 	// The load promise rejects on did-fail-load, which LoadRecovery already
 	// handles — log it here instead of letting it surface as an unhandled
 	// rejection.
@@ -818,7 +868,13 @@ function registerIpc(svc: CoreService): void {
 	// Bind every channel from the catalog. The handlers map is exhaustive
 	// over keyof IpcChannels — TypeScript errors if a channel is added to
 	// the catalog without a matching handler (or vice-versa).
-	const handlers = buildHandlers(svc, { getMainWindow: () => mainWindow, coreSidecar, audioSidecar, spotifySidecar, mcpConfirm, cloudAccount, cloudTransport });
+	const handlers = buildHandlers(svc, {
+		getMainWindow: () => mainWindow, coreSidecar, audioSidecar, spotifySidecar, mcpConfirm, cloudAccount, cloudTransport,
+		profileBlocks: {
+			downloads: rails.downloadsBlocked,
+			googleBackup: rails.backup ? null : `Backup is off in profile "${PROFILE}".`,
+		},
+	});
 	for (const name of Object.keys(TOOL_CATALOG) as (keyof IpcChannels)[]) {
 		const fn = handlers[name] as (...args: unknown[]) => Promise<unknown>;
 		ipcMain.handle(name, (_evt, ...args) => fn(...args));
@@ -972,8 +1028,12 @@ app.whenReady().then(async () => {
 	// app appears under "electron.app.Electron" instead of our brand. macOS
 	// and Linux ignore this call; safe to invoke on every platform.
 	if (process.platform === 'win32') {
-		app.setAppUserModelId('com.curator.app');
+		app.setAppUserModelId(profileAppUserModelId('com.curator.app', PROFILE));
 	}
+
+	// One line naming the profile and every rail, so a log read cold shows
+	// whether this instance could touch the live library or accounts.
+	if (PROFILE) bootLog.warn(`profile mode: ${PROFILE}`, profileRailsSummary(rails, app.getPath('userData')));
 
 	// A staged restore (Settings → Backup → Restore…) is applied HERE, before
 	// the first DB open below: files are swapped while no handle is live, and
@@ -989,6 +1049,15 @@ app.whenReady().then(async () => {
 	if (restoreApplied?.remap && !restoreApplied.error) {
 		const r = remapLocalPathsAt(dbPath, restoreApplied.remap.from, restoreApplied.remap.to);
 		bootLog.info('library root remapped after restore', { ...restoreApplied.remap, ...r });
+	}
+	// A restored DB carries the backed-up machine's sync identity; give this
+	// install its own before anything emits or syncs. Checked on every boot
+	// while the restore's record exists (a crash right after the swap must
+	// not leave the old id in place); runs once per restore.
+	const restoreRecord = restoreApplied ?? await readRestoreApplied(app.getPath('userData'));
+	if (restoreRecord) {
+		const r = remintAfterRestoreAt(dbPath, restoreRecord);
+		if (r.reminted) bootLog.info('device identity re-minted after restore', { oldDeviceId: r.oldDeviceId, newDeviceId: r.newDeviceId, restampedPending: r.restamped });
 	}
 
 	// Ensure the cover-cache directory exists before we register the protocol
@@ -1021,9 +1090,11 @@ app.whenReady().then(async () => {
 	const mirSpec = process.env['CURATOR_DISABLE_MIR'] === '1' ? null : getMirSpec();
 	if (mirSpec) bootLog.info('AI engine sidecar', { executable: mirSpec.spec.executable, provision: mirSpec.provision?.extra ?? 'dev' });
 	else bootLog.info('AI engine disabled (CURATOR_DISABLE_MIR or missing env)');
-	const rekordboxSpec = process.env['CURATOR_DISABLE_REKORDBOX'] === '1' ? null : getRekordboxSpec();
+	// Profile rail: no rekordbox sidecar ⇒ no master.db reads or writes (every
+	// master.db access goes through it) unless CURATOR_PROFILE_ALLOW_REKORDBOX=1.
+	const rekordboxSpec = process.env['CURATOR_DISABLE_REKORDBOX'] === '1' || !rails.rekordbox ? null : getRekordboxSpec();
 	if (rekordboxSpec) bootLog.info('rekordbox sidecar', { executable: rekordboxSpec.executable, args: (rekordboxSpec.args ?? []).join(' ') });
-	else bootLog.info('rekordbox sidecar disabled (CURATOR_DISABLE_REKORDBOX or missing spec)');
+	else bootLog.info(rails.rekordbox ? 'rekordbox sidecar disabled (CURATOR_DISABLE_REKORDBOX or missing spec)' : 'rekordbox sidecar disabled (profile rail)');
 	// Research sidecar (KB agent tier). Needs ANTHROPIC_API_KEY + a built
 	// apps/researcher; either missing just disables similar-artists research.
 	const researcherSpec = process.env['CURATOR_DISABLE_RESEARCHER'] === '1' ? null : getResearcherSpec();
@@ -1127,7 +1198,7 @@ app.whenReady().then(async () => {
 				subscribeWakeups: (onWake) => accountForCore.subscribeWakeups(onWake),
 				// Focus + OS idle time decide the fallback poll's cadence.
 				watchActivity: (onChange) => watchAppActivity(() => mainWindow, onChange),
-				device: { name: hostname(), platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32' },
+				device: { name: profileDeviceName(hostname(), PROFILE), platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32' },
 				// Shared analysis: waveform blobs move directly between this
 				// device and Supabase Storage under the user's own session.
 				blobs: createCatalogueBlobStore(accountForCore),
@@ -1150,7 +1221,9 @@ app.whenReady().then(async () => {
 			? { command: audioBinary.executable, args: [...(audioBinary.args ?? []), ...(audioBinary.args?.length ? ['--'] : []), 'convert'], cwd: audioBinary.cwd }
 			: undefined,
 		// Follows the OS Music known folder (it can live outside the profile).
-		wavDefaultOutputDir: join(app.getPath('music'), 'WAV'),
+		// A profile keeps it in its own userData: the converter adds its output
+		// folder to the watched folders, and ~/Music/WAV is the real library's.
+		wavDefaultOutputDir: PROFILE ? join(app.getPath('userData'), 'WAV') : join(app.getPath('music'), 'WAV'),
 		// In-process core shares main's root logger — records land in the
 		// session JSONL file (userData/logs). The core-sidecar copy injects
 		// its own port-forwarding logger instead (core-sidecar/entry.ts).
@@ -1159,7 +1232,11 @@ app.whenReady().then(async () => {
 		// 190 GB, zstd, uploads — none of it on main's loop). The Drive refresh
 		// token stays in main (safeStorage); the worker only ever asks for
 		// short-lived access tokens over a host-call.
-		backup: {
+		//
+		// Profile rail: omitted ⇒ backup reports unavailable, the scheduler
+		// never arms, and nothing snapshots (or restores into) rekordbox's
+		// master.db or writes to the user's Drive target.
+		backup: rails.backup ? {
 			userDataDir: app.getPath('userData'),
 			peaksDir,
 			coversDir,
@@ -1170,7 +1247,7 @@ app.whenReady().then(async () => {
 			host: (cfg) => new UtilityBackupHost(join(__dirname, 'backup-worker.cjs'), cfg, true),
 			beforeRun: () => writeHostArtifacts(mainWindow, core!),
 			google: { status: getGoogleAuthStatus, needsReconnect: googleNeedsReconnect, accessToken: getGoogleAccessToken },
-		},
+		} : undefined,
 		// shell.trashItem is main-only; injecting here keeps CoreService
 		// usable from the headless build (tests/CLI) where the Electron
 		// surface isn't bound. Paths are stored normalized to forward
@@ -1185,7 +1262,9 @@ app.whenReady().then(async () => {
 		// Off-product builds (tests/CLI, the read-only core sidecar) construct
 		// CoreService WITHOUT this and are default-deny — a stray script can't
 		// mutate the live account. See CLAUDE.md "Streaming remote writes".
-		remoteWritePolicy: { allow: () => true },
+		// A profile instance is off-product in that sense: never injected there,
+		// and deliberately no env override (profile.ts → rails.remoteWrites).
+		remoteWritePolicy: rails.remoteWrites ? { allow: () => true } : undefined,
 		// Append-only forensics trail: every streaming remote-write attempt and
 		// every rekordbox write batch, one JSON line each. The 2026-07 playlist
 		// order investigation took hours of backup archaeology precisely because

@@ -147,11 +147,44 @@ describe('migration gate before 0004', () => {
 		expect(shipped).toContain('0004_catalogue.sql');
 		const { log, lines } = capture();
 		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
-		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: ['0004_catalogue.sql'] })]);
+		// Later files are missing too; the point is that 0004 is named.
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0004_') })]);
+		expect(shipped.filter((n) => n >= '0004_')[0]).toBe('0004_catalogue.sql');
 	});
 
 	it('lets it start once the owner has run the migration', async () => {
 		await migrate(t.db, sqlDir);
+		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
+	});
+});
+
+// 0005 is index-only, but it ships like any other file: a database without it
+// is behind, and the gate says so by name.
+describe('migration gate before 0005', () => {
+	let t: TestDb;
+	beforeAll(async () => {
+		t = await createTestDb({ migrate: false });
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0005_')));
+		await t.db.exec(rolesSql);
+	});
+	afterAll(() => t.db.close());
+
+	it('refuses an image that ships 0005_library_op_device_seq.sql, naming it', async () => {
+		expect(shipped).toContain('0005_library_op_device_seq.sql');
+		const { log, lines } = capture();
+		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
+		expect(lines).toEqual([
+			expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0005_') }),
+		]);
+	});
+
+	it('creates the (user_id, device_id, seq) index once the owner runs it', async () => {
+		await migrate(t.db, sqlDir);
+		const rows = await t.db.query<{ indexdef: string }>(
+			`select indexdef from pg_indexes where schemaname = 'curator' and indexname = 'library_op_user_device_seq'`,
+		);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]!.indexdef).toMatch(/\(user_id, device_id, seq\)/);
 		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
 	});
 });

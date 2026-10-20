@@ -441,6 +441,26 @@ export class SyncStateStore {
 		}
 	}
 
+	// ── device re-mint (restored backup) ────────────────────────────────
+	// Every clock in the loaded records that came from one of `opIds` takes
+	// device `to`: those ops were re-stamped in the outbox with this
+	// install's new id (remint.ts), and the server stores them under it, so
+	// the LWW tie-break here must compare the same (ts, device) every other
+	// device will. Callers prefetch the ops first; flush persists the change.
+	reassignDevice(opIds: ReadonlySet<string>, to: string): void {
+		const fix = (v: unknown): void => {
+			if (Array.isArray(v)) { for (const x of v) fix(x); return; }
+			if (v === null || typeof v !== 'object') return;
+			const o = v as Record<string, unknown>;
+			if (typeof o['op'] === 'string' && opIds.has(o['op']) && typeof o['device'] === 'string' && typeof o['ts'] === 'number') { o['device'] = to; return; }
+			for (const x of Object.values(o)) fix(x);
+		};
+		for (const name of STATE_MAPS) for (const v of this.map(name).values()) fix(v);
+		for (const [k, c] of this.state.tombstones) {
+			if (opIds.has(c.op) && c.device !== to) this.state.tombstones.set(k, { ...c, device: to });
+		}
+	}
+
 	// ── snapshot join (bootstrap) ───────────────────────────────────────
 	// A snapshot is the server's raw records, clocks included. Loading one
 	// onto local records is the state-based form of the reducer: every rule

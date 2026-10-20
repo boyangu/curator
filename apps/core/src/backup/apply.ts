@@ -12,6 +12,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { log } from '../log.js';
+import { remintDeviceIdentityAt, type RemintResult } from '../sync-log/remint.js';
 import type { PendingRestore } from './types.js';
 
 const alog = log.for('backup-apply');
@@ -134,4 +135,15 @@ export function remapLocalPathsAt(dbPath: string, from: string, to: string): { l
 	const db = new Database(dbPath);
 	try { return remapLocalPaths(db, from, to); }
 	finally { db.close(); }
+}
+
+// A restored database must not keep the sync identity of the machine it was
+// backed up on (sync-log/remint.ts). Called after migrate() on every boot
+// while the restore's record exists — not only the boot that swapped the
+// files — so a crash in between is caught; the re-mint itself runs once per
+// restore. Also after a restore that stopped part-way: whether curator.db
+// was swapped in cannot be told reliably (a fresh machine has nothing to
+// park), and a needless re-mint costs only a new device id.
+export function remintAfterRestoreAt(dbPath: string, applied: RestoreApplied): RemintResult {
+	return remintDeviceIdentityAt(dbPath, `${applied.snapshotId}@${applied.appliedAt}`);
 }

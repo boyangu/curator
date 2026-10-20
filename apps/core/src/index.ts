@@ -20,7 +20,7 @@ export * from './backup/types.js';
 export { BackupEngine } from './backup/engine.js';
 export { createInlineBackupHost } from './backup/host.js';
 export type { TargetDeps as BackupTargetDeps } from './backup/targets/index.js';
-export { applyPendingRestore, readPendingRestore, readRestoreApplied, clearRestoreApplied, remapLocalPathsAt, PENDING_RENDERER_SETTINGS_FILE, type RestoreApplied } from './backup/apply.js';
+export { applyPendingRestore, readPendingRestore, readRestoreApplied, clearRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, PENDING_RENDERER_SETTINGS_FILE, type RestoreApplied } from './backup/apply.js';
 export { CloudTransportError, type CloudTransport, type CloudSession, type CloudErrorKind, type CloudSyncStatus, type CloudSyncEvent, type CloudSyncApplied, type WakeReason } from './sync-log/client.js';
 export { decodeLibraryStateSnapshot, type SnapshotRecord } from './sync-log/snapshot.js';
 export type { SyncPollPolicy, SyncPollSettings } from './sync-log/poll-policy.js';

@@ -468,9 +468,19 @@ export class RekordboxImporter extends EventEmitter {
 			// The grid and phrase units another device needs: one snapshot +
 			// diff per batch (an unchanged re-emitted grid compares equal byte
 			// for byte and emits nothing), inside the batch's transaction.
-			const ids = [...new Set(batch.map((r) => this.resolveTrackId(r.rb_content_id, trackIdByRbId)).filter((id): id is string => id !== null))];
+			// Each row names the units applyWaveformDelta writes for it, which
+			// is what the per-device rekordbox baseline is kept for.
+			const written = new Map<string, Array<'grid' | 'segments'>>();
+			for (const r of batch) {
+				const id = this.resolveTrackId(r.rb_content_id, trackIdByRbId);
+				if (!id) continue;
+				const units = written.get(id) ?? [];
+				if (Array.isArray(r.beatgrid_sec) && r.beatgrid_sec.length > 0) units.push('grid');
+				if (r.segments != null && r.segments.length > 0) units.push('segments');
+				written.set(id, units);
+			}
 			this.db.transaction((tx) => {
-				mut.recordRbAnalysisChanges(this.db, ids, () => {
+				mut.recordRbAnalysisChanges(this.db, written, () => {
 					for (const r of batch) {
 						this.applyWaveformDelta(r, opts.flags, trackIdByRbId, totals, tx, overwrite);
 					}
@@ -863,9 +873,16 @@ export class RekordboxImporter extends EventEmitter {
 		// rb's key also lands in the rekordbox slot (rb_key_camelot), where
 		// it is rekordbox's own value whatever track.key_camelot later holds
 		// (tags, enrichment), and from where it syncs as the 'key' unit. Only
-		// a change is a write: a re-import of the same key costs one read.
-		if (rbCamelot != null && readRbSlot(rawOf(this.db), link.trackId)?.rb_key_camelot !== rbCamelot) {
-			mut.recordRbAnalysisChanges(this.db, [link.trackId], (raw) => writeRbSlot(raw, link.trackId, { keyCamelot: rbCamelot }));
+		// a change is a write: a re-import of the same key costs two reads. A
+		// key equal to the slot but not yet in this device's rekordbox
+		// baseline still goes through, once, so the baseline knows it — else
+		// another desktop's key landing in the slot later would read as
+		// rekordbox changing it here (mutators.ts recordRbAnalysisChanges).
+		if (rbCamelot != null) {
+			const raw = rawOf(this.db);
+			if (readRbSlot(raw, link.trackId)?.rb_key_camelot !== rbCamelot || mut.rbUnitSeen(raw, link.trackId, 'key') !== rbCamelot) {
+				mut.recordRbAnalysisChanges(this.db, new Map([[link.trackId, ['key'] as const]]), (raw) => writeRbSlot(raw, link.trackId, { keyCamelot: rbCamelot }));
+			}
 		}
 
 		// Provenance — always upsert. rbUpdatedAtSeen + fieldsSeen advance to

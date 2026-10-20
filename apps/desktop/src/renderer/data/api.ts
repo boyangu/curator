@@ -103,6 +103,7 @@ export const tracksApi = {
 	// Date fields — same authoritative-type re-assertion as `list`.
 	removeSources: (trackIds: string[], sources: RemovableTrackSource[]): ReturnType<typeof window.api['tracks:remove-sources']> =>
 		trpc.tracks.removeSources.mutate([trackIds, sources]) as unknown as ReturnType<typeof window.api['tracks:remove-sources']>,
+	undelete: (trackIds: string[]) => trpc.tracks.undelete.mutate([trackIds]),
 };
 
 // Library artist entities — the Artists browser, the Edit Track artist

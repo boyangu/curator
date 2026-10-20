@@ -11,12 +11,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { migrate } from '../db/migrate.js';
 import { createDb, type Db } from '../db/client.js';
 import { createCoreService } from '../service.js';
 import { LibraryScanner, normalizePath } from './scanner.js';
 import type { ParseResult } from '../ingest/types.js';
+import { audioHash } from '../ingest/audio-hash.js';
+import { writeFlac } from '../test-support/catalogue-fakes.js';
+import { applyOps } from '../sync-log/apply.js';
+import { opSchemaVersion, type NewOp } from '@curator/protocol';
 import type Database from 'better-sqlite3';
 
 let dir: string;
@@ -335,7 +339,7 @@ describe('audio hash identity', () => {
 		expect(groups[0]!.tracks.map((t) => t.filePath).sort()).toEqual([normalizePath(one), normalizePath(two)].sort());
 	});
 
-	it('a missing link on a soft-deleted track is not a re-bind target', async () => {
+	it('a missing link on a soft-deleted track is not a re-bind target, and the moved file stays with the deleted row', async () => {
 		const { a, b } = twoFolders();
 		const oldPath = join(a, 'song.flac');
 		writeFileSync(oldPath, 'audio');
@@ -350,13 +354,14 @@ describe('audio hash identity', () => {
 		renameSync(oldPath, newPath);
 		const res = await ingest(scanner, newPath);
 
-		// Not re-bound: the tombstone's link stays where it was, still flagged,
-		// and the new path got a link of its own. (Whether the scorer then
-		// matches the tombstone by tags is findCandidates' pre-existing
-		// behaviour — it does not filter deleted_at — and not pinned here.)
-		expect(res.outcome).not.toBe('rebound');
+		// Not re-bound: the tombstone's link stays where it was, still flagged
+		// (for the TTL sweep), and the new path got a link of its own — on the
+		// deleted row, which stays deleted, rather than on a fresh row.
+		expect(res).toEqual({ outcome: 'deleted', trackId: first.trackId });
 		expect(linkRow(oldPath)).toMatchObject({ id: link.id, missing_at: expect.any(Number) });
 		expect(linkRow(newPath)!.id).not.toBe(link.id);
+		expect(linkRow(newPath)!.track_id).toBe(first.trackId);
+		expect(trackCount()).toBe(1);
 	});
 
 	it('sweep drops links missing for longer than the TTL and keeps younger ones', () => {
@@ -377,5 +382,114 @@ describe('audio hash identity', () => {
 		expect(linkRow('/x/31.flac')).toBeUndefined();
 		expect(linkRow('/x/29.flac')).toMatchObject({ id: 'sl-29' });
 		expect(trackCount()).toBe(2);
+	});
+});
+
+// Workstream E: a deleted track must stay deleted when its audio is still on
+// disk. A fresh row would be a new recording on every synced device — the
+// delete undone everywhere. Real (generated) FLACs through the real parser,
+// so the audio hash is the one the hasher computes.
+describe('a deleted track stays deleted', () => {
+	const PCM = 'c0ffee00'.repeat(4);
+
+	function liveTrackCount(): number {
+		return sqlite.prepare(`SELECT COUNT(*) FROM track WHERE deleted_at IS NULL`).pluck().get() as number;
+	}
+	function linkOf(filePath: string): { track_id: string } | undefined {
+		return sqlite.prepare(`SELECT track_id FROM source_link WHERE source = 'local' AND file_path = ?`).get(normalizePath(filePath)) as { track_id: string } | undefined;
+	}
+	// The real hasher over the generated file; tags are beside the point here
+	// (music-metadata does not read these minimal FLACs).
+	const parseFlac = async (p: string): Promise<ParseResult> => ({
+		title: basename(p, '.flac'), artists: ['Artist'], albumTitle: null, duration: 300,
+		isrc: null, bpm: null, genre: null, label: null, container: 'flac', audioHash: await audioHash(p),
+	});
+	const deletedAt = (id: string): number | null => sqlite.prepare(`SELECT deleted_at FROM track WHERE id = ?`).pluck().get(id) as number | null;
+	// A library_track delete as another device would push it.
+	function remoteDelete(trackId: string): void {
+		const rec = sqlite.prepare(`SELECT recording_id FROM track WHERE id = ?`).pluck().get(trackId) as string;
+		const body: NewOp = { entity: 'library_track', entity_id: rec, kind: 'delete', payload: {} };
+		applyOps(sqlite, [{ ...body, op_id: crypto.randomUUID(), device_id: 'other-desktop', client_ts: Date.now() + 1_000, schema_version: opSchemaVersion(body) }]);
+	}
+
+	it('this device: a delete whose trash step failed does not come back on the next scan', async () => {
+		const file = join(dir, 'music', 'Deep Song.flac');
+		writeFlac(file, PCM, 'TITLE=Deep Song');
+		const scanner = new LibraryScanner(db, parseFlac);
+		const first = await ingest(scanner, file);
+		expect(first.outcome).toBe('created');
+
+		// No trashFile injected: the file stays on disk, exactly as when the
+		// trash step fails. The delete drops the local link.
+		const svc = createCoreService(join(dir, 'curator.db'), { peaksDir: join(dir, 'peaks') });
+		try {
+			await svc.deleteTracks([first.trackId!]);
+		} finally {
+			svc.close();
+		}
+		expect(linkOf(file)).toBeUndefined();
+
+		// Only the recording's audio-hash claim still knows this file.
+		const again = await ingest(scanner, file);
+		expect(again).toEqual({ outcome: 'deleted', trackId: first.trackId });
+		expect(trackCount()).toBe(1);
+		expect(liveTrackCount()).toBe(0);
+		expect(linkOf(file)?.track_id).toBe(first.trackId);
+		// And a re-scan of the now-linked path is a plain skip.
+		expect((await ingest(scanner, file)).outcome).toBe('skipped');
+	});
+
+	it('another device: a synced delete holds when the local copy is moved, copied or re-tagged', async () => {
+		mkdirSync(join(dir, 'a')); mkdirSync(join(dir, 'b'));
+		const file = join(dir, 'a', 'Song.flac');
+		writeFlac(file, PCM, 'TITLE=Song');
+		const scanner = new LibraryScanner(db, parseFlac);
+		const first = await ingest(scanner, file);
+		remoteDelete(first.trackId!);
+		expect(deletedAt(first.trackId!)).not.toBeNull();
+
+		// Moved: a new path for audio the deleted row already links.
+		const moved = join(dir, 'b', 'Song.flac');
+		renameSync(file, moved);
+		expect(await ingest(scanner, moved)).toEqual({ outcome: 'deleted', trackId: first.trackId });
+		// A second copy, re-tagged: same PCM, other tags.
+		const copy = join(dir, 'a', 'Song (copy).flac');
+		writeFlac(copy, PCM, 'TITLE=Song (Original Mix)\nARTIST=Someone');
+		expect(await ingest(scanner, copy)).toEqual({ outcome: 'deleted', trackId: first.trackId });
+
+		expect(trackCount()).toBe(1);
+		expect(liveTrackCount()).toBe(0);
+		// No library_track create left this device for the deleted audio.
+		const creates = sqlite.prepare(`SELECT count(*) FROM sync_outbox WHERE entity = 'library_track' AND kind = 'create'`).pluck().get();
+		expect(creates).toBe(1);
+	});
+
+	it('different audio is still a new track, and a deliberate undelete brings the row back with its file', async () => {
+		const file = join(dir, 'music', 'Keep.flac');
+		writeFlac(file, PCM, 'TITLE=Keep');
+		const scanner = new LibraryScanner(db, parseFlac);
+		const first = await ingest(scanner, file);
+		remoteDelete(first.trackId!);
+
+		const other = join(dir, 'music', 'Other.flac');
+		writeFlac(other, 'ab'.repeat(16), 'TITLE=Other');
+		expect((await ingest(scanner, other)).outcome).toBe('created');
+
+		const svc = createCoreService(join(dir, 'curator.db'), { peaksDir: join(dir, 'peaks') });
+		try {
+			expect(await svc.undeleteTracks([first.trackId!])).toEqual({ restored: [first.trackId] });
+			expect(await svc.undeleteTracks([first.trackId!])).toEqual({ restored: [] });
+		} finally {
+			svc.close();
+		}
+		expect(deletedAt(first.trackId!)).toBeNull();
+		expect(linkOf(file)?.track_id).toBe(first.trackId);
+		const undelete = sqlite.prepare(`SELECT count(*) FROM sync_outbox WHERE entity = 'library_track' AND kind = 'undelete'`).pluck().get();
+		expect(undelete).toBe(1);
+		// Live again: the next scan of a copy finds a live owner, as before.
+		const copy = join(dir, 'music', 'Keep copy.flac');
+		writeFlac(copy, PCM, 'TITLE=Keep');
+		expect((await ingest(scanner, copy)).outcome).not.toBe('deleted');
+		expect(liveTrackCount()).toBeGreaterThanOrEqual(2);
 	});
 });

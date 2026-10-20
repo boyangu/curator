@@ -266,8 +266,27 @@ export function emitOps(raw: Raw, ops: readonly EmitOp[], opts: EmitOptions = {}
 	if (stamped.length === 0) return stamped;
 	writeClock(raw, clock);
 	store.flush();
+	for (const sink of CAPTURES.get(raw) ?? []) sink.push(...stamped);
 	notifyAppend(raw);
 	return stamped;
+}
+
+// The ops a write emits, for a caller that must refer to them afterwards by
+// op id (the upstream acks, F23: an ack names the op that implied the
+// external write). The mutators stay unchanged: emitOps reports into every
+// capture open on the handle. Run inside the caller's transaction, so a
+// rollback discards the write and the captured list with it.
+const CAPTURES = new WeakMap<Raw, Op[][]>();
+export function captureEmitted<T>(raw: Raw, fn: () => T): { result: T; ops: Op[] } {
+	const sink: Op[] = [];
+	let stack = CAPTURES.get(raw);
+	if (!stack) CAPTURES.set(raw, (stack = []));
+	stack.push(sink);
+	try {
+		return { result: fn(), ops: sink };
+	} finally {
+		stack.splice(stack.lastIndexOf(sink), 1);
+	}
 }
 
 // Convenience for single-entity writers: run `write` and the ops it returns

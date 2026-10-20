@@ -551,6 +551,15 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		label: () => 'Delete from Library…',
 		run: (c) => { void deleteTracksWithDialog(c.tracks); },
 	},
+	// Deleted rows still show where a delete leaves them (followed playlists,
+	// feed albums: the "deleted" chip). Restoring is the deliberate way back
+	// for a deleted track — the scanner never revives one on its own.
+	{
+		id: 'undelete', group: 'destructive', submenu: 'delete', iconHtml: ICON_DELETE,
+		isAvailable: (c) => any(c) && c.tracks.every((t) => !!t.deletedAt),
+		label: () => 'Restore to Library',
+		run: (c) => { void undeleteTracks(c.tracks); },
+	},
 	// Plain Delete / Backspace. Only while a real playlist is on screen.
 	// Confirmed in a Curator modal (a streaming playlist's removal hits the
 	// live account), then the 10 s Undo toast is the way back.
@@ -738,6 +747,17 @@ export async function deleteTracksWithDialog(tracks: readonly Track[]): Promise<
 		}
 	} catch (err) {
 		showToast('Delete failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error', durationMs: 6000 });
+	}
+}
+
+async function undeleteTracks(tracks: readonly Track[]): Promise<void> {
+	try {
+		const { restored } = await tracksApi.undelete(tracks.map((t) => t.id));
+		await deps.renderTracks();
+		await deps.refreshAll();
+		showToast(restored.length > 0 ? `Restored ${plural(restored.length, 'track')}` : 'Nothing to restore', { kind: restored.length > 0 ? 'success' : 'info' });
+	} catch (err) {
+		showToast('Restore failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error', durationMs: 6000 });
 	}
 }
 

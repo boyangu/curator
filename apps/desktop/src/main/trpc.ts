@@ -52,6 +52,7 @@ export function buildAppRouter(h: Handlers) {
 			addTagSkippingLocal: proc('tracks:add-tag-skipping-local'),
 			delete: proc('tracks:delete'),
 			removeSources: proc('tracks:remove-sources'),
+			undelete: proc('tracks:undelete'),
 		}),
 		wav: t.router({
 			getSettings: proc('wav:get-settings'),

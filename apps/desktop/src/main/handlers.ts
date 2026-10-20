@@ -53,6 +53,11 @@ export interface HandlerContext {
 	// The HTTP transport core syncs over; null when no cloud API URL is
 	// configured (sign-in works, sync is off).
 	cloudTransport?: CloudTransport | null;
+	// Profile-mode rails (profile.ts). A non-null message makes the gated
+	// channels reject before any network call or disk write: downloads would
+	// land in the real ~/Music library folder, and a Google connect would arm
+	// a backup target the profile has no engine for.
+	profileBlocks?: { downloads: string | null; googleBackup: string | null };
 }
 
 export type Handlers = {
@@ -66,6 +71,9 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 	const requireAccount = (): CloudAccount => {
 		if (!ctx.cloudAccount) throw new Error('Curator accounts are not configured in this build (CURATOR_SUPABASE_URL / CURATOR_SUPABASE_PUBLISHABLE_KEY).');
 		return ctx.cloudAccount;
+	};
+	const refuseIf = (reason: string | null | undefined): void => {
+		if (reason) throw new Error(reason);
 	};
 	const accountStatus = (): AccountStatus => ({
 		...(ctx.cloudAccount?.state() ?? { signedIn: false, email: null, userId: null, persistent: false }),
@@ -247,6 +255,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'tracks:set-rating': async (trackIds, rating) => svc.setRating(trackIds, rating),
 		'tracks:delete': async (trackIds) => svc.deleteTracks(trackIds),
 		'tracks:remove-sources': async (trackIds, sources) => svc.removeTrackSources(trackIds, sources),
+		'tracks:undelete': async (trackIds) => svc.undeleteTracks(trackIds),
 		'plays:record': async (e) => svc.recordPlay(e),
 		'tidal:match-track': async (trackId) => svc.matchTidalForTrack(trackId),
 		'tidal:set-playlist-hybrid': async (playlistId, enabled, sort) => svc.setPlaylistHybridTidal(playlistId, enabled, broadcastProgress, sort),
@@ -262,16 +271,19 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		},
 		'tidal:download:status': async () => ({ enabled: await svc.hasTidalDownloadSession() }),
 		'tidal:download:track': async (trackId) => {
+			refuseIf(ctx.profileBlocks?.downloads);
 			await ensureFreshTidalSession();
 			return svc.downloadTidalTrack(trackId, (p) => {
 				sendEvent(ctx.getMainWindow(), 'download:progress', p);
 			});
 		},
 		'tidal:download:enqueue': async (items) => {
+			refuseIf(ctx.profileBlocks?.downloads);
 			await ensureFreshTidalSession();
 			await svc.enqueueTidalDownloads(items);
 		},
 		'tidal:download:retry': async (trackId) => {
+			refuseIf(ctx.profileBlocks?.downloads);
 			await ensureFreshTidalSession();
 			await svc.retryTidalDownload(trackId);
 		},
@@ -280,6 +292,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'tidal:download:clear-completed': async () => svc.clearCompletedDownloads(),
 		'tidal:download:clear-all': async () => svc.clearAllDownloads(),
 		'tidal:download:redownload': async (trackId) => {
+			refuseIf(ctx.profileBlocks?.downloads);
 			await ensureFreshTidalSession();
 			await svc.redownloadTidalTrack(trackId);
 		},
@@ -451,6 +464,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'backup:restore-preview': async (id)             => svc.previewBackupRestore(id),
 		'backup:restore':         async (req)            => svc.restoreBackup(req),
 		'backup:google-connect': async (folderName) => {
+			refuseIf(ctx.profileBlocks?.googleBackup);
 			await runGoogleConnectFlow();
 			const cur = await svc.getBackupSettings();
 			const name = folderName?.trim() || (cur.target?.kind === 'googledrive' ? cur.target.folderName : 'Curator Backups');

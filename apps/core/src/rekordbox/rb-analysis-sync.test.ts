@@ -21,6 +21,7 @@ import { compareDumps, dumpLibrary, dumpView } from '../sync-log/dump.js';
 import { readOutbox } from '../sync-log/outbox.js';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { applyTrackMerge } from '../library/merge-tracks.js';
+import { remintDeviceIdentity } from '../sync-log/remint.js';
 import { RekordboxImporter, type RunImportOptions } from './importer.js';
 import type { RekordboxSidecar } from './sidecar.js';
 
@@ -43,14 +44,14 @@ function stubSidecar(frames: Frame[]): RekordboxSidecar {
 	}) as unknown as RekordboxSidecar;
 }
 
-async function runImport(frames: Frame[]): Promise<void> {
+async function runImport(frames: Frame[], on: Db = db, master = 'master.db'): Promise<void> {
 	const opts: RunImportOptions = {
 		mode: 'full',
 		flags: { syncTracks: true, syncPlaylists: false, syncMyTags: false, syncCuesGridsPhrases: true, syncWaveformPeaks: false, syncHistory: false },
-		dbPath: join(dir, 'master.db'), // never opened — stub sidecar
+		dbPath: join(dir, master), // never opened — stub sidecar
 		peaksDir: join(dir, 'peaks'),
 	};
-	await new RekordboxImporter(db, stubSidecar(frames)).runImport(opts);
+	await new RekordboxImporter(on, stubSidecar(frames)).runImport(opts);
 }
 
 const T0 = Date.parse('2026-08-14T10:00:00Z');
@@ -247,5 +248,66 @@ describe('rekordbox analysis units across two desktops', () => {
 		handles.push(fresh);
 		initialPush(fresh);
 		expect(rbBackfillPending(fresh)).toBe(false);
+	});
+
+	// Workstream E: both desktops have their own rekordbox, and the two
+	// libraries disagree on track 1's grid and track 2's key. Each device's
+	// importer keeps a baseline of what ITS rekordbox said, so a re-import
+	// that finds rekordbox unchanged leaves the synced value alone: the last
+	// change wins, not the last import.
+	it('two rekordbox libraries that disagree converge instead of flipping on every re-import', async () => {
+		// B: a copy of A's library (same tracks, links and recordings) with
+		// its own identity, before either has imported.
+		const bPath = join(dir, 'b-own.db');
+		a.prepare(`VACUUM INTO ?`).run(bPath);
+		const { db: bDb, sqlite: b } = createDb(bPath);
+		handles.push(b);
+		remintDeviceIdentity(b, 'copied-for-test');
+		const opsOf = (raw: Database.Database) => readOutbox(raw).filter((o) => o.kind === 'set-rb-analysis');
+		const shipped = new Map<Database.Database, number>([[a, 0], [b, 0]]);
+		// Everything `from` emitted since the last exchange, applied on `to`.
+		const exchange = (from: Database.Database, to: Database.Database): void => {
+			const all = readOutbox(from);
+			applyOps(to, all.slice(shipped.get(from)));
+			shipped.set(from, all.length);
+		};
+		const gridOf = (raw: Database.Database) => slotOf(raw, 't1')!.rb_beatgrid!;
+		const framesB = frames({ bpm1: 126, key2: '12B' });
+
+		await runImport(frames());
+		exchange(a, b);
+		await runImport(framesB, bDb, 'master-b.db');
+		// B's first reading of its rekordbox is a change: it differs from what A stated.
+		expect(opsOf(b).map((o) => (o.payload as { unit: string }).unit).sort()).toEqual(['grid', 'key']);
+		exchange(b, a);
+		expect(gridOf(a).equals(gridOf(b))).toBe(true);
+		expect(slotOf(a, 't2')!.rb_key_camelot).toBe('12B');
+
+		// Full re-imports on both: neither rekordbox changed, nothing flips.
+		const aOps = opsOf(a).length;
+		const bOps = opsOf(b).length;
+		for (let round = 0; round < 2; round++) {
+			await runImport(frames());
+			await runImport(framesB, bDb, 'master-b.db');
+			exchange(a, b);
+			exchange(b, a);
+		}
+		expect(opsOf(a)).toHaveLength(aOps);
+		expect(opsOf(b)).toHaveLength(bOps);
+		expect(gridOf(a).equals(gridOf(b))).toBe(true);
+		expect(slotOf(a, 't2')!.rb_key_camelot).toBe('12B');
+		expect(a.prepare(`SELECT key_camelot FROM track WHERE id = 't2'`).pluck().get()).toBe('12B');
+		expect(compareDumps(dumpLibrary(a), dumpLibrary(b)).find((r) => r.table === 'rbAnalysis')!.equal).toBe(true);
+
+		// A's rekordbox re-analyses track 1: that is a change, and it wins on B
+		// too, through B's next re-import of its own (unchanged) grid.
+		await runImport(frames({ bpm1: 128 }));
+		expect(opsOf(a)).toHaveLength(aOps + 1);
+		exchange(a, b);
+		await runImport(framesB, bDb, 'master-b.db');
+		expect(opsOf(b)).toHaveLength(bOps);
+		expect(gridOf(b).equals(gridOf(a))).toBe(true);
+		expect(compareDumps(dumpLibrary(a), dumpLibrary(b)).find((r) => r.table === 'rbAnalysis')!.equal).toBe(true);
+		expect(b.prepare(`SELECT count(*) FROM rekordbox_unit_seen`).pluck().get()).toBeGreaterThan(0);
 	});
 });

@@ -1430,6 +1430,34 @@ export const catalogueEntry = sqliteTable(
 	})
 );
 
+// Rekordbox's own value of each analysis unit (the rb slot's grid, key and
+// phrases) as THIS device's importer last read it — a digest, not the value.
+// Device-local by design: it describes this machine's rekordbox library, and
+// never rides an op.
+//
+// Why (cloud plan, Workstream E): the slot also receives other devices'
+// rekordbox values through the op log. Two desktops whose rekordbox libraries
+// disagree on a unit used to flip it back on every full re-import, because
+// the importer emitted whenever rekordbox's value differed from the synced
+// one. With the baseline it emits only when rekordbox changed the unit since
+// this device last read it; otherwise the synced value stands (the slot is
+// put back) — last CHANGE wins, not last import. A unit with no baseline
+// yet (first import after upgrade, a new link) is treated as changed once.
+export const RB_SEEN_UNITS = ['grid', 'key', 'segments'] as const;
+export const rekordboxUnitSeen = sqliteTable(
+	'rekordbox_unit_seen',
+	{
+		trackId: text('track_id').notNull().references(() => track.id, { onDelete: 'cascade' }),
+		unit: text('unit', { enum: RB_SEEN_UNITS }).notNull(),
+		// Grid and phrases: sha1 of the stored form; key: the Camelot string.
+		digest: text('digest').notNull(),
+		seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
+	},
+	(t) => ({
+		pk: primaryKey({ columns: [t.trackId, t.unit] }),
+	})
+);
+
 // Drizzle-inferred row types
 // The DB row, plus optional aggregated fields that some read paths attach:
 //   - `sources` — filled by getTracks via batched source_link + rekordbox_link

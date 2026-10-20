@@ -709,6 +709,14 @@ export interface CoreService {
 	// album (the deleted chip) and what stops the read-sync re-minting it.
 	// deleteTracks' soft path is exactly removeTrackSources(ids, ALL).
 	removeTrackSources(trackIds: string[], sources: RemovableTrackSource[]): Promise<RemoveTrackSourcesResult>;
+	// Undo a soft delete. The rows come back with what a soft delete keeps
+	// (tags, cues, rating, history, streaming links) plus any local file the
+	// scanner bound to them while they were deleted (scanner.ts: a deleted
+	// track's audio is held for it, never minted into a fresh row). A
+	// library_track undelete op carries it to every device. Not restored:
+	// playlist memberships, trashed files, the rekordbox link. Returns the
+	// ids that were deleted and now are not.
+	undeleteTracks(trackIds: string[]): Promise<{ restored: string[] }>;
 	matchTidalForTrack(trackId: string): Promise<{ tidalId: string } | null>;
 	setPlaylistHybridTidal(playlistId: string, enabled: boolean, progress?: ProgressFn, sort?: { column: ZTrackSortT['column']; dir: 'asc' | 'desc' }): Promise<{ matched: number; scanned: number; enabled: boolean }>;
 	cancelEnrichment(): Promise<void>;
@@ -2884,6 +2892,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				errors: r.errors.map(({ kind, message }) => ({ kind, message })),
 			};
 		},
+		async undeleteTracks(trackIds) {
+			const restored = mut.undeleteTracks(db, [...new Set(trackIds)]);
+			// Deleted rows carry no tier (softDeleteTracks clears it); a file
+			// bound while deleted makes the row local again.
+			if (restored.length > 0) membership.recomputeForTracks(restored);
+			return { restored };
+		},
 		async removeTrackSources(trackIds, sources) {
 			const requested = new Set(sources.filter((s): s is RemovableTrackSource => (REMOVABLE_TRACK_SOURCES as readonly string[]).includes(s)));
 			if (requested.size === 0) throw new Error('No sources selected');
@@ -3093,9 +3108,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 
 			// New rows land at the tail: order keys after the current last row,
 			// then positions restamped (appendRows / recomputePositions).
-			// (addMembers: one transaction, one `add` op per row.)
+			// (addMembers: one transaction, one `add` op per row.) On a
+			// streaming playlist the add ops are marked pending upstream in the
+			// same transaction (F23), so no read-sync — here or on another
+			// desktop — reads the service's list as removing them before the
+			// push below lands; the push's outcome settles them.
 			const now = new Date();
-			mut.addMembers(db, playlistId, toAdd.map((trackId) => ({
+			const addRows = () => mut.addMembers(db, playlistId, toAdd.map((trackId) => ({
 				playlistId,
 				trackId,
 				addedAt: now,
@@ -3106,6 +3125,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				// stable round-trip identity (no upstream to push to anyway).
 				sourceTrackId: upstreamIdByTrackId.get(trackId) ?? trackId,
 			})));
+			const pendingOps = isStreaming ? mut.withUpstreamPending(db, pl.source as StreamingSource, addRows).opIds : (addRows(), []);
 			// Refresh trackCount cache so the sidebar's per-playlist counter
 			// matches the new state immediately.
 			const total = db
@@ -3152,9 +3172,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 						}
 						upstream = 'pushed';
 						log.for('add-tracks').info('pushed upstream', ctx);
+						mut.ackUpstream(db, pendingOps, src, 'pushed');
 					} catch (err) {
 						upstream = 'failed';
 						log.for('add-tracks').warn('upstream push failed', ctx, err);
+						mut.ackUpstream(db, pendingOps, src, 'failed', err instanceof Error ? err.message : String(err));
 					}
 				}
 			}
@@ -3190,8 +3212,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// (removing #5 of 10 leaves 0..3,5..9) and the "#" column, the
 			// renderer's reorder wire format and anything reading
 			// position-as-rank would see holes.
-			// (removeMembersByTrack: one `remove` op per row.)
-			const removed = mut.removeMembersByTrack(db, playlistId, trackIds);
+			// (removeMembersByTrack: one `remove` op per row.) Pending upstream
+			// until the push below settles it, as on the add path (F23).
+			const streamingRemove = (pl.source === 'spotify' || pl.source === 'tidal') && remoteIds.length > 0;
+			const removeRows = () => mut.removeMembersByTrack(db, playlistId, trackIds);
+			const { result: removed, opIds: pendingOps } = streamingRemove
+				? mut.withUpstreamPending(db, pl.source as StreamingSource, removeRows)
+				: { result: removeRows(), opIds: [] as string[] };
 			if (removed > 0) {
 				const total = db
 					.select({ n: count() })
@@ -3241,9 +3268,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 						}
 						upstream = 'pushed';
 						log.for('remove-tracks').info('pushed upstream', ctx);
+						mut.ackUpstream(db, pendingOps, src, 'pushed');
 					} catch (err) {
 						upstream = 'failed';
 						log.for('remove-tracks').warn('upstream push failed', ctx, err);
+						mut.ackUpstream(db, pendingOps, src, 'failed', err instanceof Error ? err.message : String(err));
 						// Re-throw on forced pushes so deleteTracks can collect
 						// the error and surface it to the user — a silent
 						// failure here on a destructive action would leave them
@@ -3562,8 +3591,15 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// neighbours); the rest keep theirs, so a single drag rewrites one
 			// row's key. Positions are then restamped 0..N-1 in the new order.
 			// One `move` op per displaced row (a reverse sort is N, a drag 1).
+			// On a streaming playlist the moves are pending upstream until the
+			// push below settles them (F23): a read-sync meanwhile keeps the
+			// local order instead of reverting the drag.
 			const rowIdAt = new Map(existing.map((r) => [r.position, r.id]));
-			mut.reorderMembers(db, playlistId, newOrder.map((p) => rowIdAt.get(p)!));
+			const reorderRows = () => mut.reorderMembers(db, playlistId, newOrder.map((p) => rowIdAt.get(p)!));
+			const before = db.select({ source: playlist.source }).from(playlist).where(eq(playlist.id, playlistId)).get();
+			const pendingOps = before?.source === 'spotify' || before?.source === 'tidal'
+				? mut.withUpstreamPending(db, before.source, reorderRows).opIds
+				: (reorderRows(), [] as string[]);
 
 			db.update(playlist)
 				.set({ updatedAt: new Date() })
@@ -3588,7 +3624,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			try {
 				let snapshotId: string | null = null;
 				const moves = computePositionalMoves(perm);
-				if (moves.length === 0) return;
+				if (moves.length === 0) {
+					// The provider already has this order.
+					mut.ackUpstream(db, pendingOps, src, 'pushed');
+					return;
+				}
 				// Positional moves cost one sequential API call EACH. Perfect
 				// for drags (a dragged block = blockSize calls) — catastrophic
 				// for a mass permutation like reverse-playlist, where ~N calls
@@ -3628,8 +3668,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 						.where(eq(playlist.id, playlistId))
 						.run();
 				}
+				mut.ackUpstream(db, pendingOps, src, 'pushed');
 			} catch (err) {
 				log.for('reorder').warn('upstream push failed', { source: src, playlistSourceId: pl.sourceId }, err);
+				mut.ackUpstream(db, pendingOps, src, 'failed', err instanceof Error ? err.message : String(err));
 			}
 		},
 
@@ -3726,6 +3768,12 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 					.run();
 			}
 			log.for('push-local-only').info('pushed local-only rows upstream', ctx);
+			// Their adds were pending upstream (F23); the service has them now.
+			const pushedRows = new Set(ids);
+			const rowIds = db.select({ id: playlistTrack.id, sourceTrackId: playlistTrack.sourceTrackId }).from(playlistTrack)
+				.where(eq(playlistTrack.playlistId, playlistId)).all()
+				.filter((r) => r.sourceTrackId != null && pushedRows.has(r.sourceTrackId)).map((r) => r.id);
+			mut.ackUpstream(db, mut.pendingAddOps(sqlite, rowIds), src, 'pushed');
 			return { pushed: ids.length, snapshotId: res.snapshotId };
 		},
 

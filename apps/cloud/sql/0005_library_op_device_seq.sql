@@ -1,0 +1,12 @@
+-- Curator cloud, migration 0005: index one device's ops by seq.
+--
+-- The push path reports `priorOwnMaxSeq`, the highest seq the pushing device already has in the
+-- log (src/sync/push.ts), with `where user_id = ... and device_id = $1 order by seq desc limit 1`.
+-- `library_op_user_seq` alone answers that by walking the user's log backwards until it meets one
+-- of the device's rows, which for a second device's first push is the whole log (the first device
+-- uploaded ~100k ops). This index makes it one probe.
+--
+-- A plain `create index`, not `concurrently`: the runner applies each file in a transaction,
+-- where `concurrently` is refused, and the table is small enough that the brief write lock
+-- during the build is harmless.
+create index library_op_user_device_seq on curator.library_op (user_id, device_id, seq);

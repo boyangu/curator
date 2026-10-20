@@ -22,6 +22,16 @@
 // new path (rename, folder move — unlink and add arrive in either order) the
 // link is re-pointed and the track keeps its cues, tags and rekordbox slot.
 // Links missing for longer than MISSING_LINK_TTL_DAYS are swept at startup.
+//
+// A deleted track stays deleted. Its audio can still be on disk: the trash
+// step failed, the file was moved after the delete, or another desktop
+// deleted the recording (synced op) while this machine keeps its own copy.
+// A scan used to mint a fresh row for such a file, and with the op log that
+// row is a new recording on every device — the delete undone everywhere. So
+// audio that belongs to a deleted track (its link, its analysis, or the
+// recording's audio-hash claim in the op log's records) is bound to that
+// deleted row and left deleted. The way back is an explicit undelete
+// (CoreService.undeleteTracks), which then finds the file already attached.
 
 import { existsSync, promises as fsp } from 'node:fs';
 import { extname, basename } from 'node:path';
@@ -32,7 +42,7 @@ import { and, desc, eq, inArray, isNull, like, lt, sql } from 'drizzle-orm';
 import { track, sourceLink, libraryFolder, trackAnalysis } from '@curator/shared/schema';
 import type { LibraryFolder, NewTrack, NewSourceLink, TrackArtist } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
-import { normalizeIncomingArtists, syncTrackArtists } from '../library/artists.js';
+import { normalizeIncomingArtists, rawOf, syncTrackArtists } from '../library/artists.js';
 import { syncTrackAlbumsById } from '../library/albums.js';
 import type { Db } from '../db/client.js';
 import { log } from '../log.js';
@@ -105,10 +115,13 @@ export type ScanProgressFn = (p: ScanProgress) => void;
 //   rebound  — a new path carrying the audio of a link that had gone missing
 //              (or whose old path is already gone): that link now points here
 //   skipped  — known path, unchanged size+mtime, nothing to do
+//   deleted  — a new path carrying the audio of a track the user deleted:
+//              bound to that row, which stays deleted (nothing to analyse,
+//              no membership to recompute)
 //   orphaned — the file vanished (watcher unlink, or the missing-link sweep);
 //              the canonical track survives. Carries the now-fileless trackId
 //              so listeners (membership recompute) can re-evaluate it.
-export type IngestOutcome = 'matched' | 'created' | 'rebound' | 'skipped' | 'orphaned';
+export type IngestOutcome = 'matched' | 'created' | 'rebound' | 'skipped' | 'deleted' | 'orphaned';
 
 export interface IngestEvent {
 	outcome: IngestOutcome;
@@ -473,6 +486,25 @@ export class LibraryScanner {
 				return { outcome: 'rebound', trackId: byHash.trackId };
 			}
 
+			// Not live anywhere: is it the audio of a deleted track? Then it is
+			// that track's file, not a new one (see the header).
+			const deleted = !byHash && parsed.audioHash ? this.deletedOwnerOf(parsed.audioHash, norm) : null;
+			if (deleted) {
+				// A link of its own at this path. An older link of the deleted row
+				// (the file's previous path) is left flagged for the TTL sweep.
+				this.upsertLocalSourceLink(deleted, norm, stat, parsed);
+				totals.skipped++;
+				this.emit({
+					stage: 'ingesting',
+					folderId: folder.id,
+					folderPath: folder.path,
+					current: { path: norm, index: totals.scanned },
+					totals,
+				});
+				this.emitIngest({ outcome: 'deleted', trackId: deleted, filePath: norm });
+				return { outcome: 'deleted', trackId: deleted };
+			}
+
 			const target = toTarget(parsed, p);
 			// A byte-identical copy of a file that is still present elsewhere
 			// gets its own row rather than a second link on that track: a track
@@ -579,6 +611,73 @@ export class LibraryScanner {
 		if (rows.length === 0) return null;
 		const gone = rows.find((r) => r.missingAt != null) ?? rows.find((r) => !r.filePath || !existsSync(r.filePath));
 		return gone ? { kind: 'rebind', linkId: gone.id, trackId: gone.trackId } : { kind: 'duplicate' };
+	}
+
+	// The deleted track (soft-deleted, not a WAV copy, not a merge loser —
+	// a loser's recording lives on in its winner) this audio belongs to, if
+	// no live track holds it. Checked in order of how directly the row owns
+	// the audio:
+	//   1. a local link of its own with this hash (the file moved after the
+	//      delete, or is a second copy of the deleted file);
+	//   2. its analysis, stamped with this hash;
+	//   3. its recording's audio-hash claim in the op-log records — how a
+	//      delete made on another device, or one that dropped the link here,
+	//      still knows the file.
+	// A live track that holds the hash through its analysis wins over all
+	// of these: the audio is in the library, and the normal match finds it.
+	private deletedOwnerOf(hash: string, norm: string): string | null {
+		const raw = rawOf(this.db);
+		const live = raw.prepare(`SELECT 1 FROM track_analysis a JOIN track t ON t.id = a.track_id
+			WHERE a.audio_hash = ? AND t.deleted_at IS NULL AND t.derived_from_track_id IS NULL LIMIT 1`).get(hash);
+		if (live) return null;
+		const linked = raw.prepare(`SELECT t.id FROM source_link l JOIN track t ON t.id = l.track_id
+			WHERE l.source = 'local' AND l.audio_hash = ? AND t.deleted_at IS NOT NULL AND t.derived_from_track_id IS NULL
+				AND (l.file_path IS NULL OR l.file_path != ?)
+			ORDER BY t.deleted_at DESC LIMIT 1`).pluck().get(hash, norm) as string | undefined;
+		if (linked) return linked;
+		const analysed = raw.prepare(`SELECT t.id FROM track_analysis a JOIN track t ON t.id = a.track_id
+			WHERE a.audio_hash = ? AND t.deleted_at IS NOT NULL AND t.derived_from_track_id IS NULL
+				AND NOT EXISTS (SELECT 1 FROM recording_alias ra WHERE ra.loser = t.recording_id)
+			ORDER BY t.deleted_at DESC LIMIT 1`).pluck().get(hash) as string | undefined;
+		if (analysed) return analysed;
+		return this.deletedClaims().get(hash) ?? null;
+	}
+
+	// audio hash → deleted track, from the claims of every deleted row's
+	// recording. Claims have no index by value (their key leads with the
+	// recording), so the map is built once and rebuilt only when the
+	// deleted set or the records change: a first scan asks for every file,
+	// and probing each deleted row's claim per file would cost
+	// files × deleted lookups. The cache key is three cheap reads (an
+	// index-only count over the deleted rows, two index maxima).
+	private deletedClaimsCache: { key: string; map: Map<string, string> } | null = null;
+	private deletedClaims(): Map<string, string> {
+		const raw = rawOf(this.db);
+		const k = raw.prepare(`SELECT (SELECT count(*) FROM track WHERE deleted_at IS NOT NULL) AS n,
+			(SELECT max(deleted_at) FROM track) AS at, (SELECT max(rowid) FROM sync_state) AS rs`).get() as { n: number; at: number | null; rs: number | null };
+		const key = `${k.n}:${k.at ?? 0}:${k.rs ?? 0}`;
+		if (this.deletedClaimsCache?.key === key) return this.deletedClaimsCache.map;
+		const map = new Map<string, string>();
+		const rows = raw.prepare(`SELECT t.id, t.recording_id AS rec FROM track t
+			WHERE t.deleted_at IS NOT NULL AND t.derived_from_track_id IS NULL AND t.recording_id IS NOT NULL
+				AND NOT EXISTS (SELECT 1 FROM recording_alias ra WHERE ra.loser = t.recording_id)
+			ORDER BY t.deleted_at`).all() as Array<{ id: string; rec: string }>;
+		const byRec = new Map(rows.map((r) => [r.rec, r.id]));
+		const recs = [...byRec.keys()];
+		const marker = ':audio_hash:';
+		for (let i = 0; i < recs.length; i += 400) {
+			const chunk = recs.slice(i, i + 400);
+			const claims = raw.prepare(`SELECT key, recording_id AS rec FROM sync_state
+				WHERE map = 'claims' AND recording_id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as Array<{ key: string; rec: string }>;
+			for (const c of claims) {
+				const at = c.key.indexOf(marker);
+				if (at < 0) continue;
+				// Rows come oldest delete first, so the latest delete wins.
+				map.set(c.key.slice(at + marker.length), byRec.get(c.rec)!);
+			}
+		}
+		this.deletedClaimsCache = { key, map };
+		return map;
 	}
 
 	// Promote the file-derived fields the canonical row should own:

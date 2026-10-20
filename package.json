@@ -7,6 +7,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @curator/desktop dev",
+    "desktop:profile": "node apps/desktop/scripts/run-profile.mjs",
     "release:cloud": "node scripts/release-cloud.mjs",
     "cloud:rotate-db-password": "node scripts/rotate-cloud-db-password.mjs",
     "build": "pnpm -r --filter='./packages/**' build && pnpm --filter @curator/mcp build && pnpm --filter @curator/desktop build",
