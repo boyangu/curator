@@ -1,7 +1,12 @@
 // Node-side manager for the Python analyzer sidecar.
 //
 // Responsibilities:
-//   1. Spawn the sidecar process at service init and keep it alive.
+//   1. Spawn the sidecar process when the host says so (start()) and keep it
+//      alive. Construction never spawns: on Windows the spawn boots WSL,
+//      whose Hyper-V vEthernet adapter coming up makes Chromium abort every
+//      in-flight request with ERR_NETWORK_CHANGED — so the desktop main
+//      defers start() until the window has loaded (CoreService.startAnalyzer).
+//      Requests made before the first start() wait for it instead of failing.
 //   2. Wrap stdio JSON-RPC in a typed request/response API. Requests are
 //      correlated by id; multiple in-flight requests multiplex over the same
 //      pipe.
@@ -284,15 +289,37 @@ export class AnalyzerSidecar extends EventEmitter {
 	// then refuses to restart. A missing module can't fix itself, and looping
 	// six retries just floods the console with the same traceback.
 	private permanentlyBroken = false;
+	// Why the sidecar stopped for good (import error, handshake mismatch,
+	// executable not found, respawn limit). Set when 'disabled' is emitted;
+	// surfaced to user-initiated enqueues so a click isn't silently parked.
+	private disabledReason: string | null = null;
 	private helloSeen = false;
 	private helloTimer: NodeJS.Timeout | null = null;
+	// Until the first start(), analyze() parks requests here rather than
+	// rejecting them: the queue treats `sidecar_unavailable` as transient and
+	// would re-dispatch the same job in a loop for as long as the deferred
+	// start takes. Flushed by start(); rejected by shutdown()/cancel().
+	private started = false;
+	private awaitingStart: Array<{
+		params: AnalyzeParams;
+		resolve: (r: AnalyzeResult) => void;
+		reject: (e: SidecarError) => void;
+	}> = [];
 
 	constructor(private readonly opts: SidecarOptions) { super(); }
+
+	// True once start() has been called (whether or not the process is alive
+	// right now — a crashed sidecar respawns on its own).
+	get hasStarted(): boolean { return this.started; }
+
+	// Non-null once the sidecar has given up (no further respawns).
+	get disabled(): string | null { return this.disabledReason; }
 
 	// Idempotent — calling start() twice is a no-op while a process is alive.
 	start(): void {
 		if (this.proc) return;
 		this.shuttingDown = false;
+		this.started = true;
 		const proc = spawn(this.opts.executable, this.opts.args ?? [], {
 			cwd: this.opts.cwd,
 			env: {
@@ -325,9 +352,33 @@ export class AnalyzerSidecar extends EventEmitter {
 			}
 			this.detectImportError(chunk);
 		});
-		proc.on('exit', (code, signal) => this.onExit(code, signal));
+		proc.on('exit', (code, signal) => this.onExit(proc, code, signal));
+		// 'ready' means a process actually exists — the queue resumes on it,
+		// so emitting before a failed spawn would buy one more doomed dispatch.
+		let spawned = false;
+		proc.once('spawn', () => {
+			spawned = true;
+			this.emit('ready');
+		});
 		proc.on('error', (err) => {
 			alog.error('spawn error', err);
+			// A process that never started emits 'error' and NO 'exit' (e.g.
+			// `wsl` not on PATH → ENOENT), so without this every request
+			// written to its buffered stdin would hang forever and the queue's
+			// jobs would sit in 'running'. Post-spawn errors (a failed kill)
+			// leave a live process whose own 'exit' does the cleanup.
+			if (spawned) return;
+			const code = (err as NodeJS.ErrnoException).code;
+			// The executable isn't there — retrying won't conjure it up.
+			if (code === 'ENOENT') this.markBroken(`analyzer executable not found: ${this.opts.executable}`);
+			for (const s of [proc.stdin, proc.stdout, proc.stderr]) s.destroy();
+			this.onExit(proc, null, null, `analyzer failed to start: ${err.message}`);
+		});
+		// Requests are written the moment the process is spawned; if the spawn
+		// failed that write can error on stdin, and an unhandled stream error
+		// would take the host down. The 'error' handler above rejects them.
+		proc.stdin.on('error', (err) => {
+			alog.warn('stdin write failed', undefined, err);
 		});
 
 		this.helloSeen = false;
@@ -342,7 +393,10 @@ export class AnalyzerSidecar extends EventEmitter {
 			}
 		}, HELLO_TIMEOUT_MS);
 
-		this.emit('ready');
+		// stdin buffers until the interpreter reads it, so parked requests can
+		// go out now rather than after the hello frame.
+		const parked = this.awaitingStart.splice(0);
+		for (const p of parked) this.analyze(p.params).then(p.resolve, p.reject);
 	}
 
 	private onStdout(chunk: string): void {
@@ -377,7 +431,7 @@ export class AnalyzerSidecar extends EventEmitter {
 				// Wrong executable or incompatible wire format — letting it run
 				// would produce silently-wrong results. Kill; onExit sees
 				// permanentlyBroken and refuses to respawn.
-				this.permanentlyBroken = true;
+				this.markBroken('analyzer handshake mismatch — stale or wrong sidecar build');
 				alog.error(
 					'sidecar handshake mismatch — sidecar disabled; rebuild or repoint it',
 					undefined,
@@ -438,14 +492,18 @@ export class AnalyzerSidecar extends EventEmitter {
 		alog.warn('unhandled frame', { frame });
 	}
 
-	private onExit(code: number | null, signal: NodeJS.Signals | null): void {
-		alog.warn('sidecar exited', { code, signal, inFlight: this.pending.size });
+	// `proc` guards against a late event from a process we've already
+	// written off (a failed spawn handled via 'error', then a stray 'exit').
+	private onExit(proc: ChildProcessWithoutNullStreams, code: number | null, signal: NodeJS.Signals | null, reason?: string): void {
+		if (this.proc !== proc) return;
+		alog.warn('sidecar exited', { code, signal, inFlight: this.pending.size, ...(reason ? { reason } : {}) });
 		this.proc = null;
 		// Reject every in-flight request — caller decides retry policy. The
-		// queue treats `sidecar_unavailable` as transient; the per-track job
-		// stays in `running` state until the sidecar comes back and retries.
+		// queue treats `sidecar_unavailable` as transient: the job goes back
+		// to 'queued' and the queue waits for 'ready' before dispatching again.
+		const message = reason ?? `sidecar exited (code=${code}, signal=${signal})`;
 		for (const [, p] of this.pending) {
-			p.reject(sidecarError('sidecar_unavailable', `sidecar exited (code=${code}, signal=${signal})`));
+			p.reject(sidecarError('sidecar_unavailable', message));
 		}
 		this.pending.clear();
 		this.stdoutBuffer = '';
@@ -455,8 +513,14 @@ export class AnalyzerSidecar extends EventEmitter {
 		this.scheduleRespawn();
 	}
 
+	private markBroken(reason: string): void {
+		this.permanentlyBroken = true;
+		this.disabledReason ??= reason;
+	}
+
 	private scheduleRespawn(): void {
 		if (this.permanentlyBroken) {
+			this.disabledReason ??= 'analyzer stopped';
 			this.emit('disabled');
 			return;
 		}
@@ -467,6 +531,7 @@ export class AnalyzerSidecar extends EventEmitter {
 		}
 		if (this.respawnAttempts >= MAX_RESPAWN_BURST) {
 			alog.error('respawn limit reached — sidecar disabled. Investigate the sidecar logs.');
+			this.disabledReason = 'analyzer kept crashing and was stopped — see the analyzer log';
 			this.emit('disabled');
 			return;
 		}
@@ -488,7 +553,7 @@ export class AnalyzerSidecar extends EventEmitter {
 		for (const pat of IMPORT_ERROR_PATTERNS) {
 			const m = chunk.match(pat);
 			if (!m) continue;
-			this.permanentlyBroken = true;
+			this.markBroken(`analyzer Python environment is broken (import failed${m[1] ? `: ${m[1]}` : ''})`);
 			const missing = m[1];
 			alog.error(
 				'disabled — Python import failed. Fix: set up apps/analyzer\'s venv per apps/analyzer/README.md, or set CURATOR_DISABLE_ANALYZER=1 to skip spawning the sidecar.',
@@ -503,9 +568,6 @@ export class AnalyzerSidecar extends EventEmitter {
 	// rejects with a typed SidecarError. Progress/partial events are emitted
 	// on `this` keyed by trackId (subscribe before calling).
 	analyze(params: AnalyzeParams): Promise<AnalyzeResult> {
-		if (!this.proc || !this.proc.stdin.writable) {
-			return Promise.reject(sidecarError('sidecar_unavailable', 'sidecar not running'));
-		}
 		// Guard, don't scrub: a path with a lone UTF-16 surrogate (NTFS allows
 		// them) cannot round-trip UTF-8 to Python, and scrubbing it would
 		// silently name a DIFFERENT file. Reject this one request loudly so
@@ -515,6 +577,14 @@ export class AnalyzerSidecar extends EventEmitter {
 			if (!isWellFormedString(p)) {
 				return Promise.reject(sidecarError('internal', `file path is not valid Unicode (lone surrogate): ${p.replace(/[\uD800-\uDFFF]/g, '�')}`));
 			}
+		}
+		if (!this.started && !this.shuttingDown) {
+			return new Promise<AnalyzeResult>((resolve, reject) => {
+				this.awaitingStart.push({ params, resolve, reject });
+			});
+		}
+		if (!this.proc || !this.proc.stdin.writable) {
+			return Promise.reject(sidecarError('sidecar_unavailable', this.disabledReason ?? 'sidecar not running'));
 		}
 		const id = this.nextId++;
 		const wsl = this.opts.translatePathsToWsl === true;
@@ -587,6 +657,11 @@ export class AnalyzerSidecar extends EventEmitter {
 	}
 
 	cancel(trackId: string): void {
+		const parked = this.awaitingStart.filter((p) => p.params.trackId === trackId);
+		if (parked.length > 0) {
+			this.awaitingStart = this.awaitingStart.filter((p) => p.params.trackId !== trackId);
+			for (const p of parked) p.reject(sidecarError('cancelled', 'cancelled before the analyzer started'));
+		}
 		if (!this.proc || !this.proc.stdin.writable) return;
 		const payload = JSON.stringify({ method: 'cancel', params: { trackId } });
 		try { this.proc.stdin.write(payload + '\n'); } catch { /* sidecar going away anyway */ }
@@ -596,6 +671,9 @@ export class AnalyzerSidecar extends EventEmitter {
 		this.shuttingDown = true;
 		if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
 		if (this.helloTimer) { clearTimeout(this.helloTimer); this.helloTimer = null; }
+		for (const p of this.awaitingStart.splice(0)) {
+			p.reject(sidecarError('sidecar_unavailable', 'analyzer shut down before it started'));
+		}
 		if (!this.proc) return;
 		try {
 			this.proc.stdin.write(JSON.stringify({ method: 'shutdown' }) + '\n');

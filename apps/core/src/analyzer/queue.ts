@@ -120,6 +120,9 @@ export interface AnalysisQueueOptions {
 	// Max in-flight dispatches at once. Defaults to the sidecar pool size
 	// (4) but you can lower it if the analyzer is starving other workloads.
 	concurrency?: number;
+	// Fallback re-check while the sidecar is down and hasn't said 'ready'
+	// (tests shorten it). The normal resume is the 'ready' event itself.
+	sidecarRetryMs?: number;
 }
 
 // Display name "Artist, Artist — Title" for a track, used by the analyzer
@@ -134,6 +137,9 @@ export function formatAnalyzerTrackName(title: string, artists: TrackArtist[] | 
 export type AnalysisJobEvent =
 	| { kind: 'enqueued';   trackId: string }
 	| { kind: 'started';    trackId: string; name: string }
+	// A started job went back to 'queued' because the sidecar went away
+	// mid-dispatch; it runs again once the sidecar is back.
+	| { kind: 'requeued';   trackId: string; reason: string }
 	| { kind: 'progress';   trackId: string; stage: ProgressEvent['stage']; pct: number | null }
 	| { kind: 'partial';    trackId: string; fields: Record<string, unknown> }
 	| { kind: 'completed';  trackId: string }
@@ -141,6 +147,12 @@ export type AnalysisJobEvent =
 	| { kind: 'cancelled';  trackId: string };
 
 const DEFAULT_CONCURRENCY = 4;
+// While the sidecar is down the queue parks instead of re-dispatching: a
+// `sidecar_unavailable` rejection used to put the job back to 'queued' and
+// drain() picked it straight up again — a busy async loop (stat + DB writes
+// + events per turn) for the whole respawn gap. 'ready' resumes at once;
+// this is only the safety net for a sidecar that never says so.
+const DEFAULT_SIDECAR_RETRY_MS = 5000;
 
 // The shared analysis catalogue's seam into the queue (apps/core/src/catalogue/
 // implements it; absent = the queue behaves exactly as without a catalogue).
@@ -183,6 +195,11 @@ export class AnalysisQueue extends EventEmitter {
 	// (eventual) result and let it land in `error` state with kind='cancelled'.
 	private cancelled = new Set<string>();
 	private draining = false;
+	// Set when a dispatch saw `sidecar_unavailable`; drain() is a no-op until
+	// the sidecar emits 'ready' (or the fallback timer fires, unless the
+	// sidecar reports itself disabled — then only a 'ready' resumes).
+	private sidecarDown = false;
+	private sidecarRetryTimer: NodeJS.Timeout | null = null;
 	// Per-track analyzer overrides supplied by `enqueue({ analyzeOptions })`.
 	// Read by dispatchOne and forwarded into the sidecar.analyze() call,
 	// then cleared on completion. Memory-only — if the app restarts between
@@ -464,12 +481,43 @@ export class AnalysisQueue extends EventEmitter {
 		this.sidecar.on('partial', (e) => {
 			this.emitEvent({ kind: 'partial', trackId: e.trackId, fields: e.fields });
 		});
-		// On sidecar respawn the queue isn't notified directly — drain() is
-		// resilient (every dispatch checks sidecar availability via the
-		// returned promise). When the sidecar comes back, the next external
-		// enqueue or a manual kick will resume draining; in practice the
-		// renderer's "Reanalyze" click is the kick.
+		// A (re)spawned process: resume right away, so a respawn costs no
+		// more latency than the respawn itself.
+		this.sidecar.on('ready', () => {
+			if (!this.sidecarDown) return;
+			this.clearSidecarRetry();
+			this.sidecarDown = false;
+			qlog.info('analyzer back — resuming queue');
+			this.drain();
+		});
+		// Gave up for good: stay parked (jobs remain 'queued', visible and
+		// discarded on close like any backlog) rather than burning through
+		// the whole backlog marking every track failed.
+		this.sidecar.on('disabled', () => {
+			this.sidecarDown = true;
+			this.clearSidecarRetry();
+		});
 	}
+
+	private markSidecarDown(): void {
+		if (!this.sidecarDown) qlog.warn('analyzer unavailable — queue paused until it is back');
+		this.sidecarDown = true;
+		// `disabled` is undefined on test fakes — treated as "not disabled".
+		if (this.sidecarRetryTimer || this.sidecar.disabled) return;
+		this.sidecarRetryTimer = setTimeout(() => {
+			this.sidecarRetryTimer = null;
+			this.sidecarDown = false;
+			this.drain();
+		}, this.opts.sidecarRetryMs ?? DEFAULT_SIDECAR_RETRY_MS);
+		this.sidecarRetryTimer.unref?.();
+	}
+
+	private clearSidecarRetry(): void {
+		if (this.sidecarRetryTimer) { clearTimeout(this.sidecarRetryTimer); this.sidecarRetryTimer = null; }
+	}
+
+	// Whether the queue is parked waiting for the sidecar (status/tests).
+	get waitingForSidecar(): boolean { return this.sidecarDown; }
 
 	// Enqueue one or more tracks. Existing `done` rows are skipped unless
 	// `force` is set (explicit re-analysis path). Existing `queued`/`running`
@@ -571,6 +619,7 @@ export class AnalysisQueue extends EventEmitter {
 	// to land. We don't bother clearing `inflight` / `cancelled` — the
 	// process is exiting.
 	clearPending(): void {
+		this.clearSidecarRetry();
 		this.db
 			.delete(analysisJob)
 			.where(inArray(analysisJob.state, ['queued', 'running']))
@@ -618,7 +667,7 @@ export class AnalysisQueue extends EventEmitter {
 	// pool from a 10k-job backfill issued 4 separate ordered scans, and
 	// every job completion paid another.
 	private drain(): void {
-		if (this.draining) return;
+		if (this.draining || this.sidecarDown) return;
 		this.draining = true;
 		try {
 			while (this.inflight.size < this.concurrency) {
@@ -835,6 +884,9 @@ export class AnalysisQueue extends EventEmitter {
 					.set({ state: 'queued', startedAt: null })
 					.where(eq(analysisJob.trackId, trackId))
 					.run();
+				// Back to 'queued' in the UI too — a 'started' went out for it.
+				this.emitEvent({ kind: 'requeued', trackId, reason: message });
+				this.markSidecarDown();
 			} else if (kind === 'cancelled' || this.cancelled.delete(trackId)) {
 				this.db.update(analysisJob)
 					.set({ state: 'skipped', finishedAt: new Date() })

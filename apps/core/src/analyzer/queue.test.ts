@@ -19,6 +19,7 @@ import {
 	FINGERPRINT_ONLY_OPTIONS,
 	MIN_FULL_REANALYSIS_VERSION,
 	needsFullReanalysis,
+	type AnalysisJobEvent,
 } from './queue.js';
 import type { AnalyzerSidecar, AnalyzeOptions, AnalyzeParams, AnalyzeResult } from './sidecar.js';
 
@@ -241,5 +242,70 @@ describe('enqueue options rule', () => {
 		queue.enqueue(['t'], { priority: 100, force: true });
 		await waitFor(() => fake.calls.length === 1 && pendingJobs() === 0, 'dispatch');
 		expect(fake.calls[0]!.options).toBeUndefined();
+	});
+});
+
+describe('sidecar outage', () => {
+	// The real sidecar's down state: every analyze() rejects as transient
+	// until the test flips `up` and (optionally) emits 'ready'.
+	class FlakySidecar extends FakeSidecar {
+		up = false;
+		disabled: string | null = null;
+		override analyze(p: AnalyzeParams): Promise<AnalyzeResult> {
+			if (this.up) return super.analyze(p);
+			this.calls.push(p);
+			const e = Object.assign(new Error('sidecar exited (code=1, signal=null)'), { kind: 'sidecar_unavailable' });
+			return Promise.reject(e);
+		}
+	}
+
+	function flakyQueue(retryMs: number): { flaky: FlakySidecar; q: AnalysisQueue; events: AnalysisJobEvent[] } {
+		const flaky = new FlakySidecar();
+		const q = new AnalysisQueue(db, flaky as unknown as AnalyzerSidecar, { peaksDir: join(dir, 'peaks'), concurrency: 4, sidecarRetryMs: retryMs });
+		const events: AnalysisJobEvent[] = [];
+		q.on('event', (e: AnalysisJobEvent) => events.push(e));
+		return { flaky, q, events };
+	}
+
+	it('parks instead of re-dispatching in a loop, and resumes on ready', async () => {
+		const { flaky, q, events } = flakyQueue(60_000);
+		seedTrack('t'); seedLocalLink('t');
+		q.enqueue(['t'], { priority: 100 });
+		await waitFor(() => events.some((e) => e.kind === 'requeued'), 'requeued');
+		// The old shape re-picked the job immediately — hundreds of calls here.
+		await new Promise((r) => setTimeout(r, 150));
+		expect(flaky.calls.length).toBe(1);
+		expect(job('t')?.state).toBe('queued');
+		expect(q.waitingForSidecar).toBe(true);
+
+		flaky.up = true;
+		flaky.emit('ready');
+		await waitFor(() => job('t')?.state === 'done', 'done after ready');
+		expect(flaky.calls.length).toBe(2);
+		expect(q.waitingForSidecar).toBe(false);
+	});
+
+	it('falls back to a bounded retry when no ready arrives', async () => {
+		const { flaky, q } = flakyQueue(50);
+		seedTrack('t'); seedLocalLink('t');
+		q.enqueue(['t'], { priority: 100 });
+		await waitFor(() => flaky.calls.length === 1, 'first dispatch');
+		flaky.up = true;
+		await waitFor(() => job('t')?.state === 'done', 'done after retry timer');
+		expect(flaky.calls.length).toBe(2);
+	});
+
+	it('stays parked (queued, not failed) once the sidecar is disabled', async () => {
+		const { flaky, q, events } = flakyQueue(50);
+		seedTrack('t'); seedLocalLink('t');
+		flaky.disabled = 'analyzer executable not found: wsl';
+		flaky.emit('disabled');
+		q.enqueue(['t'], { priority: 100 });
+		await new Promise((r) => setTimeout(r, 200));
+		// Parked from the 'disabled' event on: nothing dispatched, no timer.
+		expect(flaky.calls.length).toBe(0);
+		expect(job('t')?.state).toBe('queued');
+		expect(events.some((e) => e.kind === 'failed')).toBe(false);
+		q.clearPending();
 	});
 });

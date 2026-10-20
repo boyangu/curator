@@ -1,6 +1,7 @@
 // Re-running an identical rekordbox import must emit nothing to the op log,
-// on every pull path: tracks (rating / overrides), playlists + folders +
-// membership, MyTags, the cue merge and play history. 2026-10-18: the
+// on every pull path: tracks (rating / overrides / rb key), playlists +
+// folders + membership, MyTags, the cue merge, grids + phrases and play
+// history. 2026-10-18: the
 // history pass restated every session and play on each sync (87k pending
 // ops after three syncs); this pins the whole importer against that shape.
 // Real importer, migrated temp DB, stub sidecar replaying synthetic frames —
@@ -79,6 +80,12 @@ function frames(opts: { rating1?: number; extraPlay?: boolean } = {}): Frame[] {
 		out.push({ event: 'cues', row: { rb_content_id: `C${n}`, rb_local_usn: 1, rb_local_deleted: false, slot: 0, kind: 'hot', position_sec: 12.5 + n, length_sec: null, color: null, name: null } });
 		out.push({ event: 'cues', row: { rb_content_id: `C${n}`, rb_local_usn: 1, rb_local_deleted: false, slot: 1, kind: 'memory', position_sec: 40 + n, length_sec: null, color: null, name: 'drop' } });
 	}
+	// Grids + phrases (the waveform pass): restated on every full read.
+	for (const n of [1, 2]) {
+		const beats = Array.from({ length: 600 }, (_, k) => Math.round(90 + n + k * 468.75) / 1000);
+		out.push({ event: 'waveform', row: { rb_content_id: `C${n}`, peaks_lo_path: null, peaks_hi_path: null, beatgrid_sec: beats, downbeats_sec: beats.filter((_, i) => i % 4 === 0),
+			segments: [{ startSec: 0.09, endSec: 30, label: 'Intro 1', source: 'rekordbox', rbKind: 1 }] } });
+	}
 	const plays = [1, 2, 3].map((n, i) => ({ rb_song_history_id: `H1-${n}`, rb_content_id: `C${n}`, track_no: i + 1, created_at_ms: T0 + i * 20 * 60_000 }));
 	if (opts.extraPlay) plays.push({ rb_song_history_id: 'H1-9', rb_content_id: 'C9', track_no: 4, created_at_ms: T0 + 60 * 60_000 });
 	out.push({ event: 'history', row: { rb_history_id: 'H1', name: 'HISTORY 2026-08-14', date_created_ms: T0, plays } });
@@ -113,6 +120,8 @@ describe('rekordbox re-import emits nothing when nothing changed', () => {
 		}
 		expect(first.historySessionsUpserted).toBe(2);
 		expect(first.historyPlaysUpserted).toBe(7);
+
+		expect(afterFirst.filter((o) => o.kind === 'set-rb-analysis')).toHaveLength(4 /* keys */ + 2 /* grids */ + 2 /* phrases */);
 
 		const second = await runImport(frames());
 		expect(outbox().slice(afterFirst.length)).toEqual([]);

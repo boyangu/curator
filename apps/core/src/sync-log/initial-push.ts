@@ -22,16 +22,23 @@
 // then skips it).
 //
 // Past artist renames/merges ARE reconstructed, from the artist table's
-// alias rows and curated spellings (artist_alias rules). Not reconstructed:
+// alias rows and curated spellings (artist_alias rules), and so are the
+// rekordbox analysis units (set-rb-analysis, from the rb slot; a grid too
+// large for an op stays device-local, see rows.ts). Not reconstructed:
 // past recording merges (the soft-deleted losers carry no record of which
-// row won), rekordbox analysis units (no set-rb-analysis
-// writer yet), track creates and claims (catalogue workstream D).
+// row won), track creates and claims (catalogue workstream D). Unfinalised
+// curator plays go out as they stand; the launch sweep
+// (plays.ts finalizeInterruptedPlays) re-appends them finalised.
 
 import type Database from 'better-sqlite3';
 import { cueEntityId, isAccountSettingKey, trackTagEntityId, type JsonValue } from '@curator/protocol';
-import { markRecordsComplete } from './apply.js';
+import { INITIAL_PUSH_KEY, markRecordsComplete } from './apply.js';
 import { emitOps, type EmitOp } from './outbox.js';
-import { cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, recordingResolver, stateOp, tagCreateOp, OVERRIDE_KEYS, OVERRIDE_FIELD_OF, type CueRow } from './rows.js';
+import {
+	cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
+	OVERRIDE_KEYS, OVERRIDE_FIELD_OF, RB_UNITS, type CueRow,
+} from './rows.js';
+import type { RbSlotRow } from '../rekordbox/rb-slot.js';
 import { eventAppendOp, sessionAppendOp } from '../library/mutators.js';
 
 type Raw = Database.Database;
@@ -53,16 +60,12 @@ export type InitialPushAsyncResult = InitialPushResult & {
 	maxSliceMs: number;
 };
 
-// Every op the initial push would emit, in library order, each stamped with
-// its row's own time.
-function* initialPushOps(raw: Raw): Generator<EmitOp> {
-	const stamp = (op: EmitOp, at: number | null | undefined): EmitOp => ({ ...op, client_ts: Math.max(0, Math.round(at ?? 0)) });
+const stamp = (op: EmitOp, at: number | null | undefined): EmitOp => ({ ...op, client_ts: Math.max(0, Math.round(at ?? 0)) });
 
-	// Rows are read with .all(), not .iterate(): better-sqlite3 refuses a
-	// write on a connection with an open iterator, and the chunks flush
-	// mid-scan.
+// Whether the records already hold a row (or one field / the create of it).
+function recordProbe(raw: Raw): (map: string, key: string, field?: string) => boolean {
 	const record = raw.prepare(`SELECT value FROM sync_state WHERE map = ? AND key = ?`);
-	const has = (map: string, key: string, field?: string): boolean => {
+	return (map, key, field) => {
 		const row = record.get(map, key) as { value: string } | undefined;
 		if (!row) return false;
 		if (!field) return true;
@@ -70,6 +73,40 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 		if (field === 'created' || field === 'added') return v[field] != null;
 		return (v['fields'] as Record<string, unknown> | undefined)?.[field] !== undefined;
 	};
+}
+
+// Rekordbox analysis units, at the link's last import (else the slot row's
+// own stamp). Ids first and each slot read on its own: the grids are blobs,
+// and the whole library's at once is tens of MB. Also the body of the
+// one-time backfill for libraries whose initial push predates the units.
+function* rbAnalysisOps(raw: Raw): Generator<EmitOp> {
+	const has = recordProbe(raw);
+	const rec = recordingResolver(raw);
+	const slotOf = raw.prepare(`SELECT rb_beatgrid, rb_downbeats, rb_key_camelot, rb_segments_json FROM track_analysis WHERE track_id = ?`);
+	for (const r of raw.prepare(`SELECT ta.track_id AS id, COALESCE(rl.last_synced_at, ta.analyzed_at) AS at FROM track_analysis ta
+		JOIN track t ON t.id = ta.track_id LEFT JOIN rekordbox_link rl ON rl.track_id = ta.track_id
+		WHERE t.derived_from_track_id IS NULL AND (ta.rb_beatgrid IS NOT NULL OR ta.rb_key_camelot IS NOT NULL OR ta.rb_segments_json IS NOT NULL)
+		ORDER BY ta.track_id`).all() as Array<{ id: string; at: number | null }>) {
+		const recording = rec(r.id);
+		if (!recording) continue;
+		const slot = slotOf.get(r.id) as RbSlotRow | undefined;
+		for (const unit of RB_UNITS) {
+			if (has('libraryTracks', recording, `rb.${unit}`)) continue;
+			const value = rbUnitValue(slot ?? null, unit);
+			if (value === null) continue;
+			const op = rbUnitOp(recording, unit, value);
+			if (op) yield stamp(op, r.at);
+		}
+	}
+}
+
+// Every op the initial push would emit, in library order, each stamped with
+// its row's own time.
+function* initialPushOps(raw: Raw): Generator<EmitOp> {
+	// Rows are read with .all(), not .iterate(): better-sqlite3 refuses a
+	// write on a connection with an open iterator, and the chunks flush
+	// mid-scan.
+	const has = recordProbe(raw);
 	const tomb = raw.prepare(`SELECT 1 FROM tombstone WHERE entity = ? AND entity_id = ?`);
 	const tombstoned = (entity: string, id: string): boolean => tomb.get(entity, id) !== undefined;
 	const rec = recordingResolver(raw);
@@ -149,6 +186,8 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 		}
 	}
 
+	yield* rbAnalysisOps(raw);
+
 	// Play history.
 	for (const r of raw.prepare(`SELECT id, started_at FROM play_session ORDER BY started_at, id`).all() as Array<{ id: string; started_at: number }>) {
 		if (has('playSessions', r.id, 'created')) continue;
@@ -204,6 +243,7 @@ export function estimateInitialPush(raw: Raw): number {
 		+ n(`SELECT count(*) AS n FROM cue WHERE slot >= 0`)
 		+ n(`SELECT count(*) AS n FROM track WHERE derived_from_track_id IS NULL AND (rating IS NOT NULL OR state != 'unsorted' OR overrides IS NOT NULL OR deleted_at IS NOT NULL)`)
 		+ n(`SELECT count(*) AS n FROM artist WHERE merged_into IS NOT NULL OR name_curated_at IS NOT NULL`)
+		+ n(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`)
 		+ n(`SELECT count(*) AS n FROM play_session`)
 		+ n(`SELECT count(*) AS n FROM play_event`);
 }
@@ -226,6 +266,7 @@ export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPus
 	}
 	if (pending.length > 0) emitChunk(raw, pending, byEntity);
 	markRecordsComplete(raw);
+	markRbBackfilled(raw);
 	return { ops: total, byEntity, ms: Date.now() - started };
 }
 
@@ -241,14 +282,22 @@ export async function initialPushAsync(
 	raw: Raw,
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
 ): Promise<InitialPushAsyncResult> {
+	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); }, opts);
+}
+
+async function driveAsync(
+	raw: Raw,
+	gen: Generator<EmitOp>,
+	estimate: number,
+	onDone: () => void,
+	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } },
+): Promise<InitialPushAsyncResult> {
 	const started = Date.now();
 	const chunk = Math.max(1, Math.min(2_000, opts.chunk ?? 500));
 	const byEntity: Record<string, number> = {};
-	const estimate = estimateInitialPush(raw);
 	let total = 0;
 	let chunks = 0;
 	let maxSliceMs = 0;
-	const gen = initialPushOps(raw);
 	for (;;) {
 		if (opts.signal?.aborted) {
 			gen.return(undefined);
@@ -267,11 +316,40 @@ export async function initialPushAsync(
 			total += batch.length;
 			chunks++;
 		}
-		if (done) markRecordsComplete(raw);
+		if (done) onDone();
 		maxSliceMs = Math.max(maxSliceMs, performance.now() - sliceStart);
 		opts.onProgress?.({ done: total, estimate: Math.max(estimate, total) });
 		if (done) break;
 		await yieldToLoop();
 	}
 	return { ops: total, byEntity, ms: Date.now() - started, chunks, maxSliceMs };
+}
+
+// ── backfill: rekordbox analysis units ─────────────────────────────────────
+// A library whose initial push ran before set-rb-analysis was emitted
+// (2026-10-20) has rb grids, keys and phrases no op ever stated, and nothing
+// else would state them: the importer emits only on change, and the waveform
+// pass skips tracks whose peaks are fresh. So once, after the initial push,
+// the rb section of it runs on its own — same generator, same "already
+// recorded" skips, same chunked driver. An initial push that included the
+// units marks it done.
+
+export const RB_BACKFILL_KEY = 'sync.backfill.rb_analysis_at';
+
+function markRbBackfilled(raw: Raw): void {
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)
+		.run(RB_BACKFILL_KEY, JSON.stringify(Date.now()), Date.now());
+}
+
+export function rbBackfillPending(raw: Raw): boolean {
+	return raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined
+		&& raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(RB_BACKFILL_KEY) === undefined;
+}
+
+export function rbBackfillAsync(
+	raw: Raw,
+	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
+): Promise<InitialPushAsyncResult> {
+	const estimate = (raw.prepare(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`).get() as { n: number }).n;
+	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), opts);
 }

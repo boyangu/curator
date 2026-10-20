@@ -62,7 +62,7 @@ const SAMPLES: [Entity, string, string, unknown][] = [
 	['library_track', 'set-favourite', REC_A, { favourite: false }],
 	['library_track', 'set-state', REC_A, { state: 'backlog' }],
 	['library_track', 'set-override', REC_A, { field: 'artists', value: [{ name: 'Ben Böhmer' }, { name: 'Nils Hoffmann', role: 'remixer' }] }],
-	['library_track', 'set-rb-analysis', REC_A, { unit: 'grid', value: [0.123, 0.591, 1.06] }],
+	['library_track', 'set-rb-analysis', REC_A, { unit: 'grid', value: [1, 3, 1, 123, 468, 1, 0] }],
 	['library_track', 'delete', REC_A, {}],
 	['library_track', 'undelete', REC_A, {}],
 	['cue', 'upsert', cueEntityId(REC_A, 3, 'hot'), { slot: 3, kind: 'hot', position_sec: 61.5, length_sec: null, color: '#28e214', name: 'Drop' }],

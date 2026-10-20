@@ -28,6 +28,7 @@ import { getGoogleAuthStatus, googleNeedsReconnect, getGoogleAccessToken } from 
 import { CoreSidecarHost } from './core-sidecar/host.js';
 import { AudioSidecarHost } from './audio-sidecar.js';
 import { SpotifySidecarHost } from './spotify-sidecar.js';
+import { LoadRecovery } from './load-recovery.js';
 import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport } from './cloud/transport.js';
@@ -649,6 +650,40 @@ if (!gotSingleInstanceLock) {
 	});
 }
 
+// Reload the window when a network change (WSL/VPN/Docker adapter coming up)
+// aborts its page or module loads — see load-recovery.ts. did-fail-load
+// covers the page itself in every build. Subresources only fail this way when
+// they come over the network stack, i.e. from the Vite dev server; packaged
+// builds load from file:// and custom schemes, so the webRequest hook is
+// dev-only, scoped to the dev origin (a failed third-party fetch must never
+// reload the app). onErrorOccurred only calls into JS for failed requests
+// that match the filter, so it costs the main loop nothing on the happy path.
+function attachLoadRecovery(win: BrowserWindow): void {
+	const wc = win.webContents;
+	const wcId = wc.id;
+	const recovery = new LoadRecovery(
+		{ reload: () => wc.reloadIgnoringCache(), isDestroyed: () => wc.isDestroyed() },
+		mainLog.for('window'),
+	);
+	wc.on('did-fail-load', (_e, errorCode, _desc, url, isMainFrame) => recovery.onFailLoad(errorCode, url, isMainFrame));
+	const devUrl = process.env.ELECTRON_RENDERER_URL;
+	const webRequest = wc.session.webRequest;
+	if (devUrl) {
+		try {
+			webRequest.onErrorOccurred({ urls: [`${new URL(devUrl).origin}/*`] }, (details) => {
+				if (details.webContentsId === wcId) recovery.onRequestError(details.error, details.url);
+			});
+		} catch (err) {
+			mainLog.for('window').warn('load recovery: could not watch dev-server requests', { devUrl }, err);
+		}
+	}
+	win.on('closed', () => {
+		recovery.dispose();
+		// One listener per session — drop ours so it doesn't outlive the window.
+		if (devUrl) webRequest.onErrorOccurred(null);
+	});
+}
+
 function createWindow(): void {
 	// Resolve icon.png both for dev (`out/main` → ../../resources) and packaged
 	// builds (resources live next to the main bundle). Electron tolerates a
@@ -674,11 +709,18 @@ function createWindow(): void {
 		},
 	});
 
+	// Wired before loadURL so a failure of the very first load is caught.
+	attachLoadRecovery(mainWindow);
+
+	// The load promise rejects on did-fail-load, which LoadRecovery already
+	// handles — log it here instead of letting it surface as an unhandled
+	// rejection.
+	const onLoadFailed = (err: unknown): void => mainLog.for('window').warn('initial load failed', undefined, err);
 	if (process.env.ELECTRON_RENDERER_URL) {
-		mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
+		mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL).catch(onLoadFailed);
 		mainWindow.webContents.openDevTools({ mode: 'detach' });
 	} else {
-		mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
+		mainWindow.loadFile(join(__dirname, '../renderer/index.html')).catch(onLoadFailed);
 	}
 
 	// Grant system-audio loopback to the renderer's getDisplayMedia call,
@@ -727,8 +769,21 @@ function createWindow(): void {
 	// scanner. Always started on main's CoreService (the sidecar, when
 	// enabled, only serves migrated read channels — feed polling + writes
 	// live here).
+	//
+	// The analyzer sidecar rides the same gate, first in line. On Windows it
+	// spawns through wsl.exe, and a cold WSL boot brings up a Hyper-V network
+	// adapter ~2 s later; Chromium answers a new adapter by aborting every
+	// in-flight request with ERR_NETWORK_CHANGED — at launch that was the
+	// renderer's module graph, leaving a blank window. Analysis enqueued
+	// before this waits inside the sidecar wrapper. Always main's core: the
+	// core sidecar gets no analyzer spec.
 	mainWindow.webContents.once('did-finish-load', () => {
 		setTimeout(() => {
+			try {
+				core?.startAnalyzer();
+			} catch (err) {
+				mainLog.for('analyzer').error('startAnalyzer failed', err);
+			}
 			try {
 				core?.startFeedPolling();
 			} catch (err) {

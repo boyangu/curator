@@ -747,3 +747,85 @@ describe('isRestatement', () => {
 		expect(isRestatement(s, strip(op('artist_alias', 'set', 'a', { from: 'A', to: 'B', to_key: 'b' }, later)))).toBe(false);
 	});
 });
+
+// set-rb-analysis (first emitted 2026-10-20): each unit its own LWW field, in
+// every order, folded by clock through a recording merge like any field.
+describe('rekordbox analysis units', () => {
+	const g1 = [1, 3, 1, 1000, 469, 0, 0];
+	const g2 = [1, 4, 1, 1010, 468, 1, 0, 1];
+	const segs = [{ startSec: 0, endSec: 32.1, label: 'Intro 1', source: 'rekordbox', rbKind: 1 }];
+
+	it('two devices import different grids, keys and phrases: the later write per unit wins in every order', () => {
+		const { view } = converge([
+			op('library_track', 'set-rb-analysis', A, { unit: 'grid', value: g1 }, { ts: T(10, 0), device: 'desktop' }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'grid', value: g2 }, { ts: T(10, 5), device: 'laptop' }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'key', value: '8A' }, { ts: T(10, 6), device: 'desktop' }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'key', value: '9A' }, { ts: T(10, 1), device: 'laptop' }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'segments', value: segs }, { ts: T(10, 2), device: 'laptop' }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'segments', value: null }, { ts: T(10, 1), device: 'desktop' }),
+		]);
+		expect(view.libraryTracks[0]!.rb).toEqual({ grid: g2, key: '8A', segments: segs });
+	});
+
+	it('a null clears a unit; re-applying any op changes nothing', () => {
+		const set = op('library_track', 'set-rb-analysis', A, { unit: 'grid', value: g1 }, { ts: T(10, 0) });
+		const clear = op('library_track', 'set-rb-analysis', A, { unit: 'grid', value: null }, { ts: T(10, 5) });
+		const { state, view } = converge([set, clear]);
+		expect(view.libraryTracks[0]!.rb).toEqual({});
+		const before = canonical(state);
+		expect(applyOp(state, set).changed).toEqual([]);
+		expect(applyOp(state, clear).changed).toEqual([]);
+		expect(canonical(state)).toEqual(before);
+	});
+
+	it('a merge folds each unit by clock, whether the loser\'s units arrive before or after it', () => {
+		const { view } = converge([
+			op('library_track', 'set-rb-analysis', A, { unit: 'grid', value: g1 }, { ts: T(10, 5) }),
+			op('library_track', 'set-rb-analysis', B, { unit: 'grid', value: g2 }, { ts: T(10, 0) }),
+			op('library_track', 'set-rb-analysis', B, { unit: 'key', value: '3B' }, { ts: T(10, 0) }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(11, 0) }),
+		]);
+		expect(view.libraryTracks.find((t) => t.recordingId === B)!.rb).toEqual({ grid: g1, key: '3B' });
+	});
+
+	it('restating the same grid is a restatement; a changed one is not', () => {
+		const s = reduceAll([op('library_track', 'set-rb-analysis', 'r1', { unit: 'grid', value: g1 }, { ts: T(9, 0) })]);
+		const again = (payload: PayloadOf<'library_track', 'set-rb-analysis'>) => ({ entity: 'library_track' as const, entity_id: 'r1', kind: 'set-rb-analysis' as const, payload });
+		expect(isRestatement(s, again({ unit: 'grid', value: [...g1] }))).toBe(true);
+		expect(isRestatement(s, again({ unit: 'grid', value: g2 }))).toBe(false);
+		expect(isRestatement(s, again({ unit: 'key', value: '8A' }))).toBe(false);
+	});
+});
+
+// Unfinalised plays (2026-10-20): a curator play the tracker never finalised
+// (quit, crash, reload) is finalised on this device as 'interrupted' and
+// appended then; if the play turns out to be alive after all, its real
+// finalise is a later append of the same row. Append is LWW on the clock, so
+// every order lands on the latest.
+describe('unfinalised plays', () => {
+	const session = uuid();
+	const event = uuid();
+	const base = {
+		session_id: session, recording_id: A, source: 'local' as const, played_at: T(9, 0), played_ms: 42_000, duration_ms: 240_000,
+		max_position_ms: 42_000, played75: false, ended_reason: 'interrupted' as const, context_type: null, context_id: null, track_no: null, rb_song_history_id: null,
+	};
+	const sess = (ended: number) => op('play_session', 'append', session, { origin: 'curator', kind: 'prep', kind_source: 'auto', name: null, started_at: T(9, 0), ended_at: ended, rb_history_id: null }, { ts: T(12, 0) });
+
+	it('the interrupted append and a later real finalise converge on the finalise in every order', () => {
+		const interrupted = op('play_event', 'append', event, base, { ts: T(12, 0) });
+		const finalised = op('play_event', 'append', event, { ...base, played_ms: 200_000, max_position_ms: 230_000, played75: true, ended_reason: 'ended' }, { ts: T(12, 30) });
+		const { view } = converge([sess(T(9, 1)), interrupted, finalised]);
+		expect(view.playEvents).toEqual([expect.objectContaining({ id: event, ended_reason: 'ended', played_ms: 200_000 })]);
+		expect(view.playSessions).toHaveLength(1);
+	});
+
+	it('the same interrupted append twice (a second sweep, a retried push) is one row', () => {
+		const a = op('play_event', 'append', event, base, { ts: T(12, 0) });
+		const state = reduceAll([sess(T(9, 1)), a]);
+		const before = canonical(state);
+		expect(applyOp(state, a).changed).toEqual([]);
+		expect(canonical(state)).toEqual(before);
+		const { op_id: _a, device_id: _b, client_ts: _c, schema_version: _d, ...body } = a;
+		expect(isRestatement(state, body as Parameters<typeof isRestatement>[1])).toBe(true);
+	});
+});

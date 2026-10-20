@@ -819,7 +819,14 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	let cycleAgain = false;
 	const syncNow = async (): Promise<void> => {
 		if (cycleRun) { cycleAgain = true; return cycleRun; }
-		cycleRun = (async () => {
+		// `run` is cleared by identity once it settles, never from inside the
+		// async body: a pass that ends before its first await (not usable yet,
+		// e.g. the server does not offer the catalogue) would run its cleanup
+		// synchronously, BEFORE the assignment below, and leave a finished
+		// promise in cycleRun forever, so every later wake only set cycleAgain.
+		// That stranded the catalogue for a whole session when the app started
+		// during the cloud-v0.1.2 → v0.2.0 changeover (2026-10-20).
+		const run: Promise<void> = (async () => {
 			try {
 				do {
 					cycleAgain = false;
@@ -837,13 +844,14 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				} while (cycleAgain);
 			} finally {
 				activity = null;
-				cycleRun = null;
 				emitStatus();
 			}
 			// Work waiting for the policy (kicked uploads, a running backfill).
 			if (kicked.size > 0 || settings.backfill === 'running') scheduleUpload(0);
 		})();
-		return cycleRun;
+		cycleRun = run;
+		void run.finally(() => { if (cycleRun === run) cycleRun = null; });
+		return run;
 	};
 
 	// ── prepare (pull-before-compute) ───────────────────────────────────
@@ -1184,7 +1192,9 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 
 	const refreshEstimate = (): void => {
 		if (estimating || !canUpload()) return;
-		estimating = (async () => {
+		// Cleared by identity after it settles, like syncNow's run: with no
+		// rows the body finishes before its first await.
+		const run: Promise<void> = (async () => {
 			let items = 0;
 			let bytes = 0;
 			let cursor = '';
@@ -1206,10 +1216,11 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 			} catch (err) {
 				clog.warn('estimating pending uploads failed', undefined, err);
 			} finally {
-				estimating = null;
 				emitStatus();
 			}
 		})();
+		estimating = run;
+		void run.finally(() => { if (estimating === run) estimating = null; });
 	};
 
 	// ── scheduling ──────────────────────────────────────────────────────

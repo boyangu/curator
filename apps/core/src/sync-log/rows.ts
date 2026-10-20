@@ -14,9 +14,21 @@
 //     machine's rekordbox by its exporter.
 
 import type Database from 'better-sqlite3';
-import { cueEntityId, trackTagEntityId, TRACK_STATES as WIRE_TRACK_STATES, type NewOp, type PayloadOf, type TrackStateValue } from '@curator/protocol';
+import {
+	cueEntityId,
+	encodeRbGrid,
+	MAX_OP_PAYLOAD_BYTES,
+	opPayloadBytes,
+	trackTagEntityId,
+	TRACK_STATES as WIRE_TRACK_STATES,
+	type JsonValue,
+	type NewOp,
+	type PayloadOf,
+	type TrackStateValue,
+} from '@curator/protocol';
 import { TRACK_STATES, type TrackState } from '@curator/shared';
 import type { TrackOverrides } from '@curator/shared/schema';
+import { decodeFloat32, type RbSlotRow } from '../rekordbox/rb-slot.js';
 import { recordingIdForTrack } from './recording-id.js';
 
 type Raw = Database.Database;
@@ -350,4 +362,73 @@ export function readTrackTags(raw: Raw, trackId: string): Array<{ tag_id: string
 
 export function trackTagOp(recordingId: string, tagId: string, add: boolean): NewOp {
 	return { entity: 'track_tag', entity_id: trackTagEntityId(recordingId, tagId), kind: add ? 'add' : 'remove', payload: {} };
+}
+
+// ── rekordbox analysis units ────────────────────────────────────────────────
+// The rb slot (rekordbox/rb-slot.ts) as `set-rb-analysis` ops, one per unit:
+// the grid in the protocol's compact form (rb-grid.ts), the phrases as the
+// stored SegmentRecord rows, the key as rb's Camelot string. A unit whose op
+// would pass MAX_OP_PAYLOAD_BYTES (a recorded mix's grid) yields nothing and
+// stays device-local: it cannot ride the log, and rekordbox data is kept out
+// of the catalogue by decision.
+
+export type RbUnit = 'grid' | 'key' | 'segments';
+export const RB_UNITS: readonly RbUnit[] = ['grid', 'key', 'segments'];
+
+export function rbGridValue(row: RbSlotRow | null): number[] | null {
+	if (!row?.rb_beatgrid) return null;
+	return encodeRbGrid(decodeFloat32(row.rb_beatgrid), decodeFloat32(row.rb_downbeats));
+}
+
+// Null for no phrases: an empty list and a missing one are the same unit.
+export function rbSegmentsValue(row: RbSlotRow | null): Array<Record<string, JsonValue>> | null {
+	if (!row?.rb_segments_json) return null;
+	try {
+		const v = JSON.parse(row.rb_segments_json) as unknown;
+		if (!Array.isArray(v)) return null;
+		const segs = v.filter((s): s is Record<string, JsonValue> => !!s && typeof s === 'object' && !Array.isArray(s));
+		return segs.length > 0 ? segs : null;
+	} catch {
+		return null;
+	}
+}
+
+export function rbUnitValue(row: RbSlotRow | null, unit: RbUnit): unknown {
+	switch (unit) {
+		case 'grid': return rbGridValue(row);
+		case 'key': return row?.rb_key_camelot || null;
+		case 'segments': return rbSegmentsValue(row);
+	}
+}
+
+// The op for one unit, or null when it is too large to ride the log.
+export function rbUnitOp(recordingId: string, unit: RbUnit, value: unknown): NewOp | null {
+	const op = { entity: 'library_track', entity_id: recordingId, kind: 'set-rb-analysis', payload: { unit, value } } as NewOp;
+	return opPayloadBytes(op) > MAX_OP_PAYLOAD_BYTES ? null : op;
+}
+
+// Whether two slot rows hold the same unit. The grid compares the stored
+// bytes (no encode for the common unchanged case).
+function sameUnit(a: RbSlotRow | null, b: RbSlotRow | null, unit: RbUnit): boolean {
+	switch (unit) {
+		case 'grid': {
+			const eq = (x: Buffer | null | undefined, y: Buffer | null | undefined): boolean => (!x || x.byteLength === 0 ? !y || y.byteLength === 0 : !!y && x.equals(y));
+			return eq(a?.rb_beatgrid, b?.rb_beatgrid) && eq(a?.rb_downbeats, b?.rb_downbeats);
+		}
+		case 'key': return (a?.rb_key_camelot || null) === (b?.rb_key_camelot || null);
+		case 'segments': return (a?.rb_segments_json ?? null) === (b?.rb_segments_json ?? null) || JSON.stringify(rbSegmentsValue(a)) === JSON.stringify(rbSegmentsValue(b));
+	}
+}
+
+// One op per unit the write changed. `skipped` counts units too large to
+// emit (the caller logs them).
+export function rbAnalysisDiffOps(recordingId: string, before: RbSlotRow | null, after: RbSlotRow | null): { ops: NewOp[]; skipped: number } {
+	const ops: NewOp[] = [];
+	let skipped = 0;
+	for (const unit of RB_UNITS) {
+		if (sameUnit(before, after, unit)) continue;
+		const op = rbUnitOp(recordingId, unit, rbUnitValue(after, unit));
+		if (op) ops.push(op); else skipped++;
+	}
+	return { ops, skipped };
 }

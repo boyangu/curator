@@ -16,6 +16,7 @@ import { runReplayCheck } from './replay-check.js';
 import { orderKeyAt } from '../test-support/playlist-track.js';
 
 let dir: string;
+const b0Of = (): number[] => Array.from({ length: 900 }, (_, k) => Math.round((0.087 + k * 0.46875) * 1000) / 1000);
 afterEach(() => { try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ } });
 
 function legacyLibrary(path: string): void {
@@ -54,6 +55,18 @@ function legacyLibrary(path: string): void {
 	run(`INSERT INTO play_session (id, origin, kind, started_at) VALUES ('s1', 'curator', 'prep', 6000)`);
 	run(`INSERT INTO play_event (id, session_id, track_id, source, played_at, played_ms) VALUES ('e1', 's1', 't0', 'local', 6000, 1000)`);
 	run(`INSERT INTO app_setting (key, value, updated_at) VALUES ('credit_format', '{"separator":"/","remixStyle":"dash"}', 7000)`);
+	// The rekordbox slot: a full one, a key-only placeholder, a recorded
+	// mix whose grid is too large for an op (device-local), and the WAV
+	// copy's grafted slot (device-local).
+	const f32 = (xs: number[]): Buffer => Buffer.from(new Float32Array(xs).buffer);
+	const beats = (n: number, start = 0.087): number[] => Array.from({ length: n }, (_, k) => Math.round((start + k * 0.46875) * 1000) / 1000);
+	const ta = db.prepare(`INSERT INTO track_analysis (track_id, analyzer_version, analyzed_at, rb_beatgrid, rb_downbeats, rb_key_camelot, rb_segments_json) VALUES (?, 'rekordbox', 8000, ?, ?, ?, ?)`);
+	const b0 = beats(900);
+	ta.run('t0', f32(b0), f32(b0.filter((_, i) => i % 4 === 0)), '8A', JSON.stringify([{ startSec: 0.087, endSec: 30.1, label: 'Intro 1', source: 'rekordbox', rbKind: 1 }]));
+	ta.run('t1', null, null, '11B', null);
+	const mix = beats(12_000);
+	ta.run('t5', f32(mix), f32(mix.filter((_, i) => i % 4 === 0)), '2A', null);
+	ta.run('wav', f32(b0), null, '8A', null);
 	db.close();
 }
 
@@ -77,6 +90,18 @@ describe('runReplayCheck', () => {
 		const ids = copy.prepare(`SELECT entity, entity_id FROM sync_outbox`).all() as Array<{ entity: string; entity_id: string }>;
 		copy.close();
 		expect(ids.some((o) => o.entity_id === 'wavpl' || o.entity_id === 'rb_300' || o.entity_id.includes(recordingIdForTrack('wav')))).toBe(false);
+		// rb units: t0's grid/key/phrases, t1's key, t5's key (its grid is
+		// over the cap and stays device-local, on both sides of the compare).
+		const rb = report.replicaVsCopy.find((r) => r.table === 'rbAnalysis')!;
+		expect(rb.left).toBe(3);
+		const rbOps = (() => { const c = new Database(report.copyPath, { readonly: true }); try { return c.prepare(`SELECT entity_id, payload FROM sync_outbox WHERE kind = 'set-rb-analysis'`).all() as Array<{ entity_id: string; payload: string }>; } finally { c.close(); } })();
+		expect(rbOps.map((o) => JSON.parse(o.payload).unit).sort()).toEqual(['grid', 'key', 'key', 'key', 'segments']);
+		expect(rbOps.some((o) => o.entity_id === recordingIdForTrack('t5') && JSON.parse(o.payload).unit === 'grid')).toBe(false);
+		const replica = new Database(report.replicaPath, { readonly: true });
+		const slot = replica.prepare(`SELECT rb_beatgrid, rb_key_camelot FROM track_analysis WHERE track_id = 't0'`).get() as { rb_beatgrid: Buffer; rb_key_camelot: string };
+		replica.close();
+		expect(slot.rb_beatgrid.equals(Buffer.from(new Float32Array(b0Of()).buffer))).toBe(true);
+		expect(slot.rb_key_camelot).toBe('8A');
 		expect(report.push.byEntity).toMatchObject({ tag: 4, playlist: 4 /* 3 creates + 1 favourite */, playlist_folder: 1, playlist_track: 10, track_tag: 4, cue: 3, pinned_search: 1, play_session: 1, play_event: 1, setting: 1, artist_alias: 2 });
 
 		// A second run on the same work dir refuses rather than overwrite.

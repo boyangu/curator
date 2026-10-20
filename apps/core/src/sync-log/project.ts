@@ -23,6 +23,7 @@ import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import {
 	cueAlive,
+	decodeRbGrid,
 	parseCueEntityId,
 	parseTrackTagEntityId,
 	pinnedSearchAlive,
@@ -40,13 +41,14 @@ import {
 	type TrackTagRecord,
 } from '@curator/protocol';
 import { asciifyArtists, searchFold } from '@curator/shared';
-import type { TrackArtist, TrackOverrides } from '@curator/shared/schema';
+import type { SegmentRecord, TrackArtist, TrackOverrides } from '@curator/shared/schema';
 import { diffArtistAlias, projectArtistAliasChanges } from '../library/artist-alias.js';
 import { recomputePositions } from '../library/playlist-order.js';
 import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import { syncTrackAlbumsRaw } from '../library/albums.js';
 import { log } from '../log.js';
-import { OVERRIDE_KEY_OF, parseOverrides } from './rows.js';
+import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot, type RbSlotPatch } from '../rekordbox/rb-slot.js';
+import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
 
 type Raw = Database.Database;
@@ -401,10 +403,11 @@ export function project(
 				e.played75 === null ? null : e.played75 ? 1 : 0, e.ended_reason, e.context_type, e.context_id, e.track_no, e.rb_song_history_id);
 	}
 
-	// ── 5. library_track: rating, state, overrides, deleted_at ───────────
+	// ── 5. library_track: rating, state, overrides, deleted_at, rb units ─
 	// Only fields the records hold are written: a recording with no rating
 	// cell keeps whatever the local row had before the op log existed.
 	const trackRows = raw.prepare(`SELECT id, rating, state, overrides, deleted_at, artists FROM track WHERE recording_id = ?`);
+	const rbTargets = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL`).pluck();
 	for (const recId of ids('library_track')) {
 		const rec = store.ensure('libraryTracks', recId) as LwwRecord | undefined;
 		if (!rec) continue;
@@ -445,6 +448,12 @@ export function project(
 			}
 			tracksTouched.add(row.id);
 		}
+		// The rekordbox units, into the rb slot the importer writes. Only the
+		// catalogue row, never a derived WAV copy (its slot is copied locally
+		// when it is made).
+		if (RB_UNITS.some((u) => rec.fields[`rb.${u}`] !== undefined)) {
+			for (const id of rbTargets.all(recId) as string[]) if (projectRbUnits(raw, id, rec)) tracksTouched.add(id);
+		}
 	}
 
 	// ── 6. derived: positions + counts for every playlist touched ────────
@@ -462,4 +471,63 @@ export function project(
 	summary.playlistsTouched = [...playlistsTouched];
 	if (summary.skipped.length > 0) plog.warn('apply skipped rows', { count: summary.skipped.length, sample: summary.skipped.slice(0, 5) });
 	return summary;
+}
+
+// One recording's rb.* cells onto a track's rekordbox slot, as the importer
+// would have written them: grid + downbeats as Float32 blobs, phrases as the
+// SegmentRecord JSON with intro/outro mirrored onto the track, and the key
+// both into the slot and onto track.key_camelot (the importer treats rb's
+// key as authoritative there). A null clears the slot's unit; it never
+// clears the track's key, which the importer never does either. Writes only
+// what differs; a grid in a format this build cannot read is left alone.
+// Returns whether anything was written.
+function projectRbUnits(raw: Raw, trackId: string, rec: LwwRecord): boolean {
+	const cur = readRbSlot(raw, trackId);
+	const patch: RbSlotPatch = {};
+	let changed = false;
+
+	const grid = rec.fields['rb.grid'];
+	if (grid) {
+		if (grid.value === null) {
+			if (cur?.rb_beatgrid || cur?.rb_downbeats) { patch.beatgrid = null; patch.downbeats = null; }
+		} else {
+			const g = decodeRbGrid(grid.value as number[]);
+			if (g) {
+				const beats = float32Buffer(g.beatsSec);
+				const downs = float32Buffer(g.downbeatsSec);
+				if (!cur?.rb_beatgrid || !cur.rb_beatgrid.equals(beats) || !cur.rb_downbeats || !cur.rb_downbeats.equals(downs)) {
+					patch.beatgrid = beats;
+					patch.downbeats = downs;
+				}
+			} else {
+				plog.warn('rb grid in an unknown format left alone', { trackId });
+			}
+		}
+	}
+
+	const key = rec.fields['rb.key'];
+	if (key) {
+		const v = (key.value as string | null) || null;
+		if ((cur?.rb_key_camelot ?? null) !== v) patch.keyCamelot = v;
+		if (v !== null && raw.prepare(`UPDATE track SET key_camelot = ? WHERE id = ? AND key_camelot IS NOT ?`).run(v, trackId, v).changes > 0) changed = true;
+	}
+
+	const segs = rec.fields['rb.segments'];
+	if (segs) {
+		const v = segs.value as SegmentRecord[] | null;
+		const next = v && v.length > 0 ? JSON.stringify(v) : null;
+		if (JSON.stringify(rbSegmentsValue(cur)) !== JSON.stringify(next === null ? null : v)) {
+			patch.segmentsJson = next;
+			if (v && v.length > 0) {
+				const { introLengthSec, outroLengthSec } = rbIntroOutro(v);
+				raw.prepare(`UPDATE track SET intro_length_sec = ?, outro_length_sec = ? WHERE id = ?`).run(introLengthSec, outroLengthSec, trackId);
+			}
+		}
+	}
+
+	if (Object.keys(patch).length > 0) {
+		writeRbSlot(raw, trackId, patch);
+		changed = true;
+	}
+	return changed;
 }

@@ -19,7 +19,8 @@
 //
 // What is NOT here (device-local, never an op — cloud decisions 2026-10-17
 // and design "Does not"): derived WAV copies and their playlist
-// (wav/materialize.ts, wav/convert-run.ts), analysis rows, the album/artist
+// (wav/materialize.ts, wav/convert-run.ts), Curator analysis (the catalogue's;
+// only the rekordbox slot rides ops, recordRbAnalysisChanges), the album/artist
 // derived tables (an artist rename travels as an artist_alias rule, see
 // emitArtistAliases, and each device projects it onto its own table), cover caches, rekordbox link/baseline/conflict tables,
 // source_link file columns, playlist sync stamps and per-device settings.
@@ -51,10 +52,18 @@ import {
 	type TrackStateRow,
 	playlistCreateOps,
 	pinnedCreateOp,
+	rbAnalysisDiffOps,
+	rbUnitOp,
+	rbUnitValue,
+	RB_UNITS,
 	tagCreateOp,
 } from '../sync-log/rows.js';
+import { readRbSlot, type RbSlotRow } from '../rekordbox/rb-slot.js';
+import { log } from '../log.js';
 
 type Raw = Database.Database;
+
+const mlog = log.for('sync-emit');
 
 // Who is writing. Everything but 'remote' emits; 'remote' is the apply side
 // (an op that already exists must not be echoed back as a new edit).
@@ -674,6 +683,33 @@ export function recordCueChanges<T>(db: Db, trackIds: readonly string[], write: 
 	});
 }
 
+// ── rekordbox analysis ──────────────────────────────────────────────────────
+
+// Snapshot the rb slot of `trackIds`, run `write`, emit one set-rb-analysis
+// op per unit it changed (rows.ts rbAnalysisDiffOps). The importer's grid,
+// phrase and key writes go through here; a re-import that rewrites the same
+// grid compares equal byte for byte and emits nothing, before the
+// restatement check even runs. Units too large for an op stay device-local
+// and are logged.
+export function recordRbAnalysisChanges<T>(db: Db, trackIds: readonly string[], write: (raw: Raw) => T): T {
+	return tx(db, (raw) => {
+		const before = new Map<string, RbSlotRow | null>(trackIds.map((id) => [id, readRbSlot(raw, id)]));
+		const result = write(raw);
+		const ops: EmitOp[] = [];
+		let skipped = 0;
+		for (const [id, was] of before) {
+			const r = recordingOf(raw, id);
+			if (!r) continue;
+			const diff = rbAnalysisDiffOps(r, was, readRbSlot(raw, id));
+			ops.push(...diff.ops);
+			skipped += diff.skipped;
+		}
+		if (skipped > 0) mlog.info('rekordbox analysis units over the op size cap stay on this device', { units: skipped });
+		emitOps(raw, ops);
+		return result;
+	});
+}
+
 // ── play history ────────────────────────────────────────────────────────────
 // Append-only. A curator play is emitted once, when the tracker finalises it
 // (the progress upserts before that are local bookkeeping); its session is
@@ -849,7 +885,7 @@ export function setSetting(db: Db, key: string, value: unknown): void {
 // kept side's final values at the merge's own clock — beating every loser
 // write made before the merge, losing to any made after. Stated for the
 // winner: rating, every override field (cleared ones as null), deleted
-// state, every cue, a delete for each slot only the loser had, and a remove
+// state, the rekordbox analysis units, every cue, a delete for each slot only the loser had, and a remove
 // for each loser membership row the local merge dropped (the reducer keeps
 // both rows of a playlist that held both tracks; the desktop keeps one).
 //
@@ -867,6 +903,11 @@ export function mergeRecordingRaw(raw: Raw, m: RecordingMergeInput): void {
 	const ops: EmitOp[] = [{ entity: 'recording', entity_id: m.loserRecordingId, kind: 'merge', payload: { winner } }];
 	const state = readTrackState(raw, m.winnerTrackId);
 	if (state) ops.push(...trackStateOps(winner, state, { allOverrides: true, deleted: true }));
+	// The rekordbox slot moves whole on the desktop (keep's, or the loser's
+	// grafted when keep had none); the fold goes unit by unit by clock. Every
+	// unit is stated, absent ones as null, so the kept slot is what stands.
+	const slot = readRbSlot(raw, m.winnerTrackId);
+	for (const unit of RB_UNITS) { const op = rbUnitOp(winner, unit, rbUnitValue(slot, unit)); if (op) ops.push(op); }
 	const cues = readCues(raw, m.winnerTrackId).filter((c) => c.slot >= 0);
 	const have = new Set(cues.map((c) => `${c.kind}:${c.slot}`));
 	for (const c of cues) ops.push(cueUpsertOp(winner, c));

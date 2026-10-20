@@ -74,7 +74,9 @@ function resolveHostCall(frame: HostResultFrame | HostErrorFrame): void {
 //
 // Minimal-config boot for step 1. As later migration steps move things
 // over, this section grows: peaks dir + analyzer/rekordbox specs from
-// env, beatportFetch as a hostCall, more adapters.
+// env, beatportFetch as a hostCall, more adapters. An analyzer spec moving
+// here must also move main's post-load startAnalyzer() call: the sidecar
+// never spawns on construction (a cold WSL boot blanks the window).
 
 const dbPath = process.env['CURATOR_DB_PATH'];
 if (!dbPath) {

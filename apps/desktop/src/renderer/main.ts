@@ -3432,6 +3432,11 @@ function wireAnalysisEvents(): void {
 				analysisStatus.started(evt.trackId, evt.name);
 				sweepRowAnalyzing(evt.trackId, true);
 				break;
+			case 'requeued':
+				analysisLog.warn('requeued — analyzer unavailable', { trackId: evt.trackId, reason: evt.reason });
+				analysisStatus.requeued(evt.trackId);
+				sweepRowAnalyzing(evt.trackId, false);
+				break;
 			case 'progress':
 				analysisLog.debug('progress', { trackId: evt.trackId, stage: evt.stage, pct: evt.pct });
 				break;

@@ -54,7 +54,7 @@ import { log } from '../log.js';
 import { artistCreditRewritePending, drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
 import { applyOps, INITIAL_PUSH_KEY, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
 import { getDeviceId } from './device.js';
-import { initialPushAsync, type InitialPushProgress } from './initial-push.js';
+import { initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushProgress } from './initial-push.js';
 import { observeServerTs, onOutboxAppend } from './outbox.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
@@ -636,17 +636,20 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const initialPushDone = (): boolean => raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined;
 	let initialPushRun: Promise<void> | null = null;
 	const runInitialPush = (): Promise<void> => {
-		if (initialPushDone()) return Promise.resolve();
+		// A library pushed before rekordbox units were emitted states them
+		// once, through the same chunked driver (initial-push.ts).
+		const backfill = initialPushDone() && rbBackfillPending(raw);
+		if (initialPushDone() && !backfill) return Promise.resolve();
 		if (!initialPushRun) {
 			initialPushRun = (async () => {
 				initialPushProgress = { done: 0, estimate: 0 };
 				emitStatus();
 				try {
-					const r = await initialPushAsync(raw, {
+					const r = await (backfill ? rbBackfillAsync : initialPushAsync)(raw, {
 						chunk: opts.initialPushChunk,
 						onProgress: (p) => { initialPushProgress = p; emitStatus({ progress: true }); },
 					});
-					slog.info('initial push: done', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+					slog.info(backfill ? 'rekordbox analysis backfill: done' : 'initial push: done', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
 				} finally {
 					initialPushProgress = null;
 					initialPushRun = null;

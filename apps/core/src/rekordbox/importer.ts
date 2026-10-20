@@ -58,6 +58,7 @@ import { artistProtect, normalizeIncomingArtists, rawOf, syncTrackArtistsById } 
 import { syncTrackAlbumsById } from '../library/albums.js';
 import { RekordboxSidecar, type SidecarError, type RekordboxScope } from './sidecar.js';
 import { advanceRbBaselineAfterPull, eqArr, seqIn } from './order-util.js';
+import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from './rb-slot.js';
 import { log } from '../log.js';
 
 const ilog = log.for('rekordbox-import');
@@ -464,10 +465,16 @@ export class RekordboxImporter extends EventEmitter {
 		const flushWaveforms = (): void => {
 			if (waveformBatch.length === 0) return;
 			const batch = waveformBatch.splice(0, waveformBatch.length);
+			// The grid and phrase units another device needs: one snapshot +
+			// diff per batch (an unchanged re-emitted grid compares equal byte
+			// for byte and emits nothing), inside the batch's transaction.
+			const ids = [...new Set(batch.map((r) => this.resolveTrackId(r.rb_content_id, trackIdByRbId)).filter((id): id is string => id !== null))];
 			this.db.transaction((tx) => {
-				for (const r of batch) {
-					this.applyWaveformDelta(r, opts.flags, trackIdByRbId, totals, tx, overwrite);
-				}
+				mut.recordRbAnalysisChanges(this.db, ids, () => {
+					for (const r of batch) {
+						this.applyWaveformDelta(r, opts.flags, trackIdByRbId, totals, tx, overwrite);
+					}
+				});
 			});
 		};
 
@@ -851,6 +858,14 @@ export class RekordboxImporter extends EventEmitter {
 				if ('albumTitle' in patch || 'artists' in patch || 'overrides' in patch) syncTrackAlbumsById(this.db, [link.trackId]);
 			});
 			totals.tracksUpdated++;
+		}
+
+		// rb's key also lands in the rekordbox slot (rb_key_camelot), where
+		// it is rekordbox's own value whatever track.key_camelot later holds
+		// (tags, enrichment), and from where it syncs as the 'key' unit. Only
+		// a change is a write: a re-import of the same key costs one read.
+		if (rbCamelot != null && readRbSlot(rawOf(this.db), link.trackId)?.rb_key_camelot !== rbCamelot) {
+			mut.recordRbAnalysisChanges(this.db, [link.trackId], (raw) => writeRbSlot(raw, link.trackId, { keyCamelot: rbCamelot }));
 		}
 
 		// Provenance — always upsert. rbUpdatedAtSeen + fieldsSeen advance to
@@ -1839,28 +1854,11 @@ export class RekordboxImporter extends EventEmitter {
 		const hasSegments = row.segments != null && row.segments.length > 0;
 		if (!hasBeatgrid && !hasSegments) return;
 
-		const toBuf = (vals: number[]): Buffer => {
-			const arr = new Float32Array(vals);
-			return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
-		};
+		const toBuf = float32Buffer;
 
-		// Derived intro/outro scalars from rb segments. Only these translate
-		// cleanly — rb's vocabulary is song-form (verse/chorus/bridge), so
-		// first-drop / drop-count / breakdown-count have no faithful mapping.
-		// Mirrored onto the track row for the virtualized list's sort/filter.
-		let introLengthSec: number | null = null;
-		let outroLengthSec: number | null = null;
-		if (hasSegments && row.segments) {
-			const firstIntro = row.segments.find((s) => s.label === 'Intro' || s.label === 'Intro 1' || s.label === 'Intro 2');
-			if (firstIntro) introLengthSec = firstIntro.endSec - firstIntro.startSec;
-			for (let i = row.segments.length - 1; i >= 0; i--) {
-				const s = row.segments[i]!;
-				if (s.label === 'Outro' || s.label === 'Outro 1' || s.label === 'Outro 2') {
-					outroLengthSec = s.endSec - s.startSec;
-					break;
-				}
-			}
-		}
+		// Derived intro/outro scalars from rb segments (rb-slot.ts), mirrored
+		// onto the track row for the virtualized list's sort/filter.
+		const { introLengthSec, outroLengthSec } = hasSegments && row.segments ? rbIntroOutro(row.segments) : { introLengthSec: null, outroLengthSec: null };
 
 		// NOT NULL on a fresh row — placeholder marking "rb data present, no
 		// Curator analysis yet". The analyzer overwrites it with its own

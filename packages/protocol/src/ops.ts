@@ -9,6 +9,7 @@
 
 import { z } from 'zod';
 import { isValidOrderKey } from './order-key.js';
+import { isRbGridValue } from './rb-grid.js';
 
 // Version 2 (2026-10-18) is additive: `library_track.set-state` and the
 // `artist_alias` entity. Nothing in v1 changed shape, so the minimum stays 1
@@ -270,11 +271,16 @@ export const ZOverrideField = z.discriminatedUnion('field', [
 export const OVERRIDE_FIELDS = ['title', 'artists', 'album_title', 'label', 'genre', 'bpm', 'key_camelot', 'release_date'] as const;
 export const ZLibraryTrackSetOverride = defineOp('library_track', 'set-override', ZOverrideField);
 
-// Each rekordbox unit is one LWW field. `null` clears it. The grid is beat
-// times in seconds (the `rb_beatgrid` blob decoded); segments pass through as
-// the importer's `SegmentRecord` rows.
+// Each rekordbox unit is one LWW field. `null` clears it. The grid is the
+// compact integer form in rb-grid.ts (beats AND downbeats, whole ms,
+// second-differenced) — fixed 2026-10-20 before anything emitted the unit,
+// so the array-of-numbers shape is unchanged and only its reading is new;
+// the refine rejects anything else. Segments pass through as the importer's
+// `SegmentRecord` rows; the key is rekordbox's Camelot key. A unit whose op
+// would exceed MAX_OP_PAYLOAD_BYTES (a recorded mix's grid) is not emitted
+// and stays device-local.
 export const ZRbAnalysisUnit = z.discriminatedUnion('unit', [
-	z.object({ unit: z.literal('grid'), value: z.array(z.number()).nullable() }).strict(),
+	z.object({ unit: z.literal('grid'), value: z.array(z.number()).refine(isRbGridValue, { message: 'not an rb grid (rb-grid.ts)' }).nullable() }).strict(),
 	z.object({ unit: z.literal('key'), value: z.string().nullable() }).strict(),
 	z.object({ unit: z.literal('segments'), value: z.array(z.record(ZJsonValue)).nullable() }).strict(),
 ]);

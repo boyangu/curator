@@ -12,7 +12,8 @@
 
 import type Database from 'better-sqlite3';
 import { isAccountSettingKey, type LibraryView } from '@curator/protocol';
-import { OVERRIDE_KEYS, parseOverrides } from './rows.js';
+import type { RbSlotRow } from '../rekordbox/rb-slot.js';
+import { OVERRIDE_KEYS, parseOverrides, rbUnitOp, rbUnitValue, type RbUnit } from './rows.js';
 
 type Raw = Database.Database;
 
@@ -25,10 +26,14 @@ export type LibraryDump = {
 	cues: Array<{ recordingId: string; slot: number; kind: string; positionSec: number; lengthSec: number | null; color: string | null; name: string | null }>;
 	pinnedSearches: Array<{ id: string; name: string; query: string; sortColumn: string | null; sortDir: string | null }>;
 	tracks: Array<{ recordingId: string; rating: number | null; state: string; overrides: string; deleted: boolean }>;
+	// The rekordbox slot in wire form: the grid encoded (rb-grid.ts), phrases
+	// as canonical JSON, the key. A unit too large to ride an op is
+	// device-local and left out, as the emitter leaves it out.
+	rbAnalysis: Array<{ recordingId: string; grid: number[] | null; key: string | null; segments: string | null }>;
 	settings: Record<string, unknown>;
 };
 
-export const DUMP_TABLES = ['tags', 'trackTags', 'playlists', 'playlistFolders', 'playlistTracks', 'cues', 'pinnedSearches', 'tracks', 'settings'] as const;
+export const DUMP_TABLES = ['tags', 'trackTags', 'playlists', 'playlistFolders', 'playlistTracks', 'cues', 'pinnedSearches', 'tracks', 'rbAnalysis', 'settings'] as const;
 
 // A row's schema default, and what a view without a state cell means.
 const DEFAULT_STATE = 'unsorted';
@@ -69,11 +74,25 @@ export function dumpLibrary(raw: Raw, opts: { includeSystemTags?: boolean } = {}
 		.map((r) => ({ recordingId: r.recordingId, rating: r.rating, state: r.state, overrides: canonicalOverrides(r.overrides), deleted: r.deleted_at != null }))
 		// Only rows carrying synced state: a pristine catalogue row says nothing.
 		.filter((r) => r.rating != null || r.state !== DEFAULT_STATE || r.overrides !== '{}' || r.deleted);
+	const rbAnalysis: LibraryDump['rbAnalysis'] = [];
+	for (const r of raw.prepare(`SELECT t.recording_id AS recordingId, ta.rb_beatgrid, ta.rb_downbeats, ta.rb_key_camelot, ta.rb_segments_json
+		FROM track_analysis ta JOIN track t ON t.id = ta.track_id WHERE ${liveTrack} ORDER BY recordingId`).all() as Array<RbSlotRow & { recordingId: string }>) {
+		const unit = (u: RbUnit): unknown => { const v = rbUnitValue(r, u); return v !== null && rbUnitOp(r.recordingId, u, v) ? v : null; };
+		const row = rbRow(r.recordingId, unit('grid'), unit('key'), unit('segments'));
+		if (row) rbAnalysis.push(row);
+	}
 	const settings: Record<string, unknown> = {};
 	for (const r of raw.prepare(`SELECT key, value FROM app_setting ORDER BY key`).all() as Array<{ key: string; value: string }>) {
 		if (isAccountSettingKey(r.key)) settings[r.key] = JSON.parse(r.value);
 	}
-	return { tags, trackTags, playlists, playlistFolders, playlistTracks, cues, pinnedSearches, tracks, settings };
+	return { tags, trackTags, playlists, playlistFolders, playlistTracks, cues, pinnedSearches, tracks, rbAnalysis, settings };
+}
+
+function rbRow(recordingId: string, grid: unknown, key: unknown, segments: unknown): LibraryDump['rbAnalysis'][number] | null {
+	const segs = Array.isArray(segments) && segments.length > 0 ? JSON.stringify(segments) : null;
+	const g = Array.isArray(grid) ? (grid as number[]) : null;
+	const k = typeof key === 'string' && key ? key : null;
+	return g || k || segs ? { recordingId, grid: g, key: k, segments: segs } : null;
 }
 
 // The reducer's materialised view in the same shape.
@@ -108,6 +127,11 @@ export function dumpView(view: LibraryView): LibraryDump {
 				return { recordingId: t.recordingId, rating: t.rating, state: t.state ?? DEFAULT_STATE, overrides: canonicalOverrides(ov), deleted: t.deletedAt != null };
 			})
 			.filter((r) => r.rating != null || r.state !== DEFAULT_STATE || r.overrides !== '{}' || r.deleted)
+			.sort((a, b) => cmp(a.recordingId, b.recordingId)),
+		rbAnalysis: view.libraryTracks
+			.filter((t) => !(t.recordingId in view.recordingAlias))
+			.map((t) => rbRow(t.recordingId, t.rb['grid'], t.rb['key'], t.rb['segments']))
+			.filter((r): r is LibraryDump['rbAnalysis'][number] => r !== null)
 			.sort((a, b) => cmp(a.recordingId, b.recordingId)),
 		settings: Object.fromEntries(Object.entries(view.settings).filter(([k]) => isAccountSettingKey(k))),
 	};

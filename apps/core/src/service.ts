@@ -835,6 +835,12 @@ export interface CoreService {
 	// the desktop main process after the renderer has finished loading, so
 	// the scan's sync DB pressure doesn't block the renderer's bootstrap IPC.
 	startLibraryWatching(): Promise<void>;
+	// Spawn the analyzer sidecar. Called by the desktop main after the window
+	// has finished loading: on Windows the spawn goes through wsl.exe, and a
+	// cold WSL boot brings up a Hyper-V network adapter whose arrival makes
+	// Chromium abort in-flight renderer loads (ERR_NETWORK_CHANGED). Analysis
+	// enqueued before this waits; idempotent; no-op when the analyzer is off.
+	startAnalyzer(): void;
 	// Full recompute of track.membership. Called after a Spotify connect /
 	// disconnect / account switch — that flips the my-vs-followed split for
 	// every track, so the whole table must be reclassified.
@@ -1223,6 +1229,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// First, before anything can log: swap core's module-level accessor onto
 	// the host's logger (no-op when omitted — the console default stands).
 	if (opts.logger) setCoreLogger(opts.logger);
+	// Plays last heard before this instance started belong to a renderer that
+	// is gone (plays.ts finalizeInterruptedPlays).
+	const startedAt = Date.now();
 	const { db, sqlite } = createDb(dbPath);
 	const auth = new AuthService(db);
 	// One cancel token shared across both enrichers — cancelling fires
@@ -1836,8 +1845,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// (Analyze modal, rb grid sync) bypass this object entirely.
 	let autoAnalyzeSettings: AutoAnalyzeSettings = { ...DEFAULT_AUTO_ANALYZE_SETTINGS };
 	if (opts.analyzer && opts.peaksDir) {
+		// Not started here: the desktop main calls startAnalyzer() once the
+		// window has loaded (on Windows the spawn boots WSL, and its network
+		// adapter appearing aborts the renderer's in-flight module loads).
+		// Jobs dispatched before then wait inside the sidecar wrapper.
 		analyzerSidecar = new AnalyzerSidecar(opts.analyzer);
-		analyzerSidecar.start();
 		analysisQueue = new AnalysisQueue(db, analyzerSidecar, { peaksDir: opts.peaksDir });
 		// Eager analysis: any time the scanner ingests a new (or re-matched)
 		// local file, queue it at low priority — but only when the user has
@@ -3888,10 +3900,16 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// recompute can't stall first paint. Self-healing: covers any tier drift
 			// from a missed invalidation, and tracks not touched by the scan.
 			membership.recomputeAll();
+			// Same once-per-launch slot: plays a quit or crash left open are
+			// finalised and synced. A failure must not stop the watcher.
+			try { plays.finalizeInterruptedPlays(db, { before: startedAt }); } catch (err) { log.for('plays').warn('finalising interrupted plays failed', undefined, err); }
 			await libraryScanner.startAll();
 		},
 		recomputeMembership() {
 			membership.recomputeAll();
+		},
+		startAnalyzer() {
+			if (analyzerSidecar && !analyzerSidecar.hasStarted) analyzerSidecar.start();
 		},
 
 		// ─── Discover feed ──────────────────────────────────────────────────
@@ -4534,6 +4552,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				log.for('service').warn('enqueueAnalysis called but analyzer is disabled (no sidecar configured)');
 				throw new Error('The analysis sidecar is not available in this build.');
 			}
+			// Same reasoning for a sidecar that gave up (not found, broken
+			// Python env, crash loop): the queue parks rather than failing the
+			// backlog, so a click would otherwise just sit in 'queued'.
+			const stopped = analyzerSidecar?.disabled;
+			if (stopped) throw new Error(`The analyzer is not running: ${stopped}`);
 			// Translate the unified flags into the sidecar wire shape here — the
 			// one conversion point shared with the scanner's auto-analyze path.
 			const analyzeOptions = opts?.analyzeFlags ? analysisFlagsToOptions(opts.analyzeFlags) : undefined;

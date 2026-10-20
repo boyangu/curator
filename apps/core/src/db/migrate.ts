@@ -760,11 +760,17 @@ const ALTER_MIGRATIONS: string[] = [
 	// preserved in the legacy columns) can't be attributed here and stays as
 	// Curator; re-importing Rekordbox repopulates its rb slot cleanly (also the
 	// recovery path for grids an earlier force-re-analyze wiped).
+	// Runs every boot, so it must only move rows that still HOLD legacy data:
+	// the statement after it clears those columns, and a placeholder the
+	// importer (or the op-log projection) wrote with a key or phrases but no
+	// grid would otherwise have its rb slot overwritten with those NULLs on
+	// every launch (2026-10-20, when the rb key started landing in the slot).
 	`UPDATE track_analysis SET
 		rb_beatgrid = beatgrid, rb_downbeats = downbeats, rb_bpm = bpm,
 		rb_key_camelot = key_camelot, rb_key_strength = key_strength,
 		rb_segments_json = segments_json
-		WHERE analyzer_version = 'rekordbox' AND rb_beatgrid IS NULL`,
+		WHERE analyzer_version = 'rekordbox' AND rb_beatgrid IS NULL
+			AND (beatgrid IS NOT NULL OR downbeats IS NOT NULL OR bpm IS NOT NULL OR key_camelot IS NOT NULL OR segments_json IS NOT NULL)`,
 	`UPDATE track_analysis SET
 		beatgrid = NULL, downbeats = NULL, bpm = NULL,
 		key_camelot = NULL, key_strength = NULL, segments_json = NULL,

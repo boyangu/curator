@@ -90,6 +90,13 @@ export const analysisStatus = {
 			s.queuedCount = Math.max(0, s.queuedCount - 1);
 		}));
 	},
+	// The sidecar went away mid-job; the job is back in the queue.
+	requeued(trackId: string): void {
+		setStore(produce((s) => {
+			delete s.running[trackId];
+			s.queuedCount++;
+		}));
+	},
 	completed(trackId: string): void {
 		setStore(produce((s) => {
 			delete s.running[trackId];
