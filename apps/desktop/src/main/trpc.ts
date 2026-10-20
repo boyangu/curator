@@ -183,10 +183,13 @@ export function buildAppRouter(h: Handlers) {
 			signInOtpVerify: proc('account:sign-in-otp-verify'),
 			signOut: proc('account:sign-out'),
 			devices: proc('account:devices'),
+			revokeDevice: proc('account:revoke-device'),
+			signOutOthers: proc('account:sign-out-others'),
 		}),
 		cloudSync: t.router({
 			status: proc('cloud-sync:status'),
 			now: proc('cloud-sync:now'),
+			unlink: proc('cloud-sync:unlink'),
 			setPollPolicy: proc('cloud-sync:set-poll-policy'),
 		}),
 		catalogue: t.router({

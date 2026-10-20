@@ -1,8 +1,10 @@
 // sync.bootstrap: the latest snapshot inline plus the seq it covers; the
 // client loads it, then pulls after `snapshotSeq`. Inline base64 because v1
 // keeps snapshots in Postgres; the shape is the protocol's `BootstrapResult`.
+// Behind the same revoke gate as a pull (account/device-gate.ts).
 
-import { createLibraryState, SNAPSHOT_ENCODING, type BootstrapResult } from '@curator/protocol';
+import { createLibraryState, SNAPSHOT_ENCODING, type BootstrapInput, type BootstrapResult } from '@curator/protocol';
+import { assertSessionNotRevoked, gateDevice, type Caller } from '../account/device-gate.js';
 import { num, type Db } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { encodeSnapshot } from '../snapshot/codec.js';
@@ -17,8 +19,10 @@ function emptySnapshot(): Promise<string> {
 	return emptyBody;
 }
 
-export async function bootstrap(db: Db, userId: string): Promise<BootstrapResult> {
+export async function bootstrap(db: Db, userId: string, caller: Caller, input: BootstrapInput = {}): Promise<BootstrapResult> {
 	const latest = await withUserTx(db, userId, async (tx) => {
+		if (input.deviceId !== undefined) await gateDevice(tx, caller, input.deviceId);
+		else await assertSessionNotRevoked(tx, caller);
 		const [row] = await tx.query<{ seq: unknown; body: string }>(
 			`select snapshot_seq::float8 as seq, ${BODY_BASE64} as body from curator.library_snapshot
 			where user_id = (select auth.uid())

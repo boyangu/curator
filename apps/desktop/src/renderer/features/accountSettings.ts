@@ -3,9 +3,12 @@
 // Signed out: email + password, or "email me a code" (one-time code /
 // magic link). Signed in: the email, the sync status line, Sync now, shared
 // analysis (reuse toggle, holdings, the "upload existing analysis" button),
-// the account's devices, sign out. The session and every token live in main;
-// this panel only ever sees status (account:status, cloud-sync:status,
-// catalogue:status).
+// the account's devices (remove one, sign out every other session), unlink
+// this library, sign out. Revoked (another computer removed this one): the
+// banner and Sign out only, since the server refuses everything else. The
+// session and every token live in main; this panel only ever sees status
+// (account:status, cloud-sync:status, catalogue:status). What it says and
+// offers is decided in accountModel.ts.
 //
 // Thin view, the backupSettings pattern: render from the two statuses,
 // write through accountApi / cloudSyncApi, re-render on cloud-sync:status
@@ -19,9 +22,22 @@ import { accountApi, catalogueApi, cloudSyncApi } from '../data/api.js';
 import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
+import {
+	accountActions, deviceRows, DEVICES_HINT, fmtWhen, revokeConfirm, SIGN_OUT_OTHERS_CONFIRM, syncLine, UNLINK_CONFIRM,
+	type AccountDevice, type AccountStatus, type ConfirmText,
+} from './accountModel.js';
 
-type AccountStatus = Awaited<ReturnType<typeof accountApi.status>>;
-type AccountDevice = Awaited<ReturnType<typeof accountApi.devices>>[number];
+// The confirm dialog is injected from main.ts (the backupSettings pattern),
+// so this module never imports layouts.
+export interface AccountSettingsDeps {
+	confirm(opts: ConfirmText): Promise<boolean>;
+}
+
+let deps: AccountSettingsDeps | null = null;
+
+export function initAccountSettingsFeature(d: AccountSettingsDeps): void {
+	deps = d;
+}
 
 const alog = log.for('account-settings');
 
@@ -40,26 +56,6 @@ let codeSentTo: string | null = null;
 let busy = false;
 let formError: string | null = null;
 
-function fmtWhen(ms: number | null): string {
-	if (!ms) return 'never';
-	const ago = Date.now() - ms;
-	if (ago < 60_000) return 'just now';
-	if (ago < 3_600_000) return `${Math.round(ago / 60_000)} min ago`;
-	return new Date(ms).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
-
-// One line that says where sync stands, most urgent first.
-function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null): { text: string; tone: 'ok' | 'warn' | 'error' } {
-	if (!a.syncAvailable || !s?.enabled) return { text: 'Library sync is not configured in this build (CURATOR_CLOUD_API_URL) — your account is ready for when it is.', tone: 'warn' };
-	if (s.needsUpdate) return { text: 'Update Curator to keep syncing. Your changes are kept and will sync after the update.', tone: 'error' };
-	if (s.initialPush) return { text: `Uploading your library… ${s.initialPush.done.toLocaleString()} of about ${s.initialPush.estimate.toLocaleString()} changes`, tone: 'ok' };
-	if (s.bootstrap) return { text: `Downloading your library… ${s.bootstrap.done.toLocaleString()} of ${s.bootstrap.total.toLocaleString()}`, tone: 'ok' };
-	if (s.lastError) return { text: `${s.lastError}${s.pending > 0 ? ` · ${s.pending.toLocaleString()} changes waiting` : ''}`, tone: 'error' };
-	if (s.running) return { text: 'Syncing…', tone: 'ok' };
-	const last = Math.max(s.lastPushAt ?? 0, s.lastPullAt ?? 0) || null;
-	if (s.pending > 0) return { text: `${s.pending.toLocaleString()} changes waiting to sync · last synced ${fmtWhen(last)}`, tone: 'ok' };
-	return { text: `Up to date · last synced ${fmtWhen(last)}`, tone: 'ok' };
-}
 
 // The fallback check cadence, shown in the units people think in: seconds
 // while in use, minutes when idle.
@@ -367,25 +363,73 @@ function renderSignedOut(host: HTMLElement, a: AccountStatus): void {
 	(q<HTMLInputElement>('[data-ac-code]') ?? (draftEmail ? q<HTMLInputElement>('[data-ac-password]') : q<HTMLInputElement>('[data-ac-email]')))?.focus();
 }
 
-function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusReport | null): void {
-	const line = syncLine(a, s);
-	const canSync = canSyncNow(a, s);
-	const deviceRows = devices === null
-		? `<div class="settings-toggle__hint">${a.syncAvailable ? 'Loading devices…' : 'Devices appear here once sync is on.'}</div>`
+function renderDevicesSection(a: AccountStatus, s: CloudSyncStatusReport | null): string {
+	const acts = accountActions(a, s);
+	if (!acts.manageDevices) {
+		return acts.revoked ? '' : `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Devices</div>
+			<div class="settings-toggle__hint">Devices appear here once sync is on.</div>
+		</div>`;
+	}
+	const rows = devices === null
+		? `<div class="settings-toggle__hint">Loading devices…</div>`
 		: devices.length === 0
 			? `<div class="settings-toggle__hint">No devices registered yet — this one registers on its first sync.</div>`
-			: devices.map((d) => `
+			: deviceRows(devices).map((d) => `
 				<div class="settings-rekordbox__path-row backup__row">
-					<span class="settings-ui__field-label">${escapeHtml(d.name)}${d.current ? ' (this computer)' : ''}</span>
-					<span class="settings-toggle__hint">${escapeHtml(d.platform)} · added ${escapeHtml(fmtWhen(d.registeredAt))}${d.lastSeenAt ? ` · last seen ${escapeHtml(fmtWhen(d.lastSeenAt))}` : ''}${d.revokedAt ? ' · removed' : ''}</span>
+					<span class="settings-ui__field-label">${escapeHtml(d.name)}${d.current ? ' <strong>(this computer)</strong>' : ''}</span>
+					<span class="${d.revoked ? 'backup__banner backup__banner--warn' : 'settings-toggle__hint'}">${escapeHtml(d.detail)}${d.revoked ? ' · no longer syncs' : ''}</span>
+					${d.canRevoke ? `<button class="btn-secondary" data-ac-revoke="${escapeHtml(d.deviceId)}" ${busy ? 'disabled' : ''}>Remove…</button>` : ''}
 				</div>`).join('');
+	return `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Devices</div>
+			${rows}
+			<div class="settings-toggle__hint">${escapeHtml(DEVICES_HINT)}</div>
+			<div class="settings-rekordbox__path-row backup__row">
+				<span class="settings-ui__field-label"></span>
+				<button class="btn-secondary" data-ac-signout-others ${busy ? 'disabled' : ''}>Sign out all other sessions…</button>
+			</div>
+		</div>
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">This computer</div>
+			<div class="settings-toggle__hint">Stop syncing this library with your account. Nothing on this computer is deleted.</div>
+			<div class="settings-rekordbox__path-row backup__row">
+				<span class="settings-ui__field-label"></span>
+				<button class="btn-secondary" data-ac-unlink ${busy ? 'disabled' : ''}>Unlink this library from my account…</button>
+			</div>
+		</div>`;
+}
+
+const errText = (err: unknown): string => (err instanceof Error ? err.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') : String(err));
+
+// One confirmed account action: the panel is busy while it runs, and a
+// failure is a toast, never a half-rendered panel.
+async function confirmed(host: HTMLElement, text: Parameters<AccountSettingsDeps['confirm']>[0], run: () => Promise<void>, failTitle: string, after: () => void = () => render(host)): Promise<void> {
+	if (!deps || !(await deps.confirm(text))) return;
+	busy = true;
+	render(host);
+	try {
+		await run();
+	} catch (err) {
+		showToast(failTitle, { sub: errText(err), kind: 'error' });
+	} finally {
+		busy = false;
+		after();
+	}
+}
+
+function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusReport | null): void {
+	const line = syncLine(a, s);
+	const acts = accountActions(a, s);
 	host.innerHTML = `
 		<div class="settings-ui__section">
 			<div class="settings-ui__section-label">Curator account</div>
 			<div class="settings-rekordbox__path-row backup__row">
 				<span class="settings-ui__field-label">Signed in as</span>
 				<span>${escapeHtml(a.email ?? 'unknown')}</span>
-				<button class="btn-secondary" data-ac-signout ${busy ? 'disabled' : ''}>Sign out</button>
+				<button class="${acts.revoked ? 'btn-primary' : 'btn-secondary'}" data-ac-signout ${busy ? 'disabled' : ''}>Sign out</button>
 			</div>
 			${a.persistent ? '' : `<div class="backup__banner backup__banner--warn">This system cannot store credentials securely, so you will be asked to sign in again after a restart.</div>`}
 		</div>
@@ -393,32 +437,57 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 			<div class="settings-ui__section-label">Library sync</div>
 			<div class="settings-rekordbox__path-row backup__row">
 				<span class="${line.tone === 'ok' ? 'settings-toggle__hint' : `backup__banner backup__banner--${line.tone}`}" data-ac-sync-line>${escapeHtml(line.text)}</span>
-				<button class="btn-primary" data-ac-sync-now ${canSync ? '' : 'disabled'}>Sync now</button>
+				${acts.revoked ? '' : `<button class="btn-primary" data-ac-sync-now ${acts.syncNow ? '' : 'disabled'}>Sync now</button>`}
 			</div>
 			${s && s.rejected > 0 ? `<div class="settings-toggle__hint">${s.rejected.toLocaleString()} ${s.rejected === 1 ? 'change was' : 'changes were'} refused by the server and will not be retried; see the log for details.</div>` : ''}
+			${acts.revoked && s && s.pending > 0 ? `<div class="settings-toggle__hint">${s.pending.toLocaleString()} ${s.pending === 1 ? 'change is' : 'changes are'} kept on this computer and will upload if it is signed in again.</div>` : ''}
 		</div>
-		${renderCatalogueSection(catalogue)}
-		${a.syncAvailable && s?.enabled ? renderPollSection(s) : ''}
-		<div class="settings-ui__section">
-			<div class="settings-ui__section-label">Devices</div>
-			${deviceRows}
-		</div>`;
+		${acts.revoked ? '' : renderCatalogueSection(catalogue)}
+		${a.syncAvailable && s?.enabled && !acts.revoked ? renderPollSection(s) : ''}
+		${renderDevicesSection(a, s)}`;
 
 	const q = <T extends Element>(sel: string): T | null => host.querySelector<T>(sel);
 	wirePollSection(host);
 	wireCatalogueSection(host);
 	q<HTMLButtonElement>('[data-ac-sync-now]')?.addEventListener('click', () => {
 		void cloudSyncApi.syncNow().then((st) => { sync = st; render(host); }).catch((err) => {
-			showToast('Sync failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+			showToast('Sync failed', { sub: errText(err), kind: 'error' });
 		});
 	});
+	// Revoked, main unlinks instead of a plain sign-out (a fresh device id),
+	// so signing in again later is not refused all over again.
 	q<HTMLButtonElement>('[data-ac-signout]')?.addEventListener('click', () => {
 		busy = true;
 		render(host);
 		void accountApi.signOut()
 			.then(() => { devices = null; showToast('Signed out', { sub: 'Your library stays on this computer.' }); })
-			.catch((err) => showToast('Sign-out failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' }))
+			.catch((err) => showToast('Sign-out failed', { sub: errText(err), kind: 'error' }))
 			.finally(() => { busy = false; void refresh(host); });
+	});
+	host.querySelectorAll<HTMLButtonElement>('[data-ac-revoke]').forEach((btn) => btn.addEventListener('click', () => {
+		const id = btn.dataset.acRevoke!;
+		const name = devices?.find((d) => d.deviceId === id)?.name ?? 'this device';
+		void confirmed(host, revokeConfirm(name), async () => {
+			devices = await accountApi.revokeDevice(id);
+			showToast(`Removed ${name}`, { sub: 'It no longer syncs. If it was lost or stolen, also sign out all other sessions.', kind: 'success' });
+		}, 'Could not remove the device');
+	}));
+	q<HTMLButtonElement>('[data-ac-signout-others]')?.addEventListener('click', () => {
+		void confirmed(host, SIGN_OUT_OTHERS_CONFIRM, async () => {
+			await accountApi.signOutOthers();
+			showToast('Signed out all other sessions', { sub: 'This computer stays signed in.', kind: 'success' });
+		}, 'Could not sign out other sessions');
+	});
+	q<HTMLButtonElement>('[data-ac-unlink]')?.addEventListener('click', () => {
+		void confirmed(host, UNLINK_CONFIRM, async () => {
+			const r = await cloudSyncApi.unlink();
+			devices = null;
+			showToast('Library unlinked', {
+				sub: r.outcome && !r.outcome.revokedOnServer
+					? 'Signed out. This computer could not be removed from the account’s devices just now; remove it from another computer.'
+					: 'Signed out. Your library stays on this computer.',
+			});
+		}, 'Could not unlink', () => { void refresh(host); });
 	});
 }
 
@@ -433,9 +502,6 @@ function renderNotConfigured(host: HTMLElement): void {
 		</div>`;
 }
 
-const canSyncNow = (a: AccountStatus, s: CloudSyncStatusReport | null): boolean =>
-	a.syncAvailable && !!s?.enabled && !s.running && !s.initialPush && !s.bootstrap;
-
 // A status tick while the user is typing in this panel: refresh the live
 // lines only, leaving the inputs (and the caret) alone.
 function patchSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusReport | null): void {
@@ -445,7 +511,7 @@ function patchSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusRe
 		el.textContent = line.text;
 		el.className = line.tone === 'ok' ? 'settings-toggle__hint' : `backup__banner backup__banner--${line.tone}`;
 	}
-	host.querySelector<HTMLButtonElement>('[data-ac-sync-now]')?.toggleAttribute('disabled', !canSyncNow(a, s));
+	host.querySelector<HTMLButtonElement>('[data-ac-sync-now]')?.toggleAttribute('disabled', !accountActions(a, s).syncNow);
 	const poll = host.querySelector<HTMLElement>('[data-ac-poll-status]');
 	if (poll && s) poll.textContent = pollLine(s);
 	patchCatalogue(host);
@@ -471,7 +537,8 @@ async function refresh(host: HTMLElement): Promise<void> {
 		pollSettings = ps;
 		catalogue = cs;
 		render(host);
-		if (a.signedIn && a.syncAvailable) {
+		// A revoked computer is refused the list (and everything else).
+		if (a.signedIn && accountActions(a, s).manageDevices) {
 			devices = await accountApi.devices().catch((err) => { alog.warn('devices failed', { err: String(err) }); return devices ?? []; });
 			render(host);
 		}

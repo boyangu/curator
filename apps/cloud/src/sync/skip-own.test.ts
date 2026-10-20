@@ -131,20 +131,24 @@ describe('sync.pull skipping the caller’s own ops', () => {
 		expect(rest.ops).toEqual(ops.slice(3).map((o) => o.op_id));
 	});
 
-	it('refuses a device id without its bound, and the bound without a device id', async () => {
+	it('takes a device id alone as a name, not a skip (device_reads), and refuses the bound without one', async () => {
 		const { api, aId } = await twoDevices();
-		expect(await errorReason(api.sync.pull.query({ afterSeq: 0, deviceId: aId } as never))).toMatchObject({ code: 'BAD_REQUEST' });
+		const ops = tags(aId, 3);
+		await api.sync.push.mutate({ deviceId: aId, ops });
+		const r = await drain(api, 0, { deviceId: aId });
+		expect(r.ops).toEqual(ops.map((o) => o.op_id));
 		expect(await errorReason(api.sync.pull.query({ afterSeq: 0, ownThroughSeq: 5 } as never))).toMatchObject({ code: 'BAD_REQUEST' });
 	});
 
-	it('narrows only the caller’s own rows: another account’s device id hides nothing and reveals nothing', async () => {
+	it('reveals nothing about another account’s device: its id is unknown here', async () => {
 		const x = await app.signIn();
 		const y = await app.signIn();
-		const xOps = tags(x.deviceId, 3);
-		await x.api.sync.push.mutate({ deviceId: x.deviceId, ops: xOps });
+		await x.api.sync.push.mutate({ deviceId: x.deviceId, ops: tags(x.deviceId, 3) });
 		await y.api.sync.push.mutate({ deviceId: y.deviceId, ops: tags(y.deviceId, 2) });
-		const r = await drain(x.api, 0, { deviceId: y.deviceId, ownThroughSeq: Number.MAX_SAFE_INTEGER });
-		expect(r.ops).toEqual(xOps.map((o) => o.op_id));
+		expect(await errorReason(x.api.sync.pull.query({ afterSeq: 0, deviceId: y.deviceId, ownThroughSeq: Number.MAX_SAFE_INTEGER }))).toMatchObject({
+			code: 'PRECONDITION_FAILED',
+			reason: 'device_not_registered',
+		});
 	});
 
 	it('counts only replayable ops toward the far-behind hint', async () => {
@@ -156,6 +160,7 @@ describe('sync.pull skipping the caller’s own ops', () => {
 			expect((await buildSnapshot(small.db, userId)).status).toBe('built');
 			// Everyone else would replay all of them: bootstrap.
 			expect((await api.sync.pull.query({ afterSeq: 0 })).snapshotSeq).toBeDefined();
+			await api.account.registerDevice.mutate({ deviceId: 'other', name: 'Other', platform: 'win32' });
 			expect((await api.sync.pull.query({ afterSeq: 0, deviceId: 'other', ownThroughSeq: 0 })).snapshotSeq).toBeDefined();
 			// The pushing device would replay none: no reason to bootstrap.
 			const mine = await api.sync.pull.query({ afterSeq: 0, deviceId, ownThroughSeq: pushed.batchMaxSeq! });

@@ -5,7 +5,8 @@
 // - roles `anon`, `authenticated`, `service_role` (NOLOGIN, no BYPASSRLS for
 //   the first two, so RLS applies after `set role authenticated`);
 // - `auth.users` (the FK target) and `auth.uid()` reading `sub` from
-//   `request.jwt.claims`, as Supabase's own definition does;
+//   `request.jwt.claims`, as Supabase's own definition does, and `auth.jwt()`
+//   returning those claims whole (Storage policies read `session_id` there);
 // - `realtime.messages` with RLS on and `realtime.topic()`, so the channel
 //   policy in 0001 can be created;
 // - `realtime.send(payload, event, topic, private)` recording each call in
@@ -30,6 +31,11 @@ create function auth.uid() returns uuid
 language sql stable
 as $$
 	select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub', '')::uuid
+$$;
+create function auth.jwt() returns jsonb
+language sql stable
+as $$
+	select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb
 $$;
 
 create schema realtime;

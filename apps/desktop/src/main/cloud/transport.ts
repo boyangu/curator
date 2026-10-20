@@ -29,6 +29,7 @@ import { CloudTransportError, decodeLibraryStateSnapshot, type CloudTransport } 
 import {
 	CALL_ERROR_REASONS,
 	SNAPSHOT_ENCODING,
+	type BootstrapInput,
 	type BootstrapResult,
 	type CallErrorReason,
 	type CatalogueInventoryInput,
@@ -253,6 +254,8 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 
 	return {
 		session: () => account.cloudSession(),
+		// The sync client's unlink: this install only (scope 'local').
+		signOut: async () => { await account.signOut(); },
 		sync: {
 			push: (input: PushInput) => call<PushResult>(PROCS.push, input),
 			pull: (input: PullInput) => call<PullResult>(PROCS.pull, input),
@@ -260,8 +263,10 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 		// The snapshot arrives inline (base64 gzip of the serialised state).
 		// gunzip runs on libuv's pool; the JSON parse and flatten are the one
 		// synchronous step (~100–300 ms for a 40k-track library, once).
-		async bootstrap() {
-			const res = await call<BootstrapResult>(PROCS.bootstrap);
+		// `input` only when the server offers 'device_reads' (the sync client
+		// decides); without it an older server's input-less query is sent.
+		async bootstrap(input?: BootstrapInput) {
+			const res = await call<BootstrapResult>(PROCS.bootstrap, input);
 			if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
 			const json = await gunzipAsync(Buffer.from(res.snapshot, 'base64'), { maxOutputLength: MAX_INFLATED_BYTES });
 			return { snapshotSeq: res.snapshotSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };

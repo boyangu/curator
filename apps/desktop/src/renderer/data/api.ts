@@ -331,11 +331,14 @@ export const accountApi = {
 	verifyCode: (email: string, code: string) => trpc.account.signInOtpVerify.mutate([email, code]),
 	signOut: () => trpc.account.signOut.mutate([]),
 	devices: () => trpc.account.devices.mutate([]),
+	revokeDevice: (deviceId: string) => trpc.account.revokeDevice.mutate([deviceId]),
+	signOutOthers: () => trpc.account.signOutOthers.mutate([]),
 };
 
 export const cloudSyncApi = {
 	status: () => api()['cloud-sync:status'](),
 	syncNow: () => trpc.cloudSync.now.mutate([]),
+	unlink: () => trpc.cloudSync.unlink.mutate([]),
 	pollSettings: () => api()['cloud-sync:get-poll-settings'](),
 	setPollPolicy: (patch: Parameters<typeof window.api['cloud-sync:set-poll-policy']>[0]) => trpc.cloudSync.setPollPolicy.mutate([patch]),
 	onStatus: (cb: Parameters<typeof window.api.onCloudSyncStatus>[0]) => api().onCloudSyncStatus(cb),

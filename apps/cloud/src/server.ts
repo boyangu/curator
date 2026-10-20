@@ -48,7 +48,9 @@ const handler = createFetchHandler({
 	limits: defaultRateLimits(),
 	pull: DEFAULT_PULL_OPTIONS,
 	catalogue: config.catalogue,
+	requireDeviceId: config.requireDeviceId,
 });
+log.info('device_reads', { requireDeviceId: config.requireDeviceId });
 log.info('catalogue_policy', { allow: config.catalogue?.allow.map((a) => (a.variants ? `${a.unit}:${a.variants.join('|')}` : a.unit)) ?? 'off' });
 
 const server = createServer(toNodeListener(handler, { log, audit }));

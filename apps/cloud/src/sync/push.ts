@@ -6,8 +6,10 @@
 //
 // Order of work, all before the first write: shape and size caps, schema
 // version gate, zod payload validation (`parseOp`), provenance, storability.
-// Then one transaction: device check, per-user advisory lock, one INSERT for
-// the whole batch (one statement, so one wake-up), duplicate resolution.
+// Then one transaction: device check (the device named and the device the
+// session acts as, account/device-gate.ts), per-user advisory lock, one
+// INSERT for the whole batch (one statement, so one wake-up), duplicate
+// resolution.
 
 import {
 	clampClientTs,
@@ -25,6 +27,7 @@ import type { AuditEmit } from '../audit.js';
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
+import { assertSessionNotRevoked, bindSession, DeviceRevokedError, type Caller, type RevokedVia } from '../account/device-gate.js';
 
 export type PushCall = { deviceId: string; ops: readonly unknown[] };
 
@@ -134,7 +137,7 @@ async function headSeq(tx: Queryable): Promise<number> {
 
 // `audit` raises the security events (revoked device, rejections, clamps);
 // the request context stamps the request id, user and device on them.
-export async function push(db: Db, audit: AuditEmit, userId: string, call: PushCall): Promise<PushResult> {
+export async function push(db: Db, audit: AuditEmit, userId: string, caller: Caller, call: PushCall): Promise<PushResult> {
 	// Size caps first, before a connection is even taken.
 	assertBatchSize(call.ops);
 
@@ -144,17 +147,31 @@ export async function push(db: Db, audit: AuditEmit, userId: string, call: PushC
 	const result = await withUserTx(db, userId, async (tx): Promise<PushResult> => {
 		const { valid, rejected, clamped, sentTs } = validatePush(call, tx.nowMs);
 
-		// `last_seen_at` moves for a revoked device too: "still trying" is what
-		// the account's device list should show for it.
-		const [device] = await tx.query<{ revoked: boolean }>(
-			`update curator.device set last_seen_at = now()
-			where user_id = (select auth.uid()) and device_id = $1
-			returning revoked_at is not null as revoked`,
-			[call.deviceId],
-		);
-		if (!device) throw new CloudError('PRECONDITION_FAILED', 'device_not_registered');
-		if (device.revoked) {
-			events.push(['push_from_revoked_device', { ops: call.ops.length }]);
+		// A session acting as a revoked device is refused whatever device it
+		// names now. It touches nothing: the id it names may be a live device
+		// of the account, whose "last seen" must not move for it.
+		let revoked: RevokedVia | null = null;
+		try {
+			await assertSessionNotRevoked(tx, caller);
+		} catch (e) {
+			if (!(e instanceof DeviceRevokedError)) throw e;
+			revoked = e.via;
+		}
+		if (revoked === null) {
+			// `last_seen_at` moves for a revoked device too: "still trying" is
+			// what the account's device list should show for it.
+			const [device] = await tx.query<{ revoked: boolean }>(
+				`update curator.device set last_seen_at = now()
+				where user_id = (select auth.uid()) and device_id = $1
+				returning revoked_at is not null as revoked`,
+				[call.deviceId],
+			);
+			if (!device) throw new CloudError('PRECONDITION_FAILED', 'device_not_registered');
+			if (device.revoked) revoked = 'device';
+			else await bindSession(tx, caller, call.deviceId);
+		}
+		if (revoked !== null) {
+			events.push(['push_from_revoked_device', { ops: call.ops.length, via: revoked }]);
 			return {
 				accepted: 0,
 				maxSeq: await headSeq(tx),

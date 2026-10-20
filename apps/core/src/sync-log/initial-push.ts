@@ -24,9 +24,10 @@
 // Past artist renames/merges ARE reconstructed, from the artist table's
 // alias rows and curated spellings (artist_alias rules), and so are the
 // rekordbox analysis units (set-rb-analysis, from the rb slot; a grid too
-// large for an op stays device-local, see rows.ts). Not reconstructed:
-// past recording merges (the soft-deleted losers carry no record of which
-// row won), track creates and claims (catalogue workstream D). Unfinalised
+// large for an op stays device-local, see rows.ts), and so is every row's
+// recording: its create and the claims its columns hold (recordingOps). Not
+// reconstructed: past recording merges (the soft-deleted losers carry no
+// record of which row won). Unfinalised
 // curator plays go out as they stand; the launch sweep
 // (plays.ts finalizeInterruptedPlays) re-appends them finalised.
 
@@ -35,8 +36,8 @@ import { cueEntityId, isAccountSettingKey, trackTagEntityId, type JsonValue } fr
 import { INITIAL_PUSH_KEY, markRecordsComplete } from './apply.js';
 import { emitOps, type EmitOp } from './outbox.js';
 import {
-	cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
-	OVERRIDE_KEYS, OVERRIDE_FIELD_OF, RB_UNITS, type CueRow,
+	claimOp, cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
+	OVERRIDE_KEYS, OVERRIDE_FIELD_OF, RB_UNITS, type CueRow, type RecordingClaim,
 } from './rows.js';
 import type { RbSlotRow } from '../rekordbox/rb-slot.js';
 import { eventAppendOp, sessionAppendOp } from '../library/mutators.js';
@@ -98,6 +99,91 @@ function* rbAnalysisOps(raw: Raw): Generator<EmitOp> {
 			if (op) yield stamp(op, r.at);
 		}
 	}
+}
+
+// Library rows as recordings: a `library_track` create per row (stamped with
+// when it joined the library) and the claims its columns hold — the file's
+// audio hash and Chromaprint (source_link, local), the streaming ids
+// (spotify/tidal/beatport source_link rows) and the ISRC. Without them a
+// library from before the op log gives the identity resolver (identity.ts)
+// nothing to match another desktop's copy of the same file against, and the
+// catalogue nothing to file analysis under. Deleted rows are included: their
+// audio-hash claim is how a delete made here keeps another desktop's scanner
+// from minting a fresh row for the same file (scanner.ts deletedOwnerOf);
+// the resolver itself never merges a deleted recording. Rows whose recording
+// is already a merge loser are skipped: their claims live on the winner.
+//
+// Rows are read in pages (keyset on rowid) with their links in one IN (...)
+// read per page, so no slice of the chunked driver pays for the whole
+// library; the Chromaprint (kilobytes, thousands of files) is read by link
+// id only for the claim it becomes. Also the body of the one-time backfill
+// for libraries pushed before claims were.
+type RecTrackRow = { rowid: number; id: string; isrc: string | null; added_at: number | null; created_at: number | null };
+type RecLinkRow = { id: string; track_id: string; source: string; source_track_id: string; audio_hash: string | null; fetched_at: number | null };
+
+function* recordingOps(raw: Raw): Generator<EmitOp> {
+	const has = recordProbe(raw);
+	const rec = recordingResolver(raw);
+	const aliased = new Set(raw.prepare(`SELECT loser FROM recording_alias`).pluck().all() as string[]);
+	const page = raw.prepare(`SELECT rowid, id, isrc, added_at, created_at FROM track WHERE derived_from_track_id IS NULL AND rowid > ? ORDER BY rowid LIMIT 400`);
+	for (let after = 0; ;) {
+		const tracks = page.all(after) as RecTrackRow[];
+		if (tracks.length === 0) return;
+		after = tracks[tracks.length - 1]!.rowid;
+		const links = new Map<string, RecLinkRow[]>();
+		for (const l of raw.prepare(`SELECT id, track_id, source, source_track_id, audio_hash, fetched_at
+			FROM source_link WHERE track_id IN (${tracks.map(() => '?').join(',')}) AND source IN ('local', 'spotify', 'tidal', 'beatport')
+			ORDER BY track_id, source, id`).all(...tracks.map((t) => t.id)) as RecLinkRow[]) {
+			let list = links.get(l.track_id);
+			if (!list) links.set(l.track_id, (list = []));
+			list.push(l);
+		}
+		for (const t of tracks) {
+			const recording = rec(t.id);
+			if (!recording || aliased.has(recording)) continue;
+			const joined = t.added_at ?? t.created_at;
+			if (!has('libraryTracks', recording, 'created')) {
+				yield stamp({ entity: 'library_track', entity_id: recording, kind: 'create', payload: joined != null ? { added_at: Math.max(0, Math.round(joined)) } : {} }, joined);
+			}
+			const seen = new Set<string>();
+			const claim = (c: RecordingClaim, at: number | null | undefined): EmitOp | null => {
+				const key = `${recording}:${c.kind}:${c.value}`;
+				if (seen.has(key) || has('claims', key)) return null;
+				seen.add(key);
+				const op = claimOp(recording, c);
+				return op ? stamp(op, at) : null;
+			};
+			const own = links.get(t.id) ?? [];
+			// A tag ISRC is weaker evidence than a provider's (the scanner's 0.8
+			// vs the streaming upserts' 0.9); which one filled the column is not
+			// recorded, so a row with a streaming link counts as the provider's.
+			const streamed = own.some((l) => l.source !== 'local');
+			for (const l of own) {
+				let op: EmitOp | null = null;
+				if (l.source !== 'local') {
+					if (l.source_track_id) op = claim({ kind: l.source as 'spotify' | 'tidal' | 'beatport', value: l.source_track_id }, l.fetched_at);
+					if (op) yield op;
+					continue;
+				}
+				if (l.audio_hash) { op = claim({ kind: 'audio_hash', value: l.audio_hash }, l.fetched_at); if (op) yield op; }
+				// Fingerprint claims are NOT replayed here (decided 2026-10-20): the
+				// resolver merges on exact audio hashes only, and the prints would
+				// add ~19 MB to the push and 40-60 MB to sync_state on the live
+				// library for evidence nothing reads yet. New analyses still emit
+				// theirs (analyzer/persist.ts addClaims); when a fuzzy evidence tier
+				// lands, a backfill of its own replays the existing prints.
+			}
+			if (t.isrc) { const op = claim({ kind: 'isrc', value: t.isrc, confidence: streamed ? 0.9 : 0.8 }, t.created_at); if (op) yield op; }
+		}
+	}
+}
+
+function estimateRecordingOps(raw: Raw): number {
+	const n = (sql: string): number => (raw.prepare(sql).get() as { n: number }).n;
+	return n(`SELECT count(*) AS n FROM track WHERE derived_from_track_id IS NULL`)
+		+ n(`SELECT count(*) AS n FROM track WHERE derived_from_track_id IS NULL AND isrc IS NOT NULL`)
+		+ n(`SELECT count(*) AS n FROM source_link WHERE source = 'local' AND audio_hash IS NOT NULL`)
+		+ n(`SELECT count(*) AS n FROM source_link WHERE source IN ('spotify', 'tidal', 'beatport')`);
 }
 
 // Every op the initial push would emit, in library order, each stamped with
@@ -164,12 +250,21 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 		yield stamp(cueUpsertOp(recording, r), r.cues_edited_at ?? r.created_at);
 	}
 
+	// Recordings: each row's create and claims, before the state that
+	// addresses them.
+	yield* recordingOps(raw);
+
 	// Track state: rating, curation stage (only away from the default a new
-	// row gets everywhere), overrides, soft deletes.
+	// row gets everywhere), overrides, soft deletes. Not for a merge loser's
+	// row: its recording is an alias, so its soft delete (the merge's own
+	// bookkeeping, never a delete op: merge-tracks.ts) would be redirected
+	// to the survivor and delete it — a merge made before the first sign-in
+	// leaves exactly such a row behind.
+	const aliasedLosers = new Set(raw.prepare(`SELECT loser FROM recording_alias`).pluck().all() as string[]);
 	for (const r of raw.prepare(`SELECT id, rating, state, state_changed_at, overrides, deleted_at, updated_at FROM track
 		WHERE derived_from_track_id IS NULL AND (rating IS NOT NULL OR state != 'unsorted' OR overrides IS NOT NULL OR deleted_at IS NOT NULL)`).all() as Array<{ id: string; rating: number | null; state: string; state_changed_at: number | null; overrides: string | null; deleted_at: number | null; updated_at: number }>) {
 		const recording = rec(r.id);
-		if (!recording) continue;
+		if (!recording || aliasedLosers.has(recording)) continue;
 		if (r.rating != null && !has('libraryTracks', recording, 'rating')) yield stamp(ratingOp(recording, r.rating), r.updated_at);
 		if (r.state !== 'unsorted' && !has('libraryTracks', recording, 'state')) {
 			const op = stateOp(recording, r.state);
@@ -245,7 +340,8 @@ export function estimateInitialPush(raw: Raw): number {
 		+ n(`SELECT count(*) AS n FROM artist WHERE merged_into IS NOT NULL OR name_curated_at IS NOT NULL`)
 		+ n(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`)
 		+ n(`SELECT count(*) AS n FROM play_session`)
-		+ n(`SELECT count(*) AS n FROM play_event`);
+		+ n(`SELECT count(*) AS n FROM play_event`)
+		+ estimateRecordingOps(raw);
 }
 
 function emitChunk(raw: Raw, batch: EmitOp[], byEntity: Record<string, number>): void {
@@ -267,6 +363,7 @@ export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPus
 	if (pending.length > 0) emitChunk(raw, pending, byEntity);
 	markRecordsComplete(raw);
 	markRbBackfilled(raw);
+	markClaimsBackfilled(raw);
 	return { ops: total, byEntity, ms: Date.now() - started };
 }
 
@@ -282,7 +379,7 @@ export async function initialPushAsync(
 	raw: Raw,
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
 ): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); }, opts);
+	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); markClaimsBackfilled(raw); }, opts);
 }
 
 async function driveAsync(
@@ -352,4 +449,32 @@ export function rbBackfillAsync(
 ): Promise<InitialPushAsyncResult> {
 	const estimate = (raw.prepare(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`).get() as { n: number }).n;
 	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), opts);
+}
+
+// ── backfill: recordings (creates + claims) ────────────────────────────────
+// A library whose initial push ran before recordingOps existed (2026-10-20)
+// stated its tags, playlists and ratings but never which recordings its rows
+// are or what identifies them, and nothing would state it later: the
+// scanner and the streaming upserts claim only new rows. So once, after the
+// initial push, that section runs on its own, like the rekordbox backfill
+// above. Its claims are what lets the identity resolver merge this
+// library's copy of a file with another desktop's.
+
+export const CLAIMS_BACKFILL_KEY = 'sync.backfill.recording_claims_at';
+
+function markClaimsBackfilled(raw: Raw): void {
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)
+		.run(CLAIMS_BACKFILL_KEY, JSON.stringify(Date.now()), Date.now());
+}
+
+export function claimsBackfillPending(raw: Raw): boolean {
+	return raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined
+		&& raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(CLAIMS_BACKFILL_KEY) === undefined;
+}
+
+export function claimsBackfillAsync(
+	raw: Raw,
+	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
+): Promise<InitialPushAsyncResult> {
+	return driveAsync(raw, recordingOps(raw), estimateRecordingOps(raw), () => markClaimsBackfilled(raw), opts);
 }

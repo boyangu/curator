@@ -7,6 +7,7 @@ import {
 	MIN_SUPPORTED_SCHEMA_VERSION,
 	SCHEMA_VERSION,
 	SYNC_FEATURES,
+	ZBootstrapInput,
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
@@ -21,6 +22,7 @@ import {
 	type SyncFeature,
 } from '@curator/protocol';
 import { z } from 'zod';
+import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
@@ -57,8 +59,32 @@ const ZCataloguePutInput = z.object({ deviceId: ZDeviceId, items: z.array(z.unkn
 // 500-op / 1 MB caps are checked in push() so they answer `batch_too_large`.
 const ZPushInput = z.object({ deviceId: ZDeviceId, ops: z.array(z.unknown()) }).strict();
 
-// sync.pull's input lives in the protocol (sync-input.ts), next to the
-// 'pull_skip_own' contract it carries.
+// sync.pull's and sync.bootstrap's inputs live in the protocol
+// (sync-input.ts), next to the 'pull_skip_own' / 'device_reads' contracts
+// they carry.
+
+// Who the revoke gate judges (account/device-gate.ts): the session id from
+// the verified token, never from the input.
+const callerOf = (ctx: { user: { sessionId: string | null } }): Caller => ({ sessionId: ctx.user.sessionId });
+
+// A read that names its device ('device_reads'). Without one it is still
+// served during the transition, judged by its session alone, unless the
+// server is set to require it: then the answer is the one an outdated
+// client already knows how to show ("Update Curator to keep syncing").
+function readDevice(ctx: AppContext, deviceId: string | undefined): void {
+	if (deviceId !== undefined) ctx.call.deviceId = deviceId;
+	else if (ctx.deps.requireDeviceId) throw new CloudError('PRECONDITION_FAILED', 'update_required');
+}
+
+// A refused read is audited with which fact refused it; the error goes on.
+async function auditedRead<T>(ctx: AppContext, procedure: 'sync.pull' | 'sync.bootstrap', fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (e) {
+		if (e instanceof DeviceRevokedError) ctx.call.audit('read_from_revoked_device', { procedure, via: e.via });
+		throw e;
+	}
+}
 
 const ZRegisterDeviceInput = z
 	.object({
@@ -68,9 +94,9 @@ const ZRegisterDeviceInput = z
 	})
 	.strict();
 
-// A pull's optional device id is a filter, not an identity (nothing checks
-// it is registered, and a client could rotate it at will), so the bucket is
-// per Supabase session, which is one per signed-in install.
+// A pull's device id is the client's word (a client could rotate it at
+// will), so the bucket is per Supabase session, which is one per signed-in
+// install.
 const pullKey = (user: { id: string; sessionId: string | null }) => `${user.id}:${user.sessionId ?? '-'}`;
 
 export const appRouter = router({
@@ -94,22 +120,24 @@ export const appRouter = router({
 			ctx.call.deviceId = input.deviceId;
 			ctx.call.opsIn = input.ops.length;
 			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
-			return withFeatures(ctx, await push(ctx.deps.db, ctx.call.audit, ctx.user.id, input));
+			return withFeatures(ctx, await push(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input));
 		}),
 		pull: authedProcedure.input(ZPullInput).query(async ({ ctx, input }): Promise<PullResult> => {
+			readDevice(ctx, input.deviceId);
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
-			const { result, skippedOwn } = await pull(ctx.deps.db, ctx.user.id, input, ctx.deps.pull);
+			const { result, skippedOwn } = await auditedRead(ctx, 'sync.pull', () => pull(ctx.deps.db, ctx.user.id, callerOf(ctx), input, ctx.deps.pull));
 			// What was actually sent; the own ops left out go to the stdout
 			// line only (request_log has no column for them).
 			ctx.call.opsOut = result.ops.length;
-			if (input.deviceId !== undefined) ctx.call.opsSkippedOwn = skippedOwn;
+			if (input.ownThroughSeq !== undefined) ctx.call.opsSkippedOwn = skippedOwn;
 			return withFeatures(ctx, result);
 		}),
 		// Shares the pull bucket: it is the heaviest read there is. Audited
 		// because it hands out the whole library in one response.
-		bootstrap: authedProcedure.query(async ({ ctx }): Promise<BootstrapResult> => {
+		bootstrap: authedProcedure.input(ZBootstrapInput).query(async ({ ctx, input }): Promise<BootstrapResult> => {
+			readDevice(ctx, input?.deviceId);
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
-			const r = await bootstrap(ctx.deps.db, ctx.user.id);
+			const r = await auditedRead(ctx, 'sync.bootstrap', () => bootstrap(ctx.deps.db, ctx.user.id, callerOf(ctx), input ?? {}));
 			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes: Buffer.byteLength(r.snapshot, 'base64') });
 			return r;
 		}),
@@ -118,17 +146,17 @@ export const appRouter = router({
 	account: router({
 		registerDevice: authedProcedure.input(ZRegisterDeviceInput).mutation(async ({ ctx, input }): Promise<{ ok: true }> => {
 			try {
-				const r = await registerDevice(ctx.deps.db, ctx.user.id, input);
+				const r = await registerDevice(ctx.deps.db, ctx.user.id, input, callerOf(ctx));
 				ctx.call.audit('device_registered', { platform: input.platform, created: r.created }, { deviceId: input.deviceId });
 				return { ok: true };
 			} catch (e) {
-				if (e instanceof CloudError && e.reason === 'device_revoked') ctx.call.audit('device_reregister_refused', {}, { deviceId: input.deviceId });
+				if (e instanceof DeviceRevokedError) ctx.call.audit('device_reregister_refused', { via: e.via }, { deviceId: input.deviceId });
 				throw e;
 			}
 		}),
-		devices: authedProcedure.query(({ ctx }): Promise<DeviceInfo[]> => listDevices(ctx.deps.db, ctx.user.id)),
+		devices: authedProcedure.query(({ ctx }): Promise<DeviceInfo[]> => listDevices(ctx.deps.db, ctx.user.id, callerOf(ctx))),
 		revokeDevice: authedProcedure.input(z.object({ deviceId: ZDeviceId }).strict()).mutation(async ({ ctx, input }): Promise<{ ok: true }> => {
-			const r = await revokeDevice(ctx.deps.db, ctx.user.id, input.deviceId);
+			const r = await revokeDevice(ctx.deps.db, ctx.user.id, input.deviceId, callerOf(ctx));
 			ctx.call.audit('device_revoked', {}, { deviceId: input.deviceId });
 			return r;
 		}),
@@ -145,7 +173,7 @@ export const appRouter = router({
 			ctx.call.opsIn = input.audioHashes.length;
 			cataloguePolicy(ctx);
 			rateLimit(ctx, 'catalogue', `${ctx.user.id}:${input.deviceId}`);
-			const r = await lookup(ctx.deps.db, ctx.call.audit, ctx.user.id, input);
+			const r = await lookup(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input);
 			ctx.call.opsOut = r.items.length;
 			return r;
 		}),
@@ -154,7 +182,7 @@ export const appRouter = router({
 			ctx.call.opsIn = input.items.length;
 			const policy = cataloguePolicy(ctx);
 			rateLimit(ctx, 'catalogue', `${ctx.user.id}:${input.deviceId}`);
-			const r = await put(ctx.deps.db, ctx.call.audit, ctx.user.id, policy, input);
+			const r = await put(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), policy, input);
 			ctx.call.opsOut = r.accepted.length;
 			return r;
 		}),
@@ -162,7 +190,7 @@ export const appRouter = router({
 			ctx.call.deviceId = input.deviceId;
 			const policy = cataloguePolicy(ctx);
 			rateLimit(ctx, 'catalogue', `${ctx.user.id}:${input.deviceId}`);
-			const r = await inventory(ctx.deps.db, ctx.call.audit, ctx.user.id, policy, input);
+			const r = await inventory(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), policy, input);
 			ctx.call.opsOut = r.entries.length;
 			return r;
 		}),

@@ -121,7 +121,8 @@ export interface CatalogueLayerDeps {
 	raw: Raw;
 	transport: CatalogueTransport;
 	blobs: CatalogueBlobStore;
-	deviceId: string;
+	// Read per call: the sync client's unlink gives the install a new one.
+	deviceId: () => string;
 	// Root of the analyzer's `.cpk` tiers (`<peaksDir>/lo`, `<peaksDir>/hi`);
 	// null = no peaks on this device, so peaks never move.
 	peaksDir: string | null;
@@ -323,7 +324,8 @@ type HydratePlan = {
 };
 
 export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
-	const { db, raw, transport, blobs, deviceId, peaksDir } = deps;
+	const { db, raw, transport, blobs, peaksDir } = deps;
+	const deviceId = deps.deviceId;
 	const clog = deps.logger ?? log.for('catalogue');
 	const cfg = {
 		prepareTimeoutMs: deps.prepareTimeoutMs ?? DEFAULTS.prepareTimeoutMs,
@@ -531,7 +533,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				const out: LookupMap = new Map();
 				for (let i = 0; i < fresh.length; i += MAX_CATALOGUE_LOOKUP_HASHES) {
 					stats.lookups++;
-					const res = await transport.catalogue.lookup({ deviceId, audioHashes: fresh.slice(i, i + MAX_CATALOGUE_LOOKUP_HASHES), want });
+					const res = await transport.catalogue.lookup({ deviceId: deviceId(), audioHashes: fresh.slice(i, i + MAX_CATALOGUE_LOOKUP_HASHES), want });
 					for (const item of res.items) {
 						if (!keySet.has(keyId(item)) || !acceptable(item)) continue;
 						const list = out.get(item.audioHash) ?? [];
@@ -753,7 +755,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		let entries = 0;
 		let changed = 0;
 		for (;;) {
-			const res = await transport.catalogue.inventory({ deviceId, afterRev: after });
+			const res = await transport.catalogue.inventory({ deviceId: deviceId(), afterRev: after });
 			pages++;
 			policy = res.policy;
 			entitled = res.account.entitled;
@@ -1006,7 +1008,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		let res: CataloguePutResult;
 		try {
 			stats.puts++;
-			res = await transport.catalogue.put({ deviceId, items: batch.map((c) => c.item) });
+			res = await transport.catalogue.put({ deviceId: deviceId(), items: batch.map((c) => c.item) });
 		} catch (err) {
 			const f = classify(err);
 			if (f.kind === 'too_large' && batch.length > 1) {

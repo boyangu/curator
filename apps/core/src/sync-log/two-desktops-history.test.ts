@@ -274,6 +274,7 @@ describe('scenario 16 — offline divergence, and a device revoked mid-way', () 
 		const bId = await b.deviceId();
 		await a.transport.account.revokeDevice({ deviceId: bId });
 		const landedBefore = rig.cloud.log.filter((o) => o.device_id === bId).length;
+		const pushesBefore = rig.cloud.pushLog.filter((p) => p.deviceId === bId).length;
 
 		await b.svc.setRating(['trk-0'], 1);
 		await b.svc.addTrackTag('trk-1', 'interested');
@@ -282,22 +283,25 @@ describe('scenario 16 — offline divergence, and a device revoked mid-way', () 
 		// Held, not rejected: re-admitted, it would deliver them.
 		expect(s).toMatchObject({ rejected: 0 });
 		expect(s.pending).toBeGreaterThanOrEqual(2);
+		expect(s.revoked).toBe(true);
 		await b.svc.cloudSyncNow();
 		expect(rig.cloud.log.filter((o) => o.device_id === bId)).toHaveLength(landedBefore);
-		const after = rig.cloud.pushLog.filter((p) => p.deviceId === bId).slice(-2);
-		expect(after.length).toBeGreaterThan(0);
-		expect(after.every((p) => p.accepted === 0)).toBe(true);
+		// One refused push told it; after that it does not even try.
+		const after = rig.cloud.pushLog.filter((p) => p.deviceId === bId).slice(pushesBefore);
+		expect(after).toHaveLength(1);
+		expect(after[0]!.accepted).toBe(0);
 
 		// A carries on and never sees B's post-revocation edits.
 		await a.svc.setRating(['trk-2'], 3);
 		await a.sync();
 		expect(rating(a, 'trk-0')).toBe(5);
 		expect(a.one(`SELECT count(*) FROM track_tag WHERE track_id = 'trk-1' AND tag_id = 'interested'`)).toBe(0);
-		// The server would still serve B's pulls (it checks push only,
-		// apps/cloud sync/push.ts), but B's client ends the cycle at the
-		// held push (client.ts runOnce), so with edits pending it stops
-		// pulling too.
+		// B pulls nothing either: the server refuses a revoked device's reads
+		// ('device_reads', apps/cloud device-gate.ts), and B's client, once
+		// told, stops calling at all until it is unlinked (client.ts).
+		const pulls = rig.cloud.calls.pull;
 		await b.svc.cloudSyncNow();
+		expect(rig.cloud.calls.pull).toBe(pulls);
 		expect(rating(b, 'trk-2')).toBeNull();
 		expect(readCursor(b.raw).lastSeq).toBeLessThan(rig.cloud.maxSeq);
 		// Re-registering is refused: revocation is final.

@@ -87,8 +87,8 @@ describe('health with the catalogue switched', () => {
 			// Push and pull answer with the same list, so a client never sees
 			// the probe and a sync result disagree.
 			const { api, deviceId } = await off.signIn();
-			expect((await api.sync.push.mutate({ deviceId, ops: [] })).features).toEqual(['pull_skip_own']);
-			expect((await api.sync.pull.query({ afterSeq: 0 })).features).toEqual(['pull_skip_own']);
+			expect((await api.sync.push.mutate({ deviceId, ops: [] })).features).toEqual(['pull_skip_own', 'device_reads']);
+			expect((await api.sync.pull.query({ afterSeq: 0 })).features).toEqual(['pull_skip_own', 'device_reads']);
 		} finally {
 			await off.db.close();
 		}

@@ -20,7 +20,7 @@ import { runTidalSniffFlow } from './auth/tidal-sniff.js';
 import { getRedactedAgentConfig, saveAgentConfig } from './agent-config.js';
 import { disconnectGoogle, runGoogleConnectFlow } from './backup/google-auth.js';
 import { PENDING_RENDERER_SETTINGS_FILE } from '@curator/core';
-import type { AccountStatus, IpcChannels } from '../ipc.js';
+import type { AccountDevice, AccountStatus, IpcChannels } from '../ipc.js';
 import type { CloudTransport } from '@curator/core';
 import type { CloudAccount } from './cloud/account.js';
 import type { CoreSidecarHost } from './core-sidecar/host.js';
@@ -80,6 +80,13 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		configured: !!ctx.cloudAccount,
 		syncAvailable: !!ctx.cloudTransport,
 	});
+	// The account's devices with this install flagged; empty when sync is off
+	// or signed out. The current device id comes from core (unlink changes it).
+	const listAccountDevices = async (): Promise<AccountDevice[]> => {
+		if (!ctx.cloudTransport || !ctx.cloudAccount?.cloudSession()) return [];
+		const [devices, status] = await Promise.all([ctx.cloudTransport.account.devices(), svc.getCloudSyncStatus()]);
+		return devices.map((d) => ({ ...d, current: d.deviceId === status.deviceId }));
+	};
 
 	// Route a READ-ONLY channel through the core sidecar when it's enabled —
 	// these are the hot per-page lookups (track list, tag/playlist membership
@@ -488,14 +495,26 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'account:sign-in-password': async (email, password) => { await requireAccount().signInWithPassword(email, password); return accountStatus(); },
 		'account:sign-in-otp-request': async (email) => requireAccount().requestOtp(email),
 		'account:sign-in-otp-verify': async (email, code) => { await requireAccount().verifyOtp(email, code); return accountStatus(); },
-		'account:sign-out': async () => { await requireAccount().signOut(); return accountStatus(); },
-		'account:devices': async () => {
-			if (!ctx.cloudTransport || !ctx.cloudAccount?.cloudSession()) return [];
-			const [devices, status] = await Promise.all([ctx.cloudTransport.account.devices(), svc.getCloudSyncStatus()]);
-			return devices.map((d) => ({ ...d, current: d.deviceId === status.deviceId }));
+		// A revoked device's id is dead for good, so signing it out goes
+		// through the unlink (fresh id, same sign-out): otherwise the next
+		// sign-in would be refused all over again.
+		'account:sign-out': async () => {
+			const account = requireAccount();
+			if ((await svc.getCloudSyncStatus()).revoked) await svc.unlinkCloudLibrary();
+			else await account.signOut();
+			return accountStatus();
 		},
+		'account:devices': async () => listAccountDevices(),
+		'account:revoke-device': async (deviceId) => {
+			if (!ctx.cloudTransport || !ctx.cloudAccount?.cloudSession()) throw new Error('Sign in first.');
+			if (deviceId === (await svc.getCloudSyncStatus()).deviceId) throw new Error('This is this computer: use "Unlink this library" instead.');
+			await ctx.cloudTransport.account.revokeDevice({ deviceId });
+			return listAccountDevices();
+		},
+		'account:sign-out-others': async () => { await requireAccount().signOutOthers(); return { ok: true as const }; },
 		'cloud-sync:status': () => svc.getCloudSyncStatus(),
 		'cloud-sync:now': () => svc.cloudSyncNow(),
+		'cloud-sync:unlink': () => svc.unlinkCloudLibrary(),
 		'cloud-sync:get-poll-settings': () => svc.getCloudSyncPollSettings(),
 		'cloud-sync:set-poll-policy': (patch) => svc.setCloudSyncPollPolicy(patch),
 		'catalogue:status': () => svc.getCatalogueStatus(),

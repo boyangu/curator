@@ -347,15 +347,26 @@ describe('catalogue access', () => {
 		await s.api.account.revokeDevice.mutate({ deviceId: s.deviceId });
 		for (const call of calls(s.deviceId)) expect(await errorReason(call())).toMatchObject({ code: 'FORBIDDEN', reason: 'device_revoked' });
 		await app.audit.flush();
-		const events = await app.pg.query<{ detail: { procedure: string; reason: string } }>(
+		const events = await app.pg.query<{ detail: { procedure: string; reason: string; via: string } }>(
 			`select detail from curator.audit_event where user_id = $1 and kind = 'catalogue_rejected' order by id`,
 			[s.userId],
 		);
+		// Its session acted as the revoked device, so the session is what
+		// refuses first; a fresh sign-in naming the same device is refused by
+		// the device itself.
 		expect(events.rows.map((e) => e.detail)).toEqual([
-			{ procedure: 'lookup', reason: 'device_revoked' },
-			{ procedure: 'put', reason: 'device_revoked' },
-			{ procedure: 'inventory', reason: 'device_revoked' },
+			{ procedure: 'lookup', reason: 'device_revoked', via: 'session' },
+			{ procedure: 'put', reason: 'device_revoked', via: 'session' },
+			{ procedure: 'inventory', reason: 'device_revoked', via: 'session' },
 		]);
+		const fresh = app.client(await app.sign(s.userId, { sessionId: 'a later sign-in' }));
+		expect(await errorReason(fresh.catalogue.inventory.query({ deviceId: s.deviceId, afterRev: 0 }))).toMatchObject({ code: 'FORBIDDEN', reason: 'device_revoked' });
+		await app.audit.flush();
+		const last = await app.pg.query<{ detail: unknown }>(
+			`select detail from curator.audit_event where user_id = $1 and kind = 'catalogue_rejected' order by id desc limit 1`,
+			[s.userId],
+		);
+		expect(last.rows[0]!.detail).toEqual({ procedure: 'inventory', reason: 'device_revoked', via: 'device' });
 	});
 
 	it('answers catalogue_disabled on a server without a policy', async () => {

@@ -35,6 +35,7 @@ import { rawOf } from './artists.js';
 import { appendRows, planReorderKeys, recomputePositions, type MemberDraft } from './playlist-order.js';
 import { captureEmitted, emitOps, type EmitOp } from '../sync-log/outbox.js';
 import {
+	claimOp,
 	cueDeleteOp,
 	cueDiffOps,
 	cueUpsertOp,
@@ -49,6 +50,7 @@ import {
 	trackStateOps,
 	trackTagOp,
 	type CueRow,
+	type RecordingClaim,
 	type TrackStateRow,
 	playlistCreateOps,
 	pinnedCreateOp,
@@ -295,23 +297,12 @@ export function emitHardDelete(db: Db, trackIds: readonly string[]): void {
 }
 
 // A new library row (scanner, streaming ingest): its existence plus the
-// claims the catalogue resolver will read (design: `recording_claim`).
-export type Claim = { kind: 'isrc' | 'audio_hash' | 'fingerprint' | 'spotify' | 'tidal' | 'beatport'; value: string; confidence?: number; durationSec?: number };
+// claims the identity resolver (sync-log/identity.ts) and the catalogue read
+// (design: `recording_claim`).
+export type Claim = RecordingClaim;
 
 function claimOps(recordingId: string, claims: readonly Claim[]): EmitOp[] {
-	return claims
-		.filter((c) => c.value)
-		.map((c) => ({
-			entity: 'recording_claim' as const,
-			entity_id: recordingId,
-			kind: 'add' as const,
-			payload: {
-				kind: c.kind,
-				value: c.value,
-				confidence: c.confidence ?? 1,
-				...(c.durationSec !== undefined ? { duration_sec: Math.max(0, Math.round(c.durationSec)) } : {}),
-			},
-		}));
+	return claims.map((c) => claimOp(recordingId, c)).filter((op): op is NonNullable<typeof op> => op !== null);
 }
 
 export function recordTrackCreated(db: Db, trackId: string, claims: readonly Claim[], addedAt: Date = new Date()): void {

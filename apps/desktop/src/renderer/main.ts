@@ -138,6 +138,7 @@ import { wireDataEvents } from './data/events.js';
 import { log, installGlobalErrorCapture } from './data/log.js';
 import { backupApi, cloudSyncApi } from './data/api.js';
 import { initBackupSettingsFeature } from './features/backupSettings.js';
+import { initAccountSettingsFeature } from './features/accountSettings.js';
 import { initSettingsFeature, handleSettingsTabActivate, handleSettingsClose, renderSettingsConnections, renderSettingsPlayer, pushAllSourceSyncSettingsToCore, hydrateCreditFormatFromCore, getSourceSyncSettings, loadRekordboxSettings, startRekordboxImport } from './features/settings.js';
 import { initUiSettingsFeature, tagCountsSignal, setTagCountsSignal, visibleSourceTabsMemo, visibleStateTabsMemo, applyActiveTabFallback, uiSettingsSignal, updateUiSettings } from './features/uiSettings.js';
 import { setSimilarityRefTrack, similaritySettingsSignal } from './features/similarity.js';
@@ -5215,6 +5216,12 @@ async function boot(): Promise<void> {
 		}),
 		openRestore: (snapshot) => { backupRestoreDialog?.open(snapshot); },
 		reopenProgress: () => backupProgressDialog?.reopen() ?? false,
+	});
+	initAccountSettingsFeature({
+		confirm: (opts) => new Promise((resolve) => {
+			if (!confirmDialog) { resolve(false); return; }
+			confirmDialog.open({ ...opts, onConfirm: () => resolve(true), onCancel: () => resolve(false) });
+		}),
 	});
 
 	// MergeTracksDialog — the Edit Track save flow's "already linked" offer.

@@ -29,6 +29,8 @@ export type AppDeps = {
 	// The catalogue units this server accepts (src/catalogue/policy.ts), or
 	// null: catalogue off, procedures refuse, 'catalogue' not advertised.
 	catalogue: CataloguePolicy | null;
+	// Refuse reads that name no device (config.ts `requireDeviceId`).
+	requireDeviceId: boolean;
 };
 
 export type AppContext = {

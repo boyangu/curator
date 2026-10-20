@@ -29,14 +29,19 @@ describe('account devices', () => {
 		expect(devices.find((d) => d.deviceId === 'phone')!.revokedAt).toBe(revokedAt);
 	});
 
-	it('does not let a revoked device re-register its way back', async () => {
-		const { deviceId, api } = await app.signIn();
+	it('does not let a revoked device re-register its way back, even from a new sign-in', async () => {
+		const { userId, deviceId, api } = await app.signIn();
 		await api.account.revokeDevice.mutate({ deviceId });
 		expect(await errorReason(api.account.registerDevice.mutate({ deviceId, name: 'again', platform: 'win32' }))).toMatchObject({
 			code: 'FORBIDDEN',
 			reason: 'device_revoked',
 		});
-		expect((await api.account.devices.query())[0]!.revokedAt).not.toBeNull();
+		const fresh = app.client(await app.sign(userId, { sessionId: 'a later sign-in' }));
+		expect(await errorReason(fresh.account.registerDevice.mutate({ deviceId, name: 'again', platform: 'win32' }))).toMatchObject({
+			code: 'FORBIDDEN',
+			reason: 'device_revoked',
+		});
+		expect((await fresh.account.devices.query())[0]!.revokedAt).not.toBeNull();
 	});
 
 	it('answers NOT_FOUND for an unknown device and BAD_REQUEST for bad input', async () => {

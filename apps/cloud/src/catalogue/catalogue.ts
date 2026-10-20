@@ -40,21 +40,11 @@ import type { AuditEmit } from '../audit.js';
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
+import { DeviceRevokedError, gateDevice, type Caller } from '../account/device-gate.js';
 import { hasUnstorableText } from '../sync/push.js';
 
 // ── shared ──────────────────────────────────────────────────────────────────
 
-// Lookups and inventories only read, so the device check is a select: no
-// `last_seen_at` write on a read path that a hydrating device calls every
-// few seconds. Push keeps the device list's "last seen" current.
-async function assertDevice(tx: Queryable, deviceId: string): Promise<void> {
-	const [d] = await tx.query<{ revoked: boolean }>(
-		`select revoked_at is not null as revoked from curator.device where user_id = (select auth.uid()) and device_id = $1`,
-		[deviceId],
-	);
-	if (!d) throw new CloudError('PRECONDITION_FAILED', 'device_not_registered');
-	if (d.revoked) throw new CloudError('FORBIDDEN', 'device_revoked');
-}
 
 async function readAccount(tx: Queryable): Promise<CatalogueAccount> {
 	const [a] = await tx.query<{ entitled: boolean; quota: unknown }>(
@@ -66,25 +56,29 @@ async function readAccount(tx: Queryable): Promise<CatalogueAccount> {
 	return { entitled: a?.entitled ?? false, quotaBytes: a ? num(a.quota) : 0, usedBytes: num(u!.used) };
 }
 
-// A revoked device is told so per call; the audit row is what an incident
-// review greps for.
+// The device gate (account/device-gate.ts) as a select plus, on a session's
+// first call, one binding row: no `last_seen_at` write on a read path that
+// a hydrating device calls every few seconds. Push keeps the device list's
+// "last seen" current. A revoked device, or a session acting as one, is
+// told so per call; the audit row (with `via`: which of the two it was) is
+// what an incident review greps for.
 async function withDevice<T>(
 	db: Db,
 	audit: AuditEmit,
 	userId: string,
+	caller: Caller,
 	procedure: 'lookup' | 'put' | 'inventory',
 	deviceId: string,
 	fn: (tx: Queryable) => Promise<T>,
 ): Promise<T> {
 	try {
 		return await withUserTx(db, userId, async (tx) => {
-			await assertDevice(tx, deviceId);
+			await gateDevice(tx, caller, deviceId);
 			return fn(tx);
 		});
 	} catch (e) {
-		if (e instanceof CloudError && (e.reason === 'device_revoked' || e.reason === 'catalogue_not_entitled')) {
-			audit('catalogue_rejected', { procedure, reason: e.reason });
-		}
+		if (e instanceof DeviceRevokedError) audit('catalogue_rejected', { procedure, reason: e.reason, via: e.via });
+		else if (e instanceof CloudError && e.reason === 'catalogue_not_entitled') audit('catalogue_rejected', { procedure, reason: e.reason });
 		throw e;
 	}
 }
@@ -127,8 +121,8 @@ type ItemRow = {
 	updated_at: unknown;
 };
 
-export async function lookup(db: Db, audit: AuditEmit, userId: string, input: CatalogueLookupInput): Promise<CatalogueLookupResult> {
-	return withDevice(db, audit, userId, 'lookup', input.deviceId, async (tx) => {
+export async function lookup(db: Db, audit: AuditEmit, userId: string, caller: Caller, input: CatalogueLookupInput): Promise<CatalogueLookupResult> {
+	return withDevice(db, audit, userId, caller, 'lookup', input.deviceId, async (tx) => {
 		const want = input.want.map((w) => ({
 			unit: w.unit,
 			variant: w.variant ?? null,
@@ -246,13 +240,13 @@ export function validatePut(userId: string, policy: CataloguePolicy, items: read
 type ExistingRow = { audio_hash: string; unit: string; variant: string; version: string; bytes: unknown; blob_paths: string };
 const asPaths = (v: string): string[] => JSON.parse(v) as string[];
 
-export async function put(db: Db, audit: AuditEmit, userId: string, policy: CataloguePolicy, call: PutCall): Promise<CataloguePutResult> {
+export async function put(db: Db, audit: AuditEmit, userId: string, caller: Caller, policy: CataloguePolicy, call: PutCall): Promise<CataloguePutResult> {
 	// Caps (validatePut checks them first) and shapes, before a connection
 	// is even taken.
 	const uid = userId.toLowerCase();
 	const { candidates, rejected } = validatePut(uid, policy, call.items);
 
-	const result = await withDevice(db, audit, userId, 'put', call.deviceId, async (tx): Promise<CataloguePutResult> => {
+	const result = await withDevice(db, audit, userId, caller, 'put', call.deviceId, async (tx): Promise<CataloguePutResult> => {
 		// Serialise one user's puts: rev order then equals commit order, so an
 		// inventory cursor never passes a rev a slower put has yet to commit,
 		// and the usage, versions and retention read below stay true until
@@ -431,11 +425,12 @@ export async function inventory(
 	db: Db,
 	audit: AuditEmit,
 	userId: string,
+	caller: Caller,
 	policy: CataloguePolicy,
 	input: CatalogueInventoryInput,
 ): Promise<CatalogueInventoryResult> {
 	const limit = Math.min(input.limit ?? MAX_CATALOGUE_INVENTORY, MAX_CATALOGUE_INVENTORY);
-	return withDevice(db, audit, userId, 'inventory', input.deviceId, async (tx) => {
+	return withDevice(db, audit, userId, caller, 'inventory', input.deviceId, async (tx) => {
 		const rows = await tx.query<{
 			audio_hash: string;
 			unit: CatalogueUnit;

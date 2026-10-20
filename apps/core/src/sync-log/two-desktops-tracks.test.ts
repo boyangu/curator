@@ -196,8 +196,7 @@ describe('scenario 8 — a track deleted on A while B still has its file: B\'s s
 	// copy when the delete arrived, and the file turns up later in a newly
 	// added folder. Only the recording's audio-hash claim ties the file to
 	// the deleted row: A's scanner matched its copy to the recording and
-	// pushed the claim (the initial push carries no claims for files a
-	// pre-op-log library already held; see initial-push.ts).
+	// pushed the claim.
 	it('the file first appears on B after the delete (known only by the recording\'s audio-hash claim)', async () => {
 		const named = (raw: Database.Database) => { raw.prepare(`UPDATE track SET title = 'Song', artists = '[{"name":"Someone"}]' WHERE id = ?`).run(LOC); };
 		const a = await rig.desktop('a', { catalogue: [...TRACKS, LOC], parseAudio: flacParse, seed: named });

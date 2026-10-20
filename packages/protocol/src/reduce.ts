@@ -346,18 +346,47 @@ function applyArtistAlias(state: LibraryState, op: OpOf<'artist_alias'>, clock: 
 // Rebuilds the flattened alias map from the per-loser merge records. Latest
 // merge first, so when two devices merged the same pair in opposite
 // directions the later op's direction stands and the earlier one, which
-// would now close a cycle, is skipped. Chains are flattened as they are
-// inserted so every lookup is one hop.
+// would now close a cycle, is skipped. Built as parent pointers resolved to
+// their roots (union-find with path compression), then flattened so every
+// lookup is one hop: O(M log M) for the sort. It used to re-point every
+// alias on each insert, O(M²) per rebuild and so O(M³) over a log, which
+// was fine for hand merges and is not for the identity resolver, which can
+// emit one merge per file a second desktop shares with the first.
 function rebuildAlias(state: LibraryState): void {
 	const entries = [...state.merges.entries()].filter(([, m]) => m.winner !== null).sort((a, b) => -compareClock(a[1].clock, b[1].clock));
-	const alias = new Map<string, string>();
+	const parent = new Map<string, string>();
+	const root = (x: string): string => {
+		let r = x;
+		for (let next = parent.get(r); next !== undefined; next = parent.get(r)) r = next;
+		for (let c = x; c !== r;) { const next = parent.get(c)!; parent.set(c, r); c = next; }
+		return r;
+	};
 	for (const [loser, m] of entries) {
-		const winner = alias.get(m.winner!) ?? m.winner!;
+		const winner = root(m.winner!);
 		if (winner === loser) continue;
-		alias.set(loser, winner);
-		for (const [l, w] of alias) if (w === loser) alias.set(l, winner);
+		parent.set(loser, winner);
 	}
+	const alias = new Map<string, string>();
+	for (const loser of parent.keys()) alias.set(loser, root(loser));
 	state.recordingAlias = alias;
+}
+
+// The common case without the rebuild: a merge newer than every merge on
+// record, for a loser with no record of its own. The rebuild would process
+// it first, before every older merge; that gives the same roots as adding
+// it last, unless its winner already resolves to its loser (then the older
+// merges that close that cycle are the ones the rebuild skips, so it must
+// run). Returns false when the rebuild is needed.
+function extendAlias(state: LibraryState, loser: string, winner: string, clock: Clock): boolean {
+	for (const [l, m] of state.merges) {
+		if (l !== loser && compareClock(m.clock, clock) >= 0) return false;
+	}
+	const target = state.recordingAlias.get(winner) ?? winner;
+	if (target === loser) return false;
+	const alias = state.recordingAlias;
+	for (const [l, w] of alias) if (w === loser) alias.set(l, target);
+	alias.set(loser, target);
+	return true;
 }
 
 // Moves every row of `loser` onto `winner`. Every rule here must give the same
@@ -461,7 +490,7 @@ function applyRecording(state: LibraryState, op: OpOf<'recording'>, clock: Clock
 	const cur = state.merges.get(loser);
 	if (cur && compareClock(cur.clock, clock) >= 0) return [];
 	state.merges.set(loser, { winner: op.kind === 'merge' ? op.payload.winner : null, clock });
-	rebuildAlias(state);
+	if (cur || op.kind !== 'merge' || !extendAlias(state, loser, op.payload.winner, clock)) rebuildAlias(state);
 	const changed: EntityRef[] = [ref('recording', loser), ref('recording', op.payload.winner)];
 	const target = state.recordingAlias.get(loser);
 	// A split withdraws the alias only; rows already folded stay where they

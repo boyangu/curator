@@ -5,9 +5,11 @@
 // a client_ts clamp far in the future, materialisation with the protocol
 // reducer, a `snapshotSeq` hint for a far-behind cursor, the 'pull_skip_own'
 // feature (or, with `legacy`, a server from before it, strict about its pull
-// input), device revocation (a revoked device's pushes come back
-// `device_revoked` op by op and it cannot re-register; pull is not checked,
-// as on the real server) and injectable transport failures, globally or per
+// input), device revocation as the real server has it since 'device_reads'
+// (a revoked device's pushes come back `device_revoked` op by op, its pulls
+// and bootstraps are refused, and it cannot re-register; each transport is
+// one session, judged by the device it last acted as, so leaving the device
+// id out does not help) and injectable transport failures, globally or per
 // device (`online`).
 //
 // Nothing here leaves the process.
@@ -22,6 +24,7 @@ import {
 	safeParseOp,
 	schemaVersionStatus,
 	serializeLibraryState,
+	type BootstrapInput,
 	type DeviceInfo,
 	type Op,
 	type PullInput,
@@ -136,8 +139,8 @@ export class FakeCloud {
 		this.pullInputs.push({ ...input });
 		const f = this.fail.pull.shift();
 		if (f) throw f;
-		const skip = input.deviceId !== undefined || input.ownThroughSeq !== undefined;
-		if (skip && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
+		if ((input.deviceId !== undefined || input.ownThroughSeq !== undefined) && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
+		const skip = input.ownThroughSeq !== undefined;
 		const features = this.legacy ? {} : { features: [...SYNC_FEATURES] };
 		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq, ...features };
 		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
@@ -165,18 +168,40 @@ export class FakeCloud {
 	transport(userId: string, email = `${userId}@example.test`): FakeTransport {
 		const cloud = this;
 		const offline = (): void => { if (!t.online) throw new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'); };
+		// The device this session last acted as (apps/cloud device-gate.ts).
+		let actsAs: string | null = null;
+		const revokedSession = (): boolean => actsAs !== null && cloud.isRevoked(actsAs);
+		// A read: refused for a revoked session or a revoked device named.
+		const gateRead = (deviceId: string | undefined): void => {
+			if (revokedSession() || (deviceId !== undefined && cloud.isRevoked(deviceId))) throw new CloudTransportError('device_revoked', 'device_revoked');
+			if (deviceId !== undefined && cloud.devices.has(deviceId)) actsAs = deviceId;
+		};
 		const t: FakeTransport = {
 			signedIn: true,
 			online: true,
 			session: () => (t.signedIn ? { userId, email } : null),
+			// The next sign-in is a new session, bound to nothing yet.
+			signOut: async () => { t.signedIn = false; actsAs = null; },
 			sync: {
-				push: async (input: PushInput) => { offline(); return cloud.push(userId, input); },
-				pull: async (input: PullInput) => { offline(); return cloud.pull(input); },
+				push: async (input: PushInput) => {
+					offline();
+					if (revokedSession()) return cloud.push(userId, { ...input, deviceId: actsAs! });
+					const r = cloud.push(userId, input);
+					if (!cloud.isRevoked(input.deviceId) && cloud.devices.has(input.deviceId)) actsAs = input.deviceId;
+					return r;
+				},
+				pull: async (input: PullInput) => {
+					offline();
+					// A refused pull still reached the server: counted.
+					if (!cloud.legacy) try { gateRead(input.deviceId); } catch (e) { cloud.calls.pull++; throw e; }
+					return cloud.pull(input);
+				},
 			},
 			// The protocol's serialised state (gzip + base64 are the HTTP
 			// transport's), decoded by the same function that transport uses.
-			bootstrap: async () => {
+			bootstrap: async (input?: BootstrapInput) => {
 				offline();
+				if (!cloud.legacy) gateRead(input?.deviceId);
 				cloud.calls.bootstrap++;
 				if (!cloud.snapshot) return { snapshotSeq: 0, records: [] };
 				return { snapshotSeq: cloud.snapshot.seq, records: decodeLibraryStateSnapshot(cloud.snapshot.json) };
@@ -185,13 +210,23 @@ export class FakeCloud {
 				registerDevice: async (input: { deviceId: string; name: string; platform: DeviceInfo['platform'] }) => {
 					offline();
 					cloud.calls.register++;
-					// Revocation is final (apps/cloud account/devices.ts).
-					if (cloud.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+					// Revocation is final (apps/cloud account/devices.ts), and a
+					// session that acted as a revoked device cannot mint another.
+					if (revokedSession() || cloud.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
 					cloud.devices.set(input.deviceId, { ...input, registeredAt: Date.now(), lastSeenAt: null, revokedAt: null });
+					actsAs = input.deviceId;
 					return { ok: true as const };
 				},
-				devices: async () => [...cloud.devices.values()],
-				revokeDevice: async (input: { deviceId: string }) => { cloud.revoke(input.deviceId); return { ok: true as const }; },
+				devices: async () => {
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return [...cloud.devices.values()];
+				},
+				revokeDevice: async (input: { deviceId: string }) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					cloud.revoke(input.deviceId);
+					return { ok: true as const };
+				},
 			},
 		};
 		return t;

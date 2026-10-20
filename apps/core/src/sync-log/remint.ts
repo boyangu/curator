@@ -38,6 +38,11 @@
 // boot that finds it already applied does nothing. The desktop calls this on
 // every boot while the restore's record (restore-applied.json) exists, so a
 // crash between the file swap and this step is caught on the next launch.
+//
+// The same swap, without the restore record, is how the sync client detaches
+// this install from its account (client.ts `unlink`, after a revoke or on
+// "Unlink"): a revoked device id is refused for good, so coming back needs a
+// new one, and everything above holds for it unchanged.
 
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
@@ -79,49 +84,64 @@ function writeSetting(raw: Raw, key: string, value: unknown): void {
 
 type OutboxRow = { op_id: string; device_id: string; client_ts: number; schema_version: number; entity: string; entity_id: string; kind: string; payload: string };
 
+// The swap itself: a fresh device id, the pending outbox re-stamped to it,
+// the clock re-derived, registration and the own-op bound reset (header).
+// Call inside a transaction.
+function swapIdentity(raw: Raw, oldDeviceId: string | null): RemintResult {
+	const newDeviceId = randomUUID();
+	writeSetting(raw, DEVICE_ID_KEY, newDeviceId);
+
+	let restamped = 0;
+	const rows = raw.prepare(`SELECT op_id, device_id, client_ts, schema_version, entity, entity_id, kind, payload
+		FROM sync_outbox WHERE state = 'pending' AND device_id != ? ORDER BY seq_local`).all(newDeviceId) as OutboxRow[];
+	const setDevice = raw.prepare(`UPDATE sync_outbox SET device_id = ? WHERE op_id = ?`);
+	for (let i = 0; i < rows.length; i += CHUNK) {
+		const slice = rows.slice(i, i + CHUNK);
+		const ops: Op[] = slice.map((r) => parseOp({
+			op_id: r.op_id, device_id: r.device_id, client_ts: r.client_ts, schema_version: r.schema_version,
+			entity: r.entity, entity_id: r.entity_id, kind: r.kind, payload: JSON.parse(r.payload),
+		}));
+		const store = new SyncStateStore(raw);
+		store.prefetch(ops);
+		for (const op of ops) store.touch(op);
+		store.reassignDevice(new Set(ops.map((o) => o.op_id)), newDeviceId);
+		store.flush();
+		for (const r of slice) setDevice.run(newDeviceId, r.op_id);
+		restamped += slice.length;
+	}
+
+	raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLOCK_KEY);
+
+	const client = readSetting(raw, CLIENT_STATE_KEY);
+	if (client && typeof client === 'object') {
+		writeSetting(raw, CLIENT_STATE_KEY, { ...(client as Record<string, unknown>), registeredFor: null, ownThroughSeq: 0 });
+	}
+	return { reminted: true, oldDeviceId, newDeviceId, restamped };
+}
+
+function currentDeviceId(raw: Raw): string | null {
+	const current = readSetting(raw, DEVICE_ID_KEY);
+	return typeof current === 'string' && current ? current : null;
+}
+
 // `restoreId` names the restore (snapshot id + apply time), so the same
 // restore never re-mints twice and a later restore always does.
 export function remintDeviceIdentity(raw: Raw, restoreId: string): RemintResult {
 	return raw.transaction((): RemintResult => {
-		const current = readSetting(raw, DEVICE_ID_KEY);
-		const oldDeviceId = typeof current === 'string' && current ? current : null;
+		const oldDeviceId = currentDeviceId(raw);
 		const mark = readSetting(raw, RESTORE_REMINT_KEY) as { restoreId?: unknown } | undefined;
 		if (mark?.restoreId === restoreId && oldDeviceId) {
 			return { reminted: false, oldDeviceId, newDeviceId: oldDeviceId, restamped: 0 };
 		}
-
-		const newDeviceId = randomUUID();
-		writeSetting(raw, DEVICE_ID_KEY, newDeviceId);
-
-		let restamped = 0;
-		const rows = raw.prepare(`SELECT op_id, device_id, client_ts, schema_version, entity, entity_id, kind, payload
-			FROM sync_outbox WHERE state = 'pending' AND device_id != ? ORDER BY seq_local`).all(newDeviceId) as OutboxRow[];
-		const setDevice = raw.prepare(`UPDATE sync_outbox SET device_id = ? WHERE op_id = ?`);
-		for (let i = 0; i < rows.length; i += CHUNK) {
-			const slice = rows.slice(i, i + CHUNK);
-			const ops: Op[] = slice.map((r) => parseOp({
-				op_id: r.op_id, device_id: r.device_id, client_ts: r.client_ts, schema_version: r.schema_version,
-				entity: r.entity, entity_id: r.entity_id, kind: r.kind, payload: JSON.parse(r.payload),
-			}));
-			const store = new SyncStateStore(raw);
-			store.prefetch(ops);
-			for (const op of ops) store.touch(op);
-			store.reassignDevice(new Set(ops.map((o) => o.op_id)), newDeviceId);
-			store.flush();
-			for (const r of slice) setDevice.run(newDeviceId, r.op_id);
-			restamped += slice.length;
-		}
-
-		raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLOCK_KEY);
-
-		const client = readSetting(raw, CLIENT_STATE_KEY);
-		if (client && typeof client === 'object') {
-			writeSetting(raw, CLIENT_STATE_KEY, { ...(client as Record<string, unknown>), registeredFor: null, ownThroughSeq: 0 });
-		}
-
-		writeSetting(raw, RESTORE_REMINT_KEY, { restoreId, oldDeviceId, newDeviceId, at: Date.now() });
-		return { reminted: true, oldDeviceId, newDeviceId, restamped };
+		const r = swapIdentity(raw, oldDeviceId);
+		writeSetting(raw, RESTORE_REMINT_KEY, { restoreId, oldDeviceId, newDeviceId: r.newDeviceId, at: Date.now() });
+		return r;
 	})();
+}
+
+// Unconditionally, for the sync client's detach (header).
+export function remintDeviceForDetach(raw: Raw): RemintResult {
+	return raw.transaction((): RemintResult => swapIdentity(raw, currentDeviceId(raw)))();
 }
 
 // For the desktop main, which holds a path, not a handle, at boot.

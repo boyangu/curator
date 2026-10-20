@@ -23,20 +23,33 @@
 -- The API never touches Storage objects itself; catalogue.put only reads storage.objects under
 -- the caller's RLS to check that each named object exists with the stated size.
 --
+-- A revoked device: every policy also requires `not curator.session_revoked()` (0006), so a
+-- session the API has bound to a revoked device can no longer list, read, upload or delete here
+-- either. Storage requests carry the device's own JWT, whose `session_id` claim is what that
+-- function looks up; the device id never reaches Storage. Two limits, accepted: a session the
+-- API never saw (no call since 0006 shipped) is not bound and still passes, and an access token
+-- already issued stays valid until it expires (≤ 1 h) even after "sign out other sessions"
+-- revokes its refresh token, which is why that action ends the session for good and this check
+-- is the part that takes effect at once.
+--
 -- ── If the SQL editor refuses this file ─────────────────────────────────────────────────────
 -- Supabase owns the `storage` schema; if `postgres` may not create policies on storage.objects
 -- in your project (error 42501, "must be owner of table objects"), make the same thing in the
--- dashboard instead, and run only the curator.catalogue_upload_allowed() function below:
+-- dashboard instead (editing the three existing policies when they are already there), and run
+-- only the curator.catalogue_upload_allowed() function below:
 --
 --   1. Storage → New bucket: name `catalogue`, Public OFF, "Restrict file upload size" 16 MB,
 --      "Allowed MIME types" application/octet-stream.
 --   2. Storage → Policies → `catalogue` → New policy → "For full customization", three times,
 --      each "Target roles: authenticated":
 --        SELECT  using:      bucket_id = 'catalogue' and (storage.foldername(name))[1] = (select auth.uid())::text
+--                              and not (select curator.session_revoked())
 --        INSERT  with check: bucket_id = 'catalogue' and (storage.foldername(name))[1] = (select auth.uid())::text
 --                              and name ~ ('^' || (select auth.uid())::text || '/(peaks/[0-9a-f]{64}\.cpk|vec/[0-9a-f]{64}\.cvec)$')
 --                              and (select curator.catalogue_upload_allowed())
+--                              and not (select curator.session_revoked())
 --        DELETE  using:      bucket_id = 'catalogue' and (storage.foldername(name))[1] = (select auth.uid())::text
+--                              and not (select curator.session_revoked())
 --      No UPDATE policy.
 --   3. Check: `select policyname, cmd from pg_policies where tablename = 'objects' and policyname
 --      like 'curator_catalogue%'` lists the three (dashboard names differ; check cmd + qual).
@@ -79,7 +92,11 @@ grant execute on function curator.catalogue_upload_allowed() to authenticated;
 drop policy if exists curator_catalogue_select on storage.objects;
 create policy curator_catalogue_select on storage.objects
 	for select to authenticated
-	using (bucket_id = 'catalogue' and (storage.foldername(name))[1] = (select auth.uid())::text);
+	using (
+		bucket_id = 'catalogue'
+		and (storage.foldername(name))[1] = (select auth.uid())::text
+		and not (select curator.session_revoked())
+	);
 
 drop policy if exists curator_catalogue_insert on storage.objects;
 create policy curator_catalogue_insert on storage.objects
@@ -89,9 +106,14 @@ create policy curator_catalogue_insert on storage.objects
 		and (storage.foldername(name))[1] = (select auth.uid())::text
 		and name ~ ('^' || (select auth.uid())::text || '/(peaks/[0-9a-f]{64}\.cpk|vec/[0-9a-f]{64}\.cvec)$')
 		and (select curator.catalogue_upload_allowed())
+		and not (select curator.session_revoked())
 	);
 
 drop policy if exists curator_catalogue_delete on storage.objects;
 create policy curator_catalogue_delete on storage.objects
 	for delete to authenticated
-	using (bucket_id = 'catalogue' and (storage.foldername(name))[1] = (select auth.uid())::text);
+	using (
+		bucket_id = 'catalogue'
+		and (storage.foldername(name))[1] = (select auth.uid())::text
+		and not (select curator.session_revoked())
+	);

@@ -33,6 +33,7 @@ function stubTransport(): StubTransport {
 	return {
 		calls,
 		session: () => ({ userId: 'user-1', email: null }),
+		signOut: async () => { /* not exercised */ },
 		sync: {
 			push: async (input: PushInput) => { calls.push++; return { accepted: input.ops.length, maxSeq: 0, rejected: [] }; },
 			pull: async (input: PullInput) => { calls.pull++; return { ops: [], nextSeq: input.afterSeq }; },

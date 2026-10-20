@@ -27,6 +27,11 @@
 //     hold) and reports `needsUpdate`; local reads keep working.
 //   - A library is bound to the first account that syncs it. Signing in as
 //     someone else does not merge two people's libraries; it reports an error.
+//   - Reads name the device when the server offers 'device_reads'. A
+//     `device_revoked` answer on anything (push, pull, bootstrap,
+//     registration) is final for this device id: the client records it and
+//     stops pushing AND pulling — no further calls — until `unlink` detaches
+//     the install (a fresh device id, signed out; local data untouched).
 //
 // The transport is a port: the desktop main injects an HTTP/tRPC transport
 // holding the Supabase session; tests inject an in-memory fake server.
@@ -43,6 +48,7 @@ import {
 	type DevicePlatform,
 	type EntityRef,
 	type Op,
+	type BootstrapInput,
 	type PullInput,
 	type PullResult,
 	type RejectReason,
@@ -54,9 +60,11 @@ import { log } from '../log.js';
 import { artistCreditRewritePending, drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
 import { applyOps, INITIAL_PUSH_KEY, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
 import { getDeviceId } from './device.js';
-import { initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushProgress } from './initial-push.js';
-import { observeServerTs, onOutboxAppend } from './outbox.js';
+import { claimsBackfillAsync, claimsBackfillPending, initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushAsyncResult, type InitialPushProgress } from './initial-push.js';
+import { resolveRecordingIdentitiesAsync } from './identity.js';
+import { CLOCK_KEY, observeServerTs, onOutboxAppend } from './outbox.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
+import { remintDeviceForDetach } from './remint.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
 
 type Raw = Database.Database;
@@ -73,8 +81,12 @@ export type CloudSession = { userId: string; email: string | null };
 export interface CloudTransport {
 	sync: Pick<CloudService['sync'], 'push' | 'pull'>;
 	account: CloudService['account'];
-	bootstrap(): Promise<{ snapshotSeq: number; records: readonly SnapshotRecord[] }>;
+	bootstrap(input?: BootstrapInput): Promise<{ snapshotSeq: number; records: readonly SnapshotRecord[] }>;
 	session(): CloudSession | null;
+	// Ends this install's session (Supabase scope 'local'; other devices stay
+	// signed in). `unlink` calls it so the detached library cannot re-bind on
+	// the next wake-up.
+	signOut(): Promise<void>;
 	// The shared analysis catalogue's procedures (apps/core/src/catalogue/).
 	// Optional: without them (or without a blob store beside them) the
 	// catalogue layer is simply not built.
@@ -114,6 +126,12 @@ export type CloudSyncStatus = {
 	lastSeq: number;
 	lastError: string | null;
 	needsUpdate: boolean;
+	// This device was revoked from the account: nothing is pushed or pulled
+	// until it is unlinked (signed out under a fresh device id).
+	revoked: boolean;
+	// The account this library's sync history belongs to (null until the
+	// first sign-in syncs it). Unlink keeps it: see `unlink`.
+	boundUserId: string | null;
 	initialPushDone: boolean;
 	// Set while the first-sign-in push of the existing library runs.
 	initialPush: InitialPushProgress | null;
@@ -172,6 +190,10 @@ export type SyncClientOptions = {
 };
 
 export type PushOutcome = { pushed: number; rejected: number; more: boolean; stopped: 'update_required' | 'device_revoked' | null };
+// What `unlink` did. `revokedOnServer` is false when the device was already
+// revoked, never registered, or the server could not be reached (then it
+// stays listed until another computer revokes it).
+export type UnlinkOutcome = { revokedOnServer: boolean; signedOut: boolean; oldDeviceId: string | null; newDeviceId: string; restamped: number };
 // `received`: ops the server sent; `applied`: how many changed local state
 // (own echoes and already-seen ops are skipped).
 export type PullOutcome = { applied: number; received: number; pages: number; bootstrapped: boolean; stopped: 'ahead' | 'unreadable' | null };
@@ -200,9 +222,22 @@ export interface SyncClient {
 	stop(): void;
 	status(): CloudSyncStatus;
 	// The server's optional features as last answered on a push or pull
-	// (null until the first answer this session). The catalogue layer reads
-	// 'catalogue' here rather than probing the server itself.
+	// (null until the first answer this session, and while revoked). The
+	// catalogue layer reads 'catalogue' here rather than probing the server
+	// itself, so a revoked device's catalogue goes quiet with its sync.
 	serverFeatures(): readonly SyncFeature[] | null;
+	// This install's device id now (`unlink` replaces it).
+	deviceId(): string;
+	// Detach this install from the account, keeping every local row and
+	// every outbox op: waits out a running cycle, revokes this device on the
+	// account (best effort; skipped when already revoked), signs this install
+	// out, and gives it a fresh device id (remint.ts: pending ops re-stamped
+	// to it, registration and the own-op bound reset). The account binding
+	// (`boundUserId`) and the pull cursor stay: this library's sync history
+	// is that account's, so signing in with it again resumes as a new device
+	// that uploads what it never pushed, and signing in with another account
+	// is refused as before rather than mixing two accounts' libraries.
+	unlink(): Promise<UnlinkOutcome>;
 	subscribe(cb: (e: CloudSyncEvent) => void): () => void;
 }
 
@@ -226,6 +261,10 @@ type ClientState = {
 	// and an LWW cell keeps only its winner, so the next pull reloads the
 	// snapshot and replays from its seq.
 	needsRepair?: boolean;
+	// Set when the server answered `device_revoked` for this device id. Tied
+	// to the id: a re-mint (unlink, a restore) leaves a stale mark behind,
+	// which then means nothing.
+	revoked?: { deviceId: string; at: number } | null;
 	// Every op stamped with this device id at or below this seq is held here
 	// (in the outbox, or applied from a pull). What the pull asks the server
 	// to leave out. Kept in this database, so a restored backup rewinds it
@@ -283,7 +322,8 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const backoffBase = opts.backoffBaseMs ?? 1_000;
 	const backoffCap = opts.backoffCapMs ?? 60_000;
 	const random = opts.random ?? Math.random;
-	const deviceId = getDeviceId(raw);
+	// Replaced by unlink (a fresh identity); everything reads it per call.
+	let deviceId = getDeviceId(raw);
 
 	const listeners = new Set<(e: CloudSyncEvent) => void>();
 	let lastError: string | null = null;
@@ -322,13 +362,27 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// server refuses the extra pull fields, and one that omits `features`
 	// simply has none. Until the first answer, pulls go without it.
 	let serverSkipsOwn = false;
+	// Likewise 'device_reads': pulls and bootstraps name this device.
+	let serverDeviceReads = false;
 	let features: SyncFeature[] | null = null;
 	const learnFeatures = (f: readonly SyncFeature[] | undefined): void => {
 		serverSkipsOwn = f?.includes('pull_skip_own') ?? false;
+		serverDeviceReads = f?.includes('device_reads') ?? false;
 		features = [...(f ?? [])];
 	};
+	const forgetFeatures = (): void => {
+		serverSkipsOwn = false;
+		serverDeviceReads = false;
+		features = null;
+	};
+	// Set while unlink runs: no cycle may start (it would register the old
+	// id again, or the new one under the session being ended).
+	let detaching = false;
 
 	const counts = raw.prepare(`SELECT state, count(*) AS n FROM sync_outbox WHERE state IN ('pending', 'rejected') GROUP BY state`);
+
+	const REVOKED_MESSAGE = 'This computer was removed from your Curator account. Sign out to stop using that account here; your library stays on this computer.';
+	const isRevoked = (st: ClientState = readClientState(raw)): boolean => st.revoked?.deviceId === deviceId;
 
 	const status = (): CloudSyncStatus => {
 		const session = transport.session();
@@ -347,6 +401,8 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			lastSeq: readCursor(raw).lastSeq,
 			lastError,
 			needsUpdate: pushRefused || pullHeld,
+			revoked: isRevoked(st),
+			boundUserId: st.userId,
 			initialPushDone: raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined,
 			initialPush: initialPushProgress,
 			bootstrap: bootstrapProgress,
@@ -372,6 +428,20 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	const patchClientState = (patch: Partial<ClientState>): void => {
 		writeClientState(raw, { ...readClientState(raw), ...patch });
+	};
+
+	// Kept in the database, so a restart does not knock on the server again
+	// just to be told the same thing; the features go too, which quiets the
+	// catalogue layer (serverFeatures).
+	const markRevoked = (): void => {
+		if (!isRevoked()) {
+			patchClientState({ revoked: { deviceId, at: Date.now() } });
+			slog.warn('this device was revoked from the account — sync stopped (push and pull) until it is unlinked', { deviceId });
+		}
+		lastError = REVOKED_MESSAGE;
+		forgetFeatures();
+		clearRetry();
+		attempt = 0;
 	};
 
 	const emitApplied = (tracks: Iterable<string>, playlists: Iterable<string>, entities: readonly EntityRef[]): void => {
@@ -477,28 +547,31 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		if (nRejected > 0) slog.warn('push: ops rejected', { count: nRejected, sample: res.rejected.slice(0, 5) });
 		patchClientState({ lastPushAt: Date.now() });
 		if (held === 'update_required') pushRefused = true;
-		if (held === 'device_revoked') lastError = 'This device was removed from your Curator account.';
+		if (held === 'device_revoked') markRevoked();
 		const full = rows.length === MAX_PUSH_OPS || ops.length < rows.length;
 		return { pushed: nAcked, rejected: nRejected, more: held === null && full, stopped: held };
 	};
 
 	// ── pull ────────────────────────────────────────────────────────────
 
-	// One page, without this device's held ops when the server offers that.
-	// A server that advertised the skip and then refuses its fields (rolled
-	// back mid-session) gets the same pull without them, so sync carries on.
+	// One page, naming this device when the server offers 'device_reads' and
+	// without its held ops when it offers the skip. A server that advertised
+	// either and then refuses the fields (rolled back mid-session) gets the
+	// same pull without them, so sync carries on.
 	const pullPage = async (afterSeq: number): Promise<PullResult> => {
 		const base: PullInput = { afterSeq, limit: MAX_PULL_OPS };
 		const through = readClientState(raw).ownThroughSeq ?? 0;
-		if (serverSkipsOwn && through > 0) {
+		const skip = serverSkipsOwn && through > 0;
+		if (serverDeviceReads || skip) {
 			try {
-				const res = await transport.sync.pull({ ...base, deviceId, ownThroughSeq: through });
+				const res = await transport.sync.pull({ ...base, deviceId, ...(skip ? { ownThroughSeq: through } : {}) });
 				learnFeatures(res.features);
 				return res;
 			} catch (err) {
 				if (!(err instanceof CloudTransportError && err.kind === 'bad_request')) throw err;
-				slog.warn('pull: the server refused the own-op skip; pulling without it', { reason: err.message });
+				slog.warn('pull: the server refused the device fields; pulling without them', { reason: err.message });
 				serverSkipsOwn = false;
+				serverDeviceReads = false;
 			}
 		}
 		const res = await transport.sync.pull(base);
@@ -610,8 +683,21 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	// `resetCursor`: replay from the snapshot's seq even when the cursor is
 	// past it (the clamp repair), instead of keeping the further cursor.
+	const fetchSnapshot = async (): ReturnType<CloudTransport['bootstrap']> => {
+		if (serverDeviceReads) {
+			try {
+				return await transport.bootstrap({ deviceId });
+			} catch (err) {
+				if (!(err instanceof CloudTransportError && err.kind === 'bad_request')) throw err;
+				slog.warn('bootstrap: the server refused the device id; loading without it', { reason: err.message });
+				serverDeviceReads = false;
+			}
+		}
+		return transport.bootstrap();
+	};
+
 	const bootstrap = async (bopts: { resetCursor?: boolean } = {}): Promise<void> => {
-		const b = await transport.bootstrap();
+		const b = await fetchSnapshot();
 		const records = b.records;
 		if (tally) { tally.bootstrapped = true; tally.snapshotRecords += records.length; }
 		slog.info('bootstrap: loading snapshot', { records: records.length, snapshotSeq: b.snapshotSeq });
@@ -635,21 +721,30 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	const initialPushDone = (): boolean => raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined;
 	let initialPushRun: Promise<void> | null = null;
+	type Driver = (r: Raw, o: { chunk?: number; onProgress?: (p: InitialPushProgress) => void }) => Promise<InitialPushAsyncResult>;
 	const runInitialPush = (): Promise<void> => {
-		// A library pushed before rekordbox units were emitted states them
-		// once, through the same chunked driver (initial-push.ts).
-		const backfill = initialPushDone() && rbBackfillPending(raw);
-		if (initialPushDone() && !backfill) return Promise.resolve();
+		// A library pushed before rekordbox units, or before recordings and
+		// their claims, were emitted states them once, through the same
+		// chunked driver (initial-push.ts).
+		const runs: Array<[string, Driver]> = initialPushDone()
+			? [
+				...(rbBackfillPending(raw) ? [['rekordbox analysis backfill: done', rbBackfillAsync] as [string, Driver]] : []),
+				...(claimsBackfillPending(raw) ? [['recording claims backfill: done', claimsBackfillAsync] as [string, Driver]] : []),
+			]
+			: [['initial push: done', initialPushAsync]];
+		if (runs.length === 0) return Promise.resolve();
 		if (!initialPushRun) {
 			initialPushRun = (async () => {
 				initialPushProgress = { done: 0, estimate: 0 };
 				emitStatus();
 				try {
-					const r = await (backfill ? rbBackfillAsync : initialPushAsync)(raw, {
-						chunk: opts.initialPushChunk,
-						onProgress: (p) => { initialPushProgress = p; emitStatus({ progress: true }); },
-					});
-					slog.info(backfill ? 'rekordbox analysis backfill: done' : 'initial push: done', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+					for (const [done, drive] of runs) {
+						const r = await drive(raw, {
+							chunk: opts.initialPushChunk,
+							onProgress: (p) => { initialPushProgress = p; emitStatus({ progress: true }); },
+						});
+						slog.info(done, { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+					}
 				} finally {
 					initialPushProgress = null;
 					initialPushRun = null;
@@ -658,6 +753,43 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			})();
 		}
 		return initialPushRun;
+	};
+
+	// ── recording identity ──────────────────────────────────────────────
+	// The identity resolver (identity.ts) whenever the op log moved since its
+	// last run: this device's clock (any local op, the scanner's claims
+	// among them) or the pull cursor (claims from elsewhere). The signature
+	// is read before the run, so the run's own merges cost one more plan
+	// (a range read) rather than hiding a claim made while it yielded. A
+	// failure is logged and retried on the next cycle, never fails the sync.
+	let identitySig: string | null = null;
+	let identityHeld = -1;
+	const resolveIdentities = async (): Promise<void> => {
+		const clock = raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).pluck().get(CLOCK_KEY) as string | undefined;
+		const sig = `${clock ?? ''}|${readCursor(raw).lastSeq}`;
+		if (sig === identitySig) return;
+		identitySig = sig;
+		try {
+			const r = await resolveRecordingIdentitiesAsync(raw);
+			if (r.merged > 0) {
+				slog.info('identity: merged recordings that share an audio hash', { merged: r.merged, planned: r.merges.length, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+				emitApplied(r.tracksTouched, r.playlistsTouched, []);
+			}
+			// Groups this device keeps apart (its own duplicate files, or a
+			// hash on too many recordings), said once per change, not per cycle.
+			if (r.held.length !== identityHeld) {
+				identityHeld = r.held.length;
+				if (r.held.length > 0) {
+					slog.info('identity: groups held for the user, not merged', {
+						held: r.held.length,
+						sample: r.held.slice(0, 5).map((h) => ({ reason: h.reason, recordings: h.recordings.length, rows: h.trackIds, blockers: h.blockers })),
+					});
+				}
+			}
+		} catch (err) {
+			identitySig = null;
+			slog.warn('identity: resolver failed; retrying next cycle', undefined, err);
+		}
 	};
 
 	// ── cycle + scheduling ──────────────────────────────────────────────
@@ -695,7 +827,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				case 'rate_limited': return 'Syncing too fast; slowing down.';
 				case 'auth': return 'Your session expired — sign in again.';
 				case 'update_required': return 'Update Curator to keep syncing.';
-				case 'device_revoked': return 'This device was removed from your Curator account.';
+				case 'device_revoked': return REVOKED_MESSAGE;
 				case 'device_not_registered': return 'Registering this device with your account.';
 				case 'bad_request': return `The sync server refused a request (${err.message}).`;
 			}
@@ -718,8 +850,14 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			lastError = null;
 			return;
 		}
+		// unlink is detaching this install: nothing may reach the server
+		// until it has signed out under the new id.
+		if (detaching) return;
 		const bindingError = checkBinding(session);
 		if (bindingError) { lastError = bindingError; return; }
+		// Revoked: no call at all, push or pull. The poll keeps waking this,
+		// at no cost, until unlink.
+		if (isRevoked()) { lastError = REVOKED_MESSAGE; clearRetry(); attempt = 0; return; }
 		const t: CycleTally = { pushed: 0, rejected: 0, held: 0, pulled: 0, applied: 0, bootstrapped: false, snapshotRecords: 0 };
 		tally = t;
 		const started = Date.now();
@@ -727,6 +865,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		try {
 			await ensureRegistered(session);
 			await runInitialPush();
+			// Claims made here since the last cycle (and by the backfills just
+			// above) resolve before the push carries them.
+			await resolveIdentities();
 			// Push first (design "Offline": on reconnect push, then pull).
 			while (!pushRefused) {
 				const p = await pushOnce();
@@ -734,6 +875,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				if (!p.more) break;
 			}
 			await pullOnce();
+			// Claims from other devices; merges it emits wake the next cycle's
+			// push through the outbox listener.
+			await resolveIdentities();
 			lastError = null;
 			attempt = 0;
 			clearRetry();
@@ -746,7 +890,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			lastError = describe(err);
 			outcome = err instanceof CloudTransportError ? err.kind : 'error';
 			if (err instanceof CloudTransportError && err.kind === 'update_required') { pushRefused = true; return; }
-			if (err instanceof CloudTransportError && err.kind === 'device_revoked') return;
+			if (err instanceof CloudTransportError && err.kind === 'device_revoked') { markRevoked(); return; }
 			// Re-register on the next attempt (the backoff's first step is short).
 			if (err instanceof CloudTransportError && err.kind === 'device_not_registered') patchClientState({ registeredFor: null });
 			slog.warn('sync cycle failed; backing off', { attempt: attempt + 1, kind: err instanceof CloudTransportError ? err.kind : 'unknown' }, err);
@@ -798,6 +942,49 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			void cycle();
 		}, debounceMs);
 		debounceTimer.unref?.();
+	};
+
+	// ── unlink ──────────────────────────────────────────────────────────
+
+	const unlink = async (): Promise<UnlinkOutcome> => {
+		detaching = true;
+		try {
+			clearRetry();
+			if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+			// A cycle already past the `detaching` check finishes first; one
+			// woken meanwhile returns at it.
+			while (inflight) await inflight.catch(() => { /* reported by the cycle */ });
+			const session = transport.session();
+			const st = readClientState(raw);
+			let revokedOnServer = false;
+			// Revoke the old id so the account's list stops showing it as live,
+			// and so its session — which is ending anyway — is refused if a
+			// copy of it is still out there. Best effort: offline, the user
+			// can remove it from another computer.
+			if (session && !isRevoked(st) && st.registeredFor === session.userId) {
+				try {
+					await transport.account.revokeDevice({ deviceId });
+					revokedOnServer = true;
+				} catch (err) {
+					slog.warn('unlink: could not revoke this device on the account; another computer can remove it', { kind: err instanceof CloudTransportError ? err.kind : 'unknown' }, err);
+				}
+			}
+			if (session) await transport.signOut();
+			const r = remintDeviceForDetach(raw);
+			deviceId = r.newDeviceId;
+			// remint reset registeredFor and ownThroughSeq; the revoked mark
+			// was the old id's and goes with it.
+			patchClientState({ revoked: null });
+			forgetFeatures();
+			lastError = null;
+			pushRefused = false;
+			attempt = 0;
+			slog.info('unlinked this install from its account', { oldDeviceId: r.oldDeviceId, newDeviceId: r.newDeviceId, restamped: r.restamped, revokedOnServer, signedOut: session !== null });
+			return { revokedOnServer, signedOut: session !== null, oldDeviceId: r.oldDeviceId, newDeviceId: r.newDeviceId, restamped: r.restamped };
+		} finally {
+			detaching = false;
+			emitStatus();
+		}
 	};
 
 	const syncNow = async (): Promise<void> => {
@@ -893,7 +1080,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			clearRetry();
 		},
 		status,
-		serverFeatures: () => features,
+		serverFeatures: () => (isRevoked() ? null : features),
+		deviceId: () => deviceId,
+		unlink,
 		subscribe(cb) {
 			listeners.add(cb);
 			return () => { listeners.delete(cb); };

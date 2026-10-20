@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SYNC_FEATURES, type PullInput, type PullResult, type PushResult } from './cloud-service.js';
-import { ZPullInput } from './sync-input.js';
+import { ZBootstrapInput, ZPullInput } from './sync-input.js';
 
 const roundTrip = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
@@ -17,8 +17,8 @@ describe('sync.pull input', () => {
 		expect(ZPullInput.parse({ afterSeq: 0, deviceId: 'd', ownThroughSeq: 0 })).toEqual({ afterSeq: 0, deviceId: 'd', ownThroughSeq: 0 });
 	});
 
-	it('takes the device id and its bound together or not at all', () => {
-		expect(ZPullInput.safeParse({ afterSeq: 0, deviceId: 'd' }).success).toBe(false);
+	it('takes a device id alone (device_reads), never the bound without it', () => {
+		expect(ZPullInput.parse({ afterSeq: 0, deviceId: 'd' })).toEqual({ afterSeq: 0, deviceId: 'd' });
 		expect(ZPullInput.safeParse({ afterSeq: 0, ownThroughSeq: 3 }).success).toBe(false);
 	});
 
@@ -28,6 +28,16 @@ describe('sync.pull input', () => {
 		expect(ZPullInput.safeParse({ afterSeq: 0, deviceId: '', ownThroughSeq: 0 }).success).toBe(false);
 		expect(ZPullInput.safeParse({ afterSeq: 0, deviceId: 'd', ownThroughSeq: 1.5 }).success).toBe(false);
 		expect(ZPullInput.safeParse({ afterSeq: 0, deviceId: 'x'.repeat(129), ownThroughSeq: 0 }).success).toBe(false);
+	});
+});
+
+describe('sync.bootstrap input', () => {
+	it('accepts no input (an older client) and a device id, nothing else', () => {
+		expect(ZBootstrapInput.parse(undefined)).toBeUndefined();
+		expect(ZBootstrapInput.parse({})).toEqual({});
+		expect(ZBootstrapInput.parse(roundTrip({ deviceId: 'desktop-1' }))).toEqual({ deviceId: 'desktop-1' });
+		expect(ZBootstrapInput.safeParse({ deviceId: '' }).success).toBe(false);
+		expect(ZBootstrapInput.safeParse({ deviceId: 'd', afterSeq: 0 }).success).toBe(false);
 	});
 });
 
@@ -51,5 +61,6 @@ describe('sync results', () => {
 		expect(roundTrip(oldPush).features).toBeUndefined();
 		expect(roundTrip(oldPull).features).toBeUndefined();
 		expect(SYNC_FEATURES).toContain('pull_skip_own');
+		expect(SYNC_FEATURES).toContain('device_reads');
 	});
 });

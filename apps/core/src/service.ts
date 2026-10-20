@@ -64,7 +64,7 @@ import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
 import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
-import { createSyncClient, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type WakeReason } from './sync-log/client.js';
+import { createSyncClient, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
@@ -245,7 +245,6 @@ import { createMirLayer } from './mir/layer.js';
 import { createCatalogueLayer, type CatalogueLayer } from './catalogue/layer.js';
 import { readCatalogueSettings, writeCatalogueSettings, clampKbps } from './catalogue/mirror.js';
 import type { CatalogueBackfillAction, CatalogueBlobStore, CatalogueEvent, CatalogueSettingsPatch, CatalogueStatus } from './catalogue/types.js';
-import { getDeviceId } from './sync-log/device.js';
 import { sqliteLibraryPort } from './mir/library-port.js';
 import type { MirSidecarSpec } from './mir/sidecar.js';
 import type { MirProvisionSpec } from './mir/provision.js';
@@ -421,6 +420,10 @@ export type CloudActivityWatcher = {
 // What getCloudSyncStatus answers: the client's status, or `enabled: false`
 // (with neutral values) when the build has no cloud transport.
 export type CloudSyncStatusReport = CloudSyncStatus & { enabled: boolean };
+
+// What unlinkCloudLibrary did (`outcome` null: sync is off in this build,
+// nothing to unlink) and the status after it.
+export type CloudUnlinkResult = { outcome: UnlinkOutcome | null; status: CloudSyncStatusReport };
 
 // Outcome union for the sync-to-rekordbox pipeline. 'conflicts' is the
 // clean pause: nothing is held in memory (conflicts are sync_conflict
@@ -1218,6 +1221,14 @@ export interface CoreService {
 	// Called by the desktop main after the renderer's first load, like
 	// startBackupScheduler: the first-sign-in push must not compete with boot.
 	startCloudSync(): void;
+	// Detach this install from its Curator account (sync-log/client.ts
+	// `unlink`): revoke this device on the account when it can, sign this
+	// install out, and give it a fresh device id. Every local row and every
+	// outbox op is kept (pending ops move to the new id); the library stays
+	// bound to the account whose history it holds, so signing in with that
+	// account later resumes as a new device and another account is refused.
+	// Also the way out of the revoked state. Never deletes library data.
+	unlinkCloudLibrary(): Promise<CloudUnlinkResult>;
 
 	// ─── Shared analysis catalogue (apps/core/src/catalogue/) ───────────
 	// Analysis one of the account's devices computed, reused by the others
@@ -2089,7 +2100,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			raw: sqlite,
 			transport: { catalogue: catalogueTransport, session: () => opts.cloud!.transport.session() },
 			blobs: opts.cloud.blobs,
-			deviceId: getDeviceId(sqlite),
+			deviceId: () => cloudClient.deviceId(),
 			peaksDir: opts.peaksDir ?? null,
 			serverFeatures: () => cloudClient.serverFeatures(),
 			busyElsewhere: () => (analysisQueue?.busy ? 'audio analysis' : mirLayer.isBusy() ? 'AI analysis' : null),
@@ -2131,7 +2142,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		? { ...cloudClient.status(), enabled: true }
 		: {
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
-			lastPushAt: null, lastPullAt: null, lastSeq: 0, lastError: null, needsUpdate: false, initialPushDone: false,
+			lastPushAt: null, lastPullAt: null, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
 			initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
 			poll: { policy: readPollPolicy(sqlite), active: true, nextPollAt: null },
 		};
@@ -5306,6 +5317,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			cloudClient?.setPollPolicy(next.policy);
 			cloudActivity?.setIdleAfterMs(next.policy.idleAfterSec * 1000);
 			return next;
+		},
+		async unlinkCloudLibrary() {
+			if (!cloudClient) return { outcome: null, status: cloudStatusReport() };
+			const outcome = await cloudClient.unlink();
+			// The catalogue was working for the old id under the ended session;
+			// it re-reads both on its next wake (a sign-in).
+			return { outcome, status: cloudStatusReport() };
 		},
 		startCloudSync() {
 			if (!cloudClient || cloudWakeUnsub) return;

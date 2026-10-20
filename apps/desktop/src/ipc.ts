@@ -1,6 +1,6 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
 import type { DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
@@ -291,12 +291,23 @@ export interface IpcChannels {
 	'account:sign-in-password':   { args: [email: string, password: string]; ret: AccountStatus };
 	'account:sign-in-otp-request': { args: [email: string]; ret: { sent: true } };
 	'account:sign-in-otp-verify': { args: [email: string, code: string]; ret: AccountStatus };
+	// Signed out while this device is revoked, it is unlinked instead (a
+	// fresh device id, so a later sign-in can come back).
 	'account:sign-out':           { args: []; ret: AccountStatus };
 	'account:devices':            { args: []; ret: AccountDevice[] };
+	// Another device of the account (this one is unlinked instead); answers
+	// the refreshed list.
+	'account:revoke-device':      { args: [deviceId: string]; ret: AccountDevice[] };
+	// Supabase signOut scope 'others': every other sign-in of the account,
+	// on any device, ends; this one stays.
+	'account:sign-out-others':    { args: []; ret: { ok: true } };
 	// Op-log sync state from core (named apart from 'sync:*', the Spotify
 	// read-sync). 'cloud-sync:now' runs one push-then-pull cycle.
 	'cloud-sync:status': { args: []; ret: CloudSyncStatusReport };
 	'cloud-sync:now':    { args: []; ret: CloudSyncStatusReport };
+	// Detach this install from the account (CoreService.unlinkCloudLibrary):
+	// revoke this device, sign out, fresh device id; local data kept.
+	'cloud-sync:unlink': { args: []; ret: CloudUnlinkResult };
 	// The fallback poll cadence (per device, never synced). A patch merges
 	// over the stored value and is clamped; null restores the defaults.
 	'cloud-sync:get-poll-settings': { args: []; ret: SyncPollSettings };
@@ -796,8 +807,11 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'account:sign-in-otp-verify': { description: 'Complete an emailed-code sign-in with the 6-digit code. Returns the account state.' },
 	'account:sign-out': { description: 'Sign this install out of the Curator account (other devices stay signed in). Local library data is kept.' },
 	'account:devices': { description: 'List the devices registered to the Curator account (name, platform, registered/last seen/revoked), flagging this install.' },
+	'account:revoke-device': { description: 'Revoke another device from the Curator account: it can no longer push, pull or read shared analysis. Not for this install (use cloud-sync:unlink). Returns the refreshed device list.' },
+	'account:sign-out-others': { description: 'End every other sign-in of the Curator account on all devices (Supabase sign-out scope "others"); this install stays signed in. Use after revoking a device.' },
 	'cloud-sync:status': { description: 'Library cloud sync status: signed in, pending and rejected op counts, last push/pull, last error, update required, first-sign-in push progress.' },
 	'cloud-sync:now': { description: 'Run one library cloud sync cycle now (push local changes, then pull remote ones). Returns the status after it.' },
+	'cloud-sync:unlink': { description: 'Unlink this install from the Curator account: revoke this device on the account, sign out, and give the install a fresh device id. Keeps all local library data and unsynced changes; the library stays tied to the same account. Returns the outcome and status.' },
 	'cloud-sync:get-poll-settings': { description: 'How often this device checks the cloud for changes when no push notification arrives: seconds between checks while the app is in use (activeSec), while idle (idleSec), and how long without use counts as idle (idleAfterSec); plus defaults and limits.' },
 	'cloud-sync:set-poll-policy': { description: 'Change this device\'s cloud check cadence (partial patch of activeSec / idleSec / idleAfterSec, clamped; null restores defaults). Applies to the running sync at once; not synced to other devices.' },
 	'catalogue:status': { description: 'Shared analysis status: whether this device reuses analysis from the account\'s other devices (setting, server stage/policy, entitlement), the account\'s holdings and quota, what this device reused / uploaded / has pending, the existing-library upload state, the last error.' },

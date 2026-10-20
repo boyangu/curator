@@ -27,7 +27,6 @@ import { dumpLibrary } from './dump.js';
 import { recordingIdForTrack } from './recording-id.js';
 import {
 	flacParse,
-	knownGap,
 	markPreOpLog,
 	playlistOrder,
 	positionsContiguous,
@@ -171,11 +170,10 @@ describe('scenario 2 — B joins with its own existing library', () => {
 
 	// The same song scanned on each desktop before they ever synced: each
 	// scanner mints its own row (its own recording id) and pushes a create
-	// with the file's audio-hash claim. Design: claims resolve the two to one
-	// recording (D's catalogue resolver emitting a recording alias). Today
-	// nothing resolves claims — not the desktop, not the cloud — so the two
-	// recordings stay apart and A's tag never reaches B's copy of the song.
-	knownGap('the same file scanned on both desktops becomes one recording (audio-hash claims resolve)', async () => {
+	// with the file's audio-hash claim. The identity resolver (identity.ts)
+	// on the desktop holding the larger id merges it into the smaller, so
+	// both rows end on one recording and A's tag reaches B's copy.
+	it('the same file scanned on both desktops becomes one recording (audio-hash claims resolve)', async () => {
 		const PCM = 'ab12cd34'.repeat(4);
 		const a = await rig.desktop('a', { parseAudio: flacParse });
 		const b = await rig.desktop('b', { parseAudio: flacParse });
@@ -188,13 +186,17 @@ describe('scenario 2 — B joins with its own existing library', () => {
 		await rig.settle();
 		const idOn = (d: Desktop): string => d.one(`SELECT track_id FROM source_link WHERE source = 'local' AND audio_hash = ?`, `pcm-md5:${PCM}`);
 		const recOn = (d: Desktop): string => d.one(`SELECT recording_id FROM track WHERE id = ?`, idOn(d));
-		// Both pushed a create and the claim for their own recording.
+		// Both pushed a create and the claim for their own recording; one
+		// merge op folded the larger id into the smaller, and both rows now
+		// carry the survivor.
 		const claims = rig.cloud.log.filter((o) => o.entity === 'recording_claim' && (o.payload as { value?: string }).value === `pcm-md5:${PCM}`);
-		expect(new Set(claims.map((o) => o.entity_id))).toEqual(new Set([recOn(a), recOn(b)]));
+		const minted = [...new Set(claims.map((o) => o.entity_id))].sort();
+		expect(minted).toHaveLength(2);
+		expect(rig.cloud.log.filter((o) => o.entity === 'recording').map((o) => [o.entity_id, (o.payload as { winner: string }).winner])).toEqual([[minted[1], minted[0]]]);
+		expect(recOn(a)).toBe(minted[0]);
+		expect(recOn(b)).toBe(minted[0]);
 		await a.svc.addTrackTag(idOn(a), 'interested');
 		await rig.settle();
-		// FAILS today: the two rows keep different recording ids, so B's copy
-		// stays untagged.
 		expect(recOn(a)).toBe(recOn(b));
 		expect(b.one(`SELECT count(*) FROM track_tag WHERE track_id = ? AND tag_id = 'interested'`, idOn(b))).toBe(1);
 	});

@@ -483,6 +483,76 @@ describe('recording aliases', () => {
 		expect(view.trackTags).toEqual([{ recordingId: A, tagId: TAG }]);
 	});
 
+	// The alias rebuild was rewritten from re-pointing every alias per insert
+	// to parent pointers (and a fast path for a merge newer than all others);
+	// this is the old algorithm, kept as the reference it must match.
+	function referenceAlias(state: LibraryState): Map<string, string> {
+		const entries = [...state.merges.entries()].filter(([, m]) => m.winner !== null)
+			.sort((a, b) => (a[1].clock.ts !== b[1].clock.ts ? b[1].clock.ts - a[1].clock.ts : a[1].clock.device !== b[1].clock.device ? (a[1].clock.device < b[1].clock.device ? 1 : -1) : a[1].clock.op < b[1].clock.op ? 1 : -1));
+		const alias = new Map<string, string>();
+		for (const [loser, m] of entries) {
+			const winner = alias.get(m.winner!) ?? m.winner!;
+			if (winner === loser) continue;
+			alias.set(loser, winner);
+			for (const [l, w] of alias) if (w === loser) alias.set(l, winner);
+		}
+		return alias;
+	}
+	const sortedEntries = (m: Map<string, string>) => [...m.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
+
+	it('random merge and split sets: the alias map matches the reference in every arrival order', () => {
+		let seed = 7;
+		const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return seed % n; };
+		const ids = Array.from({ length: 7 }, () => uuid());
+		for (let trial = 0; trial < 300; trial++) {
+			const ops: Op[] = [];
+			const n = 1 + rand(12);
+			for (let i = 0; i < n; i++) {
+				const loser = ids[rand(ids.length)]!;
+				let winner = ids[rand(ids.length)]!;
+				if (winner === loser) winner = ids[(ids.indexOf(loser) + 1) % ids.length]!;
+				ops.push(op('recording', rand(6) === 0 ? 'split' : 'merge', loser, { winner }, { ts: T(10, rand(20)), device: rand(2) ? 'desktop' : 'phone' }));
+			}
+			let first: Array<[string, string]> | null = null;
+			for (let shuffle = 0; shuffle < 4; shuffle++) {
+				const order = shuffle === 0 ? ops : [...ops].sort(() => rand(3) - 1);
+				const state = reduceAll(order);
+				const got = sortedEntries(state.recordingAlias);
+				expect(got, `trial ${trial}`).toEqual(sortedEntries(referenceAlias(state)));
+				if (first === null) first = got;
+				else expect(got, `trial ${trial} shuffle ${shuffle}`).toEqual(first);
+			}
+		}
+	});
+
+	it('the same merge from several devices folds once: the duplicates change nothing', () => {
+		const ops = [
+			tagCreate(),
+			op('track_tag', 'add', trackTagEntityId(A, TAG), {}, { ts: T(9, 30) }),
+			op('library_track', 'set-rating', A, { rating: 4 }, { ts: T(9, 31) }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 0), device: 'desktop-1' }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 2), device: 'desktop-2' }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 1), device: 'desktop-3' }),
+		];
+		const { state, view } = converge(ops);
+		const once = reduceAll(ops.slice(0, 4));
+		expect(view).toEqual(materialize(once));
+		expect(state.merges.get(A)!.clock.device).toBe('desktop-2');
+		expect(view.libraryTracks).toEqual([expect.objectContaining({ recordingId: B, rating: 4 })]);
+	});
+
+	it('thousands of merges in clock order apply in linear-ish time', () => {
+		const state = createLibraryState();
+		const losers = Array.from({ length: 5_000 }, () => uuid());
+		const winners = Array.from({ length: 5_000 }, () => uuid());
+		const t0 = performance.now();
+		losers.forEach((l, i) => applyOp(state, op('recording', 'merge', l, { winner: winners[i]! }, { ts: T(10, 0) + i })));
+		const ms = performance.now() - t0;
+		expect(state.recordingAlias.size).toBe(5_000);
+		// The old rebuild was O(M²) per merge: minutes here.
+		expect(ms).toBeLessThan(5_000);
+	});
+
 	it('every later op addressed to the loser is redirected', () => {
 		const state = reduceAll([op('recording', 'merge', A, { winner: B }, { ts: T(10, 0) })]);
 		const row = uuid();

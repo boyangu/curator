@@ -185,6 +185,8 @@ export async function createTestApp(
 		auditOptions?: { maxBuffered?: number; flushAt?: number };
 		// Default: stage D-a, as production runs it. `null` = catalogue off.
 		catalogue?: CataloguePolicy | null;
+		// Default false, as production runs during the 'device_reads' transition.
+		requireDeviceId?: boolean;
 	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
@@ -202,6 +204,7 @@ export async function createTestApp(
 		pull: opts.pull ?? DEFAULT_PULL_OPTIONS,
 		audit,
 		catalogue: opts.catalogue === undefined ? parseCataloguePolicy(CATALOGUE_POLICY_D_A) : opts.catalogue,
+		requireDeviceId: opts.requireDeviceId ?? false,
 	};
 	const handler = createFetchHandler(deps);
 	const client = (token?: string) =>

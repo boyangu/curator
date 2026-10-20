@@ -36,6 +36,7 @@ import {
 	type ClaimRecord,
 	type Clock,
 	type CueRecord,
+	type EntityRef,
 	type LibraryState,
 	type LwwRecord,
 	type Op,
@@ -70,8 +71,19 @@ export type StateMap = (typeof STATE_MAPS)[number];
 
 type AnyMap = Map<string, unknown>;
 
+// A claim record's `parent_id`: its kind and value, so "which recordings
+// claim this audio hash" is one range of the (map, parent_id) index instead
+// of a scan of every claim (the identity resolver, identity.ts, asks it after
+// every sync cycle). Fingerprints are left out: a Chromaprint is kilobytes,
+// and similarity is never a lookup by exact value. Migrate fills the column
+// for claim records written before it existed (indexClaimRecords).
+export function claimParentId(kind: string, value: string): string | null {
+	return kind === 'fingerprint' ? null : `${kind}:${value}`;
+}
+
 // The two index columns of a record: which recording it belongs to (for the
-// merge fold) and which container gates it (for visibility cascades).
+// merge fold) and which container gates it (for visibility cascades, or for
+// a claim, its value: claimParentId).
 function indexOf(map: StateMap, key: string, value: unknown): { recordingId: string | null; parentId: string | null } {
 	const v = value as Record<string, unknown>;
 	switch (map) {
@@ -82,8 +94,9 @@ function indexOf(map: StateMap, key: string, value: unknown): { recordingId: str
 		case 'libraryTracks':
 			return { recordingId: key, parentId: null };
 		case 'cues':
-		case 'claims':
 			return { recordingId: v['recordingId'] as string, parentId: null };
+		case 'claims':
+			return { recordingId: v['recordingId'] as string, parentId: claimParentId(v['kind'] as string, v['value'] as string) };
 		case 'playEvents': {
 			const body = v['value'] as Record<string, unknown>;
 			return { recordingId: (body['recording_id'] as string | null) ?? null, parentId: (body['session_id'] as string | null) ?? null };
@@ -117,7 +130,7 @@ type Stmts = {
 	tombPut: Database.Statement<[string, string, number, string, string, string | null]>;
 	tombDel: Database.Statement<[string, string]>;
 	aliasAll: Database.Statement<[], { loser: string; winner: string }>;
-	aliasClear: Database.Statement<[]>;
+	aliasDel: Database.Statement<[string]>;
 	aliasPut: Database.Statement<[string, string]>;
 };
 
@@ -141,8 +154,8 @@ function stmts(raw: Raw): Stmts {
 					op_id = excluded.op_id, recording_id = excluded.recording_id`),
 			tombDel: raw.prepare(`DELETE FROM tombstone WHERE entity = ? AND entity_id = ?`),
 			aliasAll: raw.prepare(`SELECT loser, winner FROM recording_alias`),
-			aliasClear: raw.prepare(`DELETE FROM recording_alias`),
-			aliasPut: raw.prepare(`INSERT INTO recording_alias (loser, winner) VALUES (?, ?)`),
+			aliasDel: raw.prepare(`DELETE FROM recording_alias WHERE loser = ?`),
+			aliasPut: raw.prepare(`INSERT INTO recording_alias (loser, winner) VALUES (?, ?) ON CONFLICT(loser) DO UPDATE SET winner = excluded.winner`),
 		};
 		STMTS.set(raw, s);
 	}
@@ -182,7 +195,7 @@ export class SyncStateStore {
 	private readonly tombSnap = new Map<string, string | null>();
 	private readonly recordingsLoaded = new Set<string>();
 	private readonly childrenLoaded = new Set<string>();
-	private aliasSnap: string;
+	private aliasSnap: Map<string, string>;
 	private readonly s: Stmts;
 	// The resolved artist alias map as loaded, before this batch: projection
 	// diffs against it to find the rules whose effect changed.
@@ -197,7 +210,7 @@ export class SyncStateStore {
 			this.snap.get('merges')!.set(r.key, r.value);
 		}
 		for (const r of this.s.aliasAll.all()) this.state.recordingAlias.set(r.loser, r.winner);
-		this.aliasSnap = aliasJson(this.state.recordingAlias);
+		this.aliasSnap = new Map(this.state.recordingAlias);
 		// Artist alias rules are few and chain resolution reads all of them.
 		for (const r of this.s.allOfMap.all('artistAliases')) {
 			this.state.artistAliases.set(r.key, JSON.parse(r.value));
@@ -329,6 +342,26 @@ export class SyncStateStore {
 			this.tombSnap.set(key, JSON.stringify(clock));
 			this.state.tombstones.set(key, clock);
 		}
+	}
+
+	// Refs to every projectable record and tombstone of one recording: what
+	// a local row that has just taken this recording on (a merge loser's row
+	// re-pointed to its winner, project.ts) must show. Until then the
+	// recording had no row here, so none of it was projected.
+	recordingRefs(recordingId: string): EntityRef[] {
+		this.ensureRecording(recordingId);
+		const refs: EntityRef[] = [];
+		if (this.state.libraryTracks.has(recordingId)) refs.push({ entity: 'library_track', id: recordingId });
+		for (const [k, v] of this.state.trackTags) if (v.recordingId === recordingId) refs.push({ entity: 'track_tag', id: k });
+		for (const [k, v] of this.state.cues) if (v.recordingId === recordingId) refs.push({ entity: 'cue', id: k });
+		for (const [k, v] of this.state.playlistTracks) if (v.recordingId === recordingId) refs.push({ entity: 'playlist_track', id: k });
+		for (const [k, v] of this.state.playEvents) if (v.value.recording_id === recordingId) refs.push({ entity: 'play_event', id: k });
+		// A removal with no live record left still has to reach the row.
+		for (const entity of ['track_tag', 'cue'] as const) {
+			const prefix = tombstoneKey(entity, `${recordingId}:`);
+			for (const tk of this.state.tombstones.keys()) if (tk.startsWith(prefix)) refs.push({ entity, id: tk.slice(entity.length + 1) });
+		}
+		return refs;
 	}
 
 	// Every record of `name` gated by container `parentId` (a tag's
@@ -619,17 +652,21 @@ export class SyncStateStore {
 			this.tombSnap.set(key, null);
 		}
 
-		const alias = aliasJson(this.state.recordingAlias);
-		const aliasChanged = alias !== this.aliasSnap;
-		if (aliasChanged) {
-			this.s.aliasClear.run();
-			for (const [loser, winner] of this.state.recordingAlias) this.s.aliasPut.run(loser, winner);
-			this.aliasSnap = alias;
+		// Only the alias rows that changed: a batch of identity merges adds a
+		// few to a table that can hold one per file shared across desktops.
+		let aliasChanged = false;
+		const alias = this.state.recordingAlias;
+		for (const [loser, winner] of alias) {
+			if (this.aliasSnap.get(loser) === winner) continue;
+			this.s.aliasPut.run(loser, winner);
+			aliasChanged = true;
 		}
+		for (const loser of this.aliasSnap.keys()) {
+			if (alias.has(loser)) continue;
+			this.s.aliasDel.run(loser);
+			aliasChanged = true;
+		}
+		if (aliasChanged) this.aliasSnap = new Map(alias);
 		return { removed, removedTombstones, aliasChanged };
 	}
-}
-
-function aliasJson(m: Map<string, string>): string {
-	return JSON.stringify([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
 }

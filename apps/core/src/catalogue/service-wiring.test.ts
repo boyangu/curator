@@ -29,6 +29,7 @@ function cloud(userId: string, catServer: FakeCatalogueServer, offered = { catal
 	const feats = () => SYNC_FEATURES.filter((f) => f !== 'catalogue' || offered.catalogue);
 	const transport: CloudTransport = {
 		session: () => ({ userId, email: `${userId}@example.test` }),
+		signOut: async () => { /* not exercised */ },
 		sync: {
 			push: async (input: PushInput) => ({ accepted: input.ops.length, maxSeq: 0, rejected: [], features: feats() }),
 			pull: async (input: PullInput) => ({ ops: [], nextSeq: input.afterSeq, features: feats() }),

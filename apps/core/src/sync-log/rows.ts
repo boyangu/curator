@@ -16,6 +16,7 @@
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
 import {
+	CLAIM_KINDS,
 	cueEntityId,
 	encodeRbGrid,
 	MAX_OP_PAYLOAD_BYTES,
@@ -363,6 +364,32 @@ export function readTrackTags(raw: Raw, trackId: string): Array<{ tag_id: string
 
 export function trackTagOp(recordingId: string, tagId: string, add: boolean): NewOp {
 	return { entity: 'track_tag', entity_id: trackTagEntityId(recordingId, tagId), kind: add ? 'add' : 'remove', payload: {} };
+}
+
+// ── recording claims ────────────────────────────────────────────────────────
+// What a row says identifies its recording (design: `recording_claim`): the
+// file's audio hash and Chromaprint, the ISRC, the streaming ids. Shared by
+// the scanner/streaming/analyzer mutators and the initial push's backfill.
+
+export type ClaimKind = (typeof CLAIM_KINDS)[number];
+export type RecordingClaim = { kind: ClaimKind; value: string; confidence?: number; durationSec?: number };
+
+// Null for an empty value, or one too large to ride an op (a Chromaprint is
+// a few KB; the cap is 16 KB, so this is a guard, not a policy).
+export function claimOp(recordingId: string, c: RecordingClaim): NewOp | null {
+	if (!c.value) return null;
+	const op: NewOp = {
+		entity: 'recording_claim',
+		entity_id: recordingId,
+		kind: 'add',
+		payload: {
+			kind: c.kind,
+			value: c.value,
+			confidence: c.confidence ?? 1,
+			...(c.durationSec !== undefined ? { duration_sec: Math.max(0, Math.round(c.durationSec)) } : {}),
+		},
+	};
+	return opPayloadBytes(op) > MAX_OP_PAYLOAD_BYTES ? null : op;
 }
 
 // ── rekordbox analysis units ────────────────────────────────────────────────

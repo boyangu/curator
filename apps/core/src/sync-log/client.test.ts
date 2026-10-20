@@ -757,8 +757,9 @@ describe('initial push', () => {
 		// Status events are coalesced (≤ 4/s) but the run is announced.
 		expect(events.length).toBeGreaterThan(0);
 		expect(raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY)).toBeDefined();
-		// 20 tags + 20 playlists + 4,000 tag rows + 2,000 members + 1,000 ratings + 2 system tags.
-		expect(c.status().pending).toBe(20 + 20 + 4_000 + 2_000 + 1_000 + 2);
+		// 20 tags + 20 playlists + 4,000 tag rows + 2,000 members + 1,000 ratings + 2 system tags
+		// + 2,000 recording creates (the rows carry no claims: no links, no ISRC).
+		expect(c.status().pending).toBe(20 + 20 + 4_000 + 2_000 + 1_000 + 2 + 2_000);
 		await c.syncNow();
 		expect(c.status().pending).toBe(0);
 	});

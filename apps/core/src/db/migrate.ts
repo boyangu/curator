@@ -18,6 +18,8 @@ import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { mergeRecordingRaw } from '../library/mutators.js';
 import { markRecordsComplete, recordsComplete } from '../sync-log/apply.js';
+import { claimParentId } from '../sync-log/store.js';
+import { CLAIMS_BACKFILL_KEY } from '../sync-log/initial-push.js';
 import { CLIENT_STATE_KEY } from '../sync-log/client.js';
 
 const mlog = log.for('migrate');
@@ -1975,6 +1977,30 @@ function backfillAnalysisAudioHash(sqlite: Database.Database): void {
 	mlog.info('stamped analysis rows with their audio hash', { stamped, rows: total, ms: Date.now() - started });
 }
 
+// Claim records written before sync_state indexed them by value (store.ts
+// claimParentId): fill parent_id so the identity resolver's lookup by audio
+// hash sees them. Writes only that index column of the op log's own records
+// (no library content), so no backup; one-shot, gated.
+const CLAIM_INDEX_VERSION = 1;
+const CLAIM_INDEX_KEY = 'sync.claim_index_version';
+
+function indexClaimRecords(sqlite: Database.Database): void {
+	if (readSettingInt(sqlite, CLAIM_INDEX_KEY) >= CLAIM_INDEX_VERSION) return;
+	sqlite.transaction(() => {
+		const put = sqlite.prepare(`UPDATE sync_state SET parent_id = ? WHERE map = 'claims' AND key = ?`);
+		let n = 0;
+		for (const r of sqlite.prepare(`SELECT key, value FROM sync_state WHERE map = 'claims'`).all() as Array<{ key: string; value: string }>) {
+			const v = JSON.parse(r.value) as { kind?: string; value?: string };
+			if (typeof v.kind !== 'string' || typeof v.value !== 'string') continue;
+			n += put.run(claimParentId(v.kind, v.value), r.key).changes;
+		}
+		sqlite.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+			.run(CLAIM_INDEX_KEY, JSON.stringify(CLAIM_INDEX_VERSION), Date.now());
+		if (n > 0) mlog.info('indexed claim records by value', { rows: n });
+	})();
+}
+
 // Consistent snapshot next to the DB before a migration that rewrites
 // library content. VACUUM INTO works under WAL and needs no open
 // transaction. Keeps the newest 3 per tag so the folder doesn't fill up.
@@ -2027,9 +2053,16 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// row ids and order keys. Before every content pass below so its backup
 	// is the library as the previous version left it.
 	migrateSyncSchema(sqlite, dbPath);
+	indexClaimRecords(sqlite);
 	// A library born empty is born complete: every row from here on is
-	// recorded by the mutators, so no initial push is owed (apply.ts).
+	// recorded by the mutators, so no initial push is owed (apply.ts). Nor
+	// the recordings backfill: the scanner and the streaming upserts record
+	// each new row's create and claims (initial-push.ts CLAIMS_BACKFILL_KEY).
 	if (recordsComplete(sqlite)) markRecordsComplete(sqlite);
+	if (sqlite.prepare(`SELECT 1 FROM track LIMIT 1`).get() === undefined) {
+		sqlite.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)
+			.run(CLAIMS_BACKFILL_KEY, JSON.stringify(Date.now()), Date.now());
+	}
 	// Collapse key storage to Camelot-only (backfill from key_musical, then
 	// drop the column). Runs before dedupe so the INHERITABLE set no longer
 	// references the dropped column.

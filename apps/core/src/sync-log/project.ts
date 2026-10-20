@@ -109,7 +109,11 @@ export function project(
 	// Records already moved to the winner; the local rows follow: when both
 	// recordings have a row here, the desktop's own merge moves links,
 	// analysis and the rest (hook; emission off) and soft-deletes the loser;
-	// when only the loser has one, it simply becomes the winner's row.
+	// when only the loser has one, it simply becomes the winner's row — and
+	// then shows everything the winner's records hold, none of which had a
+	// row to land on here before (the other desktop's tags on its copy of
+	// the same file, identity.ts).
+	const adopted = new Set<string>();
 	for (const id of ids('recording')) {
 		const target = state.recordingAlias.get(id);
 		if (!target) continue;
@@ -119,6 +123,7 @@ export function project(
 		if (!winner) {
 			raw.prepare(`UPDATE track SET recording_id = ? WHERE recording_id = ?`).run(target, id);
 			for (const r of loserRows) tracksTouched.add(r.id);
+			adopted.add(target);
 		} else {
 			for (const r of loserRows) {
 				if (r.id === winner) continue;
@@ -137,6 +142,7 @@ export function project(
 		}
 		trackCache.clear();
 	}
+	for (const target of adopted) for (const r of store.recordingRefs(target)) add(r.entity, r.id);
 
 	// ── 1b. artist alias rules: the artist table follows the resolved map ─
 	// Diffed against the map as it stood before this batch, so a rule whose

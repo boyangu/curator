@@ -4,11 +4,14 @@
 // itself and the seq through which it holds its own ops, and those stay
 // here. Read under RLS like everything else; the explicit
 // `user_id = auth.uid()` is there for the (user_id, seq) index, not for
-// safety.
+// safety. First, in the same transaction, the revoke gate
+// (account/device-gate.ts): a revoked device, or a session acting as one,
+// reads nothing.
 
 import { MAX_PULL_OPS, SYNC_FEATURES, type PullInput, type PullResult, type StoredOp } from '@curator/protocol';
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx, type UserTx } from '../db/user-tx.js';
+import { assertSessionNotRevoked, gateDevice, type Caller } from '../account/device-gate.js';
 
 export type PullCall = PullInput;
 
@@ -175,16 +178,18 @@ async function selectPageSkippingOwn(tx: Queryable, afterSeq: number, limit: num
 	return { ops, nextSeq: num(first.next_seq), skippedOwn: num(first.in_range) - ops.length };
 }
 
-export async function pull(db: Db, userId: string, call: PullCall, opts: PullOptions = DEFAULT_PULL_OPTIONS): Promise<PullOutcome> {
+export async function pull(db: Db, userId: string, caller: Caller, call: PullCall, opts: PullOptions = DEFAULT_PULL_OPTIONS): Promise<PullOutcome> {
 	const limit = Math.min(call.limit ?? MAX_PULL_OPS, MAX_PULL_OPS);
-	// Security: the device id only narrows what the caller receives from its
-	// own rows. Every statement here is already confined to this user by RLS,
-	// so a wrong or forged id can at most hide some of the caller's own ops
-	// from the caller. No authorization depends on it, which is also why it
-	// need not name a registered device.
+	// The skip only narrows what the caller receives from its own rows. Every
+	// statement here is confined to this user by RLS, so a wrong or forged
+	// id can at most hide some of the caller's own ops from the caller. The
+	// device id does gate access now ('device_reads'), but as a refusal only:
+	// the gate also refuses by the session, which the client cannot choose.
 	const skip: SkipOwn | null =
 		call.deviceId !== undefined && call.ownThroughSeq !== undefined ? { deviceId: call.deviceId, throughSeq: call.ownThroughSeq } : null;
 	return withUserTx(db, userId, async (tx) => {
+		if (call.deviceId !== undefined) await gateDevice(tx, caller, call.deviceId);
+		else await assertSessionNotRevoked(tx, caller);
 		let result: PullResult;
 		let skippedOwn = 0;
 		if (skip) {

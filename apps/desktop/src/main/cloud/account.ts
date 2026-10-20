@@ -252,6 +252,22 @@ export class CloudAccount {
 		return this.state();
 	}
 
+	// Every OTHER session of this account, on any device (Supabase scope
+	// 'others'): their refresh tokens are revoked, so each ends when its
+	// current access token expires (≤ 1 h; the sync API refuses a revoked
+	// device's session at once). This install stays signed in. The way to
+	// make a revoked device's sign-in useless for good, since this app holds
+	// no admin key to end one particular session.
+	async signOutOthers(): Promise<void> {
+		if (!this.session) throw new Error('Sign in first.');
+		const { error } = await this.supabase.auth.signOut({ scope: 'others' });
+		if (error) {
+			alog.warn('signing out other sessions failed', authFailure(error));
+			throw new Error(friendlyAuthError(error.message));
+		}
+		alog.info('signed out all other sessions', { userId: this.session.user.id });
+	}
+
 	onChange(cb: (s: AccountState) => void): () => void {
 		this.changeListeners.add(cb);
 		return () => { this.changeListeners.delete(cb); };

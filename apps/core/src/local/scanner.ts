@@ -446,6 +446,14 @@ export class LibraryScanner {
 					}
 				});
 				if (audioChanged) slog.info('audio changed under a known path — analysis stamp cleared, re-analysis queued', { trackId: existing.trackId });
+				// A hash first computed here (the lazy backfill of links from
+				// before audio hashing) or a new one (the audio changed) is a
+				// claim nothing else would make: the initial push and its
+				// backfill run once, and the identity resolver can only pair
+				// this file with another desktop's copy through the claim.
+				if (parsed.audioHash && parsed.audioHash !== existing.audioHash) {
+					addClaims(this.db, existing.trackId, [{ kind: 'audio_hash', value: parsed.audioHash }]);
+				}
 				this.promoteFileFields(existing.trackId, parsed);
 				totals.matched++;
 				this.emit({

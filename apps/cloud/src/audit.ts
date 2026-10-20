@@ -47,13 +47,18 @@ export const AUDIT_KINDS = [
 	'device_registered',
 	'device_revoked',
 	'device_reregister_refused',
+	// `{ ops, via }`: `via` is 'device' (the device named is revoked) or
+	// 'session' (the session acts as a revoked device, whatever it named).
 	'push_from_revoked_device',
+	// sync.pull / sync.bootstrap refused for a revoked device:
+	// `{ procedure, via }` as above.
+	'read_from_revoked_device',
 	'ops_rejected',
 	'client_ts_clamped',
 	'bootstrap_served',
 	// catalogue.*: per-item rejections of a put ({ procedure, byReason }), or
-	// a whole call refused for a revoked device or a missing entitlement
-	// ({ procedure, reason }).
+	// a whole call refused for a revoked device ({ procedure, reason, via })
+	// or a missing entitlement ({ procedure, reason }).
 	'catalogue_rejected',
 ] as const;
 
@@ -83,6 +88,7 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	device_revoked: 'info',
 	device_reregister_refused: 'warn',
 	push_from_revoked_device: 'warn',
+	read_from_revoked_device: 'warn',
 	ops_rejected: 'info',
 	client_ts_clamped: 'warn',
 	bootstrap_served: 'info',

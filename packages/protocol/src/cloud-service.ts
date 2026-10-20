@@ -44,7 +44,17 @@ export type PushInput = {
 //     (catalogue.ts). A server lists it only when it is configured with a
 //     catalogue policy, so this constant is what a server CAN offer, not
 //     what every server does; read `features` from the server.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue'] as const;
+//   - 'device_reads': reads name the device. sync.pull takes `deviceId`
+//     alone (no own-op skip implied) and sync.bootstrap takes
+//     `{ deviceId }`; a revoked device is refused on both, as on push and
+//     catalogue.*. A client that sees it sends its device id on every read.
+//     Revocation does not rest on the client's word: the server also binds
+//     each Supabase session to the device it acts as and refuses a session
+//     whose device is revoked, named or not (apps/cloud device-gate.ts).
+//     Pull and bootstrap without a device id stay accepted while older
+//     desktops are in use; a server run with CURATOR_REQUIRE_DEVICE_ID
+//     answers them `update_required` instead.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -79,14 +89,22 @@ export type PullInput = {
 	afterSeq: number;
 	// At most MAX_PULL_OPS; the server caps it.
 	limit?: number;
-	// 'pull_skip_own', both or neither: leave out this device's ops with
+	// The calling device ('device_reads'; with 'pull_skip_own' alone it came
+	// only together with `ownThroughSeq`). A revoked device is refused.
+	// Optional on the wire while desktops from before 'device_reads' are in
+	// use; a client that sees the feature always sends it.
+	deviceId?: string;
+	// 'pull_skip_own', only with `deviceId`: leave out this device's ops with
 	// `seq <= ownThroughSeq`, which the caller vouches it already holds. Its
 	// later ops still come (and are skipped by `op_id` as before), so a
-	// restored or copied database gets back what it lost. Without these the
-	// page is every op after the cursor, own ones included. A filter on the
-	// caller's own rows only: it decides nothing about access.
-	deviceId?: string;
+	// restored or copied database gets back what it lost. Without it the
+	// page is every op after the cursor, own ones included.
 	ownThroughSeq?: number;
+};
+
+// sync.bootstrap's input ('device_reads'). An older client sends none.
+export type BootstrapInput = {
+	deviceId?: string;
 };
 
 export type PullResult = {
@@ -129,6 +147,9 @@ export const CALL_ERROR_REASONS = [
 	// Push or pull from a device id the account has not registered: register,
 	// then retry the same call.
 	'device_not_registered',
+	// The device the call names, or the device its session acts as, was
+	// revoked. Final for that device id: stop pushing AND pulling; the way
+	// back is a new sign-in under a new device id.
 	'device_revoked',
 	'device_not_found',
 	// An op stamped with a schema version newer than the server knows. Servers
@@ -170,7 +191,7 @@ export interface CloudService {
 	sync: {
 		push(input: PushInput): Promise<PushResult>;
 		pull(input: PullInput): Promise<PullResult>;
-		bootstrap(): Promise<BootstrapResult>;
+		bootstrap(input?: BootstrapInput): Promise<BootstrapResult>;
 	};
 	account: {
 		registerDevice(input: RegisterDeviceInput): Promise<{ ok: true }>;

@@ -17,6 +17,13 @@ export type Config = {
 	// lives in fly.toml [env], so the stage (D-a / D-b) is versioned with the
 	// code.
 	catalogue: CataloguePolicy | null;
+	// CURATOR_REQUIRE_DEVICE_ID=1: sync.pull and sync.bootstrap without a
+	// device id are refused `update_required` instead of served. Off while
+	// desktops from before 'device_reads' are in use; switched on once every
+	// install has updated, which closes the last read path a revoked device
+	// whose session the server never bound could still use (README
+	// "Revoking a device").
+	requireDeviceId: boolean;
 };
 
 export class ConfigError extends Error {
@@ -57,5 +64,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 		if (e instanceof CataloguePolicyError) throw new ConfigError(e.message);
 		throw e;
 	}
-	return { databaseUrl, supabaseUrl, port, catalogue };
+	const flag = env.CURATOR_REQUIRE_DEVICE_ID?.trim().toLowerCase() ?? '';
+	if (!['', '0', '1', 'false', 'true'].includes(flag)) throw new ConfigError(`CURATOR_REQUIRE_DEVICE_ID must be 0 or 1, not ${env.CURATOR_REQUIRE_DEVICE_ID}`);
+	const requireDeviceId = flag === '1' || flag === 'true';
+	return { databaseUrl, supabaseUrl, port, catalogue, requireDeviceId };
 }

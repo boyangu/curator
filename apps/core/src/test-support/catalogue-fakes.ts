@@ -384,7 +384,7 @@ export function makeTestDevice(
 		raw: sqlite,
 		transport: device.transport(),
 		blobs,
-		deviceId: `dev-${userId.slice(0, 4)}-${dir.length}`,
+		deviceId: () => `dev-${userId.slice(0, 4)}-${dir.length}`,
 		peaksDir,
 		serverFeatures: () => features.list as never,
 		onHydrated: (ids) => { queue.settleSatisfied(ids, (id, o) => layer.remaining(id, o)); },
