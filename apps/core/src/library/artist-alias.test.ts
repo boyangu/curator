@@ -82,26 +82,26 @@ describe('mapCredits', () => {
 		expect(mapCredits([{ name: 'A' }, { name: 'B', role: 'remixer' }], to({ b: 'Bee' }))).toEqual({ list: [{ name: 'A' }, { name: 'Bee', role: 'remixer' }], changed: true });
 	});
 	it('merges the roles of credits an alias folds into one artist: no role is lost', () => {
-		// The 2026-10-21 replay divergence (recording 0416fee4…): the title
-		// credits "Samm" as remixer, the listing "Samm (BE)" as artist, and the
-		// rule Samm → Samm (BE) folds them. Both roles stay, on the one spelling.
+		// The 2026-10-21 replay divergence (a real-library recording…): the title
+		// credits "Rho" as remixer, the listing "Rho (NL)" as artist, and the
+		// rule Rho → Rho (NL) folds them. Both roles stay, on the one spelling.
 		const credits = [
-			{ name: 'Copyright' }, { name: 'Shovell' }, { name: 'Samm (BE)' }, { name: 'MAXI MERAKI', role: 'remixer' as const },
-			{ name: 'Marlin (BE)' }, { name: 'Samm', role: 'remixer' as const }, { name: 'Marlin', role: 'remixer' as const },
+			{ name: 'Ada' }, { name: 'Bram' }, { name: 'Rho (NL)' }, { name: 'Vela', role: 'remixer' as const },
+			{ name: 'Orin (DE)' }, { name: 'Rho', role: 'remixer' as const }, { name: 'Orin', role: 'remixer' as const },
 		];
-		expect(mapCredits(credits, to({ samm: 'Samm (BE)' }))).toEqual({
+		expect(mapCredits(credits, to({ rho: 'Rho (NL)' }))).toEqual({
 			list: [
-				{ name: 'Copyright' }, { name: 'Shovell' }, { name: 'Samm (BE)' }, { name: 'MAXI MERAKI', role: 'remixer' },
-				{ name: 'Marlin (BE)' }, { name: 'Samm (BE)', role: 'remixer' }, { name: 'Marlin', role: 'remixer' },
+				{ name: 'Ada' }, { name: 'Bram' }, { name: 'Rho (NL)' }, { name: 'Vela', role: 'remixer' },
+				{ name: 'Orin (DE)' }, { name: 'Rho (NL)', role: 'remixer' }, { name: 'Orin', role: 'remixer' },
 			],
 			changed: true,
 		});
 		// The same role twice still collapses to the first.
-		expect(mapCredits([{ name: 'Samm', role: 'remixer' }, { name: 'Samm (BE)', role: 'remixer' }], to({ samm: 'Samm (BE)' })))
-			.toEqual({ list: [{ name: 'Samm (BE)', role: 'remixer' }], changed: true });
+		expect(mapCredits([{ name: 'Rho', role: 'remixer' }, { name: 'Rho (NL)', role: 'remixer' }], to({ rho: 'Rho (NL)' })))
+			.toEqual({ list: [{ name: 'Rho (NL)', role: 'remixer' }], changed: true });
 		// Order-independent in what survives: whichever credit comes first.
-		expect(mapCredits([{ name: 'Samm', role: 'remixer' }, { name: 'Samm (BE)' }], to({ samm: 'Samm (BE)' })))
-			.toEqual({ list: [{ name: 'Samm (BE)', role: 'remixer' }, { name: 'Samm (BE)' }], changed: true });
+		expect(mapCredits([{ name: 'Rho', role: 'remixer' }, { name: 'Rho (NL)' }], to({ rho: 'Rho (NL)' })))
+			.toEqual({ list: [{ name: 'Rho (NL)', role: 'remixer' }, { name: 'Rho (NL)' }], changed: true });
 	});
 	it('leaves a list with no mapped key untouched, even one holding a duplicate', () => {
 		const dup = [{ name: 'X' }, { name: 'x' }];

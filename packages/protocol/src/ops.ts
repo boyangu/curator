@@ -427,7 +427,7 @@ export const ZLibraryTrackSetRbAnalysis = defineOp('library_track', 'set-rb-anal
 // artist (its display name, first-seen unless the user renamed it): a
 // device creating the same uncurated artist from another listing would
 // otherwise keep whichever spelling it met first (the audit's 41 artists,
-// "Murat Uncuoğlu" vs "Murat Uncuoglu"); the master's spelling wins there.
+// "Ayşe Çelikoğlu" vs "Ayse Celikoglu"); the master's spelling wins there.
 export const KEY_SOURCES = ['rekordbox', 'beatport', 'traxsource', 'tidal', 'tag', 'other'] as const;
 export const PROVIDER_REF_SOURCES = ['spotify', 'tidal'] as const;
 const ZProviderAlbum = z

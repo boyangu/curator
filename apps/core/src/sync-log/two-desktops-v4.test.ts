@@ -14,7 +14,7 @@
 //   - the Discover feed: decisions by stable key both ways, a follower runs
 //     no producer;
 //   - a v3 client holds v4 ops aside and applies them once it reads them;
-//   - the remixer role merge: the replay divergence of recording 0416fee4.
+//   - the remixer role merge: the replay divergence of a real-library recording.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
@@ -388,60 +388,60 @@ describe('playlist details', () => {
 
 describe('artist spelling: the master\'s wins for an artist nobody renamed', () => {
 	it('a device that met another spelling first shows the master\'s', async () => {
-		// The master's artist row was first seen as "Murat Uncuoğlu"; one of its
+		// The master's artist row was first seen as "Ayşe Çelikoğlu"; one of its
 		// listings spells it without the diacritic.
 		await rig.desktop('a', {
 			catalogue: ['trk-0', 'trk-1'],
-			artists: (id) => [{ name: id === 'trk-0' ? 'Murat Uncuoğlu' : 'Murat Uncuoglu' }],
+			artists: (id) => [{ name: id === 'trk-0' ? 'Ayşe Çelikoğlu' : 'Ayse Celikoglu' }],
 		});
 		// B meets the plain spelling first: its own file credits it so.
-		const b = await rig.desktop('b', { catalogue: ['trk-1'], artists: () => [{ name: 'Murat Uncuoglu' }] });
-		expect(b.one(`SELECT name FROM artist WHERE name_ascii = 'muratuncuoglu'`)).toBe('Murat Uncuoglu');
+		const b = await rig.desktop('b', { catalogue: ['trk-1'], artists: () => [{ name: 'Ayse Celikoglu' }] });
+		expect(b.one(`SELECT name FROM artist WHERE name_ascii = 'aysecelikoglu'`)).toBe('Ayse Celikoglu');
 		await rig.settle();
-		expect(b.one(`SELECT name FROM artist WHERE name_ascii = 'muratuncuoglu'`)).toBe('Murat Uncuoğlu');
+		expect(b.one(`SELECT name FROM artist WHERE name_ascii = 'aysecelikoglu'`)).toBe('Ayşe Çelikoğlu');
 		// A fresh device mints it with the master's spelling, whichever row it
 		// derives first.
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
-		expect(c.one(`SELECT name FROM artist WHERE name_ascii = 'muratuncuoglu'`)).toBe('Murat Uncuoğlu');
+		expect(c.one(`SELECT name FROM artist WHERE name_ascii = 'aysecelikoglu'`)).toBe('Ayşe Çelikoğlu');
 	});
 });
 
 // ── the remixer role merge ──────────────────────────────────────────────────
 
-describe('remixer role merge (recording 0416fee4, "Kama Yeah")', () => {
+describe('remixer role merge (a real-library case, "Night Tide")', () => {
 	it('the master re-derives under the role-merging rules once and a fresh device derives the same credits', async () => {
 		const credits = [
-			{ name: 'Copyright' }, { name: 'Shovell' }, { name: 'Samm (BE)' }, { name: 'MAXI MERAKI', role: 'remixer' },
-			{ name: 'Marlin (BE)' }, { name: 'Samm', role: 'remixer' }, { name: 'Marlin', role: 'remixer' },
+			{ name: 'Ada' }, { name: 'Bram' }, { name: 'Rho (NL)' }, { name: 'Vela', role: 'remixer' },
+			{ name: 'Orin (DE)' }, { name: 'Rho', role: 'remixer' }, { name: 'Orin', role: 'remixer' },
 		];
 		const a = await rig.desktop('a', { catalogue: ['trk-0'], artists: () => credits as never });
 		await rig.settle();
-		// The rename that made the alias (as the main library has: Samm → Samm (BE)).
-		await a.svc.mergeArtists(a.one<string>(`SELECT id FROM artist WHERE name = 'Samm (BE)'`), a.one<string>(`SELECT id FROM artist WHERE name = 'Samm'`));
+		// The rename that made the alias (as the main library has: Rho → Rho (NL)).
+		await a.svc.mergeArtists(a.one<string>(`SELECT id FROM artist WHERE name = 'Rho (NL)'`), a.one<string>(`SELECT id FROM artist WHERE name = 'Rho'`));
 		await rig.settle();
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
 		const want = JSON.parse(a.one<string>(`SELECT artists FROM track WHERE id = 'trk-0'`));
-		expect(want).toContainEqual({ name: 'Samm (BE)', role: 'remixer' });
-		expect(want).toContainEqual({ name: 'Samm (BE)' });
+		expect(want).toContainEqual({ name: 'Rho (NL)', role: 'remixer' });
+		expect(want).toContainEqual({ name: 'Rho (NL)' });
 		expect(JSON.parse(c.one<string>(`SELECT artists FROM track WHERE id = ?`, remoteTrackId(R('trk-0'))))).toEqual(want);
 	});
 
 	it('a row ingested while the rule stood (the live case) converges once the upgrade re-derives it', async () => {
-		const credits = [{ name: 'Samm (BE)' }, { name: 'Samm', role: 'remixer' }];
-		const a = await rig.desktop('a', { catalogue: ['trk-0'], artists: () => [{ name: 'Samm (BE)' }, { name: 'Samm' }] });
+		const credits = [{ name: 'Rho (NL)' }, { name: 'Rho', role: 'remixer' }];
+		const a = await rig.desktop('a', { catalogue: ['trk-0'], artists: () => [{ name: 'Rho (NL)' }, { name: 'Rho' }] });
 		await rig.settle();
-		await a.svc.mergeArtists(a.one<string>(`SELECT id FROM artist WHERE name = 'Samm (BE)'`), a.one<string>(`SELECT id FROM artist WHERE name = 'Samm'`));
+		await a.svc.mergeArtists(a.one<string>(`SELECT id FROM artist WHERE name = 'Rho (NL)'`), a.one<string>(`SELECT id FROM artist WHERE name = 'Rho'`));
 		await rig.settle();
 		// What an ingest after the rule wrote on the main library: the
 		// substituted main credit plus the remixer read off the title, raw.
-		a.raw.prepare(`INSERT INTO track (id, recording_id, title, artists, state, duration) VALUES ('trk-k', ?, 'Kama Yeah - Samm Remix', ?, 'unsorted', 300)`).run(R('trk-k'), JSON.stringify(credits));
+		a.raw.prepare(`INSERT INTO track (id, recording_id, title, artists, state, duration) VALUES ('trk-k', ?, 'Night Tide - Rho Remix', ?, 'unsorted', 300)`).run(R('trk-k'), JSON.stringify(credits));
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
 		const remote = (): unknown => JSON.parse(c.one<string>(`SELECT artists FROM track WHERE id = ?`, remoteTrackId(R('trk-k'))));
 		// Both roles kept through the rule on the deriving device…
-		expect(remote()).toEqual([{ name: 'Samm (BE)' }, { name: 'Samm (BE)', role: 'remixer' }]);
+		expect(remote()).toEqual([{ name: 'Rho (NL)' }, { name: 'Rho (NL)', role: 'remixer' }]);
 		// …while the master still shows what it ingested.
 		expect(JSON.parse(a.one<string>(`SELECT artists FROM track WHERE id = 'trk-k'`))).toEqual(credits);
 		// The upgrade's one-time re-derive (migrate.ts → queueRoleMergeRederive).

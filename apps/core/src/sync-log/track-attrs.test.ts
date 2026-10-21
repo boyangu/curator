@@ -34,8 +34,8 @@ describe('trackAttrsOf', () => {
 	});
 
 	it('takes the artist table\'s spelling of each credit', () => {
-		const a = trackAttrsOf(row({ artists: JSON.stringify([{ name: 'Murat Uncuoglu' }, { name: 'B', role: 'remixer' }]) }), ctx({ artistName: (k) => (k === 'muratuncuoglu' ? 'Murat Uncuoğlu' : null) }))!;
-		expect(a.artist_names).toEqual(['Murat Uncuoğlu', 'B']);
+		const a = trackAttrsOf(row({ artists: JSON.stringify([{ name: 'Ayse Celikoglu' }, { name: 'B', role: 'remixer' }]) }), ctx({ artistName: (k) => (k === 'aysecelikoglu' ? 'Ayşe Çelikoğlu' : null) }))!;
+		expect(a.artist_names).toEqual(['Ayşe Çelikoğlu', 'B']);
 	});
 
 	it('compacts listings, dedupes them, and drops refs (then cuts the comment) to fit the op cap', () => {

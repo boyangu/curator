@@ -77,11 +77,11 @@ type Raw = Database.Database;
 //
 // Roles merge, none is lost (decided 2026-10-21): when an alias folds two
 // credits into one artist, the artist keeps every role the two carried — a
-// main credit and a remixer credit of "Samm" and "Samm (BE)" stay a main and
-// a remixer credit of "Samm (BE)", one each. Deduping by fold alone dropped
+// main credit and a remixer credit of "Rho" and "Rho (NL)" stay a main and
+// a remixer credit of "Rho (NL)", one each. Deduping by fold alone dropped
 // whichever came second, and a remote row derived through the rule then lost
-// the remixer the master showed (the 2026-10-21 replay: recording 0416fee4,
-// "Kama Yeah - Samm, MAXI MERAKI, Marlin Remix"). Two credits of one artist
+// the remixer the master showed (the 2026-10-21 replay: a real-library recording,
+// "Night Tide - Rho, Vela, Orin Remix"). Two credits of one artist
 // with the same role still collapse to the first.
 export function mapCredits(list: readonly TrackArtist[] | null | undefined, target: (key: string) => string | undefined): { list: TrackArtist[]; changed: boolean } {
 	if (!list || list.length === 0) return { list: list ? [...list] : [], changed: false };
