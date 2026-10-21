@@ -74,7 +74,7 @@ import { log } from '../log.js';
 import { artistCreditRewritePending, drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
 import { applyOps, INITIAL_PUSH_KEY, recordsComplete, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
 import { getDeviceId } from './device.js';
-import { heldCount, holdOps, replayHeldOps } from './held.js';
+import { heldCount, heldNewerCount, holdOps, replayHeldOps } from './held.js';
 import { claimsBackfillAsync, claimsBackfillPending, initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushAsyncResult, type InitialPushProgress } from './initial-push.js';
 import { resolveRecordingIdentitiesAsync } from './identity.js';
 import { CLOCK_KEY, observeServerTs, onOutboxAppend } from './outbox.js';
@@ -505,7 +505,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			transferring: moving,
 			lastSeq: readCursor(raw).lastSeq,
 			lastError,
-			needsUpdate: pushRefused || heldCount(raw) > 0,
+			needsUpdate: pushRefused || heldNewerCount(raw) > 0,
 			revoked: isRevoked(st),
 			boundUserId: st.userId,
 			initialPushDone: raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined,

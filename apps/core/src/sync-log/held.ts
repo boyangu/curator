@@ -38,6 +38,15 @@ export function heldCount(raw: Raw): number {
 	return raw.prepare(`SELECT count(*) FROM sync_inbox_held`).pluck().get() as number;
 }
 
+// Held ops this build still cannot read. Only these mean "update Curator":
+// ops held by an older build that this one understands are merely waiting
+// for the next pull to replay them, and showing the update banner for them
+// (as the 2026-10-21 upgrade did for a few minutes) tells the user to do
+// something they already did.
+export function heldNewerCount(raw: Raw, current: number = SCHEMA_VERSION): number {
+	return raw.prepare(`SELECT count(*) FROM sync_inbox_held WHERE schema_version > ?`).pluck().get(current) as number;
+}
+
 export type ReplayOutcome = { applied: number; remaining: number; outcome: ApplyOutcome | null; error: string | null };
 
 // Apply every held op this build reads (schema_version ≤ `current`), oldest
