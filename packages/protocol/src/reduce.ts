@@ -25,6 +25,7 @@ import {
 	clockOf,
 	compareClock,
 	laterClock,
+	metaCellName,
 	resolveRecording,
 	tombstoneKey,
 	type ArtistAliasRule,
@@ -197,6 +198,12 @@ function applyLibraryTrack(state: LibraryState, op: OpOf<'library_track'>, clock
 			break;
 		case 'set-state':
 			changed = writeCell(rec.fields, 'state', op.payload.state, clock);
+			break;
+		// One cell per device (state.ts metaCellName): the view picks between
+		// them (resolveTrackMeta), so a device's later write never hides the
+		// master's.
+		case 'set-meta':
+			changed = writeCell(rec.fields, metaCellName(op.device_id), op.payload, clock);
 			break;
 		case 'set-override':
 			changed = writeCell(rec.fields, `override.${op.payload.field}`, op.payload.value, clock);
@@ -603,6 +610,11 @@ export function isRestatement(state: LibraryState, op: NewOp): boolean {
 				case 'set-rating': return cellHolds(rec, 'rating', op.payload.rating);
 				case 'set-favourite': return cellHolds(rec, 'favourite', op.payload.favourite);
 				case 'set-state': return cellHolds(rec, 'state', op.payload.state);
+				// Needs the stamped op: the cell is the emitting device's.
+				case 'set-meta': {
+					const device = (op as { device_id?: string }).device_id;
+					return device !== undefined && cellHolds(rec, metaCellName(device), op.payload);
+				}
 				case 'set-override': return cellHolds(rec, `override.${op.payload.field}`, op.payload.value);
 				case 'set-rb-analysis': return cellHolds(rec, `rb.${op.payload.unit}`, op.payload.value);
 				// The delete's value is its own client_ts; already deleted at any

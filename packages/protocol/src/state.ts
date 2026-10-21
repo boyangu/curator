@@ -10,7 +10,7 @@
 // the user sees is derived from them by `materialize`, which applies the
 // visibility rules (tombstones, container deletes, add-wins).
 
-import type { CueKind, Entity, Op, PayloadOf, SourceLink } from './ops.js';
+import { MASTER_DEVICE_SETTING, type CueKind, type Entity, type Op, type PayloadOf, type SourceLink, type TrackMeta } from './ops.js';
 import { compareKeys } from './order-key.js';
 
 // ── clocks ──────────────────────────────────────────────────────────────────
@@ -196,6 +196,48 @@ export function resolveRecording(state: LibraryState, recordingId: string): stri
 	return state.recordingAlias.get(recordingId) ?? recordingId;
 }
 
+// ── base metadata (library_track.set-meta, since v3) ────────────────────────
+// Each device's meta for a recording is its own LWW cell; the view shows one
+// of them. THE RULE (decided 2026-10-20, "master device wins"): the master
+// device's cell whenever it has one — the master seeds every other device —
+// else, among the devices that do, the best source (a file's own tags over a
+// provider's listing: local > spotify > tidal > other), then the later
+// write. A function of the cells and the setting only, so every device and
+// the server pick the same cell in any arrival order, and a master change
+// re-picks everywhere at once.
+
+export const META_CELL_PREFIX = 'meta.';
+
+export function metaCellName(deviceId: string): string {
+	return `${META_CELL_PREFIX}${deviceId}`;
+}
+
+const META_SOURCE_RANK: Record<string, number> = { local: 0, spotify: 1, tidal: 2, other: 3 };
+
+export type ResolvedTrackMeta = { device: string; meta: TrackMeta; clock: Clock };
+
+export function resolveTrackMeta(rec: Pick<LwwRecord, 'fields'> | undefined, master: string | null): ResolvedTrackMeta | null {
+	if (!rec) return null;
+	let best: ResolvedTrackMeta | null = null;
+	for (const [name, cell] of Object.entries(rec.fields)) {
+		if (!name.startsWith(META_CELL_PREFIX) || cell.value === null || typeof cell.value !== 'object') continue;
+		const cand: ResolvedTrackMeta = { device: name.slice(META_CELL_PREFIX.length), meta: cell.value as TrackMeta, clock: cell.clock };
+		if (master !== null && cand.device === master) return cand;
+		if (!best) { best = cand; continue; }
+		const rb = META_SOURCE_RANK[best.meta.source] ?? 9;
+		const rc = META_SOURCE_RANK[cand.meta.source] ?? 9;
+		if (rc < rb || (rc === rb && compareClock(cand.clock, best.clock) > 0)) best = cand;
+	}
+	return best;
+}
+
+// The master device id the settings hold, or null (no master stated yet:
+// the rest of the rule decides alone).
+export function masterDeviceOf(settings: ReadonlyMap<string, Cell>): string | null {
+	const v = settings.get(MASTER_DEVICE_SETTING)?.value;
+	return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
 // ── visibility ──────────────────────────────────────────────────────────────
 
 function containerAlive(state: LibraryState, entity: Entity, rec: LwwRecord | undefined): rec is LwwRecord {
@@ -261,6 +303,9 @@ export type LibraryTrackView = {
 	deletedAt: number | null;
 	overrides: Record<string, unknown>;
 	rb: Record<string, unknown>;
+	// The winning base metadata (resolveTrackMeta) and the device it came
+	// from; null when no device has stated any.
+	meta: (TrackMeta & { device: string }) | null;
 };
 export type CueView = { recordingId: string; slot: number; kind: CueKind } & CueBody;
 export type PinnedSearchView = { id: string; name: string | null; query: string | null; sortColumn: string | null; sortDir: string | null };
@@ -360,6 +405,7 @@ export function materialize(state: LibraryState): LibraryView {
 	}
 
 	const libraryTracks: LibraryTrackView[] = [];
+	const master = masterDeviceOf(state.settings);
 	for (const id of sortedKeys(state.libraryTracks)) {
 		const r = state.libraryTracks.get(id)!;
 		const overrides: Record<string, unknown> = {};
@@ -377,6 +423,10 @@ export function materialize(state: LibraryState): LibraryView {
 			deletedAt: field(r, 'deleted_at', null),
 			overrides,
 			rb,
+			meta: (() => {
+				const m = resolveTrackMeta(r, master);
+				return m ? { ...m.meta, device: m.device } : null;
+			})(),
 		});
 	}
 

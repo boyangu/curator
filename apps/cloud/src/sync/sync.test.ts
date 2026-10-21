@@ -208,7 +208,7 @@ describe('protocol v2 kinds', () => {
 		const res = await api.sync.push.mutate({ deviceId, ops });
 		expect(res).toMatchObject({ accepted: ops.length, rejected: [] });
 		const pulled = await api.sync.pull.query({ afterSeq: 0 });
-		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, 2]));
+		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, SCHEMA_VERSION]));
 	});
 
 	it('still accepts a v1-stamped v1 kind, and rejects a v2 kind stamped v1 or an unknown state', async () => {
@@ -223,6 +223,42 @@ describe('protocol v2 kinds', () => {
 		expect(res.rejected).toEqual([
 			{ opId: v1State.op_id, reason: 'invalid_payload' },
 			{ opId: badState.op_id, reason: 'invalid_payload' },
+		]);
+	});
+});
+
+describe('protocol v3 kinds', () => {
+	const meta = { source: 'local' as const, title: 'Lilac', artists: [{ name: 'Bonobo' }], album_title: null, duration_sec: 312, isrc: null, release_date: null, label: null, genre: null, cover_url: 'https://i.scdn.co/image/x' };
+
+	it('advertises track_meta, accepts set-meta and the master device setting, and pulls them back as sent', async () => {
+		const { deviceId, api } = await app.signIn();
+		const op = opsFor(deviceId);
+		const rec = randomUUID();
+		const ops = [
+			op('library_track', 'set-meta', rec, meta),
+			op('setting', 'set', 'library.master_device', { value: deviceId }),
+		];
+		const res = await api.sync.push.mutate({ deviceId, ops });
+		expect(res).toMatchObject({ accepted: 2, rejected: [] });
+		expect(res.features).toContain('track_meta');
+		const pulled = await api.sync.pull.query({ afterSeq: 0 });
+		expect(pulled.features).toContain('track_meta');
+		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, 3]));
+	});
+
+	it('rejects either stamped v2 (a v2 client must hold them aside, not stop) and a non-http cover', async () => {
+		const { deviceId, api } = await app.signIn();
+		const op = opsFor(deviceId);
+		const rec = randomUUID();
+		const v2Meta = { ...op('library_track', 'set-meta', rec, meta), schema_version: 2 };
+		const v2Master = { ...op('setting', 'set', 'library.master_device', { value: deviceId }), schema_version: 2 };
+		const fileCover = { ...op('library_track', 'set-meta', rec, meta), payload: { ...meta, cover_url: 'file:///C:/a.jpg' } };
+		const res = await api.sync.push.mutate({ deviceId, ops: [v2Meta, v2Master, fileCover] });
+		expect(res.accepted).toBe(0);
+		expect(res.rejected).toEqual([
+			{ opId: v2Meta.op_id, reason: 'invalid_payload' },
+			{ opId: v2Master.op_id, reason: 'invalid_payload' },
+			{ opId: fileCover.op_id, reason: 'invalid_payload' },
 		]);
 	});
 });

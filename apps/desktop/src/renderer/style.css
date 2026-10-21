@@ -1389,6 +1389,14 @@ td.added, td.rel { color: var(--fg-1); font-size: 12px; }
 .src-marks i[data-src="beatport"]  { background: var(--src-beatport); }
 .src-marks i[data-src="rekordbox"] { background: var(--src-rekordbox); }
 .trk.row-analyzing .src-marks i[data-src="local"] { animation: pulse 1.4s ease-in-out infinite; }
+/* Remote row ("not on this device", track.remoteOnly): one hollow mark in the
+   SRC slot, outlined in the colour of how the holding device has it, and a
+   dimmed cover — the row still rates/tags/organises, it just can't play here. */
+.src-pip.src-pip--remote, .src-marks i.src-remote { --remote-c: var(--fg-3); background: transparent; box-shadow: inset 0 0 0 1px var(--remote-c); }
+[data-remote="local"]   { --remote-c: var(--src-local); }
+[data-remote="spotify"] { --remote-c: var(--src-spotify); }
+[data-remote="tidal"]   { --remote-c: var(--src-tidal); }
+.trk.is-remote .cover, .trk.is-remote .cover2__img { opacity: 0.55; }
 
 /* Two-line layout: 52px rows, 12px between columns (6px cell padding each
    side) and 16px outer gutters (the empty .pad cells, 10px + the 6px of the
@@ -4775,3 +4783,24 @@ body[data-view="discover"] .app {
 .backup-restore__sets { display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
 .backup-restore__tracks { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 8px 24px; }
 .backup-snaps__label-input { width: 160px; font-size: 12px; }
+/* Settings → Deleted Tracks. Reuses .backup-snaps for the table; the scroll
+   box keeps the toolbar in view over a few hundred rows. */
+.deleted-tracks { display: flex; flex-direction: column; gap: 10px; }
+.deleted-tracks__toolbar { display: flex; align-items: center; gap: 8px; }
+.deleted-tracks__filter { width: 240px; height: 28px; padding: 0 8px; font: inherit; font-size: 12.5px; color: var(--fg); background: var(--bg-2); border: 1px solid var(--line); outline: none; }
+.deleted-tracks__filter:focus { border-color: var(--accent); }
+.deleted-tracks__count { font-size: 12px; color: var(--fg-2); }
+.deleted-tracks__spacer { flex: 1; }
+.deleted-tracks__toolbar .btn-secondary, .deleted-tracks__toolbar .btn-danger { padding: 6px 12px; font-size: 12px; }
+.deleted-tracks__scroll { max-height: 52vh; overflow-y: auto; border-top: 1px solid var(--line); }
+.deleted-tracks__table thead th { position: sticky; top: 0; background: var(--bg-1); z-index: 1; }
+.deleted-tracks__table tbody tr { cursor: default; }
+.deleted-tracks__table tbody tr:hover { background: var(--bg-2); }
+.deleted-tracks__table tbody tr.is-selected { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.deleted-tracks__check { width: 24px; }
+.deleted-tracks__name { color: var(--fg); }
+.deleted-tracks__artist { color: var(--fg-2); font-size: 11.5px; }
+.deleted-tracks__when { white-space: nowrap; color: var(--fg-2); }
+.deleted-tracks__cause { white-space: nowrap; }
+.deleted-tracks__keeps { color: var(--fg-2); font-size: 11.5px; }
+.deleted-tracks__empty { color: var(--fg-3); text-align: center; padding: 16px 0; }

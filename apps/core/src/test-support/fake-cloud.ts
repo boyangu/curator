@@ -33,6 +33,7 @@ import {
 	type PushResult,
 	type RejectReason,
 	type StoredOp,
+	type SyncFeature,
 	SYNC_FEATURES,
 } from '@curator/protocol';
 import { CloudTransportError, type CloudTransport } from '../sync-log/client.js';
@@ -60,6 +61,10 @@ export class FakeCloud {
 	// Every push call's device and outcome, for "a revoked device stops pushing".
 	readonly pushLog: Array<{ deviceId: string; sent: number; accepted: number }> = [];
 	pageLimit = MAX_PULL_OPS;
+	// What push and pull results advertise (not `legacy`). A suite that pins
+	// the v2 mechanics takes 'track_meta' out, so no base-metadata or master
+	// op joins its outbox counts (client.test.ts v2Cloud).
+	features: SyncFeature[] = [...SYNC_FEATURES];
 	private snapshot: { seq: number; json: string } | null = null;
 	// A pull with afterSeq below this gets the snapshot hint.
 	hintBelow = 0;
@@ -91,7 +96,7 @@ export class FakeCloud {
 				rejected: input.ops.map((o) => ({ opId: (o as { op_id?: string }).op_id ?? '?', reason: 'device_revoked' as const })),
 				clamped: [],
 				batchMaxSeq: 0,
-				features: [...SYNC_FEATURES],
+				features: [...this.features],
 			};
 		}
 		const rejected: PushResult['rejected'] = [];
@@ -130,7 +135,7 @@ export class FakeCloud {
 		return {
 			accepted, maxSeq: this.maxSeq, rejected, clamped, batchMaxSeq,
 			...(accepted > 0 ? { priorOwnMaxSeq: prior } : {}),
-			features: [...SYNC_FEATURES],
+			features: [...this.features],
 		};
 	}
 
@@ -141,7 +146,7 @@ export class FakeCloud {
 		if (f) throw f;
 		if ((input.deviceId !== undefined || input.ownThroughSeq !== undefined) && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
 		const skip = input.ownThroughSeq !== undefined;
-		const features = this.legacy ? {} : { features: [...SYNC_FEATURES] };
+		const features = this.legacy ? {} : { features: [...this.features] };
 		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq, ...features };
 		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
 		const ops = this.log

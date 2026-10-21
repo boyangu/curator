@@ -828,6 +828,12 @@ export class LibraryScanner {
 		//   2. raw LIKE on title against the first word — loose enough to catch
 		//      accent/case variation, narrow enough not to scan the whole table
 		// The scorer's strict acceptance rule is what actually decides.
+		//
+		// Remote rows (remote_only, another device's track projected here)
+		// are never candidates: a tag match is the fuzziest evidence there
+		// is, and binding a file onto one would graft this file onto another
+		// device's recording on a title/artist guess. A file reaches a remote
+		// row only through the exact audio-hash claim (claimedRecordingOf).
 		const ids = new Set<string>();
 		const out: Candidate[] = [];
 
@@ -835,7 +841,7 @@ export class LibraryScanner {
 			const rows = this.db
 				.select()
 				.from(track)
-				.where(and(eq(track.isrc, target.isrc.toUpperCase()), isNull(track.derivedFromTrackId)))
+				.where(and(eq(track.isrc, target.isrc.toUpperCase()), isNull(track.derivedFromTrackId), eq(track.remoteOnly, false)))
 				.all();
 			for (const r of rows) {
 				ids.add(r.id);
@@ -854,7 +860,7 @@ export class LibraryScanner {
 			const rows = this.db
 				.select()
 				.from(track)
-				.where(and(like(track.title, `%${firstWord}%`), isNull(track.derivedFromTrackId)))
+				.where(and(like(track.title, `%${firstWord}%`), isNull(track.derivedFromTrackId), eq(track.remoteOnly, false)))
 				.limit(200)
 				.all();
 			for (const r of rows) {

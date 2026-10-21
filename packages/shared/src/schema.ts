@@ -185,6 +185,32 @@ export const track = sqliteTable(
 		// followed playlist). The hard "burn the row" path still exists for
 		// feed un-promotion (deleteTracks { hard: true }).
 		deletedAt: integer('deleted_at', { mode: 'timestamp_ms' }),
+		// Set by "Delete permanently" in Settings → Deleted Tracks: the
+		// tombstone's tags and cues are gone and it leaves that list, but the
+		// row stays — its links, analysis and recording keep the track deleted
+		// (streaming read-sync, the scanner and the feed all bind a re-seen
+		// track to it). Meaningful only while deletedAt is set; every undelete
+		// and fresh delete clears it. Device-local, never an op.
+		purgedAt: integer('purged_at', { mode: 'timestamp_ms' }),
+		// A track the account holds but THIS device has no source for: no
+		// file, no streaming link, no rekordbox entry — "not on this device".
+		// Materialised from another device's `library_track.set-meta`
+		// (apps/core/src/sync-log/remote-rows.ts) so every device shows the
+		// account's whole library; its columns are that meta, its tags, cues,
+		// playlist rows and rating come through the op log like any row's.
+		// It is a projection: every device-local writer (scanner and import
+		// matching, the ISRC dedupe, rekordbox export, analysis, downloads,
+		// meta emission) skips it, and it is dropped and re-derived freely.
+		// A source arriving here (a scanned file, an import's link) turns it
+		// into an ordinary row (the source_link trigger in migrate.ts).
+		remoteOnly: integer('remote_only', { mode: 'boolean' }).notNull().default(false),
+		// Where the winning meta's device holds the track (its set-meta
+		// `source`: local | spotify | tidal | other), set only on remote rows.
+		// Source scopes read it in place of the links this row lacks, so a
+		// track that is a local file on the master shows in this device's
+		// library root, marked "not on this device" (service.ts
+		// sourceMembership).
+		remoteSource: text('remote_source'),
 		// Materialized library-membership tier — see MembershipTier above.
 		// NULL = none. Written by the MembershipClassifier on every event that
 		// can change local-file presence or playlist membership (sync, scan,
@@ -243,6 +269,10 @@ export const track = sqliteTable(
 		artistSortIdx: index('track_artist_sort_idx').on(t.artistSort),
 		derivedFromIdx: index('track_derived_from_idx').on(t.derivedFromTrackId),
 		albumIdx: index('track_album_idx').on(t.albumId),
+		// Partial (migrate.ts: WHERE remote_only = 1): the remote rows are the
+		// few-to-many minority on a source-holding desktop and the count,
+		// sweep and filter read only them.
+		remoteOnlyIdx: index('track_remote_only_idx').on(t.remoteOnly),
 	})
 );
 
@@ -1484,6 +1514,48 @@ export const rekordboxUnitSeen = sqliteTable(
 		pk: primaryKey({ columns: [t.trackId, t.unit] }),
 	})
 );
+
+// ─── TRACK META SYNC (device-local) ──────────────────────────────────────────
+// What lets this device's base metadata reach the others as
+// `library_track.set-meta` (apps/core/src/sync-log/track-meta.ts) without
+// re-reading 40k rows per sync cycle.
+//
+// `track_meta_dirty`: rows whose meta may have changed since they were last
+// stated. Filled by SQLite triggers on track (insert, and an update of any
+// meta column) and on source_link (insert/delete: the row's source may
+// flip), so every writer is covered — the rekordbox importer, for one,
+// rewrites columns without bumping updated_at. Drained in chunks by the
+// sync client once the server reads protocol v3.
+//
+// `track_meta_seen`: the digest of the meta last emitted per row — the
+// baseline that turns a dirty mark into "emit only if it really changed"
+// (a re-import restating the same tags costs a read, not an op).
+export const trackMetaDirty = sqliteTable('track_meta_dirty', {
+	trackId: text('track_id').primaryKey(),
+});
+export const trackMetaSeen = sqliteTable('track_meta_seen', {
+	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
+	recordingId: text('recording_id').notNull(),
+	digest: text('digest').notNull(),
+	seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
+});
+
+// Remote rows (track.remoteOnly) whose derived tables — the artist junction,
+// the album — are still to be built. A fresh device materialises the whole
+// account at once; deriving 40k rows' junctions inside the projection would
+// stall the main loop, so materialisation queues them here and the sync
+// client drains the queue in chunks (sync-log/remote-rows.ts).
+export const trackDerivePending = sqliteTable('track_derive_pending', {
+	trackId: text('track_id').primaryKey(),
+});
+
+// Recordings whose remote row is still to be made: a batch makes at most a
+// handful inline (remote-rows.ts INLINE_CREATE_ROWS) and queues the rest
+// here for the same kind of sliced drain, so a fresh device's first pull or
+// snapshot never makes 40k rows inside one transaction.
+export const trackRemotePending = sqliteTable('track_remote_pending', {
+	recordingId: text('recording_id').primaryKey(),
+});
 
 // Drizzle-inferred row types
 // The DB row, plus optional aggregated fields that some read paths attach:

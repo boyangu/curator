@@ -19,6 +19,13 @@
 // stored tier is meaningless (readers gate on deleted_at), and the soft-delete
 // path clears it explicitly.
 //
+// Remote rows (track.remoteOnly — another device's track projected here) are
+// classified like any row, deliberately: they have no source_link, so 'local'
+// never applies, but a remote row in one of my own (synced) streaming
+// playlists IS in my streaming library by recording — the tier answers "how
+// close is this recording to my library", not "is it on this device" (that
+// is remoteOnly itself).
+//
 // `getMyId` resolves the connected Spotify user id (AuthService.getStatus). When
 // it's null (Spotify not connected) only the `local` tier can be determined —
 // "my streaming library" is undefined without an account — so streaming/followed

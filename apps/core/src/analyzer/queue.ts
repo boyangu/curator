@@ -48,6 +48,21 @@ async function fileExists(p: string): Promise<boolean> {
 	catch { return false; }
 }
 
+// Partition track ids into this device's own rows and remote rows
+// (track.remoteOnly — no file here, so nothing to analyse). One PK lookup
+// per chunk of ids that names only the remote ones, so the common all-own
+// batch moves no rows. Order of `own` follows the input.
+export function splitRemoteRows(db: Db, trackIds: readonly string[]): { own: string[]; remote: string[] } {
+	if (trackIds.length === 0) return { own: [], remote: [] };
+	const remote = new Set<string>();
+	for (let i = 0; i < trackIds.length; i += 500) {
+		const chunk = trackIds.slice(i, i + 500);
+		for (const r of db.select({ id: track.id }).from(track).where(and(inArray(track.id, chunk), eq(track.remoteOnly, true))).all()) remote.add(r.id);
+	}
+	if (remote.size === 0) return { own: [...trackIds], remote: [] };
+	return { own: trackIds.filter((id) => !remote.has(id)), remote: [...remote] };
+}
+
 // The analyzer version this Node code is paired with — what a fresh result is
 // stamped with. Bump in lockstep with
 // `apps/analyzer/src/curator_analyzer/__init__.py`.
@@ -534,6 +549,11 @@ export class AnalysisQueue extends EventEmitter {
 		opts: { priority?: number; force?: boolean; analyzeOptions?: AnalyzeOptions } = {},
 	): void {
 		const priority = opts.priority ?? 0;
+		// Remote rows (another device's tracks, projected here) have no file
+		// on this device. pickBatch's local-link join would never dispatch
+		// them, so a job row for one would sit 'queued' forever, counted by
+		// the chip as pending work. Every enqueue path funnels through here.
+		trackIds = splitRemoteRows(this.db, trackIds).own;
 		if (trackIds.length === 0) return;
 		const now = Date.now();
 		const existing = trackIds.length > 0

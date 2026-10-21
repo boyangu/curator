@@ -27,6 +27,14 @@ export class LibrarySink {
 	// written (for the renderer's per-row update), or null when nothing matched.
 	async persist(trackId: string, result: EnrichmentResult): Promise<DjMetadataPatch | null> {
 		if (!result.patch && result.sourceLinks.length === 0) return null;
+		// A remote row (track.remoteOnly — another device's track projected
+		// here) takes nothing. Its columns are the winning meta and are
+		// re-derived on the next meta change, and a catalogue source_link
+		// (beatport/traxsource) would trip the migrate.ts trigger that adopts
+		// a remote row as this device's own — a row with no file or stream
+		// here claiming to hold the track. The device that holds it enriches.
+		const remote = this.db.select({ remoteOnly: track.remoteOnly }).from(track).where(eq(track.id, trackId)).get();
+		if (remote?.remoteOnly) return null;
 
 		let applied: DjMetadataPatch | null = null;
 		if (result.patch) {

@@ -90,6 +90,11 @@ export interface UISettings {
 	// paired columns; and the field rows are grouped under.
 	trackRowLines: RowLines;
 	trackGroupBy: GroupBy;
+	// The toolbar's "This device" chip: hide the account's tracks this
+	// device holds no source of (remote rows, ZTrackFilter.hideRemote).
+	// Off by default — every device shows the account's whole library.
+	// Per device by nature (localStorage).
+	hideRemoteTracks: boolean;
 }
 
 const UI_SETTINGS_KEY = 'curator.ui-settings.v2';
@@ -105,6 +110,7 @@ const DEFAULT_UI_SETTINGS: UISettings = {
 	remixStyle: 'parenthesis',
 	trackRowLines: 2,
 	trackGroupBy: 'none',
+	hideRemoteTracks: false,
 };
 
 // Only the tabs that exist today: a persisted key for a retired tab (the old
@@ -137,6 +143,7 @@ function loadUiSettings(): UISettings {
 			remixStyle: parsed.remixStyle === 'dash' ? 'dash' : 'parenthesis',
 			trackRowLines: parsed.trackRowLines === 1 ? 1 : 2,
 			trackGroupBy: (GROUP_BY_VALUES as readonly unknown[]).includes(parsed.trackGroupBy) ? parsed.trackGroupBy! : 'none',
+			hideRemoteTracks: parsed.hideRemoteTracks === true,
 		};
 	} catch {
 		return cloneUiSettings(DEFAULT_UI_SETTINGS);
@@ -156,6 +163,7 @@ function cloneUiSettings(s: UISettings): UISettings {
 		remixStyle: s.remixStyle,
 		trackRowLines: s.trackRowLines,
 		trackGroupBy: s.trackGroupBy,
+		hideRemoteTracks: s.hideRemoteTracks,
 	};
 }
 

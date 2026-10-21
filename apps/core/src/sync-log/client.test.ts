@@ -42,6 +42,17 @@ import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '../library
 
 const TRACKS = Array.from({ length: 8 }, (_, i) => `trk-${i}`);
 
+// These suites pin the push/pull mechanics as they were before protocol v3:
+// against a server that does not advertise 'track_meta', nothing of v3 (base
+// metadata, the default master) joins an outbox — which is itself the rule
+// (track-meta.ts). The v3 stage has its own suites (track-meta.test.ts,
+// two-desktops-catalogue.test.ts).
+function v2Cloud(): FakeCloud {
+	const cloud = new FakeCloud();
+	cloud.features = cloud.features.filter((f) => f !== 'track_meta');
+	return cloud;
+}
+
 let dir: string;
 const handles: Database.Database[] = [];
 const services: CoreService[] = [];
@@ -134,7 +145,7 @@ const clientState = (raw: Database.Database): { needsRepair?: boolean; ownThroug
 
 describe('push', () => {
 	it('drains the outbox oldest first in batches of at most 500 and marks every op acked', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.runInitialPush();
@@ -152,7 +163,7 @@ describe('push', () => {
 	});
 
 	it('marks a per-op rejection rejected with its reason and never resends it', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.runInitialPush();
@@ -169,7 +180,7 @@ describe('push', () => {
 	});
 
 	it('keeps ops pending through transient failures, backs off, then delivers', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'), { random: () => 1 });
 		await c.runInitialPush();
@@ -189,7 +200,7 @@ describe('push', () => {
 	});
 
 	it('honours retry_after and caps the backoff at the configured ceiling', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'), { random: () => 1, backoffBaseMs: 1_000, backoffCapMs: 60_000 });
 		await c.runInitialPush();
@@ -203,7 +214,7 @@ describe('push', () => {
 	});
 
 	it('re-registers the device when the server has no registration for it', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.syncNow();
@@ -217,7 +228,7 @@ describe('push', () => {
 	});
 
 	it('update_required stops the push, keeps the ops pending and reports it', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.runInitialPush();
@@ -229,7 +240,7 @@ describe('push', () => {
 	});
 
 	it('does nothing while signed out, and refuses a second account on a bound library', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const t = cloud.transport('u');
 		t.signedIn = false;
@@ -251,7 +262,7 @@ describe('push', () => {
 
 describe('pull', () => {
 	it('skips its own ops and advances the cursor past them', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.runInitialPush();
@@ -263,7 +274,7 @@ describe('pull', () => {
 	});
 
 	it('applies pages and advances the cursor only with the page commit (crash mid-page)', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		cloud.pageLimit = 3;
 		const a = freshDb('a');
 		const b = freshDb('b');
@@ -291,11 +302,74 @@ describe('pull', () => {
 		expect(diffs(a.raw, b.raw)).toEqual([]);
 	});
 
+	// A page applies in sub-batches, a transaction each (client.ts
+	// PULL_SLICE_MS); only the last moves the cursor. A crash there keeps
+	// the earlier sub-batches and the cursor before the page, and the
+	// re-pull applies the whole page again, harmlessly.
+	it('a page in sub-batches: a crash in the last one keeps the cursor before the page, and the re-pull converges', async () => {
+		const cloud = v2Cloud();
+		const a = freshDb('a');
+		const b = freshDb('b');
+		const ca = client(a.raw, cloud.transport('u'));
+		await ca.runInitialPush();
+		makeTags(a.raw, 7);
+		await ca.syncNow();
+
+		let crashes = 1;
+		let lastBatchPage = 0;
+		const cb = client(b.raw, cloud.transport('u'), {
+			pullApplyChunk: 2,
+			beforeCursorAdvance: (page) => {
+				lastBatchPage = page.length;
+				if (crashes > 0) { crashes--; throw new Error('power cut'); }
+			},
+		});
+		const r0 = await cb.pullOnce().catch((e: Error) => e);
+		expect(r0).toBeInstanceOf(Error);
+		// The seam saw the whole page (one page: the log is short).
+		expect(lastBatchPage).toBe(cloud.maxSeq);
+		expect(readCursor(b.raw).lastSeq).toBe(0);
+		// The tag creates are the log's tail: the earlier sub-batches' ones
+		// committed, the last sub-batch's rolled back.
+		const tagsAfterCrash = b.raw.prepare(`SELECT count(*) FROM tag WHERE kind = 'user'`).pluck().get() as number;
+		expect(tagsAfterCrash).toBeGreaterThan(0);
+		expect(tagsAfterCrash).toBeLessThan(7);
+
+		const r = await cb.pullOnce();
+		expect(r.stopped).toBeNull();
+		expect(r.maxSliceMs).toBeGreaterThan(0);
+		expect(readCursor(b.raw).lastSeq).toBe(cloud.maxSeq);
+		expect(diffs(a.raw, b.raw)).toEqual([]);
+	});
+
+	// The page is validated whole before its first sub-batch: an op this
+	// version should read but cannot stops the pull with none of its page
+	// applied, rather than with the sub-batches before it committed.
+	it('an unreadable op stops the pull before any of its page applies', async () => {
+		const cloud = v2Cloud();
+		const a = freshDb('a');
+		const b = freshDb('b');
+		const ca = client(a.raw, cloud.transport('u'));
+		await ca.runInitialPush();
+		makeTags(a.raw, 3);
+		await ca.syncNow();
+		// A current-version op this build cannot parse (an empty tag name),
+		// at the end of the page.
+		cloud.appendRaw({ op_id: '5f0c2b9e-1d4a-4c3b-9e8f-7a6b5c4d3e2f', device_id: '0b9c8d7e-6f5a-4b3c-8d2e-1f0a9b8c7d6e', client_ts: Date.now(), schema_version: SCHEMA_VERSION, entity: 'tag', entity_id: 'tag-0', kind: 'rename', payload: { name: '' }, seq: cloud.maxSeq + 1, user_id: 'u', received_at: Date.now() } as StoredOp);
+		const cb = client(b.raw, cloud.transport('u'), { pullApplyChunk: 1 });
+		const r = await cb.pullOnce();
+		expect(r.stopped).toBe('unreadable');
+		expect(r.applied).toBe(0);
+		expect(readCursor(b.raw).lastSeq).toBe(0);
+		expect(b.raw.prepare(`SELECT count(*) FROM tag WHERE kind = 'user'`).pluck().get()).toBe(0);
+		expect(cb.status().lastError).toMatch(/cannot read/);
+	});
+
 	// Held aside, not a stop (held.ts): the rest of the log keeps applying
 	// and the cursor reaches the head; the held op replays once a build
 	// that reads its version pulls.
 	it('holds an op from a newer protocol version aside, applies the rest, and replays it after an update', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = freshDb('a');
 		const b = freshDb('b');
 		const ca = client(a.raw, cloud.transport('u'));
@@ -328,7 +402,7 @@ describe('pull', () => {
 	// From the push result (current server) or the op's echo (older server):
 	// the same repair either way.
 	it.each([['the push result', false], ['the echo from an older server', true]])('re-stamps an own op the server clamped, and repairs a write it shadowed (learnt from %s)', async (_how, legacy) => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		cloud.legacy = legacy;
 		const a = desktop('a', cloud);
 		const b = desktop('b', cloud);
@@ -356,7 +430,7 @@ describe('pull', () => {
 	});
 
 	it('emits an applied event naming the changed rows', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = desktop('a', cloud);
 		const b = desktop('b', cloud);
 		await a.svc.cloudSyncNow();
@@ -383,7 +457,7 @@ describe('own ops on pull', () => {
 
 	it('a first sign-in never pulls back the ops it pushed; an older server echoes them all', async () => {
 		for (const legacy of [false, true]) {
-			const cloud = new FakeCloud();
+			const cloud = v2Cloud();
 			cloud.legacy = legacy;
 			const { raw } = freshDb(legacy ? 'old' : 'new');
 			const c = client(raw, cloud.transport('u'));
@@ -400,7 +474,7 @@ describe('own ops on pull', () => {
 	});
 
 	it('day to day: a push is not echoed, another device’s ops still arrive, and the cursor ends at the head', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		cloud.pageLimit = 3;
 		const a = freshDb('a');
 		const b = freshDb('b');
@@ -425,7 +499,7 @@ describe('own ops on pull', () => {
 	});
 
 	it('re-stamps a clamped op from the push result, before any pull, then repairs on the pull', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.syncNow();
@@ -443,7 +517,7 @@ describe('own ops on pull', () => {
 	});
 
 	it('a server rolled back mid-session: the refused skip falls back to a plain pull', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const c = client(raw, cloud.transport('u'));
 		await c.syncNow();
@@ -465,7 +539,7 @@ describe('own ops on pull', () => {
 	});
 
 	it('a restored database gets back the own ops it lost, even when it pushes first', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = freshDb('a');
 		const ca = client(a.raw, cloud.transport('u'));
 		ownTags(a.raw, 'before', 2);
@@ -497,7 +571,7 @@ describe('own ops on pull', () => {
 	// keeps syncing. Without the re-mint both would push as one device, and
 	// each one's own-op skip would hide the other's edits from it.
 	it('a restore re-mints the device: both machines keep syncing and nothing pushed after the backup is lost', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = freshDb('a');
 		const ca = client(a.raw, cloud.transport('u'));
 		ownTags(a.raw, 'before', 2);
@@ -565,7 +639,7 @@ describe('own ops on pull', () => {
 
 describe('two desktops on one account', () => {
 	it('converge after edits on both, including concurrent edits to the same rows', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		cloud.pageLimit = 7; // exercise paging
 		const a = desktop('a', cloud);
 		const b = desktop('b', cloud);
@@ -629,7 +703,7 @@ describe('artist renames and track state across two desktops', () => {
 		JOIN artist a ON a.id = ta.artist_id WHERE t.id LIKE 'cr-%' ORDER BY t.recording_id, ta.position`).all();
 
 	it('a rename on one desktop reaches the other, including a track it added offline by the old name', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		cloud.pageLimit = 5;
 		const a = desktop('a', cloud);
 		const b = desktop('b', cloud);
@@ -678,7 +752,7 @@ describe('artist renames and track state across two desktops', () => {
 	});
 
 	it('a device that bootstraps from a snapshot gets the rules and rewrites its credits', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = desktop('a', cloud);
 		seedCredited(a.raw, [['cr-0', [{ name: 'Old Name' }]]]);
 		await a.svc.cloudSyncNow();
@@ -698,7 +772,7 @@ describe('artist renames and track state across two desktops', () => {
 
 describe('bootstrap', () => {
 	it('a far-behind device loads the snapshot, then pulls after it, and matches', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = desktop('a', cloud);
 		await a.svc.cloudSyncNow();
 		const warm = await a.svc.createTag('Warm');
@@ -763,7 +837,7 @@ function legacyLibrary(raw: Database.Database, nTracks: number): number {
 
 describe('initial push', () => {
 	it('runs in chunks off the critical path and reports progress through the client status', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a', false);
 		legacyLibrary(raw, 2_000);
 		const c = client(raw, cloud.transport('u'), { initialPushChunk: 500 });
@@ -791,7 +865,7 @@ describe('initial push', () => {
 	});
 
 	it('a second desktop that bootstraps from those ops matches the legacy library', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const a = freshDb('a', false);
 		legacyLibrary(a.raw, 300);
 		const ca = client(a.raw, cloud.transport('u'));
@@ -838,7 +912,7 @@ describe('cycle summary log', () => {
 	};
 
 	it('logs one summary per cycle with counts only, at debug when the cycle was idle', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const marker = 'payload-marker-7f3a';
 		const a = freshDb('a');
 		const ca = client(a.raw, cloud.transport('u', 'secret.person@example.test'));
@@ -879,7 +953,7 @@ describe('cycle summary log', () => {
 	});
 
 	it('counts per-op rejections in the summary', async () => {
-		const cloud = new FakeCloud();
+		const cloud = v2Cloud();
 		const { raw } = freshDb('a');
 		const { recs, logger } = capture();
 		const c = client(raw, cloud.transport('u'), { logger });

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { CloudSyncStatusReport } from '@curator/core';
-import { accountActions, deviceRows, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM, type AccountDevice, type AccountStatus } from './accountModel.js';
+import {
+	accountActions, deviceRows, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM,
+	type AccountDevice, type AccountStatus,
+} from './accountModel.js';
 
 const NOW = Date.UTC(2026, 9, 20, 12, 0, 0);
 
@@ -66,5 +69,39 @@ describe('account panel: devices', () => {
 		expect(UNLINK_CONFIRM.message).toMatch(/Nothing here is deleted/);
 		expect(UNLINK_CONFIRM.note).toMatch(/same account/);
 		expect(UNLINK_CONFIRM.note).toMatch(/can’t sync with a different account/);
+	});
+});
+
+describe('account panel: library across devices', () => {
+	it('counts the tracks not on this device, hidden at zero, pluralised', () => {
+		expect(remoteOnlyLine(0)).toBeNull();
+		expect(remoteOnlyLine(1)).toMatch(/^1 track in your account isn’t on this device\./);
+		expect(remoteOnlyLine(3519)).toMatch(/^3,519 tracks in your account aren’t on this device\./);
+	});
+
+	const devices = [
+		device({ deviceId: 'studio', name: 'Studio', lastSeenAt: NOW - 5 * 60_000 }),
+		device({ deviceId: 'this', name: 'Home', current: true, lastSeenAt: NOW - 10_000 }),
+		device({ deviceId: 'old', name: 'Old laptop', revokedAt: NOW - 3_600_000 }),
+	];
+
+	it('offers the active devices, this computer first and named so, the master selected', () => {
+		expect(masterChoices(devices, 'studio')).toEqual([
+			{ deviceId: 'this', label: 'Home (this computer)', selected: false },
+			{ deviceId: 'studio', label: 'Studio', selected: true },
+		]);
+	});
+
+	it('never claims a different master: a removed or unknown one still shows, none yet is a placeholder', () => {
+		expect(masterChoices(devices, 'old')[0]).toEqual({ deviceId: 'old', label: 'Old laptop (removed)', selected: true });
+		expect(masterChoices(devices, 'ghost')[0]).toEqual({ deviceId: 'ghost', label: 'A device not in this list', selected: true });
+		const none = masterChoices(devices, null);
+		expect(none[0]).toEqual({ deviceId: '', label: 'Not chosen yet', selected: true });
+		expect(none.filter((c) => c.selected)).toHaveLength(1);
+	});
+
+	it('explains the master in one sentence, and why it is unavailable', () => {
+		expect(MASTER_HINT).toMatch(/win on your other devices/);
+		expect(MASTER_UNAVAILABLE).toMatch(/doesn’t share track details/);
 	});
 });

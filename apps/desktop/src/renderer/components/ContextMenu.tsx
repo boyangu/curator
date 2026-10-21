@@ -40,6 +40,8 @@ export type ContextMenuItem =
 		iconHtml?: string;
 		danger?: boolean;
 		disabled?: boolean;
+		// Hover tooltip — chiefly why a disabled item can't run.
+		title?: string;
 		// Right-docked type chip — e.g. "Playlist", "Artist", "Album".
 		// Used by the Navigate to submenu to label the kind of jump
 		// each row performs. No truncation here; chip styling caps
@@ -355,6 +357,7 @@ export function openContextMenu(
 				classList={{ 'ctx-menu__item--danger': !!item.danger }}
 				type="button"
 				disabled={item.disabled}
+				title={item.title}
 				onClick={() => { void handleClick(item.id); }}
 			>
 				<Show when={item.iconHtml}>

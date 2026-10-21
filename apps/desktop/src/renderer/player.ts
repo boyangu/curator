@@ -37,6 +37,7 @@ import { createEffect, createRoot, createSignal, type Accessor } from 'solid-js'
 import { createMutable } from 'solid-js/store';
 import { acquireLoopbackAnalyser } from './spectrum.js';
 import { log } from './data/log.js';
+import { isRemoteRow, RemoteOnlyPlayError } from './remoteRows.js';
 
 const slog = log.for('player');
 // Seek/jump latency instrumentation fires on every seek gesture (incl.
@@ -747,6 +748,9 @@ async function resolveSourceTrackId(trackId: string, source: 'spotify' | 'tidal'
 // Tidal tab. Otherwise prefer Spotify (warm SDK, fast state events) over
 // Tidal (currently stubbed).
 function pickSource(track: Track): 'spotify' | 'tidal' | 'local' | null {
+	// Remote rows carry no links here; explicit so queue auto-advance skips
+	// them silently whatever `sources` says.
+	if (isRemoteRow(track)) return null;
 	const sources = new Set(track.sources ?? []);
 	if (sources.has('local')) return 'local';
 	if (sources.has('spotify')) return 'spotify';
@@ -755,6 +759,10 @@ function pickSource(track: Track): 'spotify' | 'tidal' | 'local' | null {
 }
 
 export async function play(track: Track, list?: Track[]): Promise<void> {
+	// A remote row has nothing to play on this device. Refused before any
+	// state moves (queue, ownership, now-playing) so the current playback
+	// carries on; callers toast the message.
+	if (isRemoteRow(track)) throw new RemoteOnlyPlayError();
 	// Library play takes playback ownership back from the feed.
 	feedPlaybackActive = false;
 	// Grab the loopback analyser HERE — before the async source-id resolve below —

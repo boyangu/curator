@@ -51,6 +51,14 @@ function rowToCandidate(r: CandRow): Candidate {
 // or null to create a fresh row. Candidate discovery mirrors the scanner's two
 // cheap lookups (indexed ISRC + first-word title LIKE, scoped to non-deleted
 // rows); the scorer's strict rule decides acceptance.
+//
+// This device's own rows only: a remote row (track.remoteOnly — another
+// device's track projected here) is never a content candidate. A content
+// match is the fuzziest bind there is (0.7), and attaching a link to a
+// remote row adopts it as this device's own (migrate.ts trigger) — i.e. it
+// would fold this provider id into another device's recording on a
+// title/duration guess. Remote rows are reached only by an exact claim or
+// the ISRC (spotify.ts / tidal.ts upsertTrack).
 export function findExistingByContent(db: Db, target: Target): ContentMatch | null {
 	const cols = {
 		id: track.id,
@@ -78,7 +86,7 @@ export function findExistingByContent(db: Db, target: Target): ContentMatch | nu
 		for (const r of db
 			.select(cols)
 			.from(track)
-			.where(and(eq(track.isrc, targetIsrc), isNull(track.deletedAt), isNull(track.derivedFromTrackId)))
+			.where(and(eq(track.isrc, targetIsrc), isNull(track.deletedAt), isNull(track.derivedFromTrackId), eq(track.remoteOnly, false)))
 			.all()) {
 			push(r);
 		}
@@ -91,7 +99,7 @@ export function findExistingByContent(db: Db, target: Target): ContentMatch | nu
 			.from(track)
 			// Derived copies (Convert to WAV) share title/artists/duration with
 			// their original — a streaming track must bind to the original.
-			.where(and(like(track.title, `%${firstWord}%`), isNull(track.deletedAt), isNull(track.derivedFromTrackId)))
+			.where(and(like(track.title, `%${firstWord}%`), isNull(track.deletedAt), isNull(track.derivedFromTrackId), eq(track.remoteOnly, false)))
 			.limit(200)
 			.all()) {
 			push(r);

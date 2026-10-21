@@ -6,21 +6,34 @@
 // track's rows twice — once per importing device. Nothing upstream
 // changed, so nothing would ever remove them.
 //
-// THE RULE, per streaming playlist and per recording with two or more live
-// rows, computed from the synced records only so every device that looks
-// reaches the same answer:
+// THE RULE, per streaming playlist and per GROUP OF UPSTREAM ITEMS, computed
+// from the synced records only so every device that looks reaches the same
+// answer:
+//   - a group is the rows whose recordings share a provider track id
+//     (their own claims of the playlist's provider, joined transitively):
+//     the upstream items a row can stand for. Usually one recording; but an
+//     old ISRC bind on one device folded two releases of a song (two
+//     provider ids, one ISRC) into one recording, while another device kept
+//     a recording per release — the 2026-10-20 dry run's "Astral Traveling"
+//     playlist, whose two "Back Stabbers" items came out three rows when
+//     grouped per recording. Grouped by the items they can stand for, each
+//     device's rows count the same thing;
 //   - group the rows by the device whose add bound them (the add clock's
 //     device): one device's rows are one import of the provider list;
-//   - when two or more devices hold rows, keep one device's set — the one
-//     with the most rows (an import made after the provider list gained a
-//     duplicate holds it twice; the other import's single row is the stale
-//     one), then the earliest add (the original import), then device id —
-//     and remove the other devices' rows;
+//   - rows under a provider-derived id (stable-ids.ts) name their item
+//     exactly — every device converges on them — so they always stay, and
+//     cover that many of the group's items;
+//   - the group holds N items: the largest device set (an import made after
+//     the provider list gained a duplicate holds it twice; the other
+//     import's single row is the stale one), and at least the derived rows.
+//     Keep one device's random-id rows — the device with the most rows, then
+//     the earliest add (the original import), then device id — up to the
+//     items the derived rows leave uncovered (preferring rows whose
+//     recording names an item no derived row names), and remove every other
+//     random-id row;
 //   - never remove a row whose add the user made (it carries an upstream
-//     ack, F23: a deliberate add, maybe of a second copy), nor a row under a
-//     provider-derived id (stable-ids.ts: every device converges on it, so
-//     it is the provider's own row, not a double). They still count toward
-//     their device's set.
+//     ack, F23: a deliberate add, maybe of a second copy). It still counts
+//     toward its device's set.
 // Local, rekordbox and smart playlists are never touched: their rows are
 // the user's, and a duplicate there is the user's choice.
 //
@@ -34,7 +47,7 @@ import type Database from 'better-sqlite3';
 import { compareClock, type Clock, type EntityRef, type PlaylistTrackRecord } from '@curator/protocol';
 import { emitOps, observeServerTs } from './outbox.js';
 import { project } from './project.js';
-import { isStreamingMemberId } from './stable-ids.js';
+import { streamingMemberId } from './stable-ids.js';
 import { SyncStateStore } from './store.js';
 
 type Raw = Database.Database;
@@ -49,7 +62,7 @@ export type DedupeRemove = { playlistId: string; rowId: string; recordingId: str
 
 export type DedupePlan = {
 	playlists: number;
-	// (playlist, recording) pairs held by two or more devices.
+	// Item groups that held rows to fold.
 	groups: number;
 	removes: DedupeRemove[];
 	// Per playlist: rows to remove (the report's "excess rows").
@@ -59,8 +72,9 @@ export type DedupePlan = {
 export type DedupeScope = {
 	// Only these playlists (default: every streaming playlist).
 	playlists?: Iterable<string>;
-	// Only rows of these recordings (resolved); the playlists holding them
-	// are found through the record index.
+	// Only groups holding rows of these recordings (resolved); the playlists
+	// holding them are found through the record index, and so are the other
+	// recordings that share a provider id with them.
 	recordings?: Iterable<string>;
 	// Extra loser → winner pairs on top of recording_alias: the read-only
 	// report plans the dedupe as it would stand after the planned merges.
@@ -68,6 +82,7 @@ export type DedupeScope = {
 };
 
 type Row = { id: string; rec: PlaylistTrackRecord; tomb: number | null };
+type LiveRow = Row & { recording: string };
 
 function aliasResolver(raw: Raw, extra?: ReadonlyMap<string, string>): (id: string) => string {
 	const alias = new Map((raw.prepare(`SELECT loser, winner FROM recording_alias`).all() as Array<{ loser: string; winner: string }>).map((r) => [r.loser, r.winner]));
@@ -104,17 +119,89 @@ function streamingPlaylists(raw: Raw, only?: readonly string[]): Map<string, str
 	return out;
 }
 
+// Provider ids (of `source`) a recording claims, read once per recording
+// per plan. `+map`: without it the planner takes (map, parent_id) and walks
+// every claim of the account per lookup (measured 2026-10-20: ~110 ms of a
+// 50-merge chunk's ~130 at 10k claims; ~1 ms with it).
+// `prefetch` reads a whole sweep chunk's recordings in a few IN (...)
+// queries instead of one each (a chunk of playlists holds thousands).
+function claimReader(raw: Raw): { prefetch(recordings: Iterable<string>): void; of(recording: string, source: string): string[] } {
+	const claimsOf = raw.prepare(`SELECT key FROM sync_state WHERE +map = 'claims' AND recording_id = ?`).pluck();
+	const keys = new Map<string, string[]>();
+	const keysOf = (recording: string): string[] => {
+		let v = keys.get(recording);
+		if (!v) keys.set(recording, (v = claimsOf.all(recording) as string[]));
+		return v;
+	};
+	return {
+		prefetch(recordings) {
+			const want = [...new Set(recordings)].filter((r) => !keys.has(r));
+			for (let i = 0; i < want.length; i += CHUNK) {
+				const chunk = want.slice(i, i + CHUNK);
+				for (const r of chunk) keys.set(r, []);
+				for (const row of raw.prepare(`SELECT recording_id AS rec, key FROM sync_state WHERE +map = 'claims' AND recording_id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as Array<{ rec: string; key: string }>) {
+					keys.get(row.rec)?.push(row.key);
+				}
+			}
+		},
+		of(recording, source) {
+			const prefix = `${recording}:${source}:`;
+			return keysOf(recording).filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length));
+		},
+	};
+}
+
+// The recordings that share a streaming provider id with `seed`, two hops
+// out through the claim index: the rest of a scoped run's item groups.
+function siblingRecordings(raw: Raw, seed: ReadonlySet<string>, R: (id: string) => string): Set<string> {
+	const out = new Set(seed);
+	const claims = raw.prepare(`SELECT key FROM sync_state WHERE +map = 'claims' AND recording_id = ?`).pluck();
+	const claimants = raw.prepare(`SELECT recording_id FROM sync_state WHERE map = 'claims' AND parent_id = ?`).pluck();
+	let frontier = [...seed];
+	for (let hop = 0; hop < 2 && frontier.length > 0; hop++) {
+		const next: string[] = [];
+		for (const rec of frontier) {
+			for (const key of claims.all(rec) as string[]) {
+				// key: `${recording}:${kind}:${value}`, parent_id: `${kind}:${value}`.
+				const parentId = key.slice(rec.length + 1);
+				if (!STREAMING.has(parentId.slice(0, parentId.indexOf(':')))) continue;
+				for (const other of claimants.all(parentId) as Array<string | null>) {
+					if (!other) continue;
+					const o = R(other);
+					if (!out.has(o)) { out.add(o); next.push(o); }
+				}
+			}
+		}
+		frontier = next;
+	}
+	return out;
+}
+
+const byCodeUnit = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+// The provider item a derived row id names (`${providerId}#${occurrence}`),
+// or null for a random id.
+function derivedItem(rowId: string, playlistId: string, providerIds: readonly string[], occurrences: number): string | null {
+	for (const p of providerIds) {
+		for (let k = 0; k < occurrences; k++) {
+			for (let bump = 0; bump < 3; bump++) if (streamingMemberId(playlistId, p, k, bump) === rowId) return `${p}#${k}`;
+		}
+	}
+	return null;
+}
+
 export function planStreamingDedupe(raw: Raw, scope: DedupeScope = {}): DedupePlan {
 	const plan: DedupePlan = { playlists: 0, groups: 0, removes: [], byPlaylist: new Map() };
 	const R = aliasResolver(raw, scope.alias);
 	const wanted = scope.recordings ? new Set([...scope.recordings].map(R)) : null;
 
-	// The live rows in scope, by playlist then recording. Scoped by
-	// recordings (a merge chunk, a pull), only their rows are read, through
-	// the record index: a 5,000-row playlist is not re-read per chunk. An
-	// applied merge's fold re-points every row record (and its index column)
-	// to the winner; the report's planned merges have not folded, so their
-	// losers' rows are read under the loser too.
+	// The live rows in scope, by playlist. Scoped by recordings (a merge
+	// chunk, a pull), only the rows of those recordings and of the ones
+	// sharing a provider id with them are read, through the record index: a
+	// 5,000-row playlist is not re-read per chunk. An applied merge's fold
+	// re-points every row record (and its index column) to the winner; the
+	// report's planned merges have not folded, so their losers' rows are read
+	// under the loser too.
 	type Stored = { key: string; value: string; tomb: number | null };
 	const rowsByPlaylist = new Map<string, Row[]>();
 	const take = (rows: Stored[]): void => {
@@ -134,8 +221,8 @@ export function planStreamingDedupe(raw: Raw, scope: DedupeScope = {}): DedupePl
 		WHERE +s.map = 'playlistTracks'`;
 	if (wanted && !scope.playlists) {
 		if (wanted.size === 0) return plan;
-		const members = new Set(wanted);
-		if (scope.alias) for (const [loser] of scope.alias) if (wanted.has(R(loser))) members.add(loser);
+		const members = siblingRecordings(raw, wanted, R);
+		if (scope.alias) for (const [loser] of scope.alias) if (members.has(R(loser))) members.add(loser);
 		const ids = [...members];
 		for (let i = 0; i < ids.length; i += CHUNK) {
 			const chunk = ids.slice(i, i + CHUNK);
@@ -152,58 +239,100 @@ export function planStreamingDedupe(raw: Raw, scope: DedupeScope = {}): DedupePl
 	}
 
 	const acked = new Set(raw.prepare(`SELECT key FROM sync_state WHERE map = 'upstreamAcks'`).pluck().all() as string[]);
-	// `+map` as above: without it the planner takes (map, parent_id) and
-	// walks every claim of the account per group (measured 2026-10-20: ~110
-	// ms of a 50-merge chunk's ~130 at 10k claims; ~1 ms with it).
-	const claimsOf = raw.prepare(`SELECT key FROM sync_state WHERE +map = 'claims' AND recording_id = ?`).pluck();
+	const claims = claimReader(raw);
+	const providerIdsOf = (recording: string, source: string): string[] => claims.of(recording, source);
+	claims.prefetch([...rowsByPlaylist.values()].flatMap((rows) => rows.flatMap((r) => (r.rec.recordingId ? [R(r.rec.recordingId), r.rec.recordingId] : []))));
 
 	for (const [playlistId, source] of playlists) {
 		plan.playlists++;
-		const byRecording = new Map<string, Row[]>();
+		// Alive as playlistTrackAlive: an add with an order key that no later
+		// remove cancelled (add wins a same-ms tie).
+		const live: LiveRow[] = [];
 		for (const row of rowsByPlaylist.get(playlistId) ?? []) {
 			const rec = row.rec;
-			// Alive as playlistTrackAlive: an add with an order key that no
-			// later remove cancelled (add wins a same-ms tie).
 			if (!rec.added || !rec.orderKey || !rec.recordingId || rec.playlistId !== playlistId) continue;
 			if (row.tomb !== null && row.tomb > rec.added.ts) continue;
-			const recording = R(rec.recordingId);
-			if (wanted && !wanted.has(recording)) continue;
-			let list = byRecording.get(recording);
-			if (!list) byRecording.set(recording, (list = []));
+			live.push({ ...row, recording: R(rec.recordingId) });
+		}
+		if (live.length < 2) continue;
+		// Each recording's provider ids: its own claims and those of every
+		// recording its rows were added under (a merged-away loser).
+		const ids = new Map<string, Set<string>>();
+		for (const row of live) {
+			let set = ids.get(row.recording);
+			if (!set) ids.set(row.recording, (set = new Set(providerIdsOf(row.recording, source))));
+			if (row.rec.recordingId !== row.recording) for (const p of providerIdsOf(row.rec.recordingId!, source)) set.add(p);
+		}
+		// Item groups: recordings joined by a shared provider id (union-find,
+		// the smaller id as root so every device builds the same groups).
+		const parent = new Map<string, string>();
+		const find = (x: string): string => {
+			let r = x;
+			while (parent.get(r) !== r) r = parent.get(r)!;
+			for (let c = x; c !== r;) { const n = parent.get(c)!; parent.set(c, r); c = n; }
+			return r;
+		};
+		const byProvider = new Map<string, string>();
+		for (const [rec, set] of ids) {
+			if (!parent.has(rec)) parent.set(rec, rec);
+			for (const p of set) {
+				const other = byProvider.get(p);
+				if (other === undefined) { byProvider.set(p, rec); continue; }
+				const a = find(rec);
+				const b = find(other);
+				if (a !== b) parent.set(byCodeUnit(a, b) <= 0 ? b : a, byCodeUnit(a, b) <= 0 ? a : b);
+			}
+		}
+		const groups = new Map<string, LiveRow[]>();
+		for (const row of live) {
+			const g = find(row.recording);
+			let list = groups.get(g);
+			if (!list) groups.set(g, (list = []));
 			list.push(row);
 		}
-		for (const [recording, rows] of byRecording) {
+		for (const rows of groups.values()) {
 			if (rows.length < 2) continue;
-			const byDevice = new Map<string, Row[]>();
+			if (wanted && !rows.some((r) => wanted.has(r.recording))) continue;
+			const byDevice = new Map<string, LiveRow[]>();
 			for (const row of rows) {
 				const d = row.rec.added!.device;
 				let list = byDevice.get(d);
 				if (!list) byDevice.set(d, (list = []));
 				list.push(row);
 			}
+			// One import's rows, all of them its items (a duplicate upstream).
 			if (byDevice.size < 2) continue;
-			plan.groups++;
-			const earliest = (list: Row[]): Clock => list.map((r) => r.rec.added!).reduce((a, b) => (compareClock(a, b) <= 0 ? a : b));
-			const keeper = [...byDevice.entries()].sort(([da, la], [db, lb]) =>
-				lb.length - la.length || compareClock(earliest(la), earliest(lb)) || (da < db ? -1 : da > db ? 1 : 0))[0]![0];
-			// The provider ids this recording's rows could have been minted
-			// under: its own claims and those of every recording the rows
-			// were added under.
-			const providerIds = new Set<string>();
-			for (const rec of new Set([recording, ...rows.map((r) => r.rec.recordingId!)])) {
-				for (const key of claimsOf.all(rec) as string[]) {
-					const prefix = `${rec}:${source}:`;
-					if (key.startsWith(prefix)) providerIds.add(key.slice(prefix.length));
+			const providerIds = [...new Set(rows.flatMap((r) => [...ids.get(r.recording)!]))].sort(byCodeUnit);
+			const derived = new Map<string, string>();
+			if (providerIds.length > 0) {
+				for (const row of rows) {
+					const item = derivedItem(row.id, playlistId, providerIds, rows.length + 8);
+					if (item !== null) derived.set(row.id, item);
 				}
 			}
-			for (const [device, list] of byDevice) {
-				if (device === keeper) continue;
-				for (const row of list) {
-					if (acked.has(row.rec.added!.op)) continue;
-					if (providerIds.size > 0 && isStreamingMemberId(row.id, playlistId, [...providerIds], rows.length + 8)) continue;
-					plan.removes.push({ playlistId, rowId: row.id, recordingId: recording, device, addedTs: row.rec.added!.ts });
-					plan.byPlaylist.set(playlistId, (plan.byPlaylist.get(playlistId) ?? 0) + 1);
-				}
+			const random = rows.filter((r) => !derived.has(r.id));
+			if (random.length === 0) continue;
+			plan.groups++;
+			const earliest = (list: Row[]): Clock => list.map((r) => r.rec.added!).reduce((a, b) => (compareClock(a, b) <= 0 ? a : b));
+			const order = [...byDevice.entries()].sort(([da, la], [db, lb]) =>
+				lb.length - la.length || compareClock(earliest(la), earliest(lb)) || byCodeUnit(da, db));
+			const keeper = order[0]![0];
+			const items = Math.max(order[0]![1].length, derived.size);
+			const covered = new Set([...derived.values()].map((item) => item.slice(0, item.lastIndexOf('#'))));
+			const namesUncovered = (r: LiveRow): number => ([...ids.get(r.recording)!].some((p) => !covered.has(p)) ? 0 : 1);
+			// Rows that stay whatever the count says — derived ones and the
+			// user's acked adds — fill the items first; the keeper's other
+			// random rows fill what is left, ones naming an item no derived
+			// row covers first, then the earliest add.
+			const isAcked = (r: LiveRow): boolean => acked.has(r.rec.added!.op);
+			const stay = derived.size + random.filter(isAcked).length;
+			const keeperRandom = byDevice.get(keeper)!.filter((r) => !derived.has(r.id) && !isAcked(r))
+				.sort((a, b) => namesUncovered(a) - namesUncovered(b) || compareClock(a.rec.added!, b.rec.added!) || byCodeUnit(a.id, b.id));
+			const keep = new Set(keeperRandom.slice(0, Math.max(0, items - stay)).map((r) => r.id));
+			for (const row of random) {
+				if (keep.has(row.id) || isAcked(row)) continue;
+				plan.removes.push({ playlistId, rowId: row.id, recordingId: row.recording, device: row.rec.added!.device, addedTs: row.rec.added!.ts });
+				plan.byPlaylist.set(playlistId, (plan.byPlaylist.get(playlistId) ?? 0) + 1);
 			}
 		}
 	}
@@ -244,34 +373,50 @@ export function healStreamingDuplicates(raw: Raw, scope: DedupeScope = {}): Dedu
 // After applying ops from elsewhere (a pull page), inside its transaction.
 // Merges can bring two devices' imports of one streaming playlist onto one
 // recording, and so can rows a device that has not heard of a merge yet
-// adds under either side of it (a pre-fix import still in its outbox): the
-// rows of those recordings are folded in the same commit, so the doubles
-// never show. Null when the page touched no such recording.
-export function healAfterApply(raw: Raw, ops: ReadonlyArray<{ entity: string; kind: string; payload: unknown }>): DedupeResult | null {
-	const winners = new Set<string>();
+// adds under either side of it (a pre-fix import still in its outbox); and
+// since every device shows the account's whole library (remote-rows.ts),
+// another device's rows in a streaming playlist show here even when no merge
+// joins them — the "Astral Traveling" case, where the other device's one
+// recording claims two releases this device holds apart, and the merge that
+// would join them is held. So the recordings of every pulled add to a
+// streaming playlist, and of every pulled streaming claim (a provider id
+// that joins two item groups), are folded in the same commit, and the
+// doubles never show. Null when the page touched no such recording.
+export function healAfterApply(raw: Raw, ops: ReadonlyArray<{ entity: string; kind: string; entity_id?: string; payload: unknown }>): DedupeResult | null {
+	const scope = new Set<string>();
 	let alias: Map<string, string> | null = null;
-	let merged: Set<string> | null = null;
+	const R = (id: string): string => {
+		alias ??= new Map((raw.prepare(`SELECT loser, winner FROM recording_alias`).all() as Array<{ loser: string; winner: string }>).map((r) => [r.loser, r.winner]));
+		return alias.get(id) ?? id;
+	};
+	const sourceOf = raw.prepare(`SELECT source FROM playlist WHERE id = ?`).pluck();
+	const streaming = new Map<string, boolean>();
+	const isStreaming = (playlistId: string): boolean => {
+		let v = streaming.get(playlistId);
+		if (v === undefined) streaming.set(playlistId, (v = STREAMING.has((sourceOf.get(playlistId) as string | undefined) ?? '')));
+		return v;
+	};
 	for (const o of ops) {
-		if (o.entity === 'recording' && o.kind === 'merge') winners.add((o.payload as { winner: string }).winner);
+		if (o.entity === 'recording' && o.kind === 'merge') scope.add((o.payload as { winner: string }).winner);
 		else if (o.entity === 'playlist_track' && o.kind === 'add') {
-			if (!alias) {
-				alias = new Map((raw.prepare(`SELECT loser, winner FROM recording_alias`).all() as Array<{ loser: string; winner: string }>).map((r) => [r.loser, r.winner]));
-				merged = new Set(alias.values());
-			}
-			const rec = (o.payload as { recording_id: string }).recording_id;
-			const r = alias.get(rec) ?? rec;
-			if (alias.has(rec) || merged!.has(r)) winners.add(r);
+			const p = o.payload as { playlist_id: string; recording_id: string };
+			if (isStreaming(p.playlist_id)) scope.add(R(p.recording_id));
+		} else if (o.entity === 'recording_claim' && o.kind === 'add' && o.entity_id !== undefined && STREAMING.has((o.payload as { kind: string }).kind)) {
+			scope.add(R(o.entity_id));
 		}
 	}
-	return winners.size > 0 ? healStreamingDuplicates(raw, { recordings: winners }) : null;
+	return scope.size > 0 ? healStreamingDuplicates(raw, { recordings: scope }) : null;
 }
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 // The one-time sweep: every streaming playlist, a few per transaction with
 // a yield between, then the gate key so it never runs again.
+// 8 playlists per slice: the item grouping reads every row's claims (one
+// batched read per chunk); 25 of the real library's playlists took up to
+// ~560 ms (measured 2026-10-20).
 export async function sweepStreamingDuplicatesAsync(raw: Raw, opts: { chunk?: number } = {}): Promise<DedupeResult & { playlists: number; maxSliceMs: number }> {
-	const chunk = Math.max(1, opts.chunk ?? 25);
+	const chunk = Math.max(1, opts.chunk ?? 8);
 	const ids = [...streamingPlaylists(raw).keys()].sort();
 	const out = { removed: 0, tracksTouched: new Set<string>(), playlistsTouched: new Set<string>(), maxSliceMs: 0 };
 	for (let i = 0; i < ids.length; i += chunk) {

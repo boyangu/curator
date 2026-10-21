@@ -1,8 +1,9 @@
 // Settings → Account: the Curator account (cloud) and library sync.
 //
 // Signed out: email + password, or "email me a code" (one-time code /
-// magic link). Signed in: the email, the sync status line, Sync now, shared
-// analysis (reuse toggle, holdings, the "upload existing analysis" button),
+// magic link). Signed in: the email, the sync status line, Sync now, the
+// library across devices (how many tracks aren't on this device, the master
+// device whose track details win elsewhere), shared analysis (reuse toggle, holdings, the "upload existing analysis" button),
 // the account's devices (remove one, sign out every other session), unlink
 // this library, sign out. Revoked (another computer removed this one): the
 // banner and Sign out only, since the server refuses everything else. The
@@ -23,9 +24,11 @@ import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
 import {
-	accountActions, deviceRows, DEVICES_HINT, fmtWhen, revokeConfirm, SIGN_OUT_OTHERS_CONFIRM, syncLine, UNLINK_CONFIRM,
+	accountActions, deviceRows, DEVICES_HINT, fmtWhen, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, revokeConfirm,
+	SIGN_OUT_OTHERS_CONFIRM, syncLine, UNLINK_CONFIRM,
 	type AccountDevice, type AccountStatus, type ConfirmText,
 } from './accountModel.js';
+import { accountLibraryInfo, onAccountLibraryInfo, refreshAccountLibraryInfo, setAccountLibraryInfo } from './accountLibrary.js';
 
 // The confirm dialog is injected from main.ts (the backupSettings pattern),
 // so this module never imports layouts.
@@ -55,6 +58,11 @@ let draftEmail = '';
 let codeSentTo: string | null = null;
 let busy = false;
 let formError: string | null = null;
+let unsubscribeLibrary: (() => void) | null = null;
+// The master selector's own state: a change in flight, and its refusal
+// (sync off, server too old) shown under it rather than as a toast.
+let masterBusy = false;
+let masterError: string | null = null;
 
 
 // The fallback check cadence, shown in the units people think in: seconds
@@ -280,6 +288,68 @@ function patchCatalogue(host: HTMLElement, inputs = false): void {
 	}
 }
 
+// ── Library across devices (remote rows + master device) ───────────────
+// Painted into its own [data-ac-library-host] so an info change (a pull
+// materialised rows, the master moved) repaints just this section; the
+// info itself lives in accountLibrary.ts, shared with the toolbar chip.
+
+function renderLibrarySection(): string {
+	const info = accountLibraryInfo();
+	if (!info) return `<div class="settings-ui__section"><div class="settings-ui__section-label">Library across devices</div><div class="settings-toggle__hint">Loading…</div></div>`;
+	const remote = remoteOnlyLine(info.remoteOnlyCount);
+	const choices = devices ? masterChoices(devices, info.masterDeviceId) : null;
+	const disabled = !info.metaSyncAvailable || !choices || masterBusy || busy;
+	const options = choices
+		? choices.map((c) => `<option value="${escapeHtml(c.deviceId)}" ${c.selected ? 'selected' : ''}${c.deviceId === '' ? ' disabled' : ''}>${escapeHtml(c.label)}</option>`).join('')
+		: '<option>Loading devices…</option>';
+	return `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Library across devices</div>
+			${remote ? `<div class="settings-toggle__hint" data-ac-remote-line>${escapeHtml(remote)}</div>` : ''}
+			<label class="settings-ui__field"><span class="settings-ui__field-label">Master device</span>
+				<select class="settings-ui__select" data-ac-master ${disabled ? 'disabled' : ''}>${options}</select>
+				${masterBusy ? '<span class="settings-ui__field-suffix">Saving…</span>' : ''}
+			</label>
+			<div class="settings-toggle__hint">${escapeHtml(info.metaSyncAvailable ? MASTER_HINT : MASTER_UNAVAILABLE)}</div>
+			${masterError ? `<div class="backup__banner backup__banner--error">${escapeHtml(masterError)}</div>` : ''}
+		</div>`;
+}
+
+function wireLibrarySection(host: HTMLElement): void {
+	const sel = host.querySelector<HTMLSelectElement>('[data-ac-master]');
+	sel?.addEventListener('change', () => {
+		const id = sel.value;
+		if (!id || id === (accountLibraryInfo()?.masterDeviceId ?? null)) return;
+		masterBusy = true;
+		masterError = null;
+		paintLibrary(host, true);
+		void accountApi.setMasterDevice(id)
+			.then((next) => {
+				setAccountLibraryInfo(next);
+				showToast('Master device changed', { sub: 'Your other devices take its track details on their next sync.', kind: 'success' });
+			})
+			.catch((err) => { masterError = errText(err); alog.warn('set master failed', { err: masterError }); })
+			.finally(() => { masterBusy = false; paintLibrary(host, true); });
+	});
+}
+
+// `force`: repaint even while the selector has focus (after its own change).
+// Otherwise a focused selector keeps its open dropdown; only the count line
+// updates under it.
+function paintLibrary(host: HTMLElement, force = false): void {
+	const slot = host.querySelector<HTMLElement>('[data-ac-library-host]');
+	if (!slot) return;
+	const sel = slot.querySelector<HTMLSelectElement>('[data-ac-master]');
+	if (!force && sel && document.activeElement === sel) {
+		const line = slot.querySelector<HTMLElement>('[data-ac-remote-line]');
+		const text = remoteOnlyLine(accountLibraryInfo()?.remoteOnlyCount ?? 0);
+		if (line && text) line.textContent = text;
+		return;
+	}
+	slot.innerHTML = renderLibrarySection();
+	wireLibrarySection(host);
+}
+
 function renderSignedOut(host: HTMLElement, a: AccountStatus): void {
 	const err = formError ? `<div class="backup__banner backup__banner--error">${escapeHtml(formError)}</div>` : '';
 	const codeStep = codeSentTo
@@ -442,6 +512,7 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 			${s && s.rejected > 0 ? `<div class="settings-toggle__hint">${s.rejected.toLocaleString()} ${s.rejected === 1 ? 'change was' : 'changes were'} refused by the server and will not be retried; see the log for details.</div>` : ''}
 			${acts.revoked && s && s.pending > 0 ? `<div class="settings-toggle__hint">${s.pending.toLocaleString()} ${s.pending === 1 ? 'change is' : 'changes are'} kept on this computer and will upload if it is signed in again.</div>` : ''}
 		</div>
+		${acts.manageDevices ? `<div data-ac-library-host>${renderLibrarySection()}</div>` : ''}
 		${acts.revoked ? '' : renderCatalogueSection(catalogue)}
 		${a.syncAvailable && s?.enabled && !acts.revoked ? renderPollSection(s) : ''}
 		${renderDevicesSection(a, s)}`;
@@ -449,6 +520,7 @@ function renderSignedIn(host: HTMLElement, a: AccountStatus, s: CloudSyncStatusR
 	const q = <T extends Element>(sel: string): T | null => host.querySelector<T>(sel);
 	wirePollSection(host);
 	wireCatalogueSection(host);
+	wireLibrarySection(host);
 	q<HTMLButtonElement>('[data-ac-sync-now]')?.addEventListener('click', () => {
 		void cloudSyncApi.syncNow().then((st) => { sync = st; render(host); }).catch((err) => {
 			showToast('Sync failed', { sub: errText(err), kind: 'error' });
@@ -539,6 +611,9 @@ async function refresh(host: HTMLElement): Promise<void> {
 		render(host);
 		// A revoked computer is refused the list (and everything else).
 		if (a.signedIn && accountActions(a, s).manageDevices) {
+			// Fresh count + master each time the panel opens (the listener
+			// below repaints the section when it lands).
+			void refreshAccountLibraryInfo();
 			devices = await accountApi.devices().catch((err) => { alog.warn('devices failed', { err: String(err) }); return devices ?? []; });
 			render(host);
 		}
@@ -551,7 +626,13 @@ async function refresh(host: HTMLElement): Promise<void> {
 export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribe?.();
 	unsubscribeCatalogue?.();
+	unsubscribeLibrary?.();
 	formError = null;
+	masterError = null;
+	unsubscribeLibrary = onAccountLibraryInfo(() => {
+		if (!host.isConnected) { unsubscribeLibrary?.(); unsubscribeLibrary = null; return; }
+		paintLibrary(host);
+	});
 	// Shared analysis ticks patch their own lines in place (they arrive
 	// during a hydrate or an upload, often while the user is in this panel).
 	unsubscribeCatalogue = catalogueApi.onStatus((c) => {
@@ -560,7 +641,8 @@ export function mountAccountSettings(host: HTMLElement): void {
 		catalogue = c;
 		if (!account?.signedIn) return;
 		if (!hadSection || !host.querySelector('[data-ac-cat-line]')) {
-			const typing = document.activeElement instanceof HTMLInputElement && host.contains(document.activeElement);
+			// A focused selector counts too: a re-render would close its dropdown.
+			const typing = (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLSelectElement) && host.contains(document.activeElement);
 			if (!typing) render(host);
 			return;
 		}
@@ -574,7 +656,8 @@ export function mountAccountSettings(host: HTMLElement): void {
 		// then. Otherwise only the signed-in view repaints (see header).
 		if (s.signedIn !== wasSignedIn) void refresh(host);
 		else if (wasSignedIn && account) {
-			const typing = document.activeElement instanceof HTMLInputElement && host.contains(document.activeElement);
+			// A focused selector counts too: a re-render would close its dropdown.
+			const typing = (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLSelectElement) && host.contains(document.activeElement);
 			if (typing) patchSignedIn(host, account, s);
 			else render(host);
 		}

@@ -97,3 +97,12 @@ export function isStreamingMemberId(rowId: string, playlistId: string, providerT
 	}
 	return false;
 }
+
+// The track row a device materialises for a recording it holds no source of
+// (remote-rows.ts). Derived from the recording so a re-run of the
+// materialisation finds the row it made instead of minting a second.
+const REMOTE_TRACK_NAMESPACE = '8f1d3c6e-5a27-5b94-a0c8-2e7b9d41f6a3';
+
+export function remoteTrackId(recordingId: string): string {
+	return uuidv5(REMOTE_TRACK_NAMESPACE, recordingId);
+}

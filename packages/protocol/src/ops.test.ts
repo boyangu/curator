@@ -4,11 +4,13 @@ import {
 	ENTITIES,
 	isAccountSettingKey,
 	kindsOf,
+	MASTER_DEVICE_SETTING,
 	MAX_OP_PAYLOAD_BYTES,
 	MIN_SUPPORTED_SCHEMA_VERSION,
 	OP_SCHEMAS,
 	opPayloadBytes,
 	OpValidationError,
+	opSchemaVersion,
 	parseCueEntityId,
 	parseOp,
 	parseTrackTagEntityId,
@@ -61,6 +63,15 @@ const SAMPLES: [Entity, string, string, unknown][] = [
 	['library_track', 'set-rating', REC_A, { rating: 4 }],
 	['library_track', 'set-favourite', REC_A, { favourite: false }],
 	['library_track', 'set-state', REC_A, { state: 'backlog' }],
+	[
+		'library_track',
+		'set-meta',
+		REC_A,
+		{
+			source: 'spotify', title: 'Lilac', artists: [{ name: 'Bonobo' }], album_title: 'Fragments', duration_sec: 312, isrc: 'GBCFB2100001',
+			release_date: '2022-01-14', label: 'Ninja Tune', genre: null, cover_url: 'https://i.scdn.co/image/ab67', track_number: 3, disc_number: 1,
+		},
+	],
 	['library_track', 'set-override', REC_A, { field: 'artists', value: [{ name: 'Ben Böhmer' }, { name: 'Nils Hoffmann', role: 'remixer' }] }],
 	['library_track', 'set-rb-analysis', REC_A, { unit: 'grid', value: [1, 3, 1, 123, 468, 1, 0] }],
 	['library_track', 'delete', REC_A, {}],
@@ -233,5 +244,38 @@ describe('helpers', () => {
 		expect(schemaVersionStatus(MIN_SUPPORTED_SCHEMA_VERSION - 1)).toBe('update_required');
 		expect(schemaVersionStatus(SCHEMA_VERSION + 1)).toBe('ahead');
 		expect(schemaVersionStatus(3, 5, 2)).toBe('ok');
+	});
+});
+
+describe('protocol v3: set-meta and the master device setting', () => {
+	const meta = { source: 'local', title: 'T', artists: [{ name: 'A' }], album_title: null, duration_sec: 300, isrc: null, release_date: null, label: null, genre: null, cover_url: null };
+
+	it('stamps set-meta and the master setting v3, every older kind and key as before', () => {
+		expect(SCHEMA_VERSION).toBe(3);
+		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
+		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-meta' })).toBe(3);
+		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-state' })).toBe(2);
+		expect(opSchemaVersion({ entity: 'setting', kind: 'set', entity_id: MASTER_DEVICE_SETTING })).toBe(3);
+		expect(opSchemaVersion({ entity: 'setting', kind: 'set', entity_id: 'credit_format' })).toBe(1);
+		expect(isAccountSettingKey(MASTER_DEVICE_SETTING)).toBe(true);
+	});
+
+	it('refuses either stamped below v3: a v2 client would stop at it instead of holding it aside', () => {
+		const m = { ...envelope('library_track', 'set-meta', REC_A, meta), schema_version: 2 };
+		expect(safeParseOp(m)).toMatchObject({ ok: false, error: { reason: 'invalid_payload' } });
+		const s = { ...envelope('setting', 'set', MASTER_DEVICE_SETTING, { value: 'dev-1' }), schema_version: 2 };
+		expect(safeParseOp(s)).toMatchObject({ ok: false, error: { reason: 'invalid_payload' } });
+		expect(safeParseOp({ ...s, schema_version: 3 }).ok).toBe(true);
+	});
+
+	it('takes only http(s) cover urls and whole-number counts', () => {
+		const bad = (p: Record<string, unknown>) => safeParseOp(envelope('library_track', 'set-meta', REC_A, { ...meta, ...p })).ok;
+		expect(bad({ cover_url: 'file:///C:/covers/a.jpg' })).toBe(false);
+		expect(bad({ cover_url: 'data:image/png;base64,AAAA' })).toBe(false);
+		expect(bad({ cover_url: 'HTTPS://i.scdn.co/x' })).toBe(true);
+		expect(bad({ duration_sec: 1.5 })).toBe(false);
+		expect(bad({ source: 'rekordbox' })).toBe(false);
+		expect(bad({ extra: 1 })).toBe(false);
+		expect(bad({ track_number: null, disc_number: 2 })).toBe(true);
 	});
 });

@@ -24,7 +24,7 @@ import type { Accessor } from 'solid-js';
 import { render } from 'solid-js/web';
 import { registerModalOpenSignal } from '../modalGate.js';
 
-export type SettingsTab = 'connections' | 'library' | 'rekordbox' | 'player' | 'similarity' | 'ui' | 'backup' | 'account';
+export type SettingsTab = 'connections' | 'library' | 'deleted' | 'rekordbox' | 'player' | 'similarity' | 'ui' | 'backup' | 'account';
 
 export interface SettingsModalProps {
 	// Fired when a tab becomes active (initial open + subsequent tab
@@ -46,6 +46,7 @@ export interface SettingsModalHandle {
 const TABS: { id: SettingsTab; label: string }[] = [
 	{ id: 'connections', label: 'Connections' },
 	{ id: 'library',     label: 'Library' },
+	{ id: 'deleted',     label: 'Deleted Tracks' },
 	{ id: 'rekordbox',   label: 'Rekordbox' },
 	{ id: 'player',      label: 'Player' },
 	{ id: 'similarity',  label: 'Track Similarity' },
@@ -131,6 +132,11 @@ export function mountSettingsModal(host: HTMLElement, props: SettingsModalProps)
 							{/* Keep id stable so existing renderLibraryFoldersModalIfOpen /
 							    wireLibraryFoldersPanel logic finds the same container. */}
 							<div id="lib-folders-body"></div>
+						</div>
+						<div class="settings-panel" data-settings-panel="deleted" role="tabpanel" hidden={activeTab() !== 'deleted'}>
+							{/* Rendered by features/deletedTracksSettings.ts:mountDeletedTracksSettings().
+							    Lists soft-deleted tracks for restore / permanent delete. */}
+							<div id="settings-deleted"></div>
 						</div>
 						<div class="settings-panel" data-settings-panel="rekordbox" role="tabpanel" hidden={activeTab() !== 'rekordbox'}>
 							{/* Rendered by main.ts:renderSettingsRekordbox(). Flags live in

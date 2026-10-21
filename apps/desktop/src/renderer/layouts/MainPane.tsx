@@ -47,6 +47,12 @@ export interface MainPaneTracklistProps {
 	open: Accessor<'group' | null>;
 	onGroupClick: (anchor: HTMLElement) => void;
 	onRowsToggle: () => void;
+	// "This device" chip: the account's tracks this device has no source of
+	// (remote rows) and whether they are hidden. Only offered once there are
+	// any (or while hiding, so it can always be turned off again).
+	remoteCount: Accessor<number>;
+	hideRemote: Accessor<boolean>;
+	onHideRemoteToggle: () => void;
 }
 
 export interface MainPaneProps {
@@ -55,6 +61,13 @@ export interface MainPaneProps {
 }
 
 const GROUP_LABELS: Record<GroupBy, string> = { none: 'None', artist: 'Artist', album: 'Album', label: 'Label' };
+
+function remoteChipTitle(n: number, hiding: boolean): string {
+	const count = n > 0 ? `${n.toLocaleString()} ${n === 1 ? 'track' : 'tracks'}` : 'tracks';
+	return hiding
+		? `Showing only tracks on this device — click to also show the ${count} your other devices hold`
+		: `Show only tracks on this device — hides the ${count} only your other devices hold`;
+}
 
 export function MainPane(props: MainPaneProps) {
 	const backTitle = (): string => (props.nav.backLabel() ? `Back to ${props.nav.backLabel()} (Alt+←)` : 'Back (Alt+←)');
@@ -130,6 +143,19 @@ export function MainPane(props: MainPaneProps) {
 							<span class="tl-chip__value">{GROUP_LABELS[props.tracklist.groupBy()]}</span>
 						</Show>
 					</button>
+					<Show when={props.tracklist.remoteCount() > 0 || props.tracklist.hideRemote()}>
+						<button
+							type="button"
+							class="tl-chip"
+							classList={{ 'is-active': props.tracklist.hideRemote() }}
+							aria-pressed={props.tracklist.hideRemote() ? 'true' : 'false'}
+							title={remoteChipTitle(props.tracklist.remoteCount(), props.tracklist.hideRemote())}
+							onClick={() => props.tracklist.onHideRemoteToggle()}
+						>
+							<svg class="tl-chip__icon" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="2.5" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 11.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+							<span class="tl-chip__label">This device</span>
+						</button>
+					</Show>
 					{/* Row mode toggle — the player-size button's idiom: a borderless
 					    icon showing the CURRENT mode (one slim line per row vs two
 					    lines per row); one click flips it. */}

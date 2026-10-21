@@ -99,6 +99,10 @@ export const ZTrackFilter = z.object({
 	// enrichment sources (e.g. 'beatport') that aren't tab sources.
 	hasSource: z.union([z.string(), z.array(z.string())]).optional(),
 	lacksSource: z.string().optional(),
+	// Hide the account's tracks this device holds no source of (remote rows,
+	// track.remoteOnly: "not on this device"). Off by default — every device
+	// shows the account's whole library, the rows marked.
+	hideRemote: z.boolean().optional(),
 	// Artist scope by Curator artist id — OR within the array. Compiles to
 	// EXISTS on track_artist (indexed), so the "Artist: X" JIT scope is a
 	// complete SQL pushdown rather than an in-memory name match over the

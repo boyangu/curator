@@ -127,9 +127,13 @@ function compactTrack(t: {
 	state?: string | null;
 	duration?: number | null;
 	releaseDate?: string | null;
+	deletedAt?: Date | null;
 }): Record<string, unknown> {
 	return {
 		id: t.id,
+		// Only a followed playlist's read returns one (the user deleted it, the
+		// playlist they don't own still lists it — the app shows a "deleted" chip).
+		...(t.deletedAt ? { deleted: true } : {}),
 		title: t.title,
 		artists: t.artists.map((a) => a.name),
 		...(t.albumTitle ? { album: t.albumTitle } : {}),
@@ -276,6 +280,9 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 					for (let offset = 0; rows.length < LOAD_CAP; offset += LOAD_PAGE) {
 						const page = await ports.svc().getTracksPage(filter, sort, { limit: LOAD_PAGE, offset });
 						for (const t of page.items) {
+							// A followed playlist still lists tracks the user deleted;
+							// they aren't library tracks, so they don't enter the workspace.
+							if (t.deletedAt) continue;
 							rows.push({
 								id: t.id,
 								title: t.title,
@@ -808,9 +815,10 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 				'  release_date, duration_sec, rating (0-5), state, membership, play_count, brightness, power, added_at',
 				'• v_track_artist (track_id, artist) · v_feed_artist (item_id, artist) — exploded one-row-per-artist:',
 				'  use for per-artist GROUP BYs and artist-set joins between library and feed',
-				'• source_link — per-provider refs: track_id, source (spotify|tidal|local|beatport), source_track_id, url',
-				'• playlist (id, name, source, track_count) · playlist_track (playlist_id, track_id, position)',
-				'• tag (id, name) · track_tag (track_id, tag_id)',
+				'• v_source_link — per-provider refs: track_id, source (spotify|tidal|local|beatport), source_track_id, url',
+				'• playlist (id, name, source) · v_playlist_track (playlist_id, track_id, position) — count members',
+				'  from v_playlist_track, not playlist.track_count (a provider total that includes deleted tracks)',
+				'• tag (id, name) · v_track_tag (track_id, tag_id)',
 				'• v_feed_item — discover feed: id, type (track|album), title, artists, genre, label, bpm, isrc,',
 				'  release_date, published_at (epoch ms), state, promoted_track_id, covered_by (non-NULL = hidden',
 				'  duplicate folded into another feed item — add covered_by IS NULL to match what the feed shows)',
@@ -818,7 +826,9 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 				'  artists, bpm, key_camelot, genre, label, isrc, duration_sec',
 				'• kb.kb_entity (id, kind: artist|release|track|label|genre, name, isrc, release_date) ·',
 				'  kb.kb_edge (src_id, kind, dst_id, confidence) · kb.kb_entity_source (entity_id, source, source_id, url)',
-				'Raw `track` holds canonical values only (user edits live in overrides JSON) — always use v_track.',
+				'Raw `track` holds canonical values only (user edits live in overrides JSON) and deleted tracks — always',
+				'use v_track. The v_ junction views (v_source_link, v_playlist_track, v_track_tag) drop deleted tracks;',
+				'the raw tables of the same name keep them, so never count or join through those.',
 				'ATTACH/PRAGMA are forbidden. On a "workspace was reset" error, re-load your tables and retry.',
 			].join('\n'),
 			parameters: {

@@ -29,7 +29,8 @@ import { heldCount, replayHeldOps } from './held.js';
 import { planIdentityMerges } from './identity.js';
 import { planStreamingDedupe } from './playlist-dedupe.js';
 import { recordingIdForTrack } from './recording-id.js';
-import { streamingPlaylistId } from './stable-ids.js';
+import { remoteTrackId, streamingPlaylistId } from './stable-ids.js';
+import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import {
 	flacParse,
 	markPreOpLog,
@@ -112,13 +113,18 @@ describe('scenario 19 — the same Spotify playlist imported on both desktops', 
 		const pl = importPlaylist(a, 'spP', [1, 2, 3]);
 		expect(pl).toBe(streamingPlaylistId('spotify', 'spP'));
 		await rig.settle();
-		// B holds the playlist (pulled) but no row of its tracks yet.
-		expect(b.one(`SELECT count(*) FROM playlist_track WHERE playlist_id = ?`, pl)).toBe(0);
+		// B holds the playlist (pulled) and A's rows, on remote rows made from
+		// A's base metadata: the tracks show, marked not on this device.
+		expect(b.one(`SELECT count(*) FROM playlist_track pt JOIN track t ON t.id = pt.track_id WHERE pt.playlist_id = ? AND t.remote_only = 1`, pl)).toBe(3);
+		const remoteIds = b.all<{ id: string }>(`SELECT t.id FROM playlist_track pt JOIN track t ON t.id = pt.track_id WHERE pt.playlist_id = ? ORDER BY pt.position`, pl).map((r) => r.id);
 
 		const before = outboxLen(b);
 		expect(importPlaylist(b, 'spP', [1, 2, 3])).toBe(pl);
 		// No create, no claim, no membership op: it is all A's already.
 		expect(outboxSince(b, before)).toEqual([]);
+		// The links landed on the rows B already showed, which are now its own.
+		expect([1, 2, 3].map((n) => trackOfSp(b, n))).toEqual(remoteIds);
+		expect(b.one(`SELECT count(*) FROM track WHERE remote_only = 1`)).toBe(0);
 		for (const n of [1, 2, 3]) expect(recOfSp(b, n), `sp${n}`).toBe(recOfSp(a, n));
 		expect(playlistOrder(b, pl)).toEqual(playlistOrder(a, pl));
 		expect(positionsContiguous(b, pl)).toBe(true);
@@ -271,6 +277,9 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 			ins.run(id, R(id), `Song ${n}`, JSON.stringify([{ name: `Artist ${n}` }]), 200 + n, `GBAAA26${String(n).padStart(5, '0')}`, addedBase, addedBase);
 			link.run(`sl-${id}`, id, `sp${n}`, addedBase);
 		});
+		// The artist junction an import derives (a remote row of these on the
+		// other desktop derives it too).
+		syncTrackArtistsByIdRaw(raw, [...ids]);
 		raw.prepare(`INSERT INTO playlist (id, source, source_id, name, created_at) VALUES (?, 'spotify', 'spP', 'Shared Mix', ?)`).run(PL, addedBase);
 		raw.prepare(`INSERT INTO playlist (id, source, source_id, name, created_at) VALUES (?, 'spotify', 'spQ', 'Second Mix', ?)`).run(PL2, addedBase);
 		const row = raw.prepare(`INSERT INTO playlist_track (id, playlist_id, track_id, order_key, position, added_at, source_track_id) VALUES (?, ?, ?, ?, ?, ?, ?)`);
@@ -330,11 +339,16 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 		const bShared = bRows.filter((_, pos) => B_LIST[pos] !== 4).map((r) => r.id).sort();
 		expect(removes).toEqual(bShared);
 		expect(removes).toHaveLength(6);
-		// A's library is the one it had: same rows, same playlist rows, upstream
-		// order, the duplicate and the user's add both still there, no doubles.
-		expect(liveTracks(a)).toBe(aTracksBefore);
-		expect(a.all(`SELECT id, track_id FROM playlist_track WHERE playlist_id = ? ORDER BY position`, PL)).toEqual(aRowsBefore);
-		expect(playlistOrder(a, PL)).toEqual([0, 1, 2, 1, 3, 0].map(survivor));
+		// A's library is the one it had — same rows, same playlist rows,
+		// upstream order, the duplicate and the user's add both still there,
+		// no doubles — plus the one track only B holds (s4), as a remote row
+		// made from B's base metadata, with B's row of it.
+		const s4 = R(ids.b[4]!);
+		expect(liveTracks(a)).toBe(aTracksBefore + 1);
+		expect(a.all(`SELECT recording_id FROM track WHERE remote_only = 1`)).toEqual([{ recording_id: s4 }]);
+		expect(a.one(`SELECT title FROM track WHERE remote_only = 1`)).toBe('Song 4');
+		expect(a.all(`SELECT id, track_id FROM playlist_track WHERE playlist_id = ? ORDER BY position`, PL).slice(0, aRowsBefore.length)).toEqual(aRowsBefore);
+		expect(playlistOrder(a, PL)).toEqual([...[0, 1, 2, 1, 3, 0].map(survivor), s4]);
 		expect(positionsContiguous(a, PL)).toBe(true);
 		for (const n of [0, 1, 2, 3]) expect(a.one(`SELECT recording_id FROM track WHERE id = ?`, ids.a[n]), `s${n}`).toBe(survivor(n));
 		// Nothing left to heal on A.
@@ -370,7 +384,7 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 		expect(playlistOrder(b, PL)).toEqual([...[0, 1, 2, 1, 3, 0].map(survivor), R(ids.b[4]!)]);
 		expect(playlistOrder(b, PL2)).toEqual(pl2Before);
 		expect(positionsContiguous(b, PL)).toBe(true);
-		expect(replicaDiff(a, b, { sharedOnly: true })).toEqual([]);
+		expect(replicaDiff(a, b)).toEqual([]);
 		// B's next read-sync of the same list changes nothing.
 		const before = outboxLen(b);
 		importPlaylist(b, 'spP', [0, 1, 2, 1, 3, 0, 4]);
@@ -381,7 +395,7 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 // ── the scanner binds a file to the recording another desktop claims ──────
 
 describe('the scanner on a desktop that already holds another desktop\'s audio claim', () => {
-	it('binds the file to that recording: no new recording, no merge, its curation shows at once', async () => {
+	it('binds the file to that recording: the remote row it showed becomes its own, no new recording, no merge', async () => {
 		const PCM = 'c0ffee11'.repeat(4);
 		const a = await rig.desktop('a', { parseAudio: flacParse });
 		const b = await rig.desktop('b', { parseAudio: flacParse });
@@ -393,13 +407,20 @@ describe('the scanner on a desktop that already holds another desktop\'s audio c
 		await a.svc.addTrackTag(ta, 'interested');
 		await a.svc.setRating([ta], 4);
 		await rig.settle();
+		// B already shows A's track, as a remote row (no file here).
+		const rec = a.one<string>(`SELECT recording_id FROM track WHERE id = ?`, ta);
+		expect(b.all(`SELECT id, remote_only FROM track WHERE recording_id = ?`, rec)).toEqual([{ id: remoteTrackId(rec), remote_only: 1 }]);
 
 		writeFlac(join(b.musicDir, 'Artist - Bound.flac'), PCM, 'TITLE=Bound\nARTIST=Artist\n');
 		const before = outboxLen(b);
 		const wb = scanWaiter(b, normalizePath(b.musicDir));
 		await b.svc.addLibraryFolder(b.musicDir);
-		expect((await wb.done(1)).created).toBe(1);
+		expect((await wb.done(1)).created).toBe(0);
+		// The file attached to that row, which is now B's own.
 		const tb = b.one<string>(`SELECT track_id FROM source_link WHERE source = 'local'`);
+		expect(tb).toBe(remoteTrackId(rec));
+		expect(b.one(`SELECT remote_only FROM track WHERE id = ?`, tb)).toBe(0);
+		expect(b.one(`SELECT count(*) FROM track WHERE recording_id = ?`, rec)).toBe(1);
 		expect(b.one(`SELECT recording_id FROM track WHERE id = ?`, tb)).toBe(a.one(`SELECT recording_id FROM track WHERE id = ?`, ta));
 		expect(outboxSince(b, before).filter((o) => o === 'library_track.create')).toEqual([]);
 		expect(b.one(`SELECT rating FROM track WHERE id = ?`, tb)).toBe(4);
@@ -420,6 +441,221 @@ describe('a signed-in desktop\'s streaming read-sync waits for its first pull', 
 		await a.sync();
 		// Past the gate: now it is only the (absent) Spotify connection.
 		await expect(a.svc.runSpotifySync()).rejects.toThrow(/Spotify not connected/);
+	});
+});
+
+// ── 17 — a fresh device with no sources shows the whole library ───────────
+
+// Protocol v3 (cloud plan: streaming identity §3): every device states its
+// rows' base metadata, and a device with no row of a recording shows it as a
+// remote row (remote-rows.ts) — "not on this device" — with its curation.
+describe('scenario 17 — a fresh device with no sources shows the account\'s whole library', () => {
+	const remoteRows = (d: Desktop): Array<{ recording_id: string; title: string; deleted: number }> =>
+		d.all(`SELECT recording_id, title, deleted_at IS NOT NULL AS deleted FROM track WHERE remote_only = 1 ORDER BY recording_id`);
+	const titleOn = (d: Desktop, id: string): string | null => d.one(`SELECT coalesce(json_extract(overrides, '$.title'), title) FROM track WHERE recording_id = ?`, R(id)) ?? null;
+
+	// A's library: tags, a rating, a playlist, an override, a delete.
+	async function curate(a: Desktop): Promise<void> {
+		await a.svc.addTrackTag('trk-1', 'interested');
+		await a.svc.setRating(['trk-2'], 5);
+		await a.svc.createLocalPlaylistFromTracks('Warmup', ['trk-3', 'trk-4']);
+		await a.svc.setTrackOverrides('trk-5', { title: 'Edited Title' });
+		mut.softDeleteTracks(a.db, ['trk-6']);
+	}
+
+	function expectWholeLibrary(a: Desktop, c: Desktop): void {
+		// Every live track of A's, on C, marked: no row of C's own exists.
+		expect(c.one(`SELECT count(*) FROM track WHERE remote_only = 0`)).toBe(0);
+		expect(remoteRows(c).filter((r) => !r.deleted).map((r) => r.recording_id).sort()).toEqual(TRACKS.filter((t) => t !== 'trk-6').map(R).sort());
+		// The deleted track's row is there, deleted (as A's own is).
+		expect(remoteRows(c).filter((r) => r.recording_id === R('trk-6')).map((r) => r.deleted)).toEqual([1]);
+		expect(titleOn(c, 'trk-0')).toBe('Title trk-0');
+		expect(titleOn(c, 'trk-5')).toBe('Edited Title');
+		expect(c.one(`SELECT rating FROM track WHERE recording_id = ?`, R('trk-2'))).toBe(5);
+		expect(c.one(`SELECT count(*) FROM track_tag tt JOIN track t ON t.id = tt.track_id WHERE t.recording_id = ? AND tt.tag_id = 'interested'`, R('trk-1'))).toBe(1);
+		const pl = a.one<string>(`SELECT id FROM playlist WHERE name = 'Warmup'`);
+		expect(playlistOrder(c, pl)).toEqual([R('trk-3'), R('trk-4')]);
+		// The credits and their artist entities, as on A.
+		expect(c.one(`SELECT count(*) FROM track_artist ta JOIN track t ON t.id = ta.track_id WHERE t.remote_only = 1`)).toBe(TRACKS.length);
+		expect(replicaDiff(a, c, { sharedOnly: true })).toEqual([]);
+	}
+
+	it('via ops: the rows appear, then follow a rename (alias re-derivation), a delete and an undelete', async () => {
+		const a = await rig.desktop('a');
+		await curate(a);
+		await rig.settle();
+		const c = await rig.desktop('c', { catalogue: [] });
+		await rig.settle();
+		expectWholeLibrary(a, c);
+		expect(await c.svc.getAccountLibraryInfo()).toMatchObject({ masterDeviceId: await a.deviceId(), remoteOnlyCount: TRACKS.length - 1, metaSyncAvailable: true });
+
+		// A renames the artist: C's credits re-derive from the source credits
+		// its remote rows keep.
+		const artistId = a.one<string>(`SELECT id FROM artist WHERE name = 'Artist'`);
+		await a.svc.renameArtist(artistId, 'The Artist');
+		mut.softDeleteTracks(a.db, ['trk-7']);
+		mut.undeleteTracks(a.db, ['trk-6']);
+		await rig.settle();
+		expect(c.one(`SELECT artists FROM track WHERE recording_id = ?`, R('trk-0'))).toBe(JSON.stringify([{ name: 'The Artist' }]));
+		expect(c.one(`SELECT deleted_at IS NOT NULL FROM track WHERE recording_id = ?`, R('trk-7'))).toBe(1);
+		expect(c.one(`SELECT deleted_at FROM track WHERE recording_id = ?`, R('trk-6'))).toBeNull();
+		expect(replicaDiff(a, c)).toEqual([]);
+		// Nothing of C's own went out: no create, no claim, no meta.
+		const cId = await c.deviceId();
+		expect(rig.cloud.log.filter((o) => o.device_id === cId && (o.entity === 'recording_claim' || o.kind === 'create' || o.kind === 'set-meta'))).toEqual([]);
+	});
+
+	it('via the snapshot: a device that bootstraps gets every remote row from the records it loads', async () => {
+		const a = await rig.desktop('a');
+		await curate(a);
+		await rig.settle();
+		const snapSeq = rig.cloud.takeSnapshot();
+		rig.cloud.hintBelow = snapSeq;
+		const c = await rig.desktop('c', { catalogue: [] });
+		await rig.settle();
+		expect(rig.cloud.calls.bootstrap).toBe(1);
+		expectWholeLibrary(a, c);
+	});
+
+	it('the v2-snapshot upgrade: records loaded before any device stated meta show nothing, then everything once the server reads v3', async () => {
+		const v2 = rig.cloud.features;
+		rig.cloud.features = v2.filter((f) => f !== 'track_meta');
+		const a = await rig.desktop('a');
+		await curate(a);
+		await rig.settle();
+		const snapSeq = rig.cloud.takeSnapshot();
+		rig.cloud.hintBelow = snapSeq;
+		const c = await rig.desktop('c', { catalogue: [] });
+		await rig.settle();
+		expect(rig.cloud.calls.bootstrap).toBe(1);
+		// The 2026-10-20 incident's second desktop: the records, no rows.
+		expect(c.one(`SELECT count(*) FROM sync_state WHERE map = 'libraryTracks'`)).toBeGreaterThan(0);
+		expect(c.one(`SELECT count(*) FROM track`)).toBe(0);
+		expect(rig.cloud.log.some((o) => o.kind === 'set-meta')).toBe(false);
+		// The server is upgraded: A states its rows' meta once (the
+		// backfill), C materialises them.
+		rig.cloud.features = v2;
+		await rig.settle();
+		expectWholeLibrary(a, c);
+		expect(rig.cloud.log.filter((o) => o.kind === 'set-meta')).toHaveLength(TRACKS.length);
+	});
+});
+
+// ── 18 — the master device's metadata wins ─────────────────────────────────
+
+describe('scenario 18 — master device wins', () => {
+	it('the master\'s spelling shows on a third device; a track only another device holds shows its own; a master change re-picks', async () => {
+		// A links the library first: the default master.
+		const a = await rig.desktop('a', { catalogue: ['trk-0', 'trk-1'] });
+		await rig.settle();
+		const b = await rig.desktop('b', {
+			catalogue: ['trk-0', 'trk-1', 'b-only'],
+			seed: (raw) => { raw.prepare(`UPDATE track SET title = 'B spelling of ' || id`).run(); },
+		});
+		const c = await rig.desktop('c', { catalogue: [] });
+		await rig.settle();
+		const [aId, bId] = [await a.deviceId(), await b.deviceId()];
+		expect(rig.cloud.log.filter((o) => o.entity === 'setting' && o.entity_id === 'library.master_device').map((o) => [o.device_id, o.payload])).toEqual([[aId, { value: aId }]]);
+		const title = (d: Desktop, id: string): string => d.one(`SELECT title FROM track WHERE recording_id = ?`, R(id));
+		// Both A and B stated meta for trk-0; A is the master.
+		expect(title(c, 'trk-0')).toBe('Title trk-0');
+		expect(title(c, 'trk-1')).toBe('Title trk-1');
+		// Only B holds b-only: its meta shows.
+		expect(title(c, 'b-only')).toBe('B spelling of b-only');
+		expect(title(a, 'b-only')).toBe('B spelling of b-only');
+		expect(a.one(`SELECT remote_only FROM track WHERE recording_id = ?`, R('b-only'))).toBe(1);
+		// Own rows keep their own spelling on every device.
+		expect(title(b, 'trk-0')).toBe('B spelling of trk-0');
+		expect(title(a, 'trk-0')).toBe('Title trk-0');
+
+		// The user makes B the master (Settings → Account).
+		expect(await b.svc.setMasterDevice(bId)).toMatchObject({ masterDeviceId: bId });
+		await rig.settle();
+		expect(title(c, 'trk-0')).toBe('B spelling of trk-0');
+		expect(title(a, 'trk-0')).toBe('Title trk-0');
+		for (const d of [a, b, c]) expect((await d.svc.getAccountLibraryInfo()).masterDeviceId, d.name).toBe(bId);
+		expect(replicaDiff(a, c, { sharedOnly: true }).map((r) => r.table)).not.toContain('tracks');
+	});
+});
+
+// ── the "Astral Traveling" edge (dry run, 2026-10-20) ──────────────────────
+
+describe('a streaming playlist holding two releases of one song that another device folded into one recording', () => {
+	// Upstream: "Back Stabbers" twice — two releases, two Spotify ids, one
+	// ISRC. A (main) holds a recording per release; B (the profile, pre-fix)
+	// bound the second release to the first by ISRC (stated at 1.0 back then),
+	// so one recording of B's claims both ids and B's import holds it twice.
+	const PL = 'pl-astral';
+	const ISRC = 'USSM17200040';
+
+	function seed(raw: Database.Database, rows: Array<[string, string[]]>, members: string[], addedBase: number): void {
+		const ins = raw.prepare(`INSERT INTO track (id, recording_id, title, artists, state, duration, isrc, added_at, created_at) VALUES (?, ?, 'Back Stabbers', '[{"name":"The O''Jays"}]', 'unsorted', 230, ?, ?, ?)`);
+		const link = raw.prepare(`INSERT INTO source_link (id, track_id, source, source_track_id, fetched_at) VALUES (?, ?, 'spotify', ?, ?)`);
+		for (const [id, sps] of rows) {
+			ins.run(id, R(id), ISRC, addedBase, addedBase);
+			for (const sp of sps) link.run(`sl-${id}-${sp}`, id, sp, addedBase);
+		}
+		syncTrackArtistsByIdRaw(raw, rows.map(([id]) => id));
+		raw.prepare(`INSERT INTO playlist (id, source, source_id, name, created_at) VALUES (?, 'spotify', 'spAstral', 'Astral Traveling', ?)`).run(PL, addedBase);
+		const row = raw.prepare(`INSERT INTO playlist_track (id, playlist_id, track_id, order_key, position, added_at, source_track_id) VALUES (?, ?, ?, ?, ?, ?, ?)`);
+		members.forEach((t, pos) => { const [id, key] = memberOrder(pos); row.run(`${t}-row-${pos}`, PL, t, key, pos, addedBase + pos, 'sp'); });
+		markPreOpLog(raw);
+	}
+
+	it('A keeps one row per upstream item, whichever recordings the rows are under', async () => {
+		const a = await rig.desktop('a', { catalogue: [], seed: (raw) => seed(raw, [['a-sa', ['spA']], ['a-sb', ['spB']]], ['a-sa', 'a-sb'], 1_700_000_000_000) });
+		await a.sync();
+		// B pushes and goes away before pulling.
+		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => seed(raw, [['b-p', ['spA', 'spB']]], ['b-p', 'b-p'], 1_750_000_000_000) });
+		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
+		await b.sync();
+		b.transport.online = false;
+		await rig.settle([a]);
+
+		// B's one recording bridges A's two: the resolver holds it (A minted
+		// two of the group), so nothing merges.
+		expect(mergeOps()).toEqual([]);
+		// A's playlist: its own two rows, B's two removed (one per upstream
+		// item stays, not one per recording).
+		expect(playlistOrder(a, PL)).toEqual([R('a-sa'), R('a-sb')]);
+		expect(planStreamingDedupe(a.raw).removes).toEqual([]);
+		expect((await opsBy(a, 'playlist_track', 'remove')).map((o) => o.entity_id).sort()).toEqual(['b-p-row-0', 'b-p-row-1']);
+		// B's recording is in A's library (a remote row), not in the playlist.
+		expect(a.one(`SELECT remote_only FROM track WHERE recording_id = ?`, R('b-p'))).toBe(1);
+
+		b.transport.online = true;
+		await rig.settle([b, a]);
+		for (const d of [a, b]) expect(playlistOrder(d, PL), d.name).toEqual([R('a-sa'), R('a-sb')]);
+		expect(positionsContiguous(b, PL)).toBe(true);
+	});
+
+	it('the dry run\'s order: the first release merged, then the second release\'s claim and row arrive', async () => {
+		const a = await rig.desktop('a', { catalogue: [], seed: (raw) => seed(raw, [['a-sa', ['spA']], ['a-sb', ['spB']]], ['a-sa', 'a-sb'], 1_700_000_000_000) });
+		await a.sync();
+		// B first holds only the first release, once.
+		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => seed(raw, [['b-p', ['spA']]], ['b-p'], 1_750_000_000_000) });
+		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
+		await b.sync();
+		b.transport.online = false;
+		await rig.settle([a]);
+		expect(mergeOps()).toHaveLength(1);
+		expect(playlistOrder(a, PL).length).toBe(2);
+		// Still offline and pre-fix, B binds the second release to its
+		// recording by ISRC and adds it: the claim and the row reach A later.
+		b.raw.prepare(`INSERT INTO source_link (id, track_id, source, source_track_id, fetched_at) VALUES ('sl-b-p-spB', 'b-p', 'spotify', 'spB', 1)`).run();
+		mut.addClaims(b.db, 'b-p', [{ kind: 'spotify', value: 'spB', confidence: 1 }]);
+		mut.addMembers(b.db, PL, [{ playlistId: PL, trackId: 'b-p', addedAt: new Date(), addedBy: null, sourceTrackId: 'spB' }]);
+		b.transport.online = true;
+		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
+		await b.sync();
+		b.transport.online = false;
+		await rig.settle([a]);
+		// Two items, two rows — not the three a per-recording fold left.
+		expect(playlistOrder(a, PL)).toHaveLength(2);
+		expect(planStreamingDedupe(a.raw).removes).toEqual([]);
+		b.transport.online = true;
+		await rig.settle([b, a]);
+		for (const d of [a, b]) expect(playlistOrder(d, PL), d.name).toHaveLength(2);
 	});
 });
 

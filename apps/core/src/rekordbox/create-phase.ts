@@ -128,7 +128,11 @@ async function planContentCreates(db: Db, ids: string[], fmt: ArtistCreditFormat
 	let unplayable = 0;
 	for (const id of unlinked) {
 		const t = db.select().from(track).where(eq(track.id, id)).get();
-		if (!t || t.deletedAt) { unplayable++; continue; }
+		// A remote row (track.remoteOnly: another device's track, projected
+		// here) has no file to hand rekordbox — even when the op log put it
+		// in this rekordbox playlist. The local-link probe below would find
+		// none either; the flag says why in one place.
+		if (!t || t.deletedAt || t.remoteOnly) { unplayable++; continue; }
 		// Live links only (missing_at IS NULL): a file the watcher saw vanish
 		// must not be created in rekordbox — rb would import a dead path and
 		// show the track missing. existsSync covers the window before the

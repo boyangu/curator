@@ -27,6 +27,24 @@ describe('snapshot codec', () => {
 		expect(materialize(back).libraryTracks[0]!.state).toBe('backlog');
 	});
 
+	it('round-trips v3 meta cells and the master setting in the unchanged format', () => {
+		const rec = '00000000-0000-4000-8000-0000000000bb';
+		const meta = { source: 'local' as const, title: 'Lilac', artists: [{ name: 'Bonobo' }], album_title: null, duration_sec: 300, isrc: null, release_date: null, label: null, genre: null, cover_url: null };
+		const state = createLibraryState();
+		const at = (o: Op, device: string): Op => ({ ...o, device_id: device }) as Op;
+		for (const o of [
+			at(op({ entity: 'library_track', kind: 'create', entity_id: rec, payload: {} }, 20), 'main'),
+			at(op({ entity: 'library_track', kind: 'set-meta', entity_id: rec, payload: meta }, 21), 'main'),
+			at(op({ entity: 'library_track', kind: 'set-meta', entity_id: rec, payload: { ...meta, title: 'Lilac (laptop)' } }, 22), 'laptop'),
+			at(op({ entity: 'setting', kind: 'set', entity_id: 'library.master_device', payload: { value: 'main' } }, 19), 'main'),
+		]) applyOp(state, o);
+		const json = serializeLibraryState(state);
+		expect(JSON.parse(json).version).toBe(1);
+		const back = deserializeLibraryState(json);
+		expect(serializeLibraryState(back)).toBe(json);
+		expect(materialize(back).libraryTracks[0]!.meta).toMatchObject({ title: 'Lilac', device: 'main' });
+	});
+
 	it('reads a snapshot written before the artist alias maps existed', () => {
 		const doc = JSON.parse(serializeLibraryState(createLibraryState())) as { maps: Record<string, unknown> };
 		delete doc.maps['artistAliases'];

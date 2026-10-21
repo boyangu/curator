@@ -362,7 +362,7 @@ describe('merge rules', () => {
 			op('library_track', 'set-rating', A, { rating: 2 }, { ts: T(9, 0) }),
 		]);
 		expect(view.libraryTracks).toEqual([
-			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' } },
+			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' }, meta: null },
 		]);
 	});
 
@@ -897,5 +897,74 @@ describe('unfinalised plays', () => {
 		expect(canonical(state)).toEqual(before);
 		const { op_id: _a, device_id: _b, client_ts: _c, schema_version: _d, ...body } = a;
 		expect(isRestatement(state, body as Parameters<typeof isRestatement>[1])).toBe(true);
+	});
+});
+
+// set-meta (v3): one cell per device, the master's wins on read wherever it
+// has one (decided 2026-10-20), else the best source, then the later write.
+describe('base metadata (v3, master device wins)', () => {
+	const meta = (title: string, source: 'local' | 'spotify' | 'tidal' | 'other' = 'spotify') => ({
+		source, title, artists: [{ name: `${title} artist` }], album_title: null, duration_sec: 300, isrc: null, release_date: null, label: null, genre: null, cover_url: null,
+	});
+	const master = (device: string, ts: number) => op('setting', 'set', 'library.master_device', { value: device }, { ts, device });
+	const title = (view: LibraryView, rec: string) => view.libraryTracks.find((t) => t.recordingId === rec)?.meta?.title ?? null;
+
+	it('each device writes its own cell; the master\'s shows even when another device wrote later, in every order', () => {
+		const { state, view } = converge([
+			op('library_track', 'create', A, {}, { ts: T(8, 0), device: 'main' }),
+			op('library_track', 'set-meta', A, meta('Main spelling'), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-meta', A, meta('Laptop spelling', 'local'), { ts: T(10, 0), device: 'laptop' }),
+			master('main', T(7, 0)),
+		]);
+		expect(Object.keys(state.libraryTracks.get(A)!.fields).sort()).toEqual(['meta.laptop', 'meta.main']);
+		expect(title(view, A)).toBe('Main spelling');
+		expect(view.libraryTracks[0]!.meta!.device).toBe('main');
+	});
+
+	it('a track the master lacks shows another device\'s meta; no master falls back to source rank, then the later write', () => {
+		const { view } = converge([
+			op('library_track', 'set-meta', A, meta('Laptop A', 'spotify'), { ts: T(9, 0), device: 'laptop' }),
+			op('library_track', 'set-meta', A, meta('Phone A', 'local'), { ts: T(8, 0), device: 'phone' }),
+			op('library_track', 'set-meta', B, meta('Laptop B 1', 'tidal'), { ts: T(9, 0), device: 'laptop' }),
+			op('library_track', 'set-meta', B, meta('Laptop B 2', 'tidal'), { ts: T(9, 5), device: 'laptop' }),
+			master('main', T(7, 0)),
+		]);
+		expect(title(view, A)).toBe('Phone A'); // local beats spotify, though earlier
+		expect(title(view, B)).toBe('Laptop B 2'); // the device's own later write
+	});
+
+	it('changing the master re-picks every track at once', () => {
+		const ops = [
+			op('library_track', 'set-meta', A, meta('Main'), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-meta', A, meta('Laptop'), { ts: T(9, 1), device: 'laptop' }),
+			master('main', T(7, 0)),
+		];
+		expect(title(materialize(reduceAll(ops)), A)).toBe('Main');
+		const { view } = converge([...ops, master('laptop', T(11, 0))]);
+		expect(title(view, A)).toBe('Laptop');
+	});
+
+	it('a recording merge folds both sides\' cells per device by clock', () => {
+		const { state, view } = converge([
+			op('library_track', 'set-meta', A, meta('Loser main'), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-meta', B, meta('Winner main'), { ts: T(8, 0), device: 'main' }),
+			op('library_track', 'set-meta', A, meta('Loser laptop'), { ts: T(9, 0), device: 'laptop' }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 0) }),
+			master('main', T(7, 0)),
+		]);
+		expect(state.libraryTracks.has(A)).toBe(false);
+		expect(Object.keys(state.libraryTracks.get(B)!.fields).sort()).toEqual(['meta.laptop', 'meta.main']);
+		expect(title(view, B)).toBe('Loser main');
+	});
+
+	it('restating a device\'s own cell is a restatement only for that device', () => {
+		const s = reduceAll([op('library_track', 'set-meta', A, meta('Same'), { ts: T(9, 0), device: 'main' })]);
+		const again = op('library_track', 'set-meta', A, meta('Same'), { ts: T(9, 5), device: 'main' });
+		expect(isRestatement(s, again)).toBe(true);
+		expect(isRestatement(s, op('library_track', 'set-meta', A, meta('Same'), { ts: T(9, 5), device: 'laptop' }))).toBe(false);
+		expect(isRestatement(s, op('library_track', 'set-meta', A, meta('Other'), { ts: T(9, 5), device: 'main' }))).toBe(false);
+		// Without a device (a NewOp) there is no cell to compare: a change.
+		const { op_id: _a, device_id: _b, client_ts: _c, schema_version: _d, ...bare } = again;
+		expect(isRestatement(s, bare as Parameters<typeof isRestatement>[1])).toBe(false);
 	});
 });

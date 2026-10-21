@@ -55,7 +55,11 @@ export class ClaimBinder {
 		this.alias = new Map((raw.prepare(`SELECT loser, winner FROM recording_alias`).all() as Array<{ loser: string; winner: string }>).map((r) => [r.loser, r.winner]));
 		// Read per bind, not cached: rows appear during the batch the binder
 		// serves (an import inserting the row for a claimed recording).
-		this.ownRows = raw.prepare(`SELECT id, deleted_at FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL ORDER BY deleted_at IS NOT NULL, created_at, id`);
+		// A remote row (remote-rows.ts) is returned as the row to attach to —
+		// the user already sees it, and the link the import attaches turns it
+		// into this device's own (migrate.ts track_remote_claimed_link) — but
+		// an own row first, and only own rows decide step 1 below.
+		this.ownRows = raw.prepare(`SELECT id, deleted_at, remote_only FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL ORDER BY remote_only, deleted_at IS NOT NULL, created_at, id`);
 	}
 
 	private resolve(id: string): string {
@@ -101,14 +105,16 @@ export class ClaimBinder {
 		if (!this.claimants.has(parent)) this.prefetch(kind, [value]);
 		const claimants = this.claimants.get(parent) ?? [];
 		if (claimants.length === 0) return null;
-		const rowsOf = (rec: string): Array<{ id: string; deleted_at: number | null }> => this.ownRows.all(rec) as Array<{ id: string; deleted_at: number | null }>;
+		const rowsOf = (rec: string): Array<{ id: string; deleted_at: number | null; remote_only: number }> => this.ownRows.all(rec) as Array<{ id: string; deleted_at: number | null; remote_only: number }>;
 		const sorted = [...claimants].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 		const live = sorted.filter((r) => this.deletedAt.get(r) == null);
 
-		// 1. A recording this device already shows.
+		// 1. A recording this device already holds. Not a remote row: every
+		// claimant may have one, and which device happened to state meta
+		// first must not decide the binding (step 2 is the resolver's pick).
 		for (const rec of live) {
 			const rows = rowsOf(rec);
-			const shown = rows.find((r) => r.deleted_at === null);
+			const shown = rows.find((r) => r.deleted_at === null && !r.remote_only);
 			if (shown) return { recordingId: rec, trackId: shown.id, deleted: false };
 		}
 		// 2. The resolver's survivor among the live claimants.

@@ -104,6 +104,8 @@ export const tracksApi = {
 	removeSources: (trackIds: string[], sources: RemovableTrackSource[]): ReturnType<typeof window.api['tracks:remove-sources']> =>
 		trpc.tracks.removeSources.mutate([trackIds, sources]) as unknown as ReturnType<typeof window.api['tracks:remove-sources']>,
 	undelete: (trackIds: string[]) => trpc.tracks.undelete.mutate([trackIds]),
+	listDeleted: () => trpc.tracks.listDeleted.mutate([]),
+	purgeDeleted: (trackIds: string[]) => trpc.tracks.purgeDeleted.mutate([trackIds]),
 };
 
 // Library artist entities — the Artists browser, the Edit Track artist
@@ -333,6 +335,8 @@ export const accountApi = {
 	devices: () => trpc.account.devices.mutate([]),
 	revokeDevice: (deviceId: string) => trpc.account.revokeDevice.mutate([deviceId]),
 	signOutOthers: () => trpc.account.signOutOthers.mutate([]),
+	libraryInfo: () => api()['account:library-info'](),
+	setMasterDevice: (deviceId: string) => trpc.account.setMasterDevice.mutate([deviceId]),
 };
 
 export const cloudSyncApi = {

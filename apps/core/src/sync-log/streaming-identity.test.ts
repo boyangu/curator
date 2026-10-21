@@ -263,9 +263,11 @@ describe('playlist dedupe: the doubled rows two imports left', () => {
 			op('dev-b', 'upstream', userAdd['op_id'] as string, 'ack', { provider: 'spotify', status: 'pushed' }),
 			op('dev-c', 'playlist_track', stable, 'add', { playlist_id: PL, recording_id: remoteRec(1), order_key: key(6) }),
 		]);
-		// dev-b holds two rows (one acked) and wins on count; dev-a's single
-		// row goes; dev-c's provider-derived row stays.
-		expect(planStreamingDedupe(raw).removes.map((r) => r.rowId)).toEqual(['a-x']);
+		// dev-b holds two rows (one acked) and wins on count: the provider
+		// list holds X twice. dev-c's provider-derived row names one of the
+		// two items exactly and the user's acked add is the other, so both
+		// stay and fill the count; dev-a's row and dev-b's plain one go.
+		expect(planStreamingDedupe(raw).removes.map((r) => r.rowId).sort()).toEqual(['a-x', 'b-x']);
 	});
 
 	it('emits the removes and takes the rows off the visible table; a second run finds nothing', () => {
@@ -481,10 +483,12 @@ describe('identity report', () => {
 		const r = identityReport(ro);
 		expect(r.identity).toMatchObject({ groups: 10, streamingGroups: 10, holdsLoser: 10, holdsSurvivor: 0, merges: { total: 10, streaming: 10, audio: 0 } });
 		expect(r.identity.merges.byDevice).toEqual([{ loserDevice: r.deviceId, winnerDevice: 'dev-profile', merges: 10 }]);
-		expect(r.dedupe.now.removes).toBe(0);
+		// Already doubles before the merges: the two devices' rows name the
+		// same provider items (playlist-dedupe.ts groups by them).
+		expect(r.dedupe.now.removes).toBe(10);
 		expect(r.dedupe.afterMerges).toMatchObject({ groups: 10, removes: 10, perPlaylist: [{ playlistId: 'pl-r', name: 'Report Mix', excessRows: 10 }] });
 		expect(r.recordsWithoutRows).toBe(10);
-		expect(r.remoteOnly).toBeNull();
+		expect(r.remoteOnly).toBe(0);
 		// A read-only handle: any write would have thrown.
 		expect(() => ro.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES ('x', '1', 1)`).run()).toThrow(/readonly/);
 	});

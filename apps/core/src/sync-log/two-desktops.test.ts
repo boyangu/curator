@@ -153,16 +153,19 @@ describe('scenario 2 — B joins with its own existing library', () => {
 		await rig.settle();
 
 		for (const d of [a, b]) expect(await d.svc.getCloudSyncStatus(), d.name).toMatchObject({ initialPushDone: true, pending: 0, rejected: 0, lastError: null });
-		// Equal over every recording both hold rows for (B's own catalogue
-		// row is projected on B only: A has no row for it).
-		expect(replicaDiff(a, b, { sharedOnly: true })).toEqual([]);
+		// Equal everywhere: B's own catalogue row reaches A as a remote row
+		// (remote-rows.ts), made from B's base metadata, with its tag and
+		// playlist row.
+		expect(replicaDiff(a, b)).toEqual([]);
+		expect(a.one(`SELECT remote_only FROM track WHERE recording_id = ?`, R('b-only'))).toBe(1);
+		expect(b.one(`SELECT remote_only FROM track WHERE id = 'b-only'`)).toBe(0);
 		// Both libraries' containers on both sides.
 		for (const d of [a, b]) {
 			expect(d.all(`SELECT id FROM tag WHERE kind = 'user' ORDER BY id`).map((r) => (r as { id: string }).id)).toEqual(['a-tag', 'b-tag']);
 			expect(d.all(`SELECT id FROM playlist ORDER BY id`).map((r) => (r as { id: string }).id)).toEqual(['a-set', 'b-set']);
 		}
-		expect(tagged(a, 'b-tag')).toEqual([R('trk-1'), R('trk-4')].sort());
-		expect(playlistOrder(a, 'b-set')).toEqual([R('trk-4'), R('trk-1')]);
+		expect(tagged(a, 'b-tag')).toEqual([R('trk-1'), R('trk-4'), R('b-only')].sort());
+		expect(playlistOrder(a, 'b-set')).toEqual([R('b-only'), R('trk-4'), R('trk-1')]);
 		expect(playlistOrder(b, 'b-set')).toEqual([R('b-only'), R('trk-4'), R('trk-1')]);
 		// The same recording rated on both before they met: one answer.
 		expect(a.one(`SELECT rating FROM track WHERE id = 'trk-3'`)).toBe(b.one(`SELECT rating FROM track WHERE id = 'trk-3'`));

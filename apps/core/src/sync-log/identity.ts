@@ -208,8 +208,12 @@ type Reader = {
 function reader(raw: Raw): Reader {
 	const alias = new Map((raw.prepare(`SELECT loser, winner FROM recording_alias`).all() as Array<{ loser: string; winner: string }>).map((r) => [r.loser, r.winner]));
 	const record = raw.prepare(`SELECT value FROM sync_state WHERE map = 'libraryTracks' AND key = ?`).pluck();
-	const rowsOf = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND deleted_at IS NULL AND derived_from_track_id IS NULL ORDER BY created_at, id`).pluck();
-	const ownOf = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL ORDER BY deleted_at IS NOT NULL, created_at, id`).pluck();
+	// Own rows only: a remote row (remote-rows.ts) is a projection of the
+	// records, not a copy this device holds — counted, a fresh device that
+	// materialised both members of a group would hold every group as its
+	// own duplicate, or emit merges for rows it has no source of.
+	const rowsOf = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND deleted_at IS NULL AND derived_from_track_id IS NULL AND remote_only = 0 ORDER BY created_at, id`).pluck();
+	const ownOf = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL AND remote_only = 0 ORDER BY deleted_at IS NOT NULL, created_at, id`).pluck();
 	const fields = (recordingId: string): Record<string, { value: unknown }> | undefined => {
 		const json = record.get(recordingId) as string | undefined;
 		return json ? (JSON.parse(json) as { fields?: Record<string, { value: unknown }> }).fields : undefined;
@@ -231,28 +235,57 @@ function reader(raw: Raw): Reader {
 	};
 }
 
-export function planIdentityMerges(raw: Raw): IdentityPlan {
+// The plan as steps: each `yield` is a point where the async driver may
+// hand the event loop back (planIdentityMergesAsync); the synchronous form
+// runs them back to back (planIdentityMerges: tests, identity-report.ts).
+// The plan reads only, and every merge it produces is re-checked in its
+// chunk's transaction (applyChunk), so a write landing between two steps
+// (the user's merge dialog, the scanner's claims) at worst drops a merge
+// for the next run to re-plan; it never forces a stale one.
+//
+// Measured 2026-10-20 on the generated 40k-track library
+// (sync-slices-perf.test.ts: 3,500 streaming groups, 7,000 members): the
+// plan as one slice took ~540 ms, 409 ms of it the row lookup below
+// planned onto track_derived_from_idx (`derived_from_track_id IS NULL`
+// matches nearly every row, so each 400-id batch scanned the table — on the
+// live 600 MB library, cold, that is most of the 1,394 ms slice). With the
+// lookup on track_recording_idx the plan is 90-190 ms in all (the spread is
+// CPU load from other processes), and the steps keep each slice to
+// PLAN_SLICE_MS plus one step (a 400-id batch: a few ms) as the group count
+// grows: longest slice 25-60 ms over 4-13 slices.
+const PLAN_BATCH = 400;
+const PLAN_SLICE_MS = 25;
+
+function* planSteps(raw: Raw): Generator<void, IdentityPlan, void> {
 	const plan: IdentityPlan = { groups: 0, streamingGroups: 0, merges: [], held: [] };
 	// Before the initial push the records do not hold this library's own
 	// claims yet: a group would look smaller than it is.
 	if (!recordsComplete(raw)) return plan;
 	const r = reader(raw);
 
-	// Recordings per claim value held by two or more, in one indexed read
-	// per kind. parent_id is `${kind}:${value}`; ';' is the code unit after
-	// ':'. The confidence only matters for the streaming anchor.
+	// Recordings per claim value held by two or more. parent_id is
+	// `${kind}:${value}`; ';' is the code unit after ':'. The values come
+	// from one index-only GROUP BY per kind (8 ms over 31,500 Spotify claims
+	// on the generated library); their records, whose JSON is the costly
+	// part, are read in batches. The confidence only matters for the
+	// streaming anchor.
 	const byValue = new Map<string, { claim: IdentityClaim; members: Set<string>; anchored: boolean }>();
 	for (const kind of AUTO_MERGE_CLAIM_KINDS) {
-		const rows = raw.prepare(`SELECT parent_id AS p, recording_id AS rec, json_extract(value, '$.cell.value.confidence') AS conf FROM sync_state
-			WHERE map = 'claims' AND parent_id IN (
-				SELECT parent_id FROM sync_state WHERE map = 'claims' AND parent_id >= ? AND parent_id < ? GROUP BY parent_id HAVING count(*) > 1
-			)`).all(`${kind}:`, `${kind};`) as Array<{ p: string; rec: string | null; conf: number | null }>;
-		for (const row of rows) {
-			if (!row.rec) continue;
-			let e = byValue.get(row.p);
-			if (!e) byValue.set(row.p, (e = { claim: { kind, value: row.p.slice(kind.length + 1) }, members: new Set(), anchored: false }));
-			e.members.add(r.resolve(row.rec));
-			if ((row.conf ?? 0) >= ANCHOR_CONFIDENCE) e.anchored = true;
+		const values = raw.prepare(`SELECT parent_id FROM sync_state WHERE map = 'claims' AND parent_id >= ? AND parent_id < ? GROUP BY parent_id HAVING count(*) > 1`)
+			.pluck().all(`${kind}:`, `${kind};`) as string[];
+		yield;
+		for (let i = 0; i < values.length; i += PLAN_BATCH) {
+			const chunk = values.slice(i, i + PLAN_BATCH);
+			const rows = raw.prepare(`SELECT parent_id AS p, recording_id AS rec, json_extract(value, '$.cell.value.confidence') AS conf FROM sync_state
+				WHERE map = 'claims' AND parent_id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as Array<{ p: string; rec: string | null; conf: number | null }>;
+			for (const row of rows) {
+				if (!row.rec) continue;
+				let e = byValue.get(row.p);
+				if (!e) byValue.set(row.p, (e = { claim: { kind, value: row.p.slice(kind.length + 1) }, members: new Set(), anchored: false }));
+				e.members.add(r.resolve(row.rec));
+				if ((row.conf ?? 0) >= ANCHOR_CONFIDENCE) e.anchored = true;
+			}
+			yield;
 		}
 	}
 	// Liveness and this device's rows, batched over every member at once
@@ -262,16 +295,19 @@ export function planIdentityMerges(raw: Raw): IdentityPlan {
 	const mintedBy = new Map<string, string>();
 	const liveRows = new Map<string, string[]>();
 	const anyRows = new Map<string, string[]>();
-	for (let i = 0; i < candidates.length; i += 400) {
-		const chunk = candidates.slice(i, i + 400);
+	for (let i = 0; i < candidates.length; i += PLAN_BATCH) {
+		const chunk = candidates.slice(i, i + PLAN_BATCH);
 		const marks = chunk.map(() => '?').join(',');
 		for (const t of raw.prepare(`SELECT key, json_extract(value, '$.fields.deleted_at.value') AS d, json_extract(value, '$.created.device') AS dev
 			FROM sync_state WHERE map = 'libraryTracks' AND key IN (${marks})`).all(...chunk) as Array<{ key: string; d: number | null; dev: string | null }>) {
 			if (t.d !== null) deleted.add(t.key);
 			if (t.dev) mintedBy.set(t.key, t.dev);
 		}
+		// `+derived_from_track_id`: keeps the planner off
+		// track_derived_from_idx (see PLAN_BATCH above); the IN list is
+		// what narrows, through track_recording_idx.
 		for (const t of raw.prepare(`SELECT recording_id AS rec, id, deleted_at FROM track WHERE recording_id IN (${marks})
-			AND derived_from_track_id IS NULL ORDER BY deleted_at IS NOT NULL, created_at, id`).all(...chunk) as Array<{ rec: string; id: string; deleted_at: number | null }>) {
+			AND +derived_from_track_id IS NULL AND remote_only = 0 ORDER BY deleted_at IS NOT NULL, created_at, id`).all(...chunk) as Array<{ rec: string; id: string; deleted_at: number | null }>) {
 			const into = (m: Map<string, string[]>): void => {
 				let list = m.get(t.rec);
 				if (!list) m.set(t.rec, (list = []));
@@ -280,6 +316,7 @@ export function planIdentityMerges(raw: Raw): IdentityPlan {
 			into(anyRows);
 			if (t.deleted_at === null) into(liveRows);
 		}
+		yield;
 	}
 	const edges: Array<{ claim: IdentityClaim; members: string[]; streaming: boolean }> = [];
 	for (const e of byValue.values()) {
@@ -317,8 +354,13 @@ export function planIdentityMerges(raw: Raw): IdentityPlan {
 		if (e.streaming) c.streaming = true;
 	}
 
+	yield;
+
 	const db = drizzle(raw, { schema });
 	for (const c of components.values()) {
+		// A step per group: a held local duplicate reads merge-tracks'
+		// blockers for its pair.
+		yield;
 		plan.groups++;
 		if (c.streaming) plan.streamingGroups++;
 		const members = [...c.members].sort(byCodeUnit);
@@ -361,6 +403,34 @@ export function planIdentityMerges(raw: Raw): IdentityPlan {
 		plan.merges.push({ loser: held[0], winner, tier: 'audio', trackId: held[1][0]!, claims: c.claims });
 	}
 	return plan;
+}
+
+export function planIdentityMerges(raw: Raw): IdentityPlan {
+	const steps = planSteps(raw);
+	for (;;) {
+		const s = steps.next();
+		if (s.done) return s.value;
+	}
+}
+
+// The same plan, handing the event loop back whenever a slice has run
+// PLAN_SLICE_MS (checked at each step).
+export async function planIdentityMergesAsync(raw: Raw, opts: { sliceMs?: number } = {}): Promise<{ plan: IdentityPlan; maxSliceMs: number; slices: number }> {
+	const budget = opts.sliceMs ?? PLAN_SLICE_MS;
+	const steps = planSteps(raw);
+	let maxSliceMs = 0;
+	let slices = 1;
+	let t0 = performance.now();
+	for (;;) {
+		const s = steps.next();
+		const now = performance.now();
+		if (s.done) return { plan: s.value, maxSliceMs: Math.max(maxSliceMs, now - t0), slices };
+		if (now - t0 < budget) continue;
+		maxSliceMs = Math.max(maxSliceMs, now - t0);
+		await yieldToLoop();
+		slices++;
+		t0 = performance.now();
+	}
 }
 
 // ── apply ───────────────────────────────────────────────────────────────────
@@ -426,27 +496,35 @@ function applyChunk(raw: Raw, merges: readonly IdentityMerge[]): { merged: numbe
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-// The chunked driver: the plan in one slice (reads only), then `chunk`
-// merges per transaction with a yield between. A second desktop that
-// scanned the same 5,000 files as the first plans 5,000 merges at once:
-// measured 2026-10-20 on a generated library at ~180 ms for that plan and
-// ~0.5-1 ms per merge including the commit, so 50 per slice keeps each one
-// to tens of ms. The streaming tier's chunks also fold the doubled
-// playlist rows: measured 2026-10-20 at ~0.9 ms per merge with its dedupe,
-// on the incident's shape (5,000 merges, a 5,000-row playlist held twice).
+// The chunked driver: the plan in slices (reads only, planSteps), then
+// `chunk` merges per transaction with a yield between. A second desktop
+// that scanned the same 5,000 files as the first plans 5,000 merges at
+// once. On a 5,000-track library a merge measured ~0.5-1 ms with its
+// commit (2026-10-20). On the generated 40k library with the incident's
+// shape (sync-slices-perf.test.ts: 3,500 streaming merges, the profile's
+// rows as remote rows in a 5,000-row playlist) a chunk costs ~17 ms fixed
+// (the commit, SyncStateStore loading every merge record — thousands
+// after a heal — per emit and projection) plus ~1-2 ms per merge (the
+// remote row's drop and the survivor's projection), measured 2026-10-20:
+// 50 per chunk ran median 71 ms, worst 138 ms (under heavy CPU load from
+// unrelated processes: median 118, worst 210-430); 20 per chunk median
+// 44 ms, p90 79 ms, worst 113 ms, for ~1.7× the total time; 10 per chunk
+// gained nothing on the worst slice (fixed cost, load spikes).
 // With nothing to merge the plan is one empty index range per kind.
+const MERGE_CHUNK = 20;
+
 export async function resolveRecordingIdentitiesAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean } } = {}): Promise<IdentityResult> {
 	const started = Date.now();
-	const chunk = Math.max(1, Math.min(1_000, opts.chunk ?? 50));
-	let t0 = performance.now();
-	const plan = planIdentityMerges(raw);
-	const out: IdentityResult = { ...plan, merged: 0, dedupeRemoved: 0, tracksTouched: [], playlistsTouched: [], chunks: 0, maxSliceMs: performance.now() - t0, ms: 0 };
+	const chunk = Math.max(1, Math.min(1_000, opts.chunk ?? MERGE_CHUNK));
+	const planned = await planIdentityMergesAsync(raw);
+	const plan = planned.plan;
+	const out: IdentityResult = { ...plan, merged: 0, dedupeRemoved: 0, tracksTouched: [], playlistsTouched: [], chunks: 0, maxSliceMs: planned.maxSliceMs, ms: 0 };
 	const tracks = new Set<string>();
 	const playlists = new Set<string>();
 	for (let i = 0; i < plan.merges.length; i += chunk) {
 		if (opts.signal?.aborted) break;
 		await yieldToLoop();
-		t0 = performance.now();
+		const t0 = performance.now();
 		const r = applyChunk(raw, plan.merges.slice(i, i + chunk));
 		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);
 		out.chunks++;

@@ -138,7 +138,9 @@ import { wireDataEvents } from './data/events.js';
 import { log, installGlobalErrorCapture } from './data/log.js';
 import { backupApi, cloudSyncApi } from './data/api.js';
 import { initBackupSettingsFeature } from './features/backupSettings.js';
+import { initDeletedTracksSettingsFeature } from './features/deletedTracksSettings.js';
 import { initAccountSettingsFeature } from './features/accountSettings.js';
+import { accountLibraryInfo, startAccountLibraryWatch } from './features/accountLibrary.js';
 import { initSettingsFeature, handleSettingsTabActivate, handleSettingsClose, renderSettingsConnections, renderSettingsPlayer, pushAllSourceSyncSettingsToCore, hydrateCreditFormatFromCore, getSourceSyncSettings, loadRekordboxSettings, startRekordboxImport } from './features/settings.js';
 import { initUiSettingsFeature, tagCountsSignal, setTagCountsSignal, visibleSourceTabsMemo, visibleStateTabsMemo, applyActiveTabFallback, uiSettingsSignal, updateUiSettings } from './features/uiSettings.js';
 import { setSimilarityRefTrack, similaritySettingsSignal } from './features/similarity.js';
@@ -944,8 +946,11 @@ async function renderTracks(): Promise<void> {
 			artistIds?: string[];
 			albumIds?: string[];
 			similarTo?: { seeds?: string[]; text?: string };
+			hideRemote?: boolean;
 		} = {};
 		if (pre.search) filter.search = pre.search;
+		// The toolbar's "This device" chip — remote rows dropped in SQL.
+		if (uiSettingsSignal().hideRemoteTracks) filter.hideRemote = true;
 		if (pre.keyCamelot) filter.keyCamelot = pre.keyCamelot;
 		if (pre.bpmMin != null) filter.bpmMin = pre.bpmMin;
 		if (pre.bpmMax != null) filter.bpmMax = pre.bpmMax;
@@ -1031,20 +1036,23 @@ async function renderTracks(): Promise<void> {
 		: shell.activeView() === 'basket'
 			? SYSTEM_TAG_BASKET
 			: null;
+	// The toolbar's "This device" chip, on every branch below.
+	const hideRemote = uiSettingsSignal().hideRemoteTracks ? { hideRemote: true } : {};
 	const allTracks = await window.api['tracks:list'](
 		tagView
-			? { tagId: tagView }
+			? { tagId: tagView, ...hideRemote }
 			: folderPlaylistIds && folderPlaylistIds.length > 0
-				? { playlistIds: folderPlaylistIds }
+				? { playlistIds: folderPlaylistIds, ...hideRemote }
 				// Rekordbox tab root → the DJ-side library: the rekordbox
 				// collection plus local files rekordbox doesn't have yet (their
 				// rows lack the rekordbox SRC pip). Membership, not `source:`
 				// — rb provenance lives in rekordbox_link, not source_link.
 				: shell.activeSource() === 'rekordbox' && !playlistIdNow
-				? { hasSource: ['rekordbox', 'local'] }
+				? { hasSource: ['rekordbox', 'local'], ...hideRemote }
 				: {
 					source: playlistIdNow ? undefined : shell.activeSource(),
 					playlistId: playlistIdNow ?? undefined,
+					...hideRemote,
 				},
 		{ column: state.sortColumn, dir: state.sortDir },
 	);
@@ -3393,6 +3401,9 @@ function wireBackupEvents(): void {
 const SYNC_PATCH_CAP = 100;
 let syncSidebarHandle: ReturnType<typeof setTimeout> | null = null;
 function wireCloudSyncEvents(): void {
+	// Remote-row count + master device (Settings → Account, the toolbar's
+	// "This device" chip), refreshed off the same events.
+	startAccountLibraryWatch();
 	cloudSyncApi.onApplied((a) => {
 		if (a.tracks.length <= SYNC_PATCH_CAP) for (const id of a.tracks) void patchTrackRow(id);
 		if (a.tracks.length > 0 || a.playlists.length > 0) scheduleTracksRefresh(a.tracks.length > SYNC_PATCH_CAP ? 250 : 1500);
@@ -5068,6 +5079,13 @@ async function boot(): Promise<void> {
 				onGroupClick: (anchor) => openTracklistMenu('group', anchor),
 				// One click flips 1 ↔ 2 lines (the layout effect remounts).
 				onRowsToggle: () => updateUiSettings((d) => { d.trackRowLines = d.trackRowLines === 1 ? 2 : 1; }),
+				remoteCount: () => accountLibraryInfo()?.remoteOnlyCount ?? 0,
+				hideRemote: () => uiSettingsSignal().hideRemoteTracks,
+				// A filter, not a layout change: refetch, no remount.
+				onHideRemoteToggle: () => {
+					updateUiSettings((d) => { d.hideRemoteTracks = !d.hideRemoteTracks; });
+					void renderTracks();
+				},
 			},
 		});
 	}
@@ -5216,6 +5234,13 @@ async function boot(): Promise<void> {
 		}),
 		openRestore: (snapshot) => { backupRestoreDialog?.open(snapshot); },
 		reopenProgress: () => backupProgressDialog?.reopen() ?? false,
+	});
+	initDeletedTracksSettingsFeature({
+		confirm: (opts) => new Promise((resolve) => {
+			if (!confirmDialog) { resolve(false); return; }
+			confirmDialog.open({ ...opts, onConfirm: () => resolve(true), onCancel: () => resolve(false) });
+		}),
+		refreshLibrary: async () => { await renderTracks(); await refreshAll(); },
 	});
 	initAccountSettingsFeature({
 		confirm: (opts) => new Promise((resolve) => {

@@ -106,6 +106,18 @@ LEFT JOIN track_artist ta ON ta.track_id = t.id AND ta.position = a.key
 LEFT JOIN artist ar ON ar.id = ta.artist_id
 WHERE t.deleted_at IS NULL;
 
+-- The junction tables, live tracks only: a deleted track keeps its links,
+-- tags and followed-playlist rows (they are what keeps it deleted), so a
+-- count or join over the raw tables would see tracks the user deleted.
+CREATE TEMP VIEW v_source_link AS SELECT l.track_id, l.source, l.source_track_id, l.url
+FROM source_link l JOIN track t ON t.id = l.track_id WHERE t.deleted_at IS NULL;
+
+CREATE TEMP VIEW v_playlist_track AS SELECT pt.playlist_id, pt.track_id, pt.position
+FROM playlist_track pt JOIN track t ON t.id = pt.track_id WHERE t.deleted_at IS NULL;
+
+CREATE TEMP VIEW v_track_tag AS SELECT tt.track_id, tt.tag_id
+FROM track_tag tt JOIN track t ON t.id = tt.track_id WHERE t.deleted_at IS NULL;
+
 CREATE TEMP VIEW v_feed_artist AS SELECT
 	i.id AS item_id,
 	a.value AS artist

@@ -565,13 +565,13 @@ export class TidalSync {
 		}
 
 		if (isrc) {
-			// Live row first — see SpotifySync.upsertTrack (merge losers keep
-			// the survivor's ISRC).
+			// Live row first, then own before remote — see
+			// SpotifySync.upsertTrack (merge losers keep the survivor's ISRC).
 			const byIsrc = this.db
 				.select({ id: track.id })
 				.from(track)
 				.where(eq(track.isrc, isrc))
-				.orderBy(sql`${track.deletedAt} IS NOT NULL`)
+				.orderBy(sql`${track.deletedAt} IS NOT NULL`, track.remoteOnly)
 				.get();
 			if (byIsrc) {
 				this.db.insert(sourceLink).values(newLinkFor(byIsrc.id)).run();

@@ -10,7 +10,7 @@
 // real sets happen in rekordbox/CDJs, and the classifier never runs on
 // curator plays.
 
-import { and, count, desc, eq, gte, isNotNull, lte, max, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, isNotNull, isNull, lte, max, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import type { Db } from '../db/client.js';
 import { recordPlayAppended, setSessionKind } from '../library/mutators.js';
@@ -362,7 +362,9 @@ export function getTopPlayed(
 		})
 		.from(playEvent)
 		.innerJoin(playSession, eq(playEvent.sessionId, playSession.id))
-		.leftJoin(track, eq(playEvent.trackId, track.id))
+		// Library tracks only: a deleted one doesn't exist (its history stays
+		// on the session reads).
+		.innerJoin(track, and(eq(playEvent.trackId, track.id), isNull(track.deletedAt)))
 		.where(and(...conds))
 		.groupBy(playEvent.trackId)
 		.orderBy(desc(count(playEvent.id)))

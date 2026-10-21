@@ -8,8 +8,10 @@ vi.mock('../data/api.js', async (importOriginal) => ({
 	mirApi: { similar: async () => ({ model: 'm', items: [], missingSeeds: [] }), analyzeNow: async () => ({ queued: 0 }) },
 }));
 
-import { buildTrackMenu, initTrackCommands, type TrackCommandContext } from './trackCommands.js';
+import { buildTrackMenu, initTrackCommands, runTrackCommand, trackCommandAvailable, type TrackCommandContext } from './trackCommands.js';
 import type { ContextMenusFeatureDeps } from './contextMenus.js';
+import type { ContextMenuItem } from '../components/ContextMenu.jsx';
+import { isRemoteRow, REMOTE_ONLY_REASON, remoteMarkSource, remoteRowTitle } from '../remoteRows.js';
 
 const track = (sources: string[], extra: Partial<Track> = {}): Track =>
 	({ id: `t-${sources.join('-')}`, title: 'Mother Nature', artists: [{ name: 'Solee' }], sources, ...extra }) as unknown as Track;
@@ -54,6 +56,50 @@ describe('track context menu', () => {
 		expect(labels.some((l) => l.startsWith('Delete > Delete from Library…'))).toBe(true);
 		expect(labels.join('\n')).not.toMatch(/Delete from Playlist/);
 		expect(labels).toContain('Sync > Sync to Rekordbox… | Add to Rekordbox…');
+	});
+});
+
+describe('remote rows (not on this device)', () => {
+	const remote = track([], { id: 'r1', remoteOnly: true, remoteSource: 'local' } as Partial<Track>);
+	const local = track(['local'], { id: 'l1' } as Partial<Track>);
+	const ctx = (tracks: Track[]): TrackCommandContext => ({ tracks, view: 'tracks', source: 'rekordbox' as never, tagIds: new Set(), drillPlaylists: [] });
+
+	it('keeps curation, explains Analyze / Sync to Rekordbox, hides device-local writers', () => {
+		const menu = buildTrackMenu(ctx([remote]));
+		const flat = menu.items.flatMap((i) => (i.kind === 'submenu' ? i.items : [i]));
+		const item = (id: string) => flat.find((i) => i.kind === 'item' && i.id === id) as (ContextMenuItem & { kind: 'item' }) | undefined;
+		expect(item('organize')?.disabled).toBeFalsy();
+		expect(item('edit')?.disabled).toBeFalsy();
+		expect(item('analyze')).toMatchObject({ disabled: true, title: REMOTE_ONLY_REASON });
+		expect(item('sync-to-rekordbox')).toMatchObject({ disabled: true, title: REMOTE_ONLY_REASON });
+		expect(item('analyze')?.mnemonic).toBeUndefined();
+		expect(menu.handlers['analyze']).toBeUndefined();
+		expect(menu.handlers['sync-to-rekordbox']).toBeUndefined();
+		for (const id of ['enrich-beatport', 'sync-tidal', 'download', 'open-local-folder', 'add-to-rekordbox', 'delete']) expect(item(id)).toBeUndefined();
+	});
+
+	it('a mixed selection is gated as a whole, menu and keyboard alike', () => {
+		const sel = ctx([local, remote]);
+		expect(trackCommandAvailable('analyze', sel)).toBe(false);
+		expect(runTrackCommand('analyze', sel)).toBe(false);
+		expect(trackCommandAvailable('organize', sel)).toBe(true);
+		// Add to Rekordbox stays: it only ever adds the local rows of a selection.
+		expect(shape(sel).join('\n')).toMatch(/Add 1 to Rekordbox…/);
+		// The gate holds even if a remote row ever carried a source mark.
+		const marked = track(['local'], { id: 'r2', remoteOnly: true } as Partial<Track>);
+		expect(trackCommandAvailable('analyze', ctx([marked]))).toBe(false);
+		expect(trackCommandAvailable('open-local-folder', ctx([marked]))).toBe(false);
+		// A plain local selection is untouched.
+		expect(trackCommandAvailable('analyze', ctx([local]))).toBe(true);
+	});
+
+	it('the row helpers', () => {
+		expect(isRemoteRow(remote)).toBe(true);
+		expect(isRemoteRow(local)).toBe(false);
+		expect(remoteRowTitle(remote)).toBe(`${REMOTE_ONLY_REASON} (as a local file)`);
+		expect(remoteRowTitle({ remoteSource: 'other' })).toBe(REMOTE_ONLY_REASON);
+		expect(remoteMarkSource({ remoteSource: 'spotify' })).toBe('spotify');
+		expect(remoteMarkSource({ remoteSource: null })).toBe('other');
 	});
 });
 

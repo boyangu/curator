@@ -707,12 +707,17 @@ export class SpotifySync {
 		// and the tombstoned loser, and binding to the loser strands the link
 		// on a deleted row. A deleted row is still the fallback so a track the
 		// user deleted stays deleted when a new Spotify id for it shows up.
+		// Among live rows this device's own beats a remote row (another
+		// device's track projected here): the ISRC may bind to a remote row —
+		// the link adopts it as own (migrate.ts trigger) instead of minting a
+		// second row of a track the user already sees — but an own row of the
+		// ISRC is the closer match and keeps the recording this device holds.
 		if (isrc) {
 			const byIsrc = this.db
 				.select({ id: track.id })
 				.from(track)
 				.where(eq(track.isrc, isrc))
-				.orderBy(sql`${track.deletedAt} IS NOT NULL`)
+				.orderBy(sql`${track.deletedAt} IS NOT NULL`, track.remoteOnly)
 				.get();
 			if (byIsrc) {
 				const newLink: NewSourceLink = {
@@ -862,6 +867,9 @@ export class SpotifySync {
 				isNull(track.bpm),
 				isNull(track.keyCamelot),
 				isNull(track.label),
+				// Remote rows (not on this device) are never enriched — see
+				// LibrarySink.persist.
+				eq(track.remoteOnly, false),
 			))
 			.orderBy(orderBy)
 			.all();
@@ -893,7 +901,7 @@ export class SpotifySync {
 				label: track.label,
 			})
 			.from(track)
-			.where(inArray(track.id, trackIds))
+			.where(and(inArray(track.id, trackIds), eq(track.remoteOnly, false)))
 			.all();
 		rows.sort((a, b) => (idIndex.get(a.id) ?? 0) - (idIndex.get(b.id) ?? 0));
 		const result = await this.enrichTargets(rows, progress);
@@ -915,7 +923,7 @@ export class SpotifySync {
 				label: track.label,
 			})
 			.from(track)
-			.where(eq(track.id, trackId))
+			.where(and(eq(track.id, trackId), eq(track.remoteOnly, false)))
 			.all();
 
 		// Single-track enrichment is user-initiated for a specific row — bypass

@@ -21,6 +21,7 @@ import { uiSettingsSignal, updateUiSettings, type StateTabKey, type StateTabMode
 import { similaritySettingsSignal, updateSimilaritySettings, type KeyRelatedLevel, type MetricRange } from './similarity.js';
 import { mountMirSettings } from './mirSettings.js';
 import { mountBackupSettings } from './backupSettings.js';
+import { mountDeletedTracksSettings } from './deletedTracksSettings.js';
 import { mountAccountSettings } from './accountSettings.js';
 import { log } from '../data/log.js';
 
@@ -75,6 +76,9 @@ export function handleSettingsTabActivate(tab: SettingsTab): void {
 		renderSettingsSimilarity();
 	} else if (tab === 'ui') {
 		renderSettingsUI().catch((err) => slog.error('ui render failed', err));
+	} else if (tab === 'deleted') {
+		const host = document.getElementById('settings-deleted');
+		if (host) mountDeletedTracksSettings(host);
 	} else if (tab === 'backup') {
 		const host = document.getElementById('settings-backup');
 		if (host) mountBackupSettings(host);

@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import {
 	cueAlive,
 	decodeRbGrid,
+	MASTER_DEVICE_SETTING,
 	parseCueEntityId,
 	parseTrackTagEntityId,
 	pinnedSearchAlive,
@@ -49,6 +50,7 @@ import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import { syncTrackAlbumsRaw } from '../library/albums.js';
 import { log } from '../log.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot, type RbSlotPatch } from '../rekordbox/rb-slot.js';
+import { adoptRefs, derivePendingCount, drainTrackDerivations, dropRemoteRow, INLINE_CREATE_ROWS, INLINE_DERIVE_ROWS, materializeRemoteRows, requestRematerialize } from './remote-rows.js';
 import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
 
@@ -74,7 +76,9 @@ export function project(
 	store: SyncStateStore,
 	changed: readonly EntityRef[],
 	flushed: FlushResult,
-	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string> } = {},
+	// remoteCreateBudget: remote rows this call may make (remote-rows.ts
+	// INLINE_CREATE_ROWS by default; the pending drain passes its slice).
+	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string>; remoteCreateBudget?: number } = {},
 ): ProjectSummary {
 	const state = store.state;
 	const now = Date.now();
@@ -94,7 +98,9 @@ export function project(
 	// recording → local track row. Live rows first: a merge loser keeps its
 	// recording id on a soft-deleted row.
 	const trackCache = new Map<string, string | null>();
-	const trackStmt = raw.prepare(`SELECT id FROM track WHERE recording_id = ? ORDER BY deleted_at IS NOT NULL, created_at, id LIMIT 1`);
+	// This device's own row before a remote one (remote-rows.ts): only a
+	// merge leaves both for a moment, and the own row is the one that stays.
+	const trackStmt = raw.prepare(`SELECT id FROM track WHERE recording_id = ? ORDER BY remote_only, deleted_at IS NOT NULL, created_at, id LIMIT 1`);
 	const trackFor = (recordingId: string | null): string | null => {
 		if (!recordingId) return null;
 		let v = trackCache.get(recordingId);
@@ -114,15 +120,32 @@ export function project(
 	// then shows everything the winner's records hold, none of which had a
 	// row to land on here before (the other desktop's tags on its copy of
 	// the same file, identity.ts).
+	//
+	// Remote rows (remote-rows.ts) are projections of the records, so they
+	// never merge: the loser's is dropped and the winner's records re-project
+	// onto whichever row now speaks for it; a remote winner gives way to the
+	// loser's own row, which takes the recording (absorb).
 	const adopted = new Set<string>();
+	const remoteDropped = new Set<string>();
 	for (const id of ids('recording')) {
 		const target = state.recordingAlias.get(id);
 		if (!target) continue;
-		const loserRows = raw.prepare(`SELECT id FROM track WHERE recording_id = ?`).all(id) as Array<{ id: string }>;
-		if (loserRows.length === 0) continue;
-		const winner = trackFor(target);
+		const all = raw.prepare(`SELECT id, remote_only FROM track WHERE recording_id = ?`).all(id) as Array<{ id: string; remote_only: number }>;
+		for (const r of all) {
+			if (!r.remote_only) continue;
+			for (const p of dropRemoteRow(raw, r.id)) remoteDropped.add(p);
+			adopted.add(target);
+		}
+		const loserRows = all.filter((r) => !r.remote_only);
+		if (loserRows.length === 0) { trackCache.clear(); continue; }
+		trackCache.clear();
+		let winner = trackFor(target);
+		if (winner && raw.prepare(`SELECT remote_only FROM track WHERE id = ?`).pluck().get(winner) === 1) {
+			for (const p of dropRemoteRow(raw, winner)) remoteDropped.add(p);
+			winner = null;
+		}
 		if (!winner) {
-			raw.prepare(`UPDATE track SET recording_id = ? WHERE recording_id = ?`).run(target, id);
+			raw.prepare(`UPDATE track SET recording_id = ? WHERE recording_id = ? AND remote_only = 0`).run(target, id);
 			for (const r of loserRows) tracksTouched.add(r.id);
 			adopted.add(target);
 		} else {
@@ -143,7 +166,8 @@ export function project(
 		}
 		trackCache.clear();
 	}
-	for (const target of adopted) for (const r of store.recordingRefs(target)) add(r.entity, r.id);
+	for (const p of remoteDropped) playlistsTouched.add(p);
+	for (const r of adoptRefs(raw, [...adopted])) add(r.entity, r.id);
 
 	// ── 1b. artist alias rules: the artist table follows the resolved map ─
 	// Diffed against the map as it stood before this batch, so a rule whose
@@ -153,6 +177,22 @@ export function project(
 	{
 		const changes = diffArtistAlias(store.artistAliasBefore, state.artistAlias, (k) => state.artistAliases.get(k)?.value?.from ?? null);
 		projectArtistAliasChanges(raw, changes);
+	}
+
+	// ── 1c. remote rows: the account's tracks this device has no row of ──
+	// Every recording whose record changed (a create, its meta, a delete or
+	// undelete) or that a merge just moved: a remote row is made, refreshed
+	// or absorbed (remote-rows.ts), and the recording's records are then
+	// projected onto it below with everything else. A master change re-picks
+	// every remote row in the client's sweep, not here (it is the account's
+	// whole library).
+	{
+		const m = materializeRemoteRows(raw, [...ids('library_track'), ...adopted], { createBudget: hooks.remoteCreateBudget ?? INLINE_CREATE_ROWS });
+		for (const p of m.playlistsTouched) playlistsTouched.add(p);
+		for (const t of [...m.created, ...m.updated]) tracksTouched.add(t);
+		if (m.adopt.length > 0 || m.dropped.length > 0) trackCache.clear();
+		for (const r of adoptRefs(raw, m.adopt)) add(r.entity, r.id);
+		if (by.get('setting')?.has(MASTER_DEVICE_SETTING)) requestRematerialize(raw);
 	}
 
 	// ── 2. containers ────────────────────────────────────────────────────
@@ -444,11 +484,15 @@ export function project(
 			if (rating === row.rating && state === row.state && !overridesChanged && deletedAt === row.deleted_at) continue;
 			const parsedArtists = (() => { try { return JSON.parse(row.artists) as TrackArtist[]; } catch { return []; } })();
 			const effective = (ov as TrackOverrides).artists ?? parsedArtists;
+			// purged_at (device-local, mutators.ts purgeDeletedTracks) only
+			// means something while deleted: an undelete from another device
+			// clears it with the tombstone.
 			raw.prepare(`UPDATE track SET rating = ?, overrides = ?, deleted_at = ?, artists_ascii = ?, updated_at = ?,
 					state = ?, state_changed_at = CASE WHEN state = ? THEN state_changed_at ELSE ? END,
-					membership = CASE WHEN ? IS NOT NULL THEN NULL ELSE membership END
+					membership = CASE WHEN ? IS NOT NULL THEN NULL ELSE membership END,
+					purged_at = CASE WHEN ? IS NULL THEN NULL ELSE purged_at END
 				WHERE id = ?`)
-				.run(rating, overrides, deletedAt, asciifyArtists(effective), now, state, state, stateCell?.clock.ts ?? now, deletedAt, row.id);
+				.run(rating, overrides, deletedAt, asciifyArtists(effective), now, state, state, stateCell?.clock.ts ?? now, deletedAt, deletedAt, row.id);
 			if (overridesChanged) {
 				syncTrackArtistsByIdRaw(raw, [row.id]);
 				syncTrackAlbumsRaw(raw, [row.id]);
@@ -469,6 +513,9 @@ export function project(
 		recomputePositions(raw, pid);
 		raw.prepare(`UPDATE playlist SET track_count = (SELECT count(*) FROM playlist_track WHERE playlist_id = ?), updated_at = ? WHERE id = ?`).run(pid, now, pid);
 	}
+	// Remote rows made above: their artist junction and album, inline for a
+	// handful, else left to the client's yielding drain (remote-rows.ts).
+	if (derivePendingCount(raw) <= INLINE_DERIVE_ROWS) drainTrackDerivations(raw, { max: INLINE_DERIVE_ROWS });
 	// Mirror the local mutators: a tag or cue edit bumps the track so the
 	// rekordbox exporter's incremental sweep carries it.
 	const bump = raw.prepare(`UPDATE track SET updated_at = ? WHERE id = ?`);

@@ -252,7 +252,9 @@ export function softDeleteTracks(db: Db, trackIds: readonly string[], at: Date =
 	if (trackIds.length === 0) return [];
 	return tx(db, (raw) => {
 		const ms = at.getTime();
-		const stamp = raw.prepare(`UPDATE track SET deleted_at = ?, membership = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL`);
+		// purged_at only means something while deleted; a fresh delete puts the
+		// row back on the Deleted Tracks list.
+		const stamp = raw.prepare(`UPDATE track SET deleted_at = ?, purged_at = NULL, membership = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL`);
 		const done: string[] = [];
 		for (const id of trackIds) if (stamp.run(ms, ms, id).changes > 0) done.push(id);
 		const rec = recordingResolver(raw);
@@ -267,12 +269,48 @@ export function undeleteTracks(db: Db, trackIds: readonly string[]): string[] {
 	if (trackIds.length === 0) return [];
 	return tx(db, (raw) => {
 		const now = Date.now();
-		const clear = raw.prepare(`UPDATE track SET deleted_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL`);
+		const clear = raw.prepare(`UPDATE track SET deleted_at = NULL, purged_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL`);
 		const done: string[] = [];
 		for (const id of trackIds) if (clear.run(now, id).changes > 0) done.push(id);
 		const rec = recordingResolver(raw);
 		const ops: EmitOp[] = [];
 		for (const id of done) { const r = rec(id); if (r) ops.push({ entity: 'library_track', entity_id: r, kind: 'undelete', payload: {} }); }
+		emitOps(raw, ops);
+		return done;
+	});
+}
+
+// "Delete permanently" from the Deleted Tracks settings list. The row is not
+// removed: its source links, analysis and recording are the evidence that
+// keeps a deleted track deleted (streaming read-sync binds a re-seen id or
+// ISRC to it, the scanner holds a re-appearing file for it, the feed hides
+// its items). What goes is the curation a restore would bring back — tags
+// and cues, stated as ops so every device's copy loses them too — and
+// purged_at takes the row off the list. Only deleted, unpurged rows qualify.
+export function purgeDeletedTracks(db: Db, trackIds: readonly string[], at: Date = new Date()): string[] {
+	if (trackIds.length === 0) return [];
+	return tx(db, (raw) => {
+		const ms = at.getTime();
+		const stamp = raw.prepare(`UPDATE track SET purged_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`);
+		const rec = recordingResolver(raw);
+		const ops: EmitOp[] = [];
+		const done: string[] = [];
+		for (const id of trackIds) {
+			const r = rec(id);
+			const tags = readTrackTags(raw, id);
+			const cues = readCues(raw, id);
+			if (stamp.run(ms, ms, id).changes === 0) continue;
+			done.push(id);
+			if (r) {
+				for (const t of tags) ops.push(trackTagOp(r, t.tag_id, false));
+				for (const c of cues) if (c.slot >= 0) ops.push(cueDeleteOp(r, c.slot, c.kind));
+			}
+		}
+		for (const c of chunks(done)) {
+			const ph = c.map(() => '?').join(',');
+			raw.prepare(`DELETE FROM track_tag WHERE track_id IN (${ph})`).run(...c);
+			raw.prepare(`DELETE FROM cue WHERE track_id IN (${ph})`).run(...c);
+		}
 		emitOps(raw, ops);
 		return done;
 	});

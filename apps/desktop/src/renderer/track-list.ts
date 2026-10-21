@@ -37,6 +37,7 @@ import { analysisStatus } from './data/analysisStatus.js';
 import { keyChipHtml, formatBpmInt } from './music-utils.js';
 import { similarLevelsFor, type SimilarityDim } from './features/similarity.js';
 import { setTrackDragPayload } from './dnd.js';
+import { isRemoteRow, remoteMarkSource, remoteRowTitle } from './remoteRows.js';
 import { fmtReleaseLabel } from './ui/format.js';
 import {
 	buildDisplayList, groupHeadInnerHeight, groupIdentity, rowHeight, GROUP_GAP_H, TRACK_ROW_H,
@@ -360,6 +361,11 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	const keyCell = keyChipHtml(t.keyCamelot);
 	const present = new Set(t.sources ?? []);
 	const srcs = SOURCE_ORDER.filter((s) => present.has(s));
+	// A remote row has no sources here: its SRC slot carries one hollow mark
+	// tinted by how the holding device has it, with the reason as tooltip.
+	// Plain markup in the same template, so no per-row cost beyond the string.
+	const remote = isRemoteRow(t);
+	const remoteTip = remote ? escapeHtml(remoteRowTitle(t)) : '';
 	const coverBg = opts.covers !== false
 		? `url(curator-cover://${encodeURIComponent(t.id)}), ${coverGradient(i)}`
 		: coverGradient(i);
@@ -421,8 +427,9 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 
 	let cells: Partial<Record<LayoutColumn, string>>;
 	if (lines === 2) {
-		const marks = srcs.map((s) => `<i data-src="${s}"></i>`).join('');
-		const srcTitle = srcs.length ? `Sources: ${srcs.map((s) => SOURCE_NAMES[s]).join(', ')}` : '';
+		const marks = srcs.map((s) => `<i data-src="${s}"></i>`).join('')
+			+ (remote ? `<i class="src-remote" data-remote="${remoteMarkSource(t)}"></i>` : '');
+		const srcTitle = remote ? remoteTip : srcs.length ? `Sources: ${srcs.map((s) => SOURCE_NAMES[s]).join(', ')}` : '';
 		const [base, version] = splitTitleVersion(title);
 		// Line 2 of the title column never repeats the grouped field.
 		const showArtist = fields.has('artist') && groupBy !== 'artist';
@@ -460,7 +467,8 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 			added: addedCell,
 		};
 	} else {
-		const pips = srcs.map((s) => `<span class="src-pip" data-src="${s}" title="${SOURCE_NAMES[s]}"></span>`).join('');
+		const pips = srcs.map((s) => `<span class="src-pip" data-src="${s}" title="${SOURCE_NAMES[s]}"></span>`).join('')
+			+ (remote ? `<span class="src-pip src-pip--remote" data-remote="${remoteMarkSource(t)}" title="${remoteTip}"></span>` : '');
 		cells = {
 			src: `<td class="sources"><span class="src-pips">${pips}</span></td>`,
 			idx: idxCell,
@@ -523,7 +531,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// padding), so outer padding holds whichever columns are hidden.
 	const pad = lines === 2 ? '<td class="pad"></td>' : '';
 	host.innerHTML = `
-		<tr class="trk${np}${coverMeter}${an}" data-state="${t.state}" data-id="${t.id}" data-title="${escapeHtml(t.title)}" data-index="${i}"${posAttr}${dragAttr}>
+		<tr class="trk${np}${coverMeter}${an}${remote ? ' is-remote' : ''}" data-state="${t.state}" data-id="${t.id}" data-title="${escapeHtml(t.title)}" data-index="${i}"${posAttr}${dragAttr}>
 			${pad}${cols.map((c) => cells[c] ?? '<td></td>').join('')}${pad}
 		</tr>
 	`;

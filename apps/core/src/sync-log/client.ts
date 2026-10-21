@@ -12,9 +12,16 @@
 //     pending and stops the loop: after an update it may well be accepted.
 //   - Network / 5xx / rate-limit errors keep everything pending and back off
 //     exponentially with jitter, capped at 60 s.
-//   - Pull reads pages after `sync_cursor.last_seq`; each page is applied and
-//     the cursor advanced in ONE transaction, so a crash mid-page leaves both
-//     untouched and the page is simply pulled again (apply is idempotent).
+//   - Pull reads pages after `sync_cursor.last_seq` and applies each in
+//     sub-batches sized to PULL_SLICE_MS, a transaction each with a yield
+//     to the event loop between (core runs on the desktop's main loop);
+//     only the page's last transaction advances the cursor. A crash mid-page keeps
+//     the sub-batches already committed and the cursor before the page,
+//     which is then simply pulled again: apply is idempotent, so re-applying
+//     a committed sub-batch changes nothing, and a sub-batch boundary is no
+//     different from the page boundaries the server draws anywhere in the
+//     log. The page is validated whole before its first sub-batch, so an
+//     unreadable op applies none of it.
 //     A `snapshotSeq` hint means "too far behind": bootstrap from the
 //     snapshot instead.
 //   - Own ops: a server with 'pull_skip_own' leaves out this device's ops up
@@ -48,6 +55,7 @@ import {
 	MAX_PUSH_BYTES,
 	MAX_PUSH_OPS,
 	OpValidationError,
+	parseOp,
 	schemaVersionStatus,
 	utf8ByteLength,
 	type CloudService,
@@ -73,7 +81,12 @@ import { CLOCK_KEY, observeServerTs, onOutboxAppend } from './outbox.js';
 import { healAfterApply, streamingDedupeSwept, type DedupeResult, sweepStreamingDuplicatesAsync } from './playlist-dedupe.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { remintDeviceForDetach } from './remint.js';
+import { derivePendingCount, drainTrackDerivationsAsync, materializeSwept, remotePendingCount } from './remote-rows.js';
+import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
+import {
+	defaultMasterDevice, drainTrackMetaAsync, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
+} from './track-meta.js';
 
 type Raw = Database.Database;
 
@@ -191,9 +204,12 @@ export type SyncClientOptions = {
 	backoffBaseMs?: number;
 	backoffCapMs?: number;
 	initialPushChunk?: number;
+	// Ops per apply transaction within a pulled page, fixed (PULL_SLICE_MS).
+	pullApplyChunk?: number;
 	random?: () => number;
-	// Test seam: runs inside a pull page's transaction after apply, before
-	// the cursor moves — throwing here is a crash mid-page.
+	// Test seam: runs inside a pull page's last transaction (the one that
+	// moves the cursor) after its apply, with the whole page — throwing here
+	// is a crash mid-page.
 	beforeCursorAdvance?: (page: StoredOp[]) => void;
 };
 
@@ -205,7 +221,9 @@ export type UnlinkOutcome = { revokedOnServer: boolean; signedOut: boolean; oldD
 // `received`: ops the server sent; `applied`: how many changed local state
 // (own echoes and already-seen ops are skipped).
 // `held`: ops from a newer protocol version set aside this pull (held.ts).
-export type PullOutcome = { applied: number; received: number; pages: number; bootstrapped: boolean; held: number; stopped: 'unreadable' | null };
+// `maxSliceMs`: the longest apply transaction (one sub-batch), the
+// longest this pull held the event loop.
+export type PullOutcome = { applied: number; received: number; pages: number; bootstrapped: boolean; held: number; stopped: 'unreadable' | null; maxSliceMs: number };
 
 // One cycle's totals for its summary log line: counts only, never an op.
 type CycleTally = { pushed: number; rejected: number; held: number; pulled: number; applied: number; bootstrapped: boolean; snapshotRecords: number };
@@ -334,6 +352,30 @@ function wireOp(o: StoredOp): Op {
 	const { seq: _seq, user_id: _user, received_at: _recv, ...op } = o;
 	return op as Op;
 }
+
+// How many ops one apply transaction of a pulled page takes (see the
+// header). A whole 1,000-op page in one transaction held the main loop up
+// to 692 ms in the 2026-10-20 dry run on the live library. Ops differ ~15×
+// in cost (a claim ~0.07 ms, a set-meta that makes a remote row ~1.1 ms on
+// the live profile copy) and each transaction pays a fixed part on top (the
+// commit of a few dozen dirtied index pages, a big playlist's position
+// restamp: ~40-100 ms measured 2026-10-20), so the size follows the time:
+// each transaction's next size aims at PULL_SLICE_MS from the last one's
+// per-op cost, growing at most 2× a step (a run of cheap ops must not
+// leave a size that a run of expensive ones then overruns by much) and kept
+// within PULL_APPLY_MIN..PULL_APPLY_MAX — the floor so that a fixed cost
+// above the target does not shrink the batches to nothing and multiply the
+// commits (a 60 ms target sat on a floor of 25 there and took 3× as long
+// as 100-op batches). Measured 2026-10-20 on the generated 40k library
+// (sync-slices-perf.test.ts: 23,500 ops of two devices' imports and merges,
+// 24 pages): one transaction per page ran 148 ms on average, worst 289 ms;
+// these sizes ran 157 transactions, median 64 ms, p90 103 ms, worst 113 ms.
+const PULL_SLICE_MS = 100;
+const PULL_APPLY_START = 100;
+const PULL_APPLY_MIN = 50;
+const PULL_APPLY_MAX = 200;
+
+const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 const ENTITY_CAP = 2_000;
 
@@ -603,8 +645,13 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		return res;
 	};
 
+	// The apply size (PULL_SLICE_MS), carried across pages and pulls: the
+	// cost of the next ops is best guessed from the last ones. A test's
+	// `pullApplyChunk` pins it.
+	const [applyMin, applyMax] = opts.pullApplyChunk ? [Math.max(1, opts.pullApplyChunk), Math.max(1, opts.pullApplyChunk)] : [PULL_APPLY_MIN, PULL_APPLY_MAX];
+	let applyStep = opts.pullApplyChunk ? applyMin : PULL_APPLY_START;
 	const pullOnce = async (): Promise<PullOutcome> => {
-		const out: PullOutcome = { applied: 0, received: 0, pages: 0, bootstrapped: false, held: 0, stopped: null };
+		const out: PullOutcome = { applied: 0, received: 0, pages: 0, bootstrapped: false, held: 0, stopped: null, maxSliceMs: 0 };
 		const tracks = new Set<string>();
 		const playlists = new Set<string>();
 		const entities: EntityRef[] = [];
@@ -662,22 +709,62 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				const ahead = res.ops.filter((o) => schemaVersionStatus(o.schema_version) === 'ahead');
 				const page = ahead.length === 0 ? res.ops : res.ops.filter((o) => schemaVersionStatus(o.schema_version) !== 'ahead');
 				const lastSeq = res.ops[res.ops.length - 1]!.seq;
-				let outcome: ApplyOutcome | null = null;
-				let healed: DedupeResult | null = null;
+				const wire = page.map(wireOp);
+				let dedupeRemoved = 0;
+				const dedupePlaylists = new Set<string>();
 				try {
-					raw.transaction(() => {
-						out.held += holdOps(raw, ahead);
-						if (page.length > 0) {
-							outcome = applyOps(raw, page.map(wireOp));
-							// Doubled streaming rows the page brought together fold
-							// in the same commit (playlist-dedupe.ts).
-							healed = healAfterApply(raw, page);
+					// The whole page first (applyOps parses each sub-batch again,
+					// ~1% of its cost): a malformed op must not leave part of
+					// its page applied.
+					for (const o of wire) parseOp(o);
+					for (let i = 0; i === 0 || i < wire.length;) {
+						const batch = wire.slice(i, i + applyStep);
+						i += applyStep;
+						const last = i >= wire.length;
+						// Before every sub-batch, the first included: the pull's
+						// await is not a turn of the loop when the transport
+						// answers from memory, and two pages' slices would run
+						// back to back.
+						await yieldToLoop();
+						const t0 = performance.now();
+						let outcome: ApplyOutcome | null = null;
+						let healed: DedupeResult | null = null;
+						raw.transaction(() => {
+							if (batch.length > 0) {
+								outcome = applyOps(raw, batch);
+								// Doubled streaming rows the sub-batch brought
+								// together fold in the same commit
+								// (playlist-dedupe.ts): no commit shows them.
+								healed = healAfterApply(raw, batch);
+							}
+							if (!last) return;
+							out.held += holdOps(raw, ahead);
+							opts.beforeCursorAdvance?.(page);
+							// The whole page applied: the cursor may pass its last
+							// op, over own ops the server left out.
+							writeCursor(raw, Math.max(lastSeq, cursor.lastSeq, res.nextSeq));
+						})();
+						const ms = performance.now() - t0;
+						out.maxSliceMs = Math.max(out.maxSliceMs, ms);
+						// Only a full batch says what a batch of this size costs
+						// (a page's short tail is mostly the fixed part).
+						if (batch.length === applyStep) {
+							applyStep = Math.max(applyMin, Math.min(applyMax, applyStep * 2, Math.round(applyStep * PULL_SLICE_MS / Math.max(ms, 1))));
 						}
-						opts.beforeCursorAdvance?.(page);
-						// The whole page applied: the cursor may pass its last op,
-						// over own ops the server left out.
-						writeCursor(raw, Math.max(lastSeq, cursor.lastSeq, res.nextSeq));
-					})();
+						const o = outcome as ApplyOutcome | null;
+						if (o && o.restamped > 0) patchClientState({ needsRepair: true });
+						if (o) {
+							out.applied += o.applied;
+							if (tally) tally.applied += o.applied;
+							collect(o);
+						}
+						const h = healed as DedupeResult | null;
+						if (h && h.removed > 0) {
+							collect(h);
+							dedupeRemoved += h.removed;
+							for (const p of h.playlistsTouched) dedupePlaylists.add(p);
+						}
+					}
 				} catch (err) {
 					if (err instanceof OpValidationError) {
 						// An op this version should read but cannot: never skip
@@ -689,18 +776,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 					}
 					throw err;
 				}
-				const o = outcome as ApplyOutcome | null;
-				if (o && o.restamped > 0) patchClientState({ needsRepair: true });
-				if (o) {
-					out.applied += o.applied;
-					if (tally) tally.applied += o.applied;
-					collect(o);
-				}
-				const h = healed as DedupeResult | null;
-				if (h && h.removed > 0) {
-					collect(h);
-					slog.info('pull: removed streaming playlist rows doubled by merges', { removed: h.removed, playlists: h.playlistsTouched.length });
-				}
+				if (dedupeRemoved > 0) slog.info('pull: removed streaming playlist rows doubled by merges', { removed: dedupeRemoved, playlists: dedupePlaylists.size });
 				// The server's receive stamps floor this device's next clock.
 				const serverTs = res.ops.reduce((m, op) => Math.max(m, op.received_at), 0);
 				if (serverTs > 0) observeServerTs(raw, serverTs);
@@ -856,6 +932,70 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 	};
 
+	// ── base metadata and remote rows (protocol v3) ─────────────────────
+	// After the pull, so the records are the account's and the features
+	// are known. Every step is a no-op when it has nothing to do; each
+	// yields between chunks. Failures are logged and retried next cycle.
+
+	// This device's own rows' meta, once the server reads v3: the one-time
+	// backfill queues every row, the drain states what changed.
+	const syncTrackMeta = async (): Promise<number> => {
+		if (!serverReadsTrackMeta(features) || !recordsComplete(raw)) return 0;
+		if (trackMetaBackfillPending(raw)) {
+			const queued = await queueTrackMetaBackfillAsync(raw);
+			slog.info('track meta: queued every own row for the one-time backfill', { rows: queued });
+		}
+		if (trackMetaDirtyCount(raw) === 0) return 0;
+		const r = await drainTrackMetaAsync(raw);
+		if (r.emitted > 0) slog.info('track meta: stated', { rows: r.rows, emitted: r.emitted, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+		return r.emitted;
+	};
+
+	// The account's master device, stated once by the device that first
+	// linked the library (the earliest still registered: track-meta.ts
+	// defaultMasterDevice) when the records hold none. Asked of the server
+	// at most once per session while unset.
+	let masterChecked = false;
+	const ensureMaster = async (): Promise<void> => {
+		if (masterChecked || !serverReadsTrackMeta(features) || !firstPullDone(raw) || masterDevice(raw) !== null) return;
+		masterChecked = true;
+		const devices = await transport.account.devices();
+		const first = defaultMasterDevice(devices);
+		if (first === deviceId && masterDevice(raw) === null) {
+			setMasterDevice(raw, deviceId);
+			slog.info('master device: this device first linked the library; stated it as the master', { deviceId });
+		}
+	};
+
+	// Remote rows: the one-time sweep (and the re-pick after a master
+	// change), then the artist/album derivations queued by any
+	// materialisation too large to derive inline.
+	const settleRemoteRows = async (): Promise<void> => {
+		const tracks = new Set<string>();
+		const playlists = new Set<string>();
+		if (!materializeSwept(raw) && firstPullDone(raw) && recordsComplete(raw)) {
+			const r = await sweepRemoteRowsAsync(raw);
+			for (const t of r.tracksTouched) tracks.add(t);
+			for (const p of r.playlistsTouched) playlists.add(p);
+		}
+		// The creations a pull page, snapshot chunk or the sweep queued.
+		if (remotePendingCount(raw) > 0) {
+			const r = await drainRemotePendingAsync(raw);
+			for (const t of r.tracksTouched) tracks.add(t);
+			for (const p of r.playlistsTouched) playlists.add(p);
+		}
+		if (derivePendingCount(raw) > 0) {
+			const d = await drainTrackDerivationsAsync(raw);
+			for (const t of d.tracks) tracks.add(t);
+			if (d.tracks.length > 0) slog.info('remote rows: artists and albums derived', { rows: d.tracks.length, chunks: d.chunks, maxSliceMs: Math.round(d.maxSliceMs) });
+		}
+		emitApplied(tracks, playlists, []);
+	};
+
+	const stage = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+		try { await fn(); } catch (err) { slog.warn(`${name} failed; retrying next cycle`, undefined, err); }
+	};
+
 	// ── cycle + scheduling ──────────────────────────────────────────────
 
 	const clearRetry = (): void => {
@@ -938,11 +1078,39 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				if (p.stopped === 'device_revoked') { outcome = 'device_revoked'; return; }
 				if (!p.more) break;
 			}
+			// Base metadata and the default master, once the server is known
+			// to read them (a push or pull answer this session said so): after
+			// the push that may have just told us, and pushed before the pull,
+			// so the cursor ends the cycle at the head. A session whose first
+			// cycle had nothing to push learns it from the pull and states them
+			// on the next cycle.
+			const metaStage = async (): Promise<void> => {
+				await stage('master device', ensureMaster);
+				await stage('track meta', syncTrackMeta);
+				while (!pushRefused) {
+					const p = await pushOnce();
+					if (p.stopped === 'device_revoked') { outcome = 'device_revoked'; return; }
+					if (!p.more) break;
+				}
+			};
+			const metaBeforePull = serverReadsTrackMeta(features) && !pushRefused;
+			if (metaBeforePull) await metaStage();
+			if (outcome === 'device_revoked') return;
 			await pullOnce();
 			// Claims from other devices; merges it emits wake the next cycle's
 			// push through the outbox listener.
 			await resolveIdentities();
 			await sweepStreamingDuplicates();
+			await stage('remote rows', settleRemoteRows);
+			// The pull was what told this session the server reads v3 (the
+			// push before it had nothing to send): the meta stage runs now,
+			// and one more pull brings the cursor back to the head past this
+			// device's own new ops (the server leaves them out).
+			if (!metaBeforePull && serverReadsTrackMeta(features) && !pushRefused) {
+				await metaStage();
+				if (outcome === 'device_revoked') return;
+				await pullOnce();
+			}
 			lastError = null;
 			attempt = 0;
 			clearRetry();

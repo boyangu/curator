@@ -86,7 +86,7 @@ function* rbAnalysisOps(raw: Raw): Generator<EmitOp> {
 	const slotOf = raw.prepare(`SELECT rb_beatgrid, rb_downbeats, rb_key_camelot, rb_segments_json FROM track_analysis WHERE track_id = ?`);
 	for (const r of raw.prepare(`SELECT ta.track_id AS id, COALESCE(rl.last_synced_at, ta.analyzed_at) AS at FROM track_analysis ta
 		JOIN track t ON t.id = ta.track_id LEFT JOIN rekordbox_link rl ON rl.track_id = ta.track_id
-		WHERE t.derived_from_track_id IS NULL AND (ta.rb_beatgrid IS NOT NULL OR ta.rb_key_camelot IS NOT NULL OR ta.rb_segments_json IS NOT NULL)
+		WHERE t.derived_from_track_id IS NULL AND t.remote_only = 0 AND (ta.rb_beatgrid IS NOT NULL OR ta.rb_key_camelot IS NOT NULL OR ta.rb_segments_json IS NOT NULL)
 		ORDER BY ta.track_id`).all() as Array<{ id: string; at: number | null }>) {
 		const recording = rec(r.id);
 		if (!recording) continue;
@@ -125,7 +125,10 @@ function* recordingOps(raw: Raw): Generator<EmitOp> {
 	const has = recordProbe(raw);
 	const rec = recordingResolver(raw);
 	const aliased = new Set(raw.prepare(`SELECT loser FROM recording_alias`).pluck().all() as string[]);
-	const page = raw.prepare(`SELECT rowid, id, isrc, added_at, created_at FROM track WHERE derived_from_track_id IS NULL AND rowid > ? ORDER BY rowid LIMIT 400`);
+	// Never a remote row (remote-rows.ts): its recording and claims are
+	// another device's, already on the log; an ISRC claim from its meta
+	// would be this device vouching for a track it does not hold.
+	const page = raw.prepare(`SELECT rowid, id, isrc, added_at, created_at FROM track WHERE derived_from_track_id IS NULL AND remote_only = 0 AND rowid > ? ORDER BY rowid LIMIT 400`);
 	for (let after = 0; ;) {
 		const tracks = page.all(after) as RecTrackRow[];
 		if (tracks.length === 0) return;
@@ -222,7 +225,9 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 	}
 
 	// Membership, in playlist order so the outbox reads like the library.
-	for (const r of raw.prepare(`SELECT id, playlist_id, track_id, order_key, added_at FROM playlist_track ORDER BY playlist_id, order_key, id`).all() as Array<{ id: string; playlist_id: string; track_id: string; order_key: string; added_at: number | null }>) {
+	// Rows on a remote track came from the records (they are on the log).
+	for (const r of raw.prepare(`SELECT id, playlist_id, track_id, order_key, added_at FROM playlist_track
+		WHERE track_id NOT IN (SELECT id FROM track WHERE remote_only = 1) ORDER BY playlist_id, order_key, id`).all() as Array<{ id: string; playlist_id: string; track_id: string; order_key: string; added_at: number | null }>) {
 		const created = playlistCreated.get(r.playlist_id);
 		if (created === undefined) continue; // device-local playlist
 		if (has('playlistTracks', r.id, 'added') || tombstoned('playlist_track', r.id)) continue;
@@ -232,7 +237,7 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 	}
 
 	// Tag assignments.
-	for (const r of raw.prepare(`SELECT track_id, tag_id, added_at FROM track_tag ORDER BY track_id, tag_id`).all() as Array<{ track_id: string; tag_id: string; added_at: number }>) {
+	for (const r of raw.prepare(`SELECT track_id, tag_id, added_at FROM track_tag WHERE track_id NOT IN (SELECT id FROM track WHERE remote_only = 1) ORDER BY track_id, tag_id`).all() as Array<{ track_id: string; tag_id: string; added_at: number }>) {
 		const recording = rec(r.track_id);
 		if (!recording) continue;
 		const key = trackTagEntityId(recording, r.tag_id);
@@ -242,7 +247,7 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 
 	// Cues, at the track's cue-edit stamp (or the cue's own creation).
 	for (const r of raw.prepare(`SELECT c.track_id, c.slot, c.kind, c.position_sec, c.length_sec, c.color, c.name, c.created_at, t.cues_edited_at
-		FROM cue c JOIN track t ON t.id = c.track_id WHERE c.slot >= 0 ORDER BY c.track_id, c.kind, c.slot`).all() as Array<CueRow & { track_id: string; created_at: number; cues_edited_at: number | null }>) {
+		FROM cue c JOIN track t ON t.id = c.track_id WHERE c.slot >= 0 AND t.remote_only = 0 ORDER BY c.track_id, c.kind, c.slot`).all() as Array<CueRow & { track_id: string; created_at: number; cues_edited_at: number | null }>) {
 		const recording = rec(r.track_id);
 		if (!recording) continue;
 		const key = cueEntityId(recording, r.slot, r.kind);
@@ -262,7 +267,7 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 	// leaves exactly such a row behind.
 	const aliasedLosers = new Set(raw.prepare(`SELECT loser FROM recording_alias`).pluck().all() as string[]);
 	for (const r of raw.prepare(`SELECT id, rating, state, state_changed_at, overrides, deleted_at, updated_at FROM track
-		WHERE derived_from_track_id IS NULL AND (rating IS NOT NULL OR state != 'unsorted' OR overrides IS NOT NULL OR deleted_at IS NOT NULL)`).all() as Array<{ id: string; rating: number | null; state: string; state_changed_at: number | null; overrides: string | null; deleted_at: number | null; updated_at: number }>) {
+		WHERE derived_from_track_id IS NULL AND remote_only = 0 AND (rating IS NOT NULL OR state != 'unsorted' OR overrides IS NOT NULL OR deleted_at IS NOT NULL)`).all() as Array<{ id: string; rating: number | null; state: string; state_changed_at: number | null; overrides: string | null; deleted_at: number | null; updated_at: number }>) {
 		const recording = rec(r.id);
 		if (!recording || aliasedLosers.has(recording)) continue;
 		if (r.rating != null && !has('libraryTracks', recording, 'rating')) yield stamp(ratingOp(recording, r.rating), r.updated_at);

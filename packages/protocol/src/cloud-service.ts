@@ -54,7 +54,11 @@ export type PushInput = {
 //     Pull and bootstrap without a device id stay accepted while older
 //     desktops are in use; a server run with CURATOR_REQUIRE_DEVICE_ID
 //     answers them `update_required` instead.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads'] as const;
+//   - 'track_meta': the server reads protocol v3 — `library_track.set-meta`
+//     and the `library.master_device` setting. A desktop emits neither
+//     before it sees this: an older server refuses both, and a refused op
+//     is never retried.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {

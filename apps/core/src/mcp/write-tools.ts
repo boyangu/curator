@@ -149,6 +149,9 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 					playlist: { id: pl.id, name: pl.name, source: pl.source, trackCount: pl.trackCount ?? 0 },
 					tracks: tracks.map((t) => ({
 						id: t.id,
+						// A followed playlist keeps tracks the user deleted (the app
+						// shows them with a "deleted" chip); they're not in the library.
+						...(t.deletedAt ? { deleted: true } : {}),
 						title: t.title,
 						artists: t.artists.map((ar) => ar.name),
 						...(t.bpm != null ? { bpm: t.bpm } : {}),

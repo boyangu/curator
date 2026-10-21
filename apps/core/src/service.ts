@@ -3,7 +3,7 @@
 // When core is deployed remotely, the same surface gets exposed via
 // HTTP/WSS — desktop swaps the transport, not the calls.
 
-import { and, asc, count, desc, eq, exists, gte, inArray, isNotNull, isNull, like, lte, ne, notExists, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, count, countDistinct, desc, eq, exists, gte, inArray, isNotNull, isNull, like, lte, ne, notExists, or, sql, type SQL } from 'drizzle-orm';
 import { scoreCandidates, type CandidateCounts, type RecommendColumnCounts, type ScoredRecommendation } from './recommend.js';
 import { createDb, type Db } from './db/client.js';
 import {
@@ -66,6 +66,8 @@ import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
 import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
+import { remoteRowCount, requestRematerialize } from './sync-log/remote-rows.js';
+import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
 
@@ -221,7 +223,7 @@ import { applyOverrides, computePositionalMoves, normalizeIsrc } from '@curator/
 import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import { AnalyzerSidecar } from './analyzer/sidecar.js';
-import { AnalysisQueue, formatAnalyzerTrackName, type AnalysisJobEvent } from './analyzer/queue.js';
+import { AnalysisQueue, formatAnalyzerTrackName, splitRemoteRows, type AnalysisJobEvent } from './analyzer/queue.js';
 import { type AnalysisFlags, type AutoAnalyzeSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, analysisFlagsToOptions } from './analyzer/flags.js';
 import { CutoffStore } from './analyzer/cutoffs.js';
 import { homedir, hostname } from 'node:os';
@@ -421,6 +423,17 @@ export type CloudActivityWatcher = {
 // (with neutral values) when the build has no cloud transport.
 export type CloudSyncStatusReport = CloudSyncStatus & { enabled: boolean };
 
+// The account-level library picture for Settings → Account (protocol v3):
+// the master device, how many of the account's tracks this device holds no
+// source of (its remote rows: "not on this device"), and whether the server
+// reads base metadata at all (a v2 server: no master can be set, nothing is
+// shared).
+export type AccountLibraryInfo = {
+	masterDeviceId: string | null;
+	remoteOnlyCount: number;
+	metaSyncAvailable: boolean;
+};
+
 // What unlinkCloudLibrary did (`outcome` null: sync is off in this build,
 // nothing to unlink) and the status after it.
 export type CloudUnlinkResult = { outcome: UnlinkOutcome | null; status: CloudSyncStatusReport };
@@ -452,6 +465,22 @@ export interface RekordboxMissingFile {
 	// The path rekordbox_link last recorded for the file — shown so the user
 	// can tell an intentional delete from an unmounted-drive false positive.
 	filePath: string | null;
+}
+
+// One row of Settings → Deleted Tracks (listDeletedTracks).
+export interface DeletedTrack {
+	trackId: string;
+	title: string;
+	artist: string | null;
+	deletedAt: number;
+	// How it got here: a Convert-to-WAV copy, the loser of a recording merge
+	// (its curation lives on in the winner), or a delete.
+	cause: 'deleted' | 'merged' | 'wav-copy';
+	// What the tombstone still holds — the sources it is linked to (the
+	// evidence that keeps it deleted) and the curation a restore brings back.
+	sources: string[];
+	tags: number;
+	playlists: number;
 }
 
 export interface CoreService {
@@ -720,6 +749,14 @@ export interface CoreService {
 	// playlist memberships, trashed files, the rekordbox link. Returns the
 	// ids that were deleted and now are not.
 	undeleteTracks(trackIds: string[]): Promise<{ restored: string[] }>;
+	// Settings → Deleted Tracks: every soft-deleted row not yet purged, newest
+	// delete first. The one surface that lists tombstones on purpose.
+	listDeletedTracks(): Promise<DeletedTrack[]>;
+	// "Delete permanently": strips the tombstones' tags and cues (synced) and
+	// takes them off the list. The rows stay as identity evidence so the
+	// track stays deleted — see mutators.ts purgeDeletedTracks. Live or
+	// already-purged ids are ignored. Returns the ids purged.
+	purgeDeletedTracks(trackIds: string[]): Promise<{ purged: string[] }>;
 	matchTidalForTrack(trackId: string): Promise<{ tidalId: string } | null>;
 	setPlaylistHybridTidal(playlistId: string, enabled: boolean, progress?: ProgressFn, sort?: { column: ZTrackSortT['column']; dir: 'asc' | 'desc' }): Promise<{ matched: number; scanned: number; enabled: boolean }>;
 	cancelEnrichment(): Promise<void>;
@@ -1229,6 +1266,14 @@ export interface CoreService {
 	// account later resumes as a new device and another account is refused.
 	// Also the way out of the revoked state. Never deletes library data.
 	unlinkCloudLibrary(): Promise<CloudUnlinkResult>;
+	// The master device and the remote-row count (AccountLibraryInfo).
+	getAccountLibraryInfo(): Promise<AccountLibraryInfo>;
+	// Make `deviceId` the account's master device: its base metadata wins on
+	// every other device for the tracks it holds (protocol state.ts
+	// resolveTrackMeta). An account setting op; every device re-picks its
+	// remote rows on its next sync. Refused when sync is off, signed out, or
+	// the server does not read protocol v3 yet.
+	setMasterDevice(deviceId: string): Promise<AccountLibraryInfo>;
 
 	// ─── Shared analysis catalogue (apps/core/src/catalogue/) ───────────
 	// Analysis one of the account's devices computed, reused by the others
@@ -1351,6 +1396,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		const myId = pl.source === 'tidal' ? status.tidal.id : status.spotify.id;
 		return myId != null && pl.ownerId === myId;
 	};
+	const isFollowedPlaylist: FollowedPlaylistProbe = (playlistId) => {
+		const pl = db.select({ source: playlist.source, ownerId: playlist.ownerId, isCollaborative: playlist.isCollaborative })
+			.from(playlist).where(eq(playlist.id, playlistId)).get();
+		return !!pl && (pl.source === 'spotify' || pl.source === 'tidal') && !canModifyUpstream(pl);
+	};
 	// Local-vs-remote membership diff for one streaming playlist. One
 	// provider read (the adapter unrolls pagination). A local row counts as
 	// present remotely if ANY provider id we know for its track is in the
@@ -1472,6 +1522,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// the spotify branch (and filter deletedAt on both) so a soft-deleted row
 		// never reads as in-library. A null tier (in library at the 'none' tier)
 		// is omitted — the feed treats absent the same as 'none'.
+		// Remote rows (track.remoteOnly) match here by ISRC on purpose: the
+		// feed asks "does the account hold this recording", and a track held
+		// on another device is in the library, not a discovery. They never
+		// match the spotify branch (no source_link on this device).
 		for (let i = 0; i < isrcs.length; i += 500) {
 			const chunk = isrcs.slice(i, i + 500);
 			const rows = db
@@ -1755,7 +1809,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async libraryTracks(ids) {
 			const out = new Map<string, string | null>();
 			const rows = chunkedIn(ids, (chunk) =>
-				db.select({ id: track.id }).from(track).where(inArray(track.id, chunk)).all());
+				db.select({ id: track.id }).from(track).where(and(inArray(track.id, chunk), isNull(track.deletedAt))).all());
 			for (const r of rows) out.set(r.id, null);
 			const links = chunkedIn(ids, (chunk) =>
 				db.select({ trackId: sourceLink.trackId, sid: sourceLink.sourceTrackId })
@@ -1945,7 +1999,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		if (!filter || !st) return null;
 		const { similarTo: _omit, ...base } = filter;
 		const scoped = Object.values(base).some((v) => v !== undefined && !(Array.isArray(v) && v.length === 0));
-		const allow = scoped ? new Set(getTrackIdsImpl(db, base, undefined, 200_000)) : null;
+		const allow = scoped ? new Set(getTrackIdsImpl(db, base, undefined, 200_000, isFollowedPlaylist)) : null;
 		const r = await mirLayer.rank({ seeds: st.seeds ?? [], text: st.text, model: st.model, k: st.k, allow });
 		return { filter: { ids: r.items.map((i) => i.trackId) }, score: new Map(r.items.map((i) => [i.trackId, i.score])) };
 	};
@@ -2099,7 +2153,12 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			transport: opts.cloud.transport,
 			device: opts.cloud.device,
 			pollPolicy: readPollPolicy(sqlite),
-			onApplied: (a) => { if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks); },
+			// A fresh device's first sync materialises the whole account
+			// (remote rows): one indexed pass beats 40k ids in chunks.
+			onApplied: (a) => {
+				if (a.tracks.length > 5_000) membership.recomputeAll();
+				else if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks);
+			},
 		})
 		: null;
 	let cloudWakeUnsub: (() => void) | null = null;
@@ -2155,6 +2214,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			activity: null, lastHydrateAt: null, lastUploadAt: null, lastError: null, nextRetryAt: null,
 		};
 
+	const accountLibraryInfo = (): AccountLibraryInfo => ({
+		masterDeviceId: masterDevice(sqlite),
+		remoteOnlyCount: remoteRowCount(sqlite),
+		metaSyncAvailable: !!cloudClient && serverReadsTrackMeta(cloudClient.serverFeatures()),
+	});
 	const cloudStatusReport = (): CloudSyncStatusReport => cloudClient
 		? { ...cloudClient.status(), enabled: true }
 		: {
@@ -2935,6 +2999,42 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (restored.length > 0) membership.recomputeForTracks(restored);
 			return { restored };
 		},
+		async listDeletedTracks() {
+			// The correlated subqueries name `track.id` literally: drizzle prints
+			// a single-table column bare ("id"), which inside a subquery over a
+			// table with its own id column binds to that table instead.
+			const rows = db
+				.select({
+					id: track.id, title: track.title, artists: track.artists, overrides: track.overrides,
+					deletedAt: track.deletedAt, derivedFrom: track.derivedFromTrackId,
+					merged: sql<number>`EXISTS (SELECT 1 FROM recording_alias ra WHERE ra.loser = track.recording_id)`,
+					sources: sql<string | null>`(SELECT group_concat(DISTINCT s.source) FROM source_link s WHERE s.track_id = track.id)`,
+					rb: sql<number>`EXISTS (SELECT 1 FROM rekordbox_link r WHERE r.track_id = track.id)`,
+					tags: sql<number>`(SELECT count(*) FROM track_tag x WHERE x.track_id = track.id)`,
+					playlists: sql<number>`(SELECT count(DISTINCT pt.playlist_id) FROM playlist_track pt WHERE pt.track_id = track.id)`,
+				})
+				.from(track)
+				.where(and(isNotNull(track.deletedAt), isNull(track.purgedAt)))
+				.orderBy(desc(track.deletedAt))
+				.all();
+			return rows.map((r): DeletedTrack => {
+				const sources = r.sources ? r.sources.split(',') : [];
+				if (r.rb) sources.push('rekordbox');
+				return {
+					trackId: r.id,
+					title: effectiveTitle(r, creditFormat),
+					artist: effectiveArtistName(r, creditFormat),
+					deletedAt: r.deletedAt!.getTime(),
+					cause: r.derivedFrom ? 'wav-copy' : r.merged ? 'merged' : 'deleted',
+					sources: sources.sort(),
+					tags: r.tags,
+					playlists: r.playlists,
+				};
+			});
+		},
+		async purgeDeletedTracks(trackIds) {
+			return { purged: mut.purgeDeletedTracks(db, [...new Set(trackIds)]) };
+		},
 		async removeTrackSources(trackIds, sources) {
 			const requested = new Set(sources.filter((s): s is RemovableTrackSource => (REMOVABLE_TRACK_SOURCES as readonly string[]).includes(s)));
 			if (requested.size === 0) throw new Error('No sources selected');
@@ -2947,16 +3047,16 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (sim) {
 				// At most k (<= 500) rows: fetch all, order in memory, slice.
 				if (sim.score.size === 0) return { items: [], total: 0, nextCursor: null };
-				const all = orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0), sim, sort);
+				const all = orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0, isFollowedPlaylist), sim, sort);
 				return { items: all.slice(offset, offset + limit), total: all.length, nextCursor: null };
 			}
-			const items = getTracksImpl(db, cutoffStore, filter, sort, limit, offset);
+			const items = getTracksImpl(db, cutoffStore, filter, sort, limit, offset, isFollowedPlaylist);
 			// A page that didn't fill ends the result — total is known without a
 			// COUNT (covers playlists, tag views, searches under one page, and the
 			// last page of a large scope). Only a full page needs the real count.
 			const total = items.length < limit
 				? offset + items.length
-				: countTracksImpl(db, filter);
+				: countTracksImpl(db, filter, isFollowedPlaylist);
 			return { items, total, nextCursor: null };
 		},
 
@@ -2964,19 +3064,19 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const sim = await resolveSimilar(filter);
 			if (sim) {
 				if (sim.score.size === 0) return [];
-				return orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0), sim, sort).map((t) => t.id);
+				return orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0, isFollowedPlaylist), sim, sort).map((t) => t.id);
 			}
 			// Cap well above any real list but below the 50k unbounded-load shape.
-			return getTrackIdsImpl(db, filter, sort, 200_000);
+			return getTrackIdsImpl(db, filter, sort, 200_000, isFollowedPlaylist);
 		},
 
 		async getTracks(filter, sort, limit = 50000, offset = 0) {
 			const sim = await resolveSimilar(filter);
 			if (sim) {
 				if (sim.score.size === 0) return [];
-				return orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0), sim, sort).slice(offset, offset + limit);
+				return orderByMatch(getTracksImpl(db, cutoffStore, sim.filter, sqlSort(sort), 5000, 0, isFollowedPlaylist), sim, sort).slice(offset, offset + limit);
 			}
-			return getTracksImpl(db, cutoffStore, filter, sort, limit, offset);
+			return getTracksImpl(db, cutoffStore, filter, sort, limit, offset, isFollowedPlaylist);
 		},
 
 		async getPlaylists() {
@@ -3342,7 +3442,8 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 					eq(sourceLink.trackId, playlistTrack.trackId),
 					eq(sourceLink.source, 'local'),
 				))
-				.where(inArray(playlistTrack.playlistId, playlistIds))
+				.innerJoin(track, eq(track.id, playlistTrack.trackId))
+				.where(and(inArray(playlistTrack.playlistId, playlistIds), isNull(track.deletedAt)))
 				.all();
 
 			const { existsSync } = await import('node:fs');
@@ -3817,6 +3918,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const rows = db
 				.select({ state: track.state, n: count() })
 				.from(track)
+				.where(isNull(track.deletedAt))
 				.groupBy(track.state)
 				.all();
 
@@ -3838,12 +3940,16 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// Per-source track counts — one COUNT GROUP BY over source_link. The
 		// renderer uses `local` to decide whether the Rekordbox tab's onboarding
 		// panel (no rekordbox library AND no local files) should take over.
+		// Distinct live tracks: a deleted track keeps its streaming links (and
+		// can hold a re-appearing file), and one track can carry two links of
+		// a source.
 		async getSourceCounts() {
 			// A local link flagged missing_at is not a file (see resolveLocalFile).
 			const rows = db
-				.select({ source: sourceLink.source, n: count() })
+				.select({ source: sourceLink.source, n: countDistinct(sourceLink.trackId) })
 				.from(sourceLink)
-				.where(or(ne(sourceLink.source, 'local'), isNull(sourceLink.missingAt)))
+				.innerJoin(track, eq(track.id, sourceLink.trackId))
+				.where(and(isNull(track.deletedAt), or(ne(sourceLink.source, 'local'), isNull(sourceLink.missingAt))))
 				.groupBy(sourceLink.source)
 				.all();
 			const out = { spotify: 0, tidal: 0, local: 0 };
@@ -4618,7 +4724,8 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return db.select({ tagId: trackTag.tagId, score: count() })
 				.from(trackTag)
 				.innerJoin(tag, eq(tag.id, trackTag.tagId))
-				.where(eq(tag.kind, 'user'))
+				.innerJoin(track, eq(track.id, trackTag.trackId))
+				.where(and(eq(tag.kind, 'user'), isNull(track.deletedAt)))
 				.groupBy(trackTag.tagId)
 				.orderBy(desc(count()))
 				.limit(10)
@@ -4649,6 +4756,14 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// backlog, so a click would otherwise just sit in 'queued'.
 			const stopped = analyzerSidecar?.disabled;
 			if (stopped) throw new Error(`The analyzer is not running: ${stopped}`);
+			// Remote rows have no file here; the queue drops them. A request
+			// made of nothing else is refused so the Analyze modal's toast
+			// says why instead of claiming queued work that never runs.
+			if (trackIds.length > 0 && splitRemoteRows(db, trackIds).own.length === 0) {
+				throw new Error(trackIds.length === 1
+					? 'This track is not on this device — there is no file to analyze.'
+					: 'These tracks are not on this device — there are no files to analyze.');
+			}
 			// Translate the unified flags into the sidecar wire shape here — the
 			// one conversion point shared with the scanner's auto-analyze path.
 			const analyzeOptions = opts?.analyzeFlags ? analysisFlagsToOptions(opts.analyzeFlags) : undefined;
@@ -5300,7 +5415,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async getSimilarTracks(q) {
 			const { filter, ...rest } = q;
 			const scoped = filter && Object.values(filter).some((v) => v !== undefined && !(Array.isArray(v) && v.length === 0));
-			const allow = scoped ? new Set(getTrackIdsImpl(db, filter, undefined, 200_000)) : null;
+			const allow = scoped ? new Set(getTrackIdsImpl(db, filter, undefined, 200_000, isFollowedPlaylist)) : null;
 			return mirLayer.rank({ ...rest, seeds: rest.seeds ?? [], allow });
 		},
 		async getTrackVector(trackId, model) {
@@ -5350,6 +5465,17 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			cloudClient?.setPollPolicy(next.policy);
 			cloudActivity?.setIdleAfterMs(next.policy.idleAfterSec * 1000);
 			return next;
+		},
+		async getAccountLibraryInfo() { return accountLibraryInfo(); },
+		async setMasterDevice(deviceId) {
+			if (!cloudClient) throw new Error('Cloud sync is off in this build.');
+			if (!serverReadsTrackMeta(cloudClient.serverFeatures())) throw new Error('The sync server does not support a master device yet — sync once more, or update the server.');
+			if (typeof deviceId !== 'string' || deviceId.length === 0 || deviceId.length > 128) throw new Error('Not a device id.');
+			setMasterDevice(sqlite, deviceId);
+			// The next cycle pushes it and re-picks this device's remote rows.
+			requestRematerialize(sqlite);
+			cloudClient.wake('local');
+			return accountLibraryInfo();
 		},
 		async unlinkCloudLibrary() {
 			if (!cloudClient) return { outcome: null, status: cloudStatusReport() };
@@ -5690,7 +5816,7 @@ function readAlbumSummaries(raw: ReturnType<typeof rawOf>, ids: readonly string[
 // rekordbox as one of a track's `sources` (decorateTracks unions it in);
 // this is the SQL side of that vocabulary, shared by getTracks'
 // hasSource / lacksSource and the artist scope so the two can't drift.
-function sourceMembership(sources: readonly string[]): SQL {
+function sourceMembership(sources: readonly string[], opts: { remote?: boolean } = {}): SQL {
 	const parts: SQL[] = [];
 	const linkSources = sources.filter((s) => s !== 'rekordbox');
 	if (linkSources.length > 0) {
@@ -5702,13 +5828,28 @@ function sourceMembership(sources: readonly string[]): SQL {
 	if (sources.includes('rekordbox')) {
 		parts.push(sql`EXISTS (SELECT 1 FROM rekordbox_link rl WHERE rl.track_id = ${track.id})`);
 	}
+	// A remote row (track.remoteOnly) has no links here; it stands where the
+	// device whose meta it shows holds the track (remote_source), so a file
+	// on the master is in this device's library root too, marked "not on
+	// this device". rekordbox is not a meta source: a remote row never
+	// claims it.
+	// `lacksSource` asks what this device lacks: a remote row lacks it all.
+	const remote = opts.remote === false ? [] : sources.filter((s) => s === 'local' || s === 'spotify' || s === 'tidal');
+	if (remote.length > 0) {
+		parts.push(sql`(${track.remoteOnly} = 1 AND ${track.remoteSource} IN (${sql.join(remote.map((s) => sql`${s}`), sql`, `)}))`);
+	}
 	if (parts.length === 0) return sql`0`;
 	return parts.length === 1 ? parts[0]! : sql`(${sql.join(parts, sql` OR `)})`;
 }
 
+// Is this playlist one the user follows but can't modify (a delete leaves the
+// track in it)? Owned by createCoreService, where the account ids live.
+type FollowedPlaylistProbe = (playlistId: string) => boolean;
+
 function buildFilteredTrackQuery(
 	db: Db,
 	filter: ZTrackFilterT | undefined,
+	isFollowed: FollowedPlaylistProbe,
 ): { empty: true } | { empty: false; q: TrackDynQuery } {
 	let q: TrackDynQuery = db.select().from(track).$dynamic();
 
@@ -5738,8 +5879,9 @@ function buildFilteredTrackQuery(
 		if (has.length > 0) conditions.push(sourceMembership(has));
 	}
 	if (filter?.lacksSource) {
-		conditions.push(sql`NOT ${sourceMembership([filter.lacksSource])}`);
+		conditions.push(sql`NOT ${sourceMembership([filter.lacksSource], { remote: false })}`);
 	}
+	if (filter?.hideRemote) conditions.push(eq(track.remoteOnly, false));
 	// Album scope by id — the indexed album_id column. Ids are resolved
 	// through merge aliases first so a scope opened before a merge (a pinned
 	// search, a history entry) still finds the release.
@@ -5783,14 +5925,15 @@ function buildFilteredTrackQuery(
 		}
 		conditions.push(or(...orParts)!);
 	}
-	// Soft-delete visibility: hide deleted tracks from EVERY scope except a
-	// single-playlist read. A deleted track is removed from the user's own
-	// playlists but kept in FOLLOWED playlists (ones they don't own) — so the
-	// only place it should still surface is when viewing such a playlist on its
-	// own, where the renderer paints a "deleted" chip. `conditions` is spread
-	// into every join branch below and the no-scope base, so this single guard
-	// (keyed on the presence of a single playlistId) covers them all.
-	if (!filter?.playlistId) conditions.push(isNull(track.deletedAt));
+	// Soft-delete visibility: a deleted track doesn't exist, in EVERY scope
+	// except a FOLLOWED streaming playlist read on its own. A delete can't
+	// take the track out of a playlist the user doesn't own, so it stays
+	// there and the renderer paints a "deleted" chip. Any other playlist
+	// still holding a deleted row (a missing-file cleanup, a delete synced
+	// from another device) hides it like every other scope. `conditions` is
+	// spread into every join branch below and the no-scope base, so this
+	// single guard covers them all.
+	if (!(filter?.playlistId && isFollowed(filter.playlistId))) conditions.push(isNull(track.deletedAt));
 	if (conditions.length) q = q.where(and(...conditions));
 
 	// playlist + source filters need joins
@@ -5937,8 +6080,8 @@ function applyTrackSort(
 // Total rows matching `filter` — wraps the shared builder as a subquery so a
 // page and its count always agree (and the GROUP BY dedupe in the playlistIds
 // branch is counted as distinct tracks, not raw join rows).
-function countTracksImpl(db: Db, filter: ZTrackFilterT | undefined): number {
-	const built = buildFilteredTrackQuery(db, filter);
+function countTracksImpl(db: Db, filter: ZTrackFilterT | undefined, isFollowed: FollowedPlaylistProbe): number {
+	const built = buildFilteredTrackQuery(db, filter, isFollowed);
 	if (built.empty) return 0;
 	const sub = built.q.as('cnt_sub');
 	const row = db.select({ n: sql<number>`count(*)` }).from(sub).get();
@@ -5955,8 +6098,9 @@ function getTrackIdsImpl(
 	filter: ZTrackFilterT | undefined,
 	sort: ZTrackSortT | undefined,
 	cap: number,
+	isFollowed: FollowedPlaylistProbe,
 ): string[] {
-	const built = buildFilteredTrackQuery(db, filter);
+	const built = buildFilteredTrackQuery(db, filter, isFollowed);
 	if (built.empty) return [];
 	const q = applyTrackSort(built.q, filter, sort).limit(cap) as TrackDynQuery;
 	return q.all().map((r: unknown) => {
@@ -5972,9 +6116,10 @@ function getTracksImpl(
 	filter: ZTrackFilterT | undefined,
 	sort: ZTrackSortT | undefined,
 	limit: number,
-	offset: number
+	offset: number,
+	isFollowed: FollowedPlaylistProbe,
 ): Track[] {
-	const built = buildFilteredTrackQuery(db, filter);
+	const built = buildFilteredTrackQuery(db, filter, isFollowed);
 	if (built.empty) return [];
 	const q = applyTrackSort(built.q, filter, sort).limit(limit).offset(offset) as TrackDynQuery;
 

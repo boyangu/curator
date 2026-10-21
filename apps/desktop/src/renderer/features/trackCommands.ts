@@ -26,6 +26,7 @@ import { tracksApi, libraryApi, enrichApi, tidalApi, shellApi, downloadsApi, mir
 import { showToast } from '../ui/toast.js';
 import { buildExactAttr, extractSqlPrefilter, parseQuery } from '../query.js';
 import { openTrackEditor } from './editTrack.js';
+import { anyRemoteRow, REMOTE_ONLY_REASON } from '../remoteRows.js';
 import { log } from '../data/log.js';
 
 // Well-known system tag ids — seeded in apps/core/src/db/migrate.ts. Owned here
@@ -90,6 +91,12 @@ export interface TrackCommand {
 	group: Group;
 	// Pure + sync — the one place "can this run on the current selection?" lives.
 	isAvailable(ctx: TrackCommandContext): boolean;
+	// Needs the audio or writes a device-local link (file, rekordbox, a
+	// provider match), so it never runs while the selection holds a remote
+	// row (track.remoteOnly — not on this device; see remoteRows.ts).
+	// 'explain' keeps it in the menu, disabled with the reason, so the user
+	// learns why Analyze / Sync to Rekordbox are out of reach; 'hide' drops it.
+	device?: 'explain' | 'hide';
 	// Leaf rendering (omitted when `build` supplies a custom item, e.g. navigate-to).
 	label?: (ctx: TrackCommandContext) => string;
 	iconHtml?: string | ((ctx: TrackCommandContext) => string);
@@ -339,7 +346,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 	},
 	{
 		// Essentia analysis + (as a flag in the modal) AI-engine embeddings.
-		id: 'analyze', group: 'curate', isAvailable: allLocal, mnemonic: 'a', iconHtml: ICON_ANALYZE,
+		id: 'analyze', group: 'curate', isAvailable: allLocal, device: 'explain', mnemonic: 'a', iconHtml: ICON_ANALYZE,
 		label: () => 'Analyze…',
 		run: (c) => { deps.getAnalyzeModal()?.open(idsOf(c)); },
 	},
@@ -380,7 +387,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 	{
 		// Shown unless every selected track is already Beatport-synced — a partial
 		// selection still offers it. Runs only on the not-yet-synced subset.
-		id: 'enrich-beatport', group: 'enrich', isAvailable: (c) => !allHave(c, 'beatport'), iconHtml: ICON_BEATPORT,
+		id: 'enrich-beatport', group: 'enrich', isAvailable: (c) => !allHave(c, 'beatport'), device: 'hide', iconHtml: ICON_BEATPORT,
 		label: () => 'Enhance with BPM, Key, Label, Genre',
 		run: async (c) => {
 			const targets = c.tracks.filter((t) => !hasSrc(t, 'beatport')).map((t) => t.id);
@@ -403,7 +410,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		// harmless (refreshes the match), and a partial selection shouldn't hide
 		// it. Single: only when not already linked (a redundant re-match on one
 		// track isn't worth the row; "Open in Tidal" covers the linked case).
-		id: 'sync-tidal', group: 'enrich', iconHtml: ICON_TIDAL,
+		id: 'sync-tidal', group: 'enrich', device: 'hide', iconHtml: ICON_TIDAL,
 		isAvailable: (c) => c.tracks.length >= 2 || (single(c) && noneHave(c, 'tidal')),
 		label: () => 'Enhance with Tidal',
 		run: (c) => { void syncTracksWithTidal(c); },
@@ -482,7 +489,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		run: (c) => shellApi.openExternal(`https://www.beatport.com/search?q=${encodeURIComponent(searchQuery(c.tracks[0]!))}`),
 	},
 	{
-		id: 'open-local-folder', group: 'open', isAvailable: (c) => single(c) && allLocal(c), iconHtml: ICON_FOLDER,
+		id: 'open-local-folder', group: 'open', isAvailable: (c) => single(c) && allLocal(c), device: 'hide', iconHtml: ICON_FOLDER,
 		label: () => 'Open File Location',
 		run: async (c) => { const local = await libraryApi.trackLocalFile(c.tracks[0]!.id).catch(() => null); if (local?.path) shellApi.showInFolder(local.path); },
 	},
@@ -490,7 +497,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		// Stream-only selections can download from anywhere; the Tidal tab
 		// additionally allows already-local tracks — core routes those to the
 		// separate redownload folder and leaves the local binding untouched.
-		id: 'download', group: 'enrich', isAvailable: (c) => allHave(c, 'tidal') && (allStream(c) || c.source === 'tidal'), iconHtml: ICON_DOWNLOAD,
+		id: 'download', group: 'enrich', isAvailable: (c) => allHave(c, 'tidal') && (allStream(c) || c.source === 'tidal'), device: 'hide', iconHtml: ICON_DOWNLOAD,
 		label: () => 'Download from Tidal',
 		run: (c) => { void downloadTracksViaTidal(idsOf(c)); },
 	},
@@ -520,7 +527,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		run: (c) => { void deps.openSyncFromRekordboxModal({ kind: 'tracks', ids: idsOf(c), displayName: displayName(c) }); },
 	},
 	{
-		id: 'sync-to-rekordbox', group: 'sync', submenu: 'sync', isAvailable: allLocal, iconHtml: ICON_SYNC_RB,
+		id: 'sync-to-rekordbox', group: 'sync', submenu: 'sync', isAvailable: allLocal, device: 'explain', iconHtml: ICON_SYNC_RB,
 		label: () => 'Sync to Rekordbox…',
 		run: (c) => { void deps.openSyncToRekordboxModal({ kind: 'tracks', ids: idsOf(c), displayName: displayName(c) }); },
 	},
@@ -573,6 +580,12 @@ const TRACK_COMMANDS: TrackCommand[] = [
 
 // ── builder + entrypoint ─────────────────────────────────────────────────────
 
+// The command's own predicate AND the remote-row gate — what the menu, the
+// keyboard delegation and a future button surface all ask.
+function commandAvailable(c: TrackCommand, ctx: TrackSelectionContext): boolean {
+	return c.isAvailable(ctx) && !(c.device && anyRemoteRow(ctx.tracks));
+}
+
 // Derive the menu (items + handler map) for a selection by filtering the command
 // table. Pure + sync — a button surface can reuse the same `isAvailable` filter.
 export function buildTrackMenu(ctx: TrackCommandContext): { items: ContextMenuItem[]; handlers: ContextMenuHandlers } {
@@ -580,14 +593,18 @@ export function buildTrackMenu(ctx: TrackCommandContext): { items: ContextMenuIt
 		{ kind: 'header', label: single(ctx) ? ctx.tracks[0]!.title : `${ctx.tracks.length} tracks selected` },
 	];
 	const handlers: ContextMenuHandlers = {};
+	const remote = anyRemoteRow(ctx.tracks);
+	const explained = (c: TrackCommand): boolean => remote && c.device === 'explain';
 	const leaf = (c: TrackCommand): ContextMenuItem => {
 		const icon = typeof c.iconHtml === 'function' ? c.iconHtml(ctx) : c.iconHtml;
+		// No handler and no mnemonic: a disabled item never dispatches.
+		if (explained(c)) return { kind: 'item', id: c.id, label: c.label!(ctx), iconHtml: icon, disabled: true, title: REMOTE_ONLY_REASON, chip: 'Other device' };
 		handlers[c.id] = () => c.run!(ctx);
 		return { kind: 'item', id: c.id, label: c.label!(ctx), iconHtml: icon, danger: c.danger, mnemonic: c.mnemonic };
 	};
 	let emittedGroup = false;
 	for (const group of GROUP_ORDER) {
-		const cmds = TRACK_COMMANDS.filter((c) => c.group === group && c.isAvailable(ctx));
+		const cmds = TRACK_COMMANDS.filter((c) => c.group === group && (commandAvailable(c, ctx) || explained(c)));
 		if (cmds.length === 0) continue;
 		if (emittedGroup) items.push({ kind: 'divider' });
 		// Submenu rows are placed where their first available child sits.
@@ -643,11 +660,11 @@ export async function showTrackMenu(evt: MouseEvent, base: TrackSelectionContext
 // aren't needed — no keyboard-bound command reads them.
 export function trackCommandAvailable(id: string, sel: TrackSelectionContext): boolean {
 	const cmd = TRACK_COMMANDS.find((c) => c.id === id);
-	return !!cmd && cmd.isAvailable(sel);
+	return !!cmd && commandAvailable(cmd, sel);
 }
 export function runTrackCommand(id: string, sel: TrackSelectionContext): boolean {
 	const cmd = TRACK_COMMANDS.find((c) => c.id === id);
-	if (!cmd || !cmd.isAvailable(sel)) return false;
+	if (!cmd || !commandAvailable(cmd, sel)) return false;
 	void cmd.run?.(sel);
 	return true;
 }

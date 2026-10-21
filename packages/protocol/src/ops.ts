@@ -17,7 +17,14 @@ import { isRbGridValue } from './rb-grid.js';
 // applying everything it can read and holds (design: `sync_inbox_held`) only
 // at the first op of a kind it does not know, instead of at every op a v2
 // device writes.
-export const SCHEMA_VERSION = 2;
+//
+// Version 3 (2026-10-20) is additive too: `library_track.set-meta` (a
+// device's base metadata for a recording, so a device without the track can
+// show it) and the account setting `library.master_device` (whose meta wins).
+// A v2 client holds both aside instead of stopping at them; a v2 server
+// refuses them, so a desktop emits either only when the server advertises
+// 'track_meta' (cloud-service.ts SYNC_FEATURES).
+export const SCHEMA_VERSION = 3;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
 export const MAX_OP_PAYLOAD_BYTES = 16 * 1024;
@@ -100,10 +107,16 @@ export const ZTrackArtist = z
 // incident), `wav.output_dir`, `library.id`, `device.id`, backup run stamps,
 // migration gates — must never ride an op, so the key is validated here and
 // the list is the allow-list, not a deny-list.
-export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed'] as const;
+export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed', 'library.master_device'] as const;
 export function isAccountSettingKey(key: string): boolean {
 	return (ACCOUNT_SETTING_KEYS as readonly string[]).includes(key);
 }
+
+// The device whose `set-meta` wins wherever it holds the recording (decided
+// 2026-10-20: the master seeds every other device). Its value is a device id;
+// the first device to link the library states it, Settings → Account
+// changes it. Since v3 (SETTING_KEY_SINCE below).
+export const MASTER_DEVICE_SETTING = 'library.master_device';
 
 // ── composite entity ids ────────────────────────────────────────────────────
 // `track_tag` is keyed by recording + tag and `cue` by recording + slot + kind;
@@ -256,6 +269,46 @@ export const ZLibraryTrackSetFavourite = defineOp('library_track', 'set-favourit
 // state: no `state` cell means the schema default ('unsorted'), which every
 // device already gives a new row, so only a change away from it is an op.
 export const ZLibraryTrackSetState = defineOp('library_track', 'set-state', z.object({ state: z.enum(TRACK_STATES) }).strict());
+
+// Since v3. The base metadata ONE device holds for the recording — its own
+// row's catalogue columns as its source spelled them, before any override
+// (overrides stay their own fields and win on read everywhere) and before
+// any artist alias rule (`artists` are the source credits, so every device
+// maps them through the converged rules itself). What lets a device that
+// holds no row of the recording show it (the desktop's remote rows, the
+// phone).
+//
+// The reducer files it under `meta.<device_id>`: the envelope already names
+// the device and the server refuses an op whose device is not the pusher's
+// (`not_owner`), so the cell key cannot be spoofed and the payload does not
+// repeat it. Each device's cell is LWW on its own; which device's cell the
+// view shows is `resolveTrackMeta` (state.ts): the master's when it has one,
+// else the best source among the rest. `source` is where this device's row
+// came from (its local file, else its streaming link), kept for that
+// tie-break and for provenance.
+export const TRACK_META_SOURCES = ['local', 'spotify', 'tidal', 'other'] as const;
+export type TrackMetaSource = (typeof TRACK_META_SOURCES)[number];
+const ZCount = z.number().int().nonnegative();
+export const ZTrackMeta = z
+	.object({
+		source: z.enum(TRACK_META_SOURCES),
+		title: z.string(),
+		artists: z.array(ZTrackArtist),
+		album_title: z.string().nullable(),
+		duration_sec: ZCount.nullable(),
+		isrc: z.string().nullable(),
+		release_date: z.string().nullable(),
+		label: z.string().nullable(),
+		genre: z.string().nullable(),
+		// A remote image only: a local path or data: URL means nothing on
+		// another device.
+		cover_url: z.string().max(2048).regex(/^https?:\/\//i, { message: 'cover_url must be http(s)' }).nullable(),
+		track_number: ZCount.nullable().optional(),
+		disc_number: ZCount.nullable().optional(),
+	})
+	.strict();
+export type TrackMeta = z.infer<typeof ZTrackMeta>;
+export const ZLibraryTrackSetMeta = defineOp('library_track', 'set-meta', ZTrackMeta);
 
 // One override field per op so each is its own LWW field. `null` clears it.
 export const ZOverrideField = z.discriminatedUnion('field', [
@@ -496,6 +549,7 @@ export const OP_SCHEMAS = [
 	ZLibraryTrackSetRating,
 	ZLibraryTrackSetFavourite,
 	ZLibraryTrackSetState,
+	ZLibraryTrackSetMeta,
 	ZLibraryTrackSetOverride,
 	ZLibraryTrackSetRbAnalysis,
 	ZLibraryTrackDelete,
@@ -520,7 +574,7 @@ export const OP_SCHEMAS = [
 
 // zod 3 cannot nest a discriminated union on `kind` inside one on `entity`
 // (options must be plain objects), so the union is flat; `parseOp` below
-// looks the schema up by (entity, kind) instead of trying all 45, which is
+// looks the schema up by (entity, kind) instead of trying every one, which is
 // also what gives it a precise error.
 export const ZOp = z.union(OP_SCHEMAS);
 export type Op = z.infer<typeof ZOp>;
@@ -595,10 +649,19 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 	['library_track/set-state', 2],
 	['artist_alias/set', 2],
 	['artist_alias/remove', 2],
+	['library_track/set-meta', 3],
 ]);
 
-export function opSchemaVersion(op: { entity: string; kind: string }): number {
-	return KIND_SINCE.get(`${op.entity}/${op.kind}`) ?? 1;
+// Account setting keys added after v1. A `setting.set` is a v1 kind, but an
+// older client validates the key against its own allow-list and would stop
+// at one it does not know (invalid_payload) instead of holding it aside, so
+// the op carries the version that introduced its key.
+const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3]]);
+
+export function opSchemaVersion(op: { entity: string; kind: string; entity_id?: string }): number {
+	const kind = KIND_SINCE.get(`${op.entity}/${op.kind}`) ?? 1;
+	if (op.entity === 'setting' && op.entity_id !== undefined) return Math.max(kind, SETTING_KEY_SINCE.get(op.entity_id) ?? 1);
+	return kind;
 }
 
 const ZHead = z.object({ entity: z.string(), kind: z.string(), op_id: z.unknown() }).passthrough();

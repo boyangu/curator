@@ -211,7 +211,7 @@ function computeBoundaries(db: Db, col: string): Boundaries | null {
 		WITH ntiled AS (
 			SELECT ${sql.raw(col)} AS v, NTILE(5) OVER (ORDER BY ${sql.raw(col)}) AS bucket
 			FROM track
-			WHERE ${sql.raw(col)} IS NOT NULL
+			WHERE ${sql.raw(col)} IS NOT NULL AND deleted_at IS NULL
 		)
 		SELECT bucket, MIN(v) AS min_v, (SELECT COUNT(*) FROM ntiled) AS total
 		FROM ntiled
@@ -240,6 +240,6 @@ function computeBoundaries(db: Db, col: string): Boundaries | null {
 }
 
 function currentAnalyzedCount(db: Db, col: string): number {
-	const row = db.all(sql`SELECT COUNT(*) AS n FROM track WHERE ${sql.raw(col)} IS NOT NULL`) as { n: number }[];
+	const row = db.all(sql`SELECT COUNT(*) AS n FROM track WHERE ${sql.raw(col)} IS NOT NULL AND deleted_at IS NULL`) as { n: number }[];
 	return row[0]?.n ?? 0;
 }

@@ -114,5 +114,42 @@ export const UNLINK_CONFIRM: ConfirmText = {
 	danger: true,
 };
 
+// ── The account's union library (core AccountLibraryInfo) ───────────────
+
+// "N tracks in your account aren't on this device"; null when there are
+// none (the line is hidden).
+export function remoteOnlyLine(n: number): string | null {
+	if (n <= 0) return null;
+	return n === 1
+		? '1 track in your account isn’t on this device. It shows in your library, marked, but can’t be played or analysed here.'
+		: `${n.toLocaleString()} tracks in your account aren’t on this device. They show in your library, marked, but can’t be played or analysed here.`;
+}
+
+export const MASTER_HINT = 'The master device’s track details (title, artists, album, label) win on your other devices for every track it holds; the others only fill in tracks it doesn’t have.';
+
+export const MASTER_UNAVAILABLE = 'Your sync server doesn’t share track details yet, so there is no master device to choose. Update the server, then sync.';
+
+export type MasterChoice = { deviceId: string; label: string; selected: boolean };
+
+// The selector's options: the account's active devices, this computer
+// first. A master that is no longer among them (removed, or a device this
+// list hasn't seen) still shows, so the selector never silently claims a
+// different one; no master yet shows a placeholder.
+export function masterChoices(devices: readonly AccountDevice[], masterDeviceId: string | null): MasterChoice[] {
+	const active = deviceRows(devices).filter((d) => !d.revoked);
+	const out: MasterChoice[] = active.map((d) => ({
+		deviceId: d.deviceId,
+		label: d.current ? `${d.name} (this computer)` : d.name,
+		selected: d.deviceId === masterDeviceId,
+	}));
+	if (masterDeviceId === null) {
+		out.unshift({ deviceId: '', label: 'Not chosen yet', selected: true });
+	} else if (!out.some((c) => c.selected)) {
+		const gone = devices.find((d) => d.deviceId === masterDeviceId);
+		out.unshift({ deviceId: masterDeviceId, label: gone ? `${gone.name} (removed)` : 'A device not in this list', selected: true });
+	}
+	return out;
+}
+
 // Under the devices list: why removing a device is not the whole job.
 export const DEVICES_HINT = 'Removing a device stops its syncing at once. Its sign-in stays valid until it expires, so for a lost or stolen computer also sign out all other sessions; your own other computers then just sign in again.';

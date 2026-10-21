@@ -22,7 +22,8 @@
 //
 // Blockers (refused, DB untouched): both rows carry their own rekordbox_link
 // (two distinct rekordbox entries — resolve in rekordbox first), either row
-// is already soft-deleted, or keep === drop.
+// is already soft-deleted, either row is a remote row (not on this device),
+// or keep === drop.
 
 import { and, count, eq, sql } from 'drizzle-orm';
 import type Database from 'better-sqlite3';
@@ -143,6 +144,16 @@ export function planTrackMerge(db: Db, keepId: string, dropId: string): TrackMer
 	const drop = loadRow(db, dropId);
 	if (!keep || !drop) { plan.blockers.push('One of the tracks no longer exists'); return plan; }
 	if (keep.deletedAt || drop.deletedAt) { plan.blockers.push('One of the tracks is already deleted'); return plan; }
+	// A remote row (track.remoteOnly) is the op log's projection of another
+	// device's track, not a row this device owns: moving its tags/playlist
+	// rows here and soft-deleting it would fight the projection (the next
+	// apply re-derives it), and it has no file or link to bring across.
+	// Recording-level merges of remote rows go through the sync log
+	// (project.ts drops/absorbs them and never calls this with one).
+	if (keep.remoteOnly || drop.remoteOnly) {
+		plan.blockers.push('One of the tracks is not on this device — merge it on the device that holds it');
+		return plan;
+	}
 
 	const keepRb = db.select({ trackId: rekordboxLink.trackId }).from(rekordboxLink).where(eq(rekordboxLink.trackId, keepId)).get();
 	const dropRb = db.select({ trackId: rekordboxLink.trackId }).from(rekordboxLink).where(eq(rekordboxLink.trackId, dropId)).get();

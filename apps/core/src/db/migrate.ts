@@ -1003,6 +1003,65 @@ const ALTER_MIGRATIONS: string[] = [
 		op TEXT NOT NULL,
 		held_at INTEGER NOT NULL
 	)`,
+	// "Delete permanently" on a soft-deleted track — see track.purgedAt in
+	// schema.ts. Starts NULL everywhere: every existing tombstone is listed.
+	`ALTER TABLE track ADD COLUMN purged_at INTEGER`,
+	// Remote rows — see track.remoteOnly in schema.ts. Every existing row
+	// is this device's own (0).
+	`ALTER TABLE track ADD COLUMN remote_only INTEGER NOT NULL DEFAULT 0`,
+	`CREATE INDEX IF NOT EXISTS track_remote_only_idx ON track(remote_only) WHERE remote_only = 1`,
+	`ALTER TABLE track ADD COLUMN remote_source TEXT`,
+	// Base metadata sync — see trackMetaDirty / trackMetaSeen /
+	// trackDerivePending in schema.ts. The dirty set starts empty; the
+	// one-time backfill (sync-log/track-meta.ts TRACK_META_BACKFILL_KEY)
+	// queues every own row once the server reads protocol v3.
+	`CREATE TABLE IF NOT EXISTS track_meta_dirty (track_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS track_meta_seen (
+		track_id TEXT PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE,
+		recording_id TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		seen_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS track_derive_pending (track_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS track_remote_pending (recording_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	// Triggers rather than calls in the writers: a dozen paths write these
+	// columns (scanner, three streaming upserts, the rekordbox importer —
+	// which does not bump updated_at —, enrichers, the edit modal, merges,
+	// the artist seams), and a missed one would leave another device
+	// showing stale metadata forever. A dirty mark costs one indexed insert;
+	// the drain's digest decides whether anything is emitted. Only this
+	// device's own catalogue rows: never a remote row (its meta came from
+	// the op log) or a derived WAV copy (device-local).
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_insert AFTER INSERT ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.id); END`,
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_update AFTER UPDATE OF recording_id, title, artists, artists_base, album_title, duration, isrc,
+		release_date, label, genre, cover_url, track_number, disc_number, remote_only ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.id); END`,
+	// A row's source (local file vs streaming link) is part of its meta.
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_insert AFTER INSERT ON source_link
+		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.track_id); END`,
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_delete AFTER DELETE ON source_link
+		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (OLD.track_id); END`,
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_move AFTER UPDATE OF track_id ON source_link
+		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (OLD.track_id), (NEW.track_id); END`,
+	// A source arriving on a remote row makes it this device's own: an
+	// import or a scan bound to the recording (claim-bind.ts) attaches its
+	// link to the row the user already sees instead of minting a second.
+	// Only a source the device can play or holds (a file, a streaming
+	// link): an enrichment link (beatport, traxsource) is catalogue data, and
+	// must not make a row with nothing to play "on this device". The flip
+	// itself marks the row dirty (UPDATE OF remote_only above).
+	`CREATE TRIGGER IF NOT EXISTS track_remote_claimed_link AFTER INSERT ON source_link
+		WHEN NEW.source IN ('local', 'spotify', 'tidal') AND EXISTS (SELECT 1 FROM track WHERE id = NEW.track_id AND remote_only = 1)
+		BEGIN UPDATE track SET remote_only = 0 WHERE id = NEW.track_id; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_remote_claimed_link_move AFTER UPDATE OF track_id ON source_link
+		WHEN NEW.source IN ('local', 'spotify', 'tidal') AND EXISTS (SELECT 1 FROM track WHERE id = NEW.track_id AND remote_only = 1)
+		BEGIN UPDATE track SET remote_only = 0 WHERE id = NEW.track_id; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_remote_claimed_rb AFTER INSERT ON rekordbox_link
+		WHEN EXISTS (SELECT 1 FROM track WHERE id = NEW.track_id AND remote_only = 1)
+		BEGIN UPDATE track SET remote_only = 0 WHERE id = NEW.track_id; END`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.
@@ -1221,6 +1280,14 @@ function normalizeIsrcColumns(sqlite: Database.Database, dbPath: string): void {
 // HARD-deletes duplicates. The copy is minted with isrc = NULL, so this guard
 // only matters if something later writes an ISRC onto it.
 //
+// Remote rows (remote_only = 1) are excluded as well: a remote row is the
+// op log's projection of another device's track, not a library row this
+// device owns. Grouped with an own row of the same ISRC it would either be
+// hard-deleted (its playlist rows, tags and cues are projections the next
+// apply re-derives, so the "merge" would silently fight the log) or, being
+// older, survive and pull the own row's file links onto itself. Recording
+// identity across devices is the resolver's job (sync-log/identity.ts).
+//
 // Grouping by the raw column value is correct only because the column holds
 // exactly one spelling per ISRC: normalizeIsrcColumns ran before this on the
 // first boot after it shipped, and every write path since goes through
@@ -1229,7 +1296,7 @@ function normalizeIsrcColumns(sqlite: Database.Database, dbPath: string): void {
 function dedupeTracksByIsrc(sqlite: Database.Database): void {
 	const dupGroups = sqlite.prepare(`
 		SELECT isrc FROM track
-		WHERE isrc IS NOT NULL AND isrc != '' AND deleted_at IS NULL AND derived_from_track_id IS NULL
+		WHERE isrc IS NOT NULL AND isrc != '' AND deleted_at IS NULL AND derived_from_track_id IS NULL AND remote_only = 0
 		GROUP BY isrc HAVING COUNT(*) > 1
 	`).all() as { isrc: string }[];
 
@@ -1254,7 +1321,7 @@ function dedupeTracksByIsrc(sqlite: Database.Database): void {
 	const tx = sqlite.transaction(() => {
 		for (const { isrc } of dupGroups) {
 			const group = sqlite.prepare(`
-				SELECT id, duration FROM track WHERE isrc = ? AND deleted_at IS NULL AND derived_from_track_id IS NULL ORDER BY created_at ASC, id ASC
+				SELECT id, duration FROM track WHERE isrc = ? AND deleted_at IS NULL AND derived_from_track_id IS NULL AND remote_only = 0 ORDER BY created_at ASC, id ASC
 			`).all(isrc) as { id: string; duration: number | null }[];
 			if (group.length < 2) continue;
 			const survivor = group[0]!.id;
@@ -2182,13 +2249,18 @@ function backfillMembershipBaseline(sqlite: Database.Database): void {
 	if (already) return;
 	// rb playlists only: playlist.id is `rb_<rbPlaylistId>`; strip the prefix
 	// to the raw rb id the baseline is keyed on. Skip smart playlists (no
-	// stored membership).
+	// stored membership). Skip remote rows (track.remote_only): the baseline
+	// is what THIS device's rekordbox holds, and a member projected from
+	// another device's playlist has no entry here (nor can it get one — it
+	// has no file); a curator-kind row for it would dangle once the remote
+	// row is dropped or absorbed (sync-log/remote-rows.ts).
 	const rows = sqlite
 		.prepare(
 			`SELECT pt.playlist_id AS playlistId, pt.track_id AS trackId, pt.position AS position,
 			        rl.rb_content_id AS rbContentId
 			   FROM playlist_track pt
 			   JOIN playlist p ON p.id = pt.playlist_id
+			   JOIN track t ON t.id = pt.track_id AND t.remote_only = 0
 			   LEFT JOIN rekordbox_link rl ON rl.track_id = pt.track_id
 			  WHERE p.source = 'rekordbox' AND p.is_smart = 0`,
 		)

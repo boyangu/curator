@@ -53,6 +53,8 @@ export function buildAppRouter(h: Handlers) {
 			delete: proc('tracks:delete'),
 			removeSources: proc('tracks:remove-sources'),
 			undelete: proc('tracks:undelete'),
+			listDeleted: proc('tracks:list-deleted'),
+			purgeDeleted: proc('tracks:purge-deleted'),
 		}),
 		wav: t.router({
 			getSettings: proc('wav:get-settings'),
@@ -185,6 +187,7 @@ export function buildAppRouter(h: Handlers) {
 			devices: proc('account:devices'),
 			revokeDevice: proc('account:revoke-device'),
 			signOutOthers: proc('account:sign-out-others'),
+			setMasterDevice: proc('account:set-master-device'),
 		}),
 		cloudSync: t.router({
 			status: proc('cloud-sync:status'),
