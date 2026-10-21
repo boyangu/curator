@@ -59,6 +59,21 @@ describe('track context menu', () => {
 	});
 });
 
+describe('claim-derived links (Track.claimSources: known from the account, not linked here)', () => {
+	const ctx = (tracks: Track[], source = 'rekordbox'): TrackCommandContext => ({ tracks, view: 'tracks', source: source as never, tagIds: new Set(), drillPlaylists: [] });
+
+	it('open / copy / search follow them; download stays with the row’s own sources', () => {
+		const t = track(['local'], { id: 'd1', claimSources: ['spotify', 'tidal', 'beatport'] } as Partial<Track>);
+		for (const id of ['open-spotify', 'copy-spotify-url', 'open-tidal', 'open-beatport']) expect(trackCommandAvailable(id, ctx([t])), id).toBe(true);
+		for (const id of ['search-spotify', 'search-tidal', 'search-beatport']) expect(trackCommandAvailable(id, ctx([t])), id).toBe(false);
+		// A derived Tidal id is not a Tidal copy this device can download.
+		expect(trackCommandAvailable('download', ctx([t], 'tidal'))).toBe(false);
+		// On a remote row the same reads are open (they write nothing).
+		const remote = track([], { id: 'd2', remoteOnly: true, claimSources: ['spotify'] } as Partial<Track>);
+		expect(trackCommandAvailable('open-spotify', ctx([remote]))).toBe(true);
+	});
+});
+
 describe('remote rows (not on this device)', () => {
 	const remote = track([], { id: 'r1', remoteOnly: true, remoteSource: 'local' } as Partial<Track>);
 	const local = track(['local'], { id: 'l1' } as Partial<Track>);

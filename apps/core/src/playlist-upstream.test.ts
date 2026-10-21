@@ -20,7 +20,7 @@ import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
 import { migrate } from './db/migrate.js';
 import { memberOrder } from './test-support/playlist-track.js';
-import { createCoreService, type CoreService } from './service.js';
+import { isProviderTrackId, createCoreService, type CoreService } from './service.js';
 import type { StreamingSourceAdapter, RemoteTrackRef } from './sources/adapter.js';
 
 let dir: string;
@@ -228,5 +228,40 @@ describe('pushPlaylistLocalOnly', () => {
 		seedRow('p1', 't1', 0, 'sp1');
 		remote = ['sp1'];
 		await expect(svc.pushPlaylistLocalOnly('p1')).resolves.toEqual({ pushed: 0, snapshotId: null });
+	});
+});
+
+describe('reorder upstream refuses rows without a provider id', () => {
+	// A row projected from another device stores the Curator track id (or
+	// nothing) as its source_track_id. Sent upstream, a full replace would
+	// drop that track from the real playlist and positional moves would be
+	// computed against positions the provider does not have (2026-10-21).
+	it('validates provider ids', () => {
+		expect(isProviderTrackId('spotify', '4uLU6hMCjMI75M1A2tKUQC')).toBe(true);
+		expect(isProviderTrackId('spotify', 'b9e2c6d4-1111-4a2b-8c3d-000000000001')).toBe(false);
+		expect(isProviderTrackId('spotify', null)).toBe(false);
+		expect(isProviderTrackId('tidal', '123456789')).toBe(true);
+		expect(isProviderTrackId('tidal', '4uLU6hMCjMI75M1A2tKUQC')).toBe(false);
+	});
+
+	it('keeps the local order, calls nothing upstream, and records why', async () => {
+		await svc.setSourceSyncSettings('spotify', { readSyncAuto: true, readIntervalMin: 15, writeSyncAuto: true });
+		const reorder = vi.fn(async () => ({ snapshotId: 's' }));
+		const replace = vi.fn(async () => ({ snapshotId: 's' }));
+		fake.reorderTracks = reorder;
+		fake.replaceTracks = replace;
+		seedPlaylist('pl');
+		seedTrack('a', ['AAAAAAAAAAAAAAAAAAAAAA']);
+		seedTrack('b', []);
+		seedTrack('c', ['CCCCCCCCCCCCCCCCCCCCCC']);
+		seedRow('pl', 'a', 0, 'AAAAAAAAAAAAAAAAAAAAAA');
+		seedRow('pl', 'b', 1, 'b'); // projected: the Curator track id
+		seedRow('pl', 'c', 2, 'CCCCCCCCCCCCCCCCCCCCCC');
+		await svc.reorderPlaylistTracks('pl', [2, 1, 0]);
+		expect(rows('pl').map((r) => r.track_id)).toEqual(['c', 'b', 'a']);
+		expect(reorder).not.toHaveBeenCalled();
+		expect(replace).not.toHaveBeenCalled();
+		const acks = (sqlite.prepare(`SELECT payload FROM sync_outbox WHERE entity = 'upstream'`).all() as Array<{ payload: string }>).map((r) => JSON.parse(r.payload) as { status: string; error?: string });
+		expect(acks.some((a) => a.status === 'failed' && /no spotify id on this computer/.test(a.error ?? ''))).toBe(true);
 	});
 });

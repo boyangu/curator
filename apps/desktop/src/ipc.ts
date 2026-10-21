@@ -83,7 +83,7 @@ export interface IpcChannels {
 	'enrich:beatport:track': { args: [trackId: string]; ret: { enriched: number; scanned: number } };
 	'enrich:beatport:tracks': { args: [trackIds: string[]]; ret: { enriched: number; scanned: number } };
 	'tidal:match-tracks': { args: [trackIds: string[]]; ret: { matched: number; scanned: number } };
-	'tracks:source-links': { args: [trackId: string]; ret: { source: string; sourceTrackId: string; url: string | null }[] };
+	'tracks:source-links': { args: [trackId: string]; ret: { source: string; sourceTrackId: string; url: string | null; derived?: boolean }[] };
 	'tracks:set-overrides': {
 		args: [trackId: string, patch: Partial<Record<keyof TrackOverrides, TrackOverrides[keyof TrackOverrides] | null>>];
 		ret: Track | null;
@@ -699,7 +699,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'enrich:beatport:track': { description: 'Enrich a single track with Beatport metadata.' },
 	'enrich:beatport:tracks': { description: 'Enrich multiple tracks (by ids) with Beatport metadata.' },
 	'tidal:match-tracks': { description: 'Run the Tidal matcher against a set of tracks — attaches tidal source_links where a confident match is found.' },
-	'tracks:source-links': { description: 'List the source_link rows attached to a track (one per provider).' },
+	'tracks:source-links': { description: 'List the source_link rows attached to a track (one per provider), then — derived: true — provider ids known only from the account’s recording claims (another device linked them) for providers the track has no own link for. Derived ids are display / Open-in only; nothing that writes upstream reads them.' },
 	'tracks:set-overrides': { description: 'Set user overrides on a track. Pass null for a field to revert that override; omit a field to leave it unchanged.' },
 	'tracks:set-source-links': { description: 'Set/clear per-source URLs on a track. Refetches metadata for any URL that changed. A provider id already bound to another live track comes back as errors[] with code=already-linked + conflictTrackId (nothing written for that provider).' },
 	'tracks:merge-preview': { description: 'Read-only dry run of merging two library tracks: per-side summary (tags/playlists/cues/links/weight), the suggested survivor, and a plan per direction with blockers + warnings.' },

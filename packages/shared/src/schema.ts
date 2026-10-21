@@ -1557,6 +1557,70 @@ export const trackRemotePending = sqliteTable('track_remote_pending', {
 	recordingId: text('recording_id').primaryKey(),
 });
 
+// ─── CLAIM LINKS (device-local, derived) ─────────────────────────────────────
+// Provider ids this device knows for a row only because the account's
+// recording claims say so (`recording_claim` spotify / tidal / beatport —
+// another device ingested or matched them), never because this device
+// ingested them (apps/core/src/sync-log/claim-links.ts). source_link is
+// device-local, so without these a second desktop shows empty Spotify /
+// Tidal / Beatport URLs for every track whose link another device made.
+//
+// A table of their own, deliberately NOT source_link rows with a marker:
+// every source_link reader is an "this device holds it" reader — the
+// upstream pushes and removals (deleteTracks, removeTrackSources, playlist
+// add/remove, pushPlaylistLocalOnly), the remote-row → own-row triggers,
+// membership, the identity resolver's own-row counts, the initial push and
+// the claims backfill, the UNIQUE(source, source_track_id) ingest guard.
+// Kept apart, a derived id can reach none of them by construction; the few
+// readers that may use one (display, Open-in, the hybrid matcher's
+// "already matched") opt in by reading this table.
+//
+// One row per (row, provider) at most: the recording's best claim of that
+// kind (highest confidence, then latest). Never where the row has its own
+// source_link for the provider — an own link always wins (migrate.ts
+// trigger deletes the derived one when it lands).
+export const claimLink = sqliteTable(
+	'claim_link',
+	{
+		trackId: text('track_id')
+			.notNull()
+			.references(() => track.id, { onDelete: 'cascade' }),
+		source: text('source', { enum: SOURCES }).notNull(),
+		sourceTrackId: text('source_track_id').notNull(),
+		// The recording the claim was read from — the row's at derivation
+		// time; a rebind (merge) re-derives.
+		recordingId: text('recording_id').notNull(),
+	},
+	(t) => ({
+		pk: primaryKey({ columns: [t.trackId, t.source] }),
+		recordingIdx: index('claim_link_recording_idx').on(t.recordingId),
+	})
+);
+
+// Recordings whose claim links are to be (re)derived: queued by triggers on
+// track (a row appears or is rebound) and source_link (an own link goes),
+// and by the projection for every recording whose claims a batch changed;
+// drained in slices by the sync client (or inline for a handful).
+export const claimLinkPending = sqliteTable('claim_link_pending', {
+	recordingId: text('recording_id').primaryKey(),
+});
+
+// Provider ids this device dropped from a row on purpose (an own link
+// deleted or replaced: the Edit screen's ×, Delete-from-Spotify, a merge's
+// duplicate): never derived back onto that row. Claims are append-only, so
+// without this a link the user removed would return as a derived one.
+export const claimLinkVeto = sqliteTable(
+	'claim_link_veto',
+	{
+		trackId: text('track_id').notNull(),
+		source: text('source', { enum: SOURCES }).notNull(),
+		sourceTrackId: text('source_track_id').notNull(),
+	},
+	(t) => ({
+		pk: primaryKey({ columns: [t.trackId, t.source, t.sourceTrackId] }),
+	})
+);
+
 // Drizzle-inferred row types
 // The DB row, plus optional aggregated fields that some read paths attach:
 //   - `sources` — filled by getTracks via batched source_link + rekordbox_link
@@ -1567,6 +1631,11 @@ export const trackRemotePending = sqliteTable('track_remote_pending', {
 //     cutoff store. Null when the raw metric is null (track not analyzed).
 export type Track = typeof track.$inferSelect & {
 	sources?: string[];
+	// Providers this row has only a claim-derived id for (claim_link: known
+	// from the account, not ingested here) — display only. Never part of
+	// `sources`, which means "this device holds it there" to every command
+	// that pushes upstream, downloads or filters by source.
+	claimSources?: string[];
 	// Curator artist ids aligned index-for-index with `artists` (the
 	// effective list). Attached by decorateTracks from track_artist; absent
 	// on read paths that don't decorate. Drives the artist chips' click →

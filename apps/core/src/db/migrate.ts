@@ -1062,6 +1062,82 @@ const ALTER_MIGRATIONS: string[] = [
 	`CREATE TRIGGER IF NOT EXISTS track_remote_claimed_rb AFTER INSERT ON rekordbox_link
 		WHEN EXISTS (SELECT 1 FROM track WHERE id = NEW.track_id AND remote_only = 1)
 		BEGIN UPDATE track SET remote_only = 0 WHERE id = NEW.track_id; END`,
+	// Claim links — see claimLink / claimLinkPending / claimLinkVeto in
+	// schema.ts. All start empty; the one-time sweep
+	// (sync-log/claim-links.ts CLAIM_LINKS_SWEEP_KEY) derives every existing
+	// row's. None of the triggers above reads claim_link: a derived id never
+	// turns a remote row into an own row, nor marks meta dirty.
+	`CREATE TABLE IF NOT EXISTS claim_link (
+		track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		source TEXT NOT NULL,
+		source_track_id TEXT NOT NULL,
+		recording_id TEXT NOT NULL,
+		PRIMARY KEY (track_id, source)
+	) WITHOUT ROWID`,
+	`CREATE INDEX IF NOT EXISTS claim_link_recording_idx ON claim_link(recording_id)`,
+	`CREATE TABLE IF NOT EXISTS claim_link_pending (recording_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	// No foreign key: rows are written from source_link's delete trigger,
+	// which also fires inside a track's cascade; the track trigger below
+	// clears them instead.
+	`CREATE TABLE IF NOT EXISTS claim_link_veto (
+		track_id TEXT NOT NULL,
+		source TEXT NOT NULL,
+		source_track_id TEXT NOT NULL,
+		PRIMARY KEY (track_id, source, source_track_id)
+	) WITHOUT ROWID`,
+	// Triggers, as for track_meta_dirty: rows appear and rebind through a
+	// dozen writers (scanner, three streaming upserts, claim binds, remote
+	// rows, merges), and a missed one would leave a row without the links
+	// the account knows. Each queues only a recording that has records to
+	// derive from (one indexed probe), so a device that never signed in
+	// queues nothing. A derived WAV copy is device-local and gets none.
+	`CREATE TRIGGER IF NOT EXISTS claim_link_track_insert AFTER INSERT ON track
+		WHEN NEW.derived_from_track_id IS NULL
+			AND EXISTS (SELECT 1 FROM sync_state WHERE recording_id = NEW.recording_id AND +map = 'claims')
+		BEGIN INSERT OR IGNORE INTO claim_link_pending (recording_id) VALUES (NEW.recording_id); END`,
+	`CREATE TRIGGER IF NOT EXISTS claim_link_track_rebind AFTER UPDATE OF recording_id ON track
+		WHEN NEW.recording_id IS NOT OLD.recording_id
+		BEGIN
+			DELETE FROM claim_link WHERE track_id = NEW.id;
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT NEW.recording_id WHERE NEW.derived_from_track_id IS NULL
+					AND EXISTS (SELECT 1 FROM sync_state WHERE recording_id = NEW.recording_id AND +map = 'claims');
+		END`,
+	`CREATE TRIGGER IF NOT EXISTS claim_link_track_delete AFTER DELETE ON track
+		BEGIN
+			DELETE FROM claim_link WHERE track_id = OLD.id;
+			DELETE FROM claim_link_veto WHERE track_id = OLD.id;
+		END`,
+	// An own link always wins: it replaces the derived one for its provider
+	// in the ingest's own statement. Re-adding an id the device once dropped
+	// lifts its veto.
+	`CREATE TRIGGER IF NOT EXISTS claim_link_own_insert AFTER INSERT ON source_link
+		WHEN NEW.source IN ('spotify', 'tidal', 'beatport')
+		BEGIN
+			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source;
+			DELETE FROM claim_link_veto WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+		END`,
+	`CREATE TRIGGER IF NOT EXISTS claim_link_own_update AFTER UPDATE OF track_id, source, source_track_id ON source_link
+		WHEN NEW.source IN ('spotify', 'tidal', 'beatport')
+		BEGIN
+			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source;
+			DELETE FROM claim_link_veto WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+			INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id)
+				SELECT OLD.track_id, OLD.source, OLD.source_track_id
+				WHERE OLD.source IN ('spotify', 'tidal', 'beatport')
+					AND (OLD.track_id IS NOT NEW.track_id OR OLD.source IS NOT NEW.source OR OLD.source_track_id IS NOT NEW.source_track_id)
+					AND EXISTS (SELECT 1 FROM track WHERE id = OLD.track_id);
+		END`,
+	// An own link dropped on purpose stays dropped (veto), and the row may
+	// now take another claim's id for that provider (re-derive).
+	`CREATE TRIGGER IF NOT EXISTS claim_link_own_delete AFTER DELETE ON source_link
+		WHEN OLD.source IN ('spotify', 'tidal', 'beatport') AND EXISTS (SELECT 1 FROM track WHERE id = OLD.track_id)
+		BEGIN
+			INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id) VALUES (OLD.track_id, OLD.source, OLD.source_track_id);
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT t.recording_id FROM track t WHERE t.id = OLD.track_id AND t.derived_from_track_id IS NULL
+					AND EXISTS (SELECT 1 FROM sync_state s WHERE s.recording_id = t.recording_id AND +s.map = 'claims');
+		END`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

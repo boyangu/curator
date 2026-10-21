@@ -50,6 +50,7 @@ import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import { syncTrackAlbumsRaw } from '../library/albums.js';
 import { log } from '../log.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot, type RbSlotPatch } from '../rekordbox/rb-slot.js';
+import { claimLinkPendingAtMost, drainClaimLinksRaw, INLINE_CLAIM_LINK_RECORDINGS, queueClaimLinks } from './claim-links.js';
 import { adoptRefs, derivePendingCount, drainTrackDerivations, dropRemoteRow, INLINE_CREATE_ROWS, INLINE_DERIVE_ROWS, materializeRemoteRows, requestRematerialize } from './remote-rows.js';
 import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
@@ -168,6 +169,13 @@ export function project(
 	}
 	for (const p of remoteDropped) playlistsTouched.add(p);
 	for (const r of adoptRefs(raw, [...adopted])) add(r.entity, r.id);
+	// Claim links (claim-links.ts) follow the claims: the loser's rows keep
+	// none (its claims moved), the winner's rows may gain them. A rebound
+	// row is queued by its trigger; the soft-deleted loser rows are not.
+	queueClaimLinks(raw, ids('recording'));
+	queueClaimLinks(raw, ids('recording').map((id) => state.recordingAlias.get(id)).filter((r): r is string => !!r));
+	// A recording whose claims this batch changed.
+	queueClaimLinks(raw, ids('recording_claim'));
 
 	// ── 1b. artist alias rules: the artist table follows the resolved map ─
 	// Diffed against the map as it stood before this batch, so a rule whose
@@ -520,6 +528,13 @@ export function project(
 	// rekordbox exporter's incremental sweep carries it.
 	const bump = raw.prepare(`UPDATE track SET updated_at = ? WHERE id = ?`);
 	for (const t of tracksTouched) bump.run(now, t);
+	// Claim links for a handful of recordings inline, the rest left to the
+	// client's yielding drain. After the bump on purpose: a derived link is
+	// display data, not a change the rekordbox exporter should carry — the
+	// rows are only named so the renderer refreshes them.
+	if (claimLinkPendingAtMost(raw, INLINE_CLAIM_LINK_RECORDINGS)) {
+		for (const t of drainClaimLinksRaw(raw, INLINE_CLAIM_LINK_RECORDINGS).tracks) tracksTouched.add(t);
+	}
 
 	summary.tracksTouched = [...tracksTouched];
 	summary.playlistsTouched = [...playlistsTouched];

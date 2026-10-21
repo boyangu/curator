@@ -18,6 +18,7 @@ import { track, sourceLink, SOURCES } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
 import { normalizeIsrc } from '@curator/library-logic';
 import type { Db } from '../../db/client.js';
+import { addClaims } from '../../library/mutators.js';
 import type { DjMetadataPatch, EnrichmentResult } from '../contract.js';
 
 export class LibrarySink {
@@ -108,6 +109,12 @@ export class LibrarySink {
 						fetchedAt: new Date(),
 					})
 					.run();
+				// A Beatport match is the account's claim for the row's
+				// recording, so the other devices show the link (and their bulk
+				// enrichment skips it) without crawling again
+				// (sync-log/claim-links.ts). Fuzzy by nature (0.7); identity
+				// never merges on beatport claims. Traxsource has no claim kind.
+				if (source === 'beatport') addClaims(this.db, trackId, [{ kind: 'beatport', value: link.sourceTrackId, confidence: 0.7 }]);
 			}
 		}
 

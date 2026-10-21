@@ -56,6 +56,11 @@ export interface TrackEditModalHandle {
 	// element to read/write, so the caller goes through these.
 	setArtists(list: TrackArtist[]): void;
 	getArtists(): TrackArtist[];
+	// URL fields (spotifyUrl / tidalUrl / beatportUrl) whose value is a
+	// claim-derived id — known from the account, not linked on this device
+	// (core sync-log/claim-links.ts). They render muted with a note; typing
+	// in one makes it an ordinary field again.
+	setDerivedUrls(names: readonly string[]): void;
 }
 
 interface FieldDef {
@@ -76,6 +81,8 @@ const META_FIELDS: FieldDef[] = [
 	{ name: 'bpm',     label: 'BPM', type: 'number', min: '0', step: '1' },
 	{ name: 'key',     label: 'Key', placeholder: 'e.g. Am or 8A' },
 ];
+
+const DERIVED_TITLE = 'Known from your account: another of your devices linked this track. Edit it to set this device’s own link; × hides it here.';
 
 const URL_FIELDS: FieldDef[] = [
 	{ name: 'spotifyUrl',  label: 'Spotify',  placeholder: 'https://open.spotify.com/track/…' },
@@ -114,6 +121,13 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 	registerModalOpenSignal(isOpen);
 	const [fieldOptions, setFieldOptions] = createSignal<{ genres: string[]; labels: string[] }>({ genres: [], labels: [] });
 	const [artists, setArtists] = createSignal<TrackArtist[]>([]);
+	const [derivedUrls, setDerivedUrls] = createSignal<ReadonlySet<string>>(new Set());
+	const undoDerived = (name: string): void => {
+		if (!derivedUrls().has(name)) return;
+		const next = new Set(derivedUrls());
+		next.delete(name);
+		setDerivedUrls(next);
+	};
 	let formRef: HTMLFormElement | null = null;
 
 	const open = (): void => { setIsOpen(true); };
@@ -172,14 +186,20 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 					list={DATALIST_ID[f.name]}
 					placeholder={f.placeholder}
 					onKeyDown={onFieldKeyDown}
+					classList={{ 'field__input--derived': derivedUrls().has(f.name) }}
+					title={derivedUrls().has(f.name) ? DERIVED_TITLE : undefined}
+					onInput={() => undoDerived(f.name)}
 				/>}
 			<button
 				type="button"
 				class="field__reset"
 				title="Reset to canonical / remove link"
 				aria-label={`Reset ${f.label}`}
-				onClick={(e) => { e.preventDefault(); void props.onResetField(f.name); }}
+				onClick={(e) => { e.preventDefault(); undoDerived(f.name); void props.onResetField(f.name); }}
 			>×</button>
+			<Show when={derivedUrls().has(f.name)}>
+				<small class="field__note">From your account — linked on another device</small>
+			</Show>
 		</label>
 	);
 
@@ -241,5 +261,6 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 		setFieldOptions,
 		setArtists: (list) => setArtists(list.map((a) => (a.role ? { name: a.name, role: a.role } : { name: a.name }))),
 		getArtists: () => artists(),
+		setDerivedUrls: (names) => setDerivedUrls(new Set(names)),
 	};
 }

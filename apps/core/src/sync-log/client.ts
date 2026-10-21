@@ -83,6 +83,7 @@ import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll
 import { remintDeviceForDetach } from './remint.js';
 import { derivePendingCount, drainTrackDerivationsAsync, materializeSwept, remotePendingCount } from './remote-rows.js';
 import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
+import { claimLinkPendingCount, claimLinksSwept, drainClaimLinksAsync, sweepClaimLinksAsync } from './claim-links.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
 import {
 	defaultMasterDevice, drainTrackMetaAsync, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
@@ -1006,6 +1007,20 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			const d = await drainTrackDerivationsAsync(raw);
 			for (const t of d.tracks) tracks.add(t);
 			if (d.tracks.length > 0) slog.info('remote rows: artists and albums derived', { rows: d.tracks.length, chunks: d.chunks, maxSliceMs: Math.round(d.maxSliceMs) });
+		}
+		// Provider links from the account's claims (claim-links.ts), after
+		// the rows above exist: once over every row, then whatever the
+		// triggers and projections queued. Display data only — they emit
+		// nothing and no upstream write reads them.
+		if (!claimLinksSwept(raw) && firstPullDone(raw) && recordsComplete(raw)) {
+			const r = await sweepClaimLinksAsync(raw);
+			for (const t of r.tracks) tracks.add(t);
+			slog.info('claim links: sweep done', { recordings: r.recordings, rows: r.tracks.length, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+		}
+		if (claimLinkPendingCount(raw) > 0) {
+			const r = await drainClaimLinksAsync(raw);
+			for (const t of r.tracks) tracks.add(t);
+			if (r.tracks.length > 0) slog.info('claim links: derived', { recordings: r.recordings, rows: r.tracks.length, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
 		}
 		emitApplied(tracks, playlists, []);
 	};

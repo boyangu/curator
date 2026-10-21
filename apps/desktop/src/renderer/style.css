@@ -1389,6 +1389,12 @@ td.added, td.rel { color: var(--fg-1); font-size: 12px; }
 .src-marks i[data-src="beatport"]  { background: var(--src-beatport); }
 .src-marks i[data-src="rekordbox"] { background: var(--src-rekordbox); }
 .trk.row-analyzing .src-marks i[data-src="local"] { animation: pulse 1.4s ease-in-out infinite; }
+/* Claim-derived provider (Track.claimSources): known from the account, not
+   linked on this device — hollow, in the source's colour. */
+.src-pip.src-pip--derived, .src-marks i.src-derived { background: transparent; box-shadow: inset 0 0 0 1px var(--derived-c, var(--fg-3)); }
+.src-pip--derived[data-src="spotify"], .src-marks i.src-derived[data-src="spotify"]   { --derived-c: var(--src-spotify); }
+.src-pip--derived[data-src="tidal"], .src-marks i.src-derived[data-src="tidal"]       { --derived-c: var(--src-tidal); }
+.src-pip--derived[data-src="beatport"], .src-marks i.src-derived[data-src="beatport"] { --derived-c: var(--src-beatport); }
 /* Remote row ("not on this device", track.remoteOnly): one hollow mark in the
    SRC slot, outlined in the colour of how the holding device has it, and a
    dimmed cover — the row still rates/tags/organises, it just can't play here. */
@@ -3432,6 +3438,10 @@ body[data-view="discover"] .app {
 }
 .field__reset:hover { color: var(--fg); background: var(--bg-2); border-color: var(--line); }
 .field__reset:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* A claim-derived URL (TrackEditModal setDerivedUrls): another device's
+   link, shown muted with a note under the input. */
+.field > input.field__input--derived { color: var(--fg-3); border-style: dashed; }
+.field__note { grid-column: 2; margin-top: -8px; font-size: 11px; color: var(--fg-3); }
 .field-sep { height: 1px; background: var(--line); margin: 8px 0 4px; }
 /* Artists token field (components/ArtistTokenField.tsx) — sits in the
    .field grid's input slot and mimics the input's frame. */

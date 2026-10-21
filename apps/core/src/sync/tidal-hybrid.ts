@@ -14,13 +14,14 @@ import { and, asc, desc, eq, isNull, or } from 'drizzle-orm';
 import { sortColumn } from './sort.js';
 import type { ZTrackSortT } from '@curator/shared';
 import { randomUUID } from 'node:crypto';
-import { track, sourceLink, playlistTrack, playlist } from '@curator/shared/schema';
+import { track, sourceLink, playlistTrack, playlist, claimLink } from '@curator/shared/schema';
 import { TidalApiClient, type TidalTrackV2 } from '@curator/tidal';
 import { sharedScorer } from '@curator/matcher';
 import { config } from '../config.js';
 import type { Db } from '../db/client.js';
 import type { AuthService } from '../auth/service.js';
 import type { ProgressFn } from './spotify.js';
+import { addClaims } from '../library/mutators.js';
 import { log } from '../log.js';
 
 const hlog = log.for('tidal-hybrid');
@@ -59,6 +60,27 @@ export class TidalHybrid {
 		if (existing) {
 			hlog.debug('already linked', { tidalId: existing.id });
 			return { tidalId: existing.id };
+		}
+		// Another device of the account already matched (or ingested) this
+		// recording on Tidal: its claim is a derived link here
+		// (sync-log/claim-links.ts). That is a match — no search crawl — but
+		// it stays derived: writing it as an own source_link would make this
+		// device claim a Tidal copy it never verified, and adopt a remote row.
+		const derived = this.db
+			.select({ id: claimLink.sourceTrackId })
+			.from(claimLink)
+			.where(and(eq(claimLink.trackId, trackId), eq(claimLink.source, 'tidal')))
+			.get();
+		if (derived) {
+			hlog.debug('already matched by the account', { tidalId: derived.id });
+			return { tidalId: derived.id };
+		}
+		// A remote row (not on this device) is matched by the device that
+		// holds it; a link here would adopt it as this device's own (the
+		// migrate.ts trigger) on a title search.
+		if (t.remoteOnly) {
+			hlog.debug('remote row: not matched here', { trackId });
+			return null;
 		}
 
 		const c = client ?? (await this.buildClient());
@@ -113,6 +135,13 @@ export class TidalHybrid {
 				fetchedAt: new Date(),
 			})
 			.run();
+		// The match is the account's claim for the row's recording, so the
+		// other devices show the link without searching again
+		// (claim-links.ts). An ISRC hit is a provider's judgement (0.9, the
+		// ISRC-bind confidence), a title + duration pick a content one (0.7):
+		// neither anchors an identity merge on its own (identity.ts).
+		const byIsrc = !!t.isrc && !!pick.isrc && pick.isrc.toUpperCase() === t.isrc.toUpperCase();
+		addClaims(this.db, t.id, [{ kind: 'tidal', value: String(pick.id), confidence: byIsrc ? 0.9 : 0.7 }]);
 
 		return { tidalId: pick.id };
 	}
@@ -201,7 +230,19 @@ export class TidalHybrid {
 				sourceLink,
 				and(eq(sourceLink.trackId, track.id), eq(sourceLink.source, 'tidal'))
 			)
-			.where(and(eq(playlistTrack.playlistId, playlistId), or(isNull(sourceLink.id))))
+			// Already matched by another device of the account (a derived
+			// link, claim-links.ts): skipped, like an own link — no re-crawl.
+			.leftJoin(
+				claimLink,
+				and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'tidal'))
+			)
+			.where(and(
+				eq(playlistTrack.playlistId, playlistId),
+				or(isNull(sourceLink.id)),
+				isNull(claimLink.trackId),
+				// Remote rows (not on this device): matchOne refuses them.
+				eq(track.remoteOnly, false),
+			))
 			.orderBy(orderBy)
 			.all();
 

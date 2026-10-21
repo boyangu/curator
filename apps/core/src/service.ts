@@ -67,6 +67,7 @@ import * as mut from './library/mutators.js';
 import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
 import { remoteRowCount, requestRematerialize } from './sync-log/remote-rows.js';
+import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
@@ -220,6 +221,16 @@ export type TrackPlaylistEntry = {
 import { CancelToken } from './sync/cancellation.js';
 import { sortColumn as sharedSortColumn, indexSortColumn } from './sync/sort.js';
 import { applyOverrides, computePositionalMoves, normalizeIsrc } from '@curator/library-logic';
+
+// A provider's own track id, as the upstream API takes it: Spotify's 22-char
+// base62 id, Tidal's numeric id. Anything else on a streaming playlist row
+// (a Curator track id projected from another device, null) must never be
+// sent upstream. Measured on the live library 2026-10-21: every Spotify row
+// is 22-char base62 and every Tidal row numeric, except 13 projected rows.
+export function isProviderTrackId(source: 'spotify' | 'tidal', id: string | null | undefined): id is string {
+	if (!id) return false;
+	return source === 'spotify' ? /^[0-9A-Za-z]{22}$/.test(id) : /^\d{1,20}$/.test(id);
+}
 import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import { AnalyzerSidecar } from './analyzer/sidecar.js';
@@ -653,7 +664,11 @@ export interface CoreService {
 	enrichBeatportTrack(trackId: string, progress?: ProgressFn): Promise<{ enriched: number; scanned: number }>;
 	enrichBeatportTracks(trackIds: string[], progress?: ProgressFn): Promise<{ enriched: number; scanned: number }>;
 	matchTidalForTracks(trackIds: string[], progress?: ProgressFn): Promise<{ matched: number; scanned: number }>;
-	getTrackSourceLinks(trackId: string): Promise<{ source: string; sourceTrackId: string; url: string | null }[]>;
+	// The row's own links, then — `derived: true` — the provider ids it
+	// knows only from the account's claims (sync-log/claim-links.ts) for
+	// providers it has no own link for. Display and Open-in only: nothing
+	// that pushes upstream reads this.
+	getTrackSourceLinks(trackId: string): Promise<{ source: string; sourceTrackId: string; url: string | null; derived?: boolean }[]>;
 	setTrackOverrides(trackId: string, patch: Partial<Record<keyof TrackOverrides, TrackOverrides[keyof TrackOverrides] | null>>): Promise<Track | null>;
 	// `errors[]` is in-band (the call resolves) so a partial success still
 	// reports per provider. `code: 'already-linked'` + `conflictTrackId`
@@ -2621,11 +2636,19 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 
 		async getTrackSourceLinks(trackId) {
-			return db
+			const own: Array<{ source: string; sourceTrackId: string; url: string | null; derived?: boolean }> = db
 				.select({ source: sourceLink.source, sourceTrackId: sourceLink.sourceTrackId, url: sourceLink.url })
 				.from(sourceLink)
 				.where(eq(sourceLink.trackId, trackId))
 				.all();
+			// An own link replaces the derived one when it lands (migrate.ts
+			// trigger); the filter only guards a read racing that.
+			const ownSources = new Set(own.map((l) => l.source));
+			for (const l of claimLinksOf(sqlite, [trackId]).get(trackId) ?? []) {
+				if (ownSources.has(l.source)) continue;
+				own.push({ source: l.source, sourceTrackId: l.sourceTrackId, url: claimLinkUrl(l.source, l.sourceTrackId), derived: true });
+			}
+			return own;
 		},
 
 		async setTrackOverrides(trackId, patch) {
@@ -2715,6 +2738,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 					}).run();
 				}
 				updated.push(source);
+				// The user's pick is the account's claim for the row's recording
+				// (an anchor, like a provider-id mint), so the account's other
+				// devices show it too (sync-log/claim-links.ts). A no-op when the
+				// records already hold it.
+				mut.addClaims(db, trackId, [{ kind: source, value: srcId, confidence: 1 }]);
 				return true;
 			};
 
@@ -2848,9 +2876,16 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// Edit Track modal's per-field reset button to drop a Spotify/Tidal/
 			// Beatport link without touching other source_links or canonical
 			// fields. Refetched data already on the canonical track stays put.
-			db.delete(sourceLink)
-				.where(and(eq(sourceLink.trackId, trackId), eq(sourceLink.source, source)))
-				.run();
+			// One transaction: the own link's delete trigger may queue a
+			// re-derive, and a derived link the user cleared is dismissed for
+			// this row (claim_link_veto) — claims are append-only, so it would
+			// otherwise come straight back.
+			sqlite.transaction(() => {
+				db.delete(sourceLink)
+					.where(and(eq(sourceLink.trackId, trackId), eq(sourceLink.source, source)))
+					.run();
+				dismissClaimLink(sqlite, trackId, source);
+			})();
 		},
 		async previewTrackMerge(aId, bId) {
 			const rows = await svcRef!.getTracks({ ids: [aId, bId] });
@@ -3334,13 +3369,20 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// vanish, and we need the provider-side ids (e.g. Spotify track id)
 			// to push the removal upstream. Distinct values: Spotify's API
 			// removes every occurrence of each URI in one shot.
+			// A row whose sourceTrackId is its own Curator track id has no
+			// provider id here (the fallback for rows projected from another
+			// device before this one linked the track — a remote row, say):
+			// there is nothing to remove upstream for it, and sending the uuid
+			// would only earn a provider error. The same rule as the drift
+			// check (computeUpstreamDrift). A claim-derived id is never used
+			// in its place: it is not this device's link to act on.
 			const sourceRows = chunkedIn(trackIds, (chunk) => db
-				.select({ sourceTrackId: playlistTrack.sourceTrackId })
+				.select({ trackId: playlistTrack.trackId, sourceTrackId: playlistTrack.sourceTrackId })
 				.from(playlistTrack)
 				.where(and(eq(playlistTrack.playlistId, playlistId), inArray(playlistTrack.trackId, chunk)))
 				.all());
 			const remoteIds = Array.from(new Set(
-				sourceRows.map((r) => r.sourceTrackId).filter((s): s is string => !!s),
+				sourceRows.filter((r) => r.sourceTrackId !== r.trackId).map((r) => r.sourceTrackId).filter((s): s is string => !!s),
 			));
 
 			// Delete + restamp positions in one transaction. Survivors keep
@@ -3757,6 +3799,27 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const settings = sourceSyncSettings[src];
 			const adapter = sourceAdapters[src];
 			if (!adapter || !settings.writeSyncAuto || !adapter.capabilities.canReorder) return;
+
+			// Every row must carry this provider's own track id before anything
+			// is sent. A row projected from another device (a "not on this
+			// device" track, or one whose provider id never reached this
+			// device) stores the Curator track id instead, or nothing. Sent
+			// as-is, a full replace would drop it from the real playlist (and a
+			// filtered list did exactly that silently), and positional moves
+			// would be computed against positions the provider does not have.
+			// So the push is refused whole; the local order stays, and the
+			// next read-sync reconciles. (2026-10-21, second-desktop work.)
+			const wire = db
+				.select({ trackId: playlistTrack.trackId, sourceTrackId: playlistTrack.sourceTrackId })
+				.from(playlistTrack)
+				.where(eq(playlistTrack.playlistId, playlistId))
+				.all();
+			const unresolved = wire.filter((r) => !isProviderTrackId(src, r.sourceTrackId) || r.sourceTrackId === r.trackId);
+			if (unresolved.length > 0) {
+				log.for('reorder').warn('upstream reorder refused: rows without a provider id', { source: src, playlistSourceId: pl.sourceId, rows: unresolved.length });
+				mut.ackUpstream(db, pendingOps, src, 'failed', `${unresolved.length} track(s) in this playlist have no ${src} id on this computer, so the new order was kept here only`);
+				return;
+			}
 
 			try {
 				let snapshotId: string | null = null;
@@ -6197,6 +6260,13 @@ function decorateTracks(db: Db, cutoffStore: CutoffStore, tracks: Track[]): Trac
 			}
 		}
 		for (const t of tracks) t.sources = bySrc.get(t.id) ?? [];
+		// Claim-derived provider ids (sync-log/claim-links.ts): a separate
+		// field, never `sources` — see Track.claimSources. Same chunked shape.
+		const derived = claimLinksOf(rawOf(db), ids);
+		for (const t of tracks) {
+			const d = derived.get(t.id);
+			t.claimSources = d ? d.map((l) => l.source) : [];
+		}
 
 		// Same shape, for playlist-name memberships. Powers the in-memory
 		// matchTrack pass for `#name` tokens (filterbox path): without this

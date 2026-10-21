@@ -154,6 +154,7 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 	set('spotifyUrl', '');
 	set('tidalUrl', '');
 	set('beatportUrl', '');
+	deps.getModal()?.setDerivedUrls([]);
 	(form.elements.namedItem('title') as HTMLInputElement | null)?.focus();
 	(form.elements.namedItem('title') as HTMLInputElement | null)?.select();
 
@@ -181,6 +182,12 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 			set('spotifyUrl',  initialUrls.spotify);
 			set('tidalUrl',    initialUrls.tidal);
 			set('beatportUrl', initialUrls.beatport);
+			// Ids another device linked (core claim-links.ts) fill the field
+			// too, marked "from your account". They sit in initialUrls like an
+			// own link, so leaving one alone saves nothing; editing it sets this
+			// device's own link, and clearing it hides it on this device (core
+			// deleteTrackSourceLink dismisses a derived link).
+			deps.getModal()?.setDerivedUrls(links.filter((l) => l.derived).map((l) => `${l.source}Url`));
 		}
 	} catch (err) {
 		slog.warn('failed to load source links', undefined, err);

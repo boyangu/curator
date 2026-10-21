@@ -29,6 +29,7 @@ import {
 	playlist,
 	playlistTrack,
 	syncJob,
+	claimLink,
 	type NewTrack,
 	type NewSourceLink,
 	type NewPlaylist,
@@ -862,6 +863,11 @@ export class SpotifySync {
 			})
 			.from(track)
 			.innerJoin(playlistTrack, eq(playlistTrack.trackId, track.id))
+			// Already matched on Beatport by another device of the account (a
+			// claim-derived link, sync-log/claim-links.ts): skipped like a
+			// matched track, so the bulk pass never re-crawls what the account
+			// already found. The per-track actions below still enrich it.
+			.leftJoin(claimLink, and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'beatport')))
 			.where(and(
 				eq(playlistTrack.playlistId, playlistRowId),
 				isNull(track.bpm),
@@ -870,6 +876,7 @@ export class SpotifySync {
 				// Remote rows (not on this device) are never enriched — see
 				// LibrarySink.persist.
 				eq(track.remoteOnly, false),
+				isNull(claimLink.trackId),
 			))
 			.orderBy(orderBy)
 			.all();

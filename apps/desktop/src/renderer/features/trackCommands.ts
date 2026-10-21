@@ -122,6 +122,13 @@ const allLocal = (c: TrackCommandContext): boolean => any(c) && c.tracks.every(h
 const allStream = (c: TrackCommandContext): boolean => any(c) && c.tracks.every((t) => !hasLocal(t));
 const allHave = (c: TrackCommandContext, s: string): boolean => any(c) && c.tracks.every((t) => hasSrc(t, s));
 const noneHave = (c: TrackCommandContext, s: string): boolean => any(c) && c.tracks.every((t) => !hasSrc(t, s));
+// Open-in / Copy URL / Search-in only: the provider id may also be one the
+// account knows from another device (Track.claimSources — a claim-derived
+// link). Everything else (download, delete, sync) keeps to `sources`: a
+// derived id is never this device's to act on.
+const knows = (t: Track, s: string): boolean => hasSrc(t, s) || (t.claimSources ?? []).includes(s);
+const allKnow = (c: TrackCommandContext, s: string): boolean => any(c) && c.tracks.every((t) => knows(t, s));
+const noneKnow = (c: TrackCommandContext, s: string): boolean => any(c) && c.tracks.every((t) => !knows(t, s));
 // Single-selection only: `ctx.tagIds` is fetched just for one row (see showTrackMenu).
 const hasTag = (c: TrackCommandContext, tagId: string): boolean => single(c) && !!c.tagIds?.has(tagId);
 const displayName = (c: TrackCommandContext): string => (single(c) ? c.tracks[0]!.title : `${c.tracks.length} tracks`);
@@ -183,7 +190,8 @@ function deriveSourceUrl(source: string, id: string): string | null {
 	}
 }
 
-// Resolve a track's per-source "open in…" URLs from its source_link rows.
+// Resolve a track's per-source "open in…" URLs from its source_link rows,
+// and the claim-derived ids for providers it has no own link for.
 // Availability of the open-* commands is already decided synchronously from
 // `sources`; this only runs on click to get the actual URL.
 async function resolveTrackSourceUrls(trackId: string): Promise<{ spotifyUrl?: string; tidalUrl?: string; beatportUrl?: string }> {
@@ -446,14 +454,14 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		run: (c) => { deps.startJourneyFromTrack(c.tracks[0]!.id); },
 	},
 	{
-		id: 'open-spotify', group: 'open', isAvailable: (c) => single(c) && allHave(c, 'spotify'), iconHtml: ICON_SPOTIFY,
+		id: 'open-spotify', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'spotify'), iconHtml: ICON_SPOTIFY,
 		label: () => 'Open in **Spotify**',
 		run: async (c) => { const { spotifyUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id); if (spotifyUrl) shellApi.openSpotify(spotifyUrl); },
 	},
 	{
 		// Copies the shareable https://open.spotify.com/track/… link (not the
 		// spotify: app URI Open-in-Spotify uses). Same availability as open-spotify.
-		id: 'copy-spotify-url', group: 'open', isAvailable: (c) => single(c) && allHave(c, 'spotify'), iconHtml: ICON_COPY,
+		id: 'copy-spotify-url', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'spotify'), iconHtml: ICON_COPY,
 		label: () => 'Copy **Spotify** URL',
 		run: async (c) => {
 			const { spotifyUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id);
@@ -463,27 +471,27 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		},
 	},
 	{
-		id: 'search-spotify', group: 'open', isAvailable: (c) => single(c) && noneHave(c, 'spotify'), iconHtml: ICON_SPOTIFY,
+		id: 'search-spotify', group: 'open', isAvailable: (c) => single(c) && noneKnow(c, 'spotify'), iconHtml: ICON_SPOTIFY,
 		label: () => 'Search in **Spotify**',
 		run: (c) => shellApi.openExternal(`https://open.spotify.com/search/${encodeURIComponent(searchQuery(c.tracks[0]!))}`),
 	},
 	{
-		id: 'open-tidal', group: 'open', isAvailable: (c) => single(c) && allHave(c, 'tidal'), iconHtml: ICON_TIDAL,
+		id: 'open-tidal', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'tidal'), iconHtml: ICON_TIDAL,
 		label: () => 'Open in **Tidal**',
 		run: async (c) => { const { tidalUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id); if (tidalUrl) shellApi.openExternal(tidalUrl); },
 	},
 	{
-		id: 'search-tidal', group: 'open', isAvailable: (c) => single(c) && noneHave(c, 'tidal'), iconHtml: ICON_TIDAL,
+		id: 'search-tidal', group: 'open', isAvailable: (c) => single(c) && noneKnow(c, 'tidal'), iconHtml: ICON_TIDAL,
 		label: () => 'Search in **Tidal**',
 		run: (c) => shellApi.openExternal(`https://tidal.com/search?q=${encodeURIComponent(searchQuery(c.tracks[0]!))}`),
 	},
 	{
-		id: 'open-beatport', group: 'open', isAvailable: (c) => single(c) && allHave(c, 'beatport'), iconHtml: ICON_BEATPORT,
+		id: 'open-beatport', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'beatport'), iconHtml: ICON_BEATPORT,
 		label: () => 'Open in **Beatport**',
 		run: async (c) => { const { beatportUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id); if (beatportUrl) shellApi.openExternal(beatportUrl); },
 	},
 	{
-		id: 'search-beatport', group: 'open', isAvailable: (c) => single(c) && noneHave(c, 'beatport'), iconHtml: ICON_BEATPORT,
+		id: 'search-beatport', group: 'open', isAvailable: (c) => single(c) && noneKnow(c, 'beatport'), iconHtml: ICON_BEATPORT,
 		label: () => 'Search in **Beatport**',
 		// /search (mixed results) reads more naturally for a browser visit than /search/tracks.
 		run: (c) => shellApi.openExternal(`https://www.beatport.com/search?q=${encodeURIComponent(searchQuery(c.tracks[0]!))}`),

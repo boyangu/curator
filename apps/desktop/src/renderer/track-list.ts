@@ -231,6 +231,13 @@ const SOURCE_ORDER = ['spotify', 'tidal', 'beatport', 'rekordbox', 'local'] as c
 const SOURCE_NAMES: Record<(typeof SOURCE_ORDER)[number], string> = {
 	spotify: 'Spotify', tidal: 'Tidal', beatport: 'Beatport', rekordbox: 'Rekordbox', local: 'Local file',
 };
+// Claim-derived providers (Track.claimSources), in the same order.
+const DERIVED_ORDER = ['spotify', 'tidal', 'beatport'] as const;
+const DERIVED_NOTE = '(from your account — linked on another device)';
+function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: readonly (typeof DERIVED_ORDER)[number][]): string {
+	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${DERIVED_NOTE}`)];
+	return parts.length ? `Sources: ${parts.join(', ')}` : '';
+}
 export const ALL_COLUMNS: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'tags', 'added'];
 
 // The two-line layout's columns from the visible fields. idx / title are
@@ -366,6 +373,12 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// Plain markup in the same template, so no per-row cost beyond the string.
 	const remote = isRemoteRow(t);
 	const remoteTip = remote ? escapeHtml(remoteRowTitle(t)) : '';
+	// Provider ids known only from the account (claim-links.ts in core): a
+	// hollow pip in the source's colour after the row's own ones. Own rows
+	// only — a remote row's single hollow mark already says "another device
+	// holds this", and a pip per provider on 30k remote rows reads as noise.
+	const derivedSet = remote ? null : new Set(t.claimSources ?? []);
+	const derived = derivedSet ? DERIVED_ORDER.filter((s) => derivedSet.has(s) && !present.has(s)) : [];
 	const coverBg = opts.covers !== false
 		? `url(curator-cover://${encodeURIComponent(t.id)}), ${coverGradient(i)}`
 		: coverGradient(i);
@@ -428,8 +441,9 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	let cells: Partial<Record<LayoutColumn, string>>;
 	if (lines === 2) {
 		const marks = srcs.map((s) => `<i data-src="${s}"></i>`).join('')
+			+ derived.map((s) => `<i class="src-derived" data-src="${s}"></i>`).join('')
 			+ (remote ? `<i class="src-remote" data-remote="${remoteMarkSource(t)}"></i>` : '');
-		const srcTitle = remote ? remoteTip : srcs.length ? `Sources: ${srcs.map((s) => SOURCE_NAMES[s]).join(', ')}` : '';
+		const srcTitle = remote ? remoteTip : sourcesTitle(srcs, derived);
 		const [base, version] = splitTitleVersion(title);
 		// Line 2 of the title column never repeats the grouped field.
 		const showArtist = fields.has('artist') && groupBy !== 'artist';
@@ -468,6 +482,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 		};
 	} else {
 		const pips = srcs.map((s) => `<span class="src-pip" data-src="${s}" title="${SOURCE_NAMES[s]}"></span>`).join('')
+			+ derived.map((s) => `<span class="src-pip src-pip--derived" data-src="${s}" title="${SOURCE_NAMES[s]} ${DERIVED_NOTE}"></span>`).join('')
 			+ (remote ? `<span class="src-pip src-pip--remote" data-remote="${remoteMarkSource(t)}" title="${remoteTip}"></span>` : '');
 		cells = {
 			src: `<td class="sources"><span class="src-pips">${pips}</span></td>`,
