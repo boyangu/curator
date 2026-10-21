@@ -234,7 +234,7 @@ export function isProviderTrackId(source: 'spotify' | 'tidal', id: string | null
 import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import { AnalyzerSidecar } from './analyzer/sidecar.js';
-import { AnalysisQueue, formatAnalyzerTrackName, splitRemoteRows, type AnalysisJobEvent } from './analyzer/queue.js';
+import { AnalysisQueue, formatAnalyzerTrackName, splitFileless, type AnalysisJobEvent } from './analyzer/queue.js';
 import { type AnalysisFlags, type AutoAnalyzeSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, analysisFlagsToOptions } from './analyzer/flags.js';
 import { CutoffStore } from './analyzer/cutoffs.js';
 import { homedir, hostname } from 'node:os';
@@ -2636,16 +2636,17 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 
 		async getTrackSourceLinks(trackId) {
-			const own: Array<{ source: string; sourceTrackId: string; url: string | null; derived?: boolean }> = db
-				.select({ source: sourceLink.source, sourceTrackId: sourceLink.sourceTrackId, url: sourceLink.url })
-				.from(sourceLink)
-				.where(eq(sourceLink.trackId, trackId))
-				.all();
-			// An own link replaces the derived one when it lands (migrate.ts
-			// trigger); the filter only guards a read racing that.
-			const ownSources = new Set(own.map((l) => l.source));
+			// Every id per provider, the primary first: own links (the most
+			// recently fetched first), then the claim-derived ones in rank order
+			// (claim-links.ts). Open-in and the Edit field take the first of a
+			// provider; the Edit screen lists the rest.
+			const own = sqlite.prepare(`SELECT source, source_track_id AS sourceTrackId, url FROM source_link WHERE track_id = ?
+				ORDER BY source, fetched_at IS NULL, fetched_at DESC, id`).all(trackId) as Array<{ source: string; sourceTrackId: string; url: string | null; derived?: boolean }>;
+			// An own link replaces the derived one of its id when it lands
+			// (migrate.ts trigger); the filter only guards a read racing that.
+			const ownIds = new Set(own.map((l) => `${l.source}\u0000${l.sourceTrackId}`));
 			for (const l of claimLinksOf(sqlite, [trackId]).get(trackId) ?? []) {
-				if (ownSources.has(l.source)) continue;
+				if (ownIds.has(`${l.source}\u0000${l.sourceTrackId}`)) continue;
 				own.push({ source: l.source, sourceTrackId: l.sourceTrackId, url: claimLinkUrl(l.source, l.sourceTrackId), derived: true });
 			}
 			return own;
@@ -2876,10 +2877,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// Edit Track modal's per-field reset button to drop a Spotify/Tidal/
 			// Beatport link without touching other source_links or canonical
 			// fields. Refetched data already on the canonical track stays put.
-			// One transaction: the own link's delete trigger may queue a
-			// re-derive, and a derived link the user cleared is dismissed for
-			// this row (claim_link_veto) — claims are append-only, so it would
-			// otherwise come straight back.
+			// One transaction: the own links' delete trigger vetoes each id and
+			// may queue a re-derive, and every derived id of the provider the
+			// user cleared is dismissed for this row (claim_link_veto, per id)
+			// — claims are append-only, so they would otherwise come straight
+			// back, and none may stand in for the cleared field.
 			sqlite.transaction(() => {
 				db.delete(sourceLink)
 					.where(and(eq(sourceLink.trackId, trackId), eq(sourceLink.source, source)))
@@ -4819,13 +4821,15 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// backlog, so a click would otherwise just sit in 'queued'.
 			const stopped = analyzerSidecar?.disabled;
 			if (stopped) throw new Error(`The analyzer is not running: ${stopped}`);
-			// Remote rows have no file here; the queue drops them. A request
-			// made of nothing else is refused so the Analyze modal's toast
-			// says why instead of claiming queued work that never runs.
-			if (trackIds.length > 0 && splitRemoteRows(db, trackIds).own.length === 0) {
+			// Remote rows and streaming-only rows have no file here; the queue
+			// drops them (their analysis, if any device made it, arrives
+			// through the catalogue). A request made of nothing else is refused
+			// so the Analyze modal's toast says why instead of claiming queued
+			// work that never runs.
+			if (trackIds.length > 0 && splitFileless(db, trackIds).own.length === 0) {
 				throw new Error(trackIds.length === 1
-					? 'This track is not on this device — there is no file to analyze.'
-					: 'These tracks are not on this device — there are no files to analyze.');
+					? 'This track has no file on this device — there is nothing to analyze.'
+					: 'These tracks have no files on this device — there is nothing to analyze.');
 			}
 			// Translate the unified flags into the sidecar wire shape here — the
 			// one conversion point shared with the scanner's auto-analyze path.
@@ -6265,7 +6269,10 @@ function decorateTracks(db: Db, cutoffStore: CutoffStore, tracks: Track[]): Trac
 		const derived = claimLinksOf(rawOf(db), ids);
 		for (const t of tracks) {
 			const d = derived.get(t.id);
-			t.claimSources = d ? d.map((l) => l.source) : [];
+			// One entry per provider (a row may know several ids of one), and
+			// none the row holds an own link of — a pip says "known only from
+			// the account".
+			t.claimSources = d ? [...new Set(d.map((l) => l.source))].filter((s) => !t.sources!.includes(s)) : [];
 		}
 
 		// Same shape, for playlist-name memberships. Powers the in-memory

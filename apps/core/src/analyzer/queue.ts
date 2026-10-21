@@ -36,6 +36,7 @@ import {
 } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
 import { log } from '../log.js';
+import { rawOf } from '../library/artists.js';
 import { persistAnalysisResult } from './persist.js';
 import { ADVANCED_FEATURES, AnalyzerSidecar, type AnalyzeOptions, type ProgressEvent, type SidecarError } from './sidecar.js';
 
@@ -48,19 +49,29 @@ async function fileExists(p: string): Promise<boolean> {
 	catch { return false; }
 }
 
-// Partition track ids into this device's own rows and remote rows
-// (track.remoteOnly — no file here, so nothing to analyse). One PK lookup
-// per chunk of ids that names only the remote ones, so the common all-own
-// batch moves no rows. Order of `own` follows the input.
-export function splitRemoteRows(db: Db, trackIds: readonly string[]): { own: string[]; remote: string[] } {
-	if (trackIds.length === 0) return { own: [], remote: [] };
-	const remote = new Set<string>();
+// Partition track ids into rows with a file to analyse here (`own`) and
+// file-less rows: remote rows (track.remoteOnly) and this device's own rows without a
+// live local link (a streaming-only row, a file the watcher flagged
+// missing). pickBatch's local-link join never dispatches a file-less row, so
+// a job for one would sit 'queued' forever — and since the catalogue fills
+// such rows from another device's analysis (catalogue/layer.ts, through the
+// recording's audio-hash claim), a queued job would also read as work the
+// row still lacks. One read per chunk of ids that names only the file-less
+// ones, so the common all-local batch moves no rows. An id with no row
+// passes through (the queue's own reads drop it). Both lists follow the
+// input.
+export function splitFileless(db: Db, trackIds: readonly string[]): { own: string[]; fileless: string[] } {
+	if (trackIds.length === 0) return { own: [], fileless: [] };
+	const fileless = new Set<string>();
 	for (let i = 0; i < trackIds.length; i += 500) {
 		const chunk = trackIds.slice(i, i + 500);
-		for (const r of db.select({ id: track.id }).from(track).where(and(inArray(track.id, chunk), eq(track.remoteOnly, true))).all()) remote.add(r.id);
+		const rows = rawOf(db).prepare(`SELECT t.id FROM track t WHERE t.id IN (${chunk.map(() => '?').join(',')})
+			AND (t.remote_only = 1 OR NOT EXISTS (SELECT 1 FROM source_link s WHERE s.track_id = t.id AND s.source = 'local' AND s.missing_at IS NULL))`)
+			.pluck().all(...chunk) as string[];
+		for (const id of rows) fileless.add(id);
 	}
-	if (remote.size === 0) return { own: [...trackIds], remote: [] };
-	return { own: trackIds.filter((id) => !remote.has(id)), remote: [...remote] };
+	if (fileless.size === 0) return { own: [...trackIds], fileless: [] };
+	return { own: trackIds.filter((id) => !fileless.has(id)), fileless: trackIds.filter((id) => fileless.has(id)) };
 }
 
 // The analyzer version this Node code is paired with — what a fresh result is
@@ -549,11 +560,12 @@ export class AnalysisQueue extends EventEmitter {
 		opts: { priority?: number; force?: boolean; analyzeOptions?: AnalyzeOptions } = {},
 	): void {
 		const priority = opts.priority ?? 0;
-		// Remote rows (another device's tracks, projected here) have no file
-		// on this device. pickBatch's local-link join would never dispatch
-		// them, so a job row for one would sit 'queued' forever, counted by
-		// the chip as pending work. Every enqueue path funnels through here.
-		trackIds = splitRemoteRows(this.db, trackIds).own;
+		// File-less rows (remote rows, streaming-only rows) have nothing to
+		// analyse on this device: pickBatch's local-link join would never
+		// dispatch them, so a job row for one would sit 'queued' forever,
+		// counted by the chip as pending work. Every enqueue path funnels
+		// through here.
+		trackIds = splitFileless(this.db, trackIds).own;
 		if (trackIds.length === 0) return;
 		const now = Date.now();
 		const existing = trackIds.length > 0

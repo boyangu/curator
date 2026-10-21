@@ -47,6 +47,7 @@ import {
 import { asciify } from '@curator/shared';
 import { mergeRecordingRaw } from './mutators.js';
 import { recordingOf } from '../sync-log/rows.js';
+import { queueClaimLinks } from '../sync-log/claim-links.js';
 import { syncTrackArtistsById } from './artists.js';
 import { syncTrackAlbumsById } from './albums.js';
 import { recomputePositions } from './playlist-order.js';
@@ -428,6 +429,12 @@ export function applyTrackMerge(db: Db, sqlite: Database.Database, keepId: strin
 		db.update(track).set({ deletedAt: now, membership: null, updatedAt: now }).where(eq(track.id, dropId)).run();
 
 		if (loserRecording) mergeRecordingRaw(sqlite, { loserRecordingId: loserRecording, winnerTrackId: keepId, droppedMemberRows, loserCueSlots });
+		// The survivor's recording now carries the loser's claims too: its
+		// claim-derived links re-derive (sync-log/claim-links.ts), so the
+		// provider id whose own link the merge dropped as a duplicate stays
+		// listed here, as it is on every other device.
+		const keepRecording = recordingOf(sqlite, keepId);
+		if (keepRecording) queueClaimLinks(sqlite, [keepRecording]);
 	})();
 
 	return result;

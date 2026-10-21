@@ -260,6 +260,20 @@ export function settlePlaylists(raw: Raw, playlistIds: Iterable<string>): void {
 	}
 }
 
+// The playlists a sliced projection deferred (project.ts
+// hooks.deferPositions), settled once each: one playlist per transaction, a
+// yield between. Returns the longest slice.
+export async function settlePlaylistsAsync(raw: Raw, playlistIds: Iterable<string>): Promise<number> {
+	let maxSliceMs = 0;
+	for (const pid of new Set(playlistIds)) {
+		const t0 = performance.now();
+		raw.transaction(() => settlePlaylists(raw, [pid]))();
+		maxSliceMs = Math.max(maxSliceMs, performance.now() - t0);
+		await yieldToLoop();
+	}
+	return maxSliceMs;
+}
+
 // Refs of every record of `recordings`, for the caller's projection.
 export function adoptRefs(raw: Raw, recordings: readonly string[]): EntityRef[] {
 	return recordings.length > 0 ? refsOfRecordings(raw, recordings) : [];

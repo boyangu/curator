@@ -61,6 +61,10 @@ export interface TrackEditModalHandle {
 	// (core sync-log/claim-links.ts). They render muted with a note; typing
 	// in one makes it an ordinary field again.
 	setDerivedUrls(names: readonly string[]): void;
+	// Further ids of a URL field's provider (field name → URLs): a merged
+	// track can hold several Spotify or Tidal ids. The field shows the
+	// primary; these are listed under it, read-only.
+	setOtherUrls(urls: Readonly<Record<string, readonly string[]>>): void;
 }
 
 interface FieldDef {
@@ -122,6 +126,7 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 	const [fieldOptions, setFieldOptions] = createSignal<{ genres: string[]; labels: string[] }>({ genres: [], labels: [] });
 	const [artists, setArtists] = createSignal<TrackArtist[]>([]);
 	const [derivedUrls, setDerivedUrls] = createSignal<ReadonlySet<string>>(new Set());
+	const [otherUrls, setOtherUrls] = createSignal<Readonly<Record<string, readonly string[]>>>({});
 	const undoDerived = (name: string): void => {
 		if (!derivedUrls().has(name)) return;
 		const next = new Set(derivedUrls());
@@ -200,6 +205,11 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 			<Show when={derivedUrls().has(f.name)}>
 				<small class="field__note">From your account — linked on another device</small>
 			</Show>
+			<Show when={(otherUrls()[f.name]?.length ?? 0) > 0}>
+				<small class="field__note field__note--others" title={otherUrls()[f.name]!.join('\n')}>
+					Also linked: {otherUrls()[f.name]!.map((u) => u.split('/').pop()).join(', ')}
+				</small>
+			</Show>
 		</label>
 	);
 
@@ -262,5 +272,6 @@ export function mountTrackEditModal(host: HTMLElement, props: TrackEditModalProp
 		setArtists: (list) => setArtists(list.map((a) => (a.role ? { name: a.name, role: a.role } : { name: a.name }))),
 		getArtists: () => artists(),
 		setDerivedUrls: (names) => setDerivedUrls(new Set(names)),
+		setOtherUrls: (urls) => setOtherUrls({ ...urls }),
 	};
 }

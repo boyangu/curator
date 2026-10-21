@@ -20,6 +20,7 @@ import { mergeRecordingRaw } from '../library/mutators.js';
 import { markRecordsComplete, recordsComplete } from '../sync-log/apply.js';
 import { claimParentId } from '../sync-log/store.js';
 import { CLAIMS_BACKFILL_KEY } from '../sync-log/initial-push.js';
+import { CLAIM_LINKS_SWEEP_KEY } from '../sync-log/claim-links.js';
 import { CLIENT_STATE_KEY } from '../sync-log/client.js';
 
 const mlog = log.for('migrate');
@@ -477,6 +478,16 @@ CREATE INDEX IF NOT EXISTS play_event_rb_content_idx ON play_event(rb_content_id
 
 // Additive migrations for existing DBs — each runs once, errors swallowed
 // when the schema already has the change applied. Keep idempotent.
+const CLAIM_LINK_DDL = `CREATE TABLE IF NOT EXISTS claim_link (
+		track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		source TEXT NOT NULL,
+		source_track_id TEXT NOT NULL,
+		recording_id TEXT NOT NULL,
+		rank INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (track_id, source, source_track_id)
+	) WITHOUT ROWID`;
+const CLAIM_LINK_INDEX_DDL = `CREATE INDEX IF NOT EXISTS claim_link_recording_idx ON claim_link(recording_id)`;
+
 const ALTER_MIGRATIONS: string[] = [
 	`ALTER TABLE playlist ADD COLUMN remote_updated_at INTEGER`,
 	`ALTER TABLE track ADD COLUMN overrides TEXT`,
@@ -1067,14 +1078,10 @@ const ALTER_MIGRATIONS: string[] = [
 	// (sync-log/claim-links.ts CLAIM_LINKS_SWEEP_KEY) derives every existing
 	// row's. None of the triggers above reads claim_link: a derived id never
 	// turns a remote row into an own row, nor marks meta dirty.
-	`CREATE TABLE IF NOT EXISTS claim_link (
-		track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
-		source TEXT NOT NULL,
-		source_track_id TEXT NOT NULL,
-		recording_id TEXT NOT NULL,
-		PRIMARY KEY (track_id, source)
-	) WITHOUT ROWID`,
-	`CREATE INDEX IF NOT EXISTS claim_link_recording_idx ON claim_link(recording_id)`,
+	// Every claimed id per provider, not one (see claimLink in schema.ts;
+	// reshapeClaimLink replaces a table of the first shape before this runs).
+	CLAIM_LINK_DDL,
+	CLAIM_LINK_INDEX_DDL,
 	`CREATE TABLE IF NOT EXISTS claim_link_pending (recording_id TEXT PRIMARY KEY) WITHOUT ROWID`,
 	// No foreign key: rows are written from source_link's delete trigger,
 	// which also fires inside a track's cascade; the track trigger below
@@ -1108,20 +1115,25 @@ const ALTER_MIGRATIONS: string[] = [
 			DELETE FROM claim_link WHERE track_id = OLD.id;
 			DELETE FROM claim_link_veto WHERE track_id = OLD.id;
 		END`,
-	// An own link always wins: it replaces the derived one for its provider
-	// in the ingest's own statement. Re-adding an id the device once dropped
-	// lifts its veto.
+	// An own link always wins, per id: it replaces the derived row of the
+	// same id in the ingest's own statement, and the row's other claimed ids
+	// for the provider are re-ranked (queued). Re-adding an id the device once
+	// dropped lifts its veto.
 	`CREATE TRIGGER IF NOT EXISTS claim_link_own_insert AFTER INSERT ON source_link
 		WHEN NEW.source IN ('spotify', 'tidal', 'beatport')
 		BEGIN
-			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source;
+			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
 			DELETE FROM claim_link_veto WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT recording_id FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source LIMIT 1;
 		END`,
 	`CREATE TRIGGER IF NOT EXISTS claim_link_own_update AFTER UPDATE OF track_id, source, source_track_id ON source_link
 		WHEN NEW.source IN ('spotify', 'tidal', 'beatport')
 		BEGIN
-			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source;
+			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
 			DELETE FROM claim_link_veto WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT recording_id FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source LIMIT 1;
 			INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id)
 				SELECT OLD.track_id, OLD.source, OLD.source_track_id
 				WHERE OLD.source IN ('spotify', 'tidal', 'beatport')
@@ -2161,6 +2173,29 @@ function indexClaimRecords(sqlite: Database.Database): void {
 // Consistent snapshot next to the DB before a migration that rewrites
 // library content. VACUUM INTO works under WAL and needs no open
 // transaction. Keeps the newest 3 per tag so the folder doesn't fill up.
+// claim_link held one id per (row, provider) until 2026-10-21; it now holds
+// every claimed id (schema.ts claimLink). It is derived data, so a table of
+// the first shape is replaced empty, not converted, and the one-time sweep
+// (sync-log/claim-links.ts CLAIM_LINKS_SWEEP_KEY) runs again to fill it.
+// Replaced in the same transaction, never left missing: the track triggers
+// read it, and an ALTER migration that touches track rows before the
+// table's own CREATE would fail on it. The own-link triggers changed with it
+// (per id, not per provider); CREATE TRIGGER IF NOT EXISTS never replaces,
+// so they are dropped here and recreated by ALTER_MIGRATIONS. The vetoes
+// stay: they were per id already.
+function reshapeClaimLink(sqlite: Database.Database): void {
+	const exists = sqlite.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_link'`).get() !== undefined;
+	if (!exists || hasColumn(sqlite, 'claim_link', 'rank')) return;
+	sqlite.transaction(() => {
+		sqlite.exec(`DROP TRIGGER IF EXISTS claim_link_own_insert`);
+		sqlite.exec(`DROP TRIGGER IF EXISTS claim_link_own_update`);
+		sqlite.exec(`DROP TABLE claim_link`);
+		sqlite.exec(CLAIM_LINK_DDL);
+		sqlite.exec(CLAIM_LINK_INDEX_DDL);
+		sqlite.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLAIM_LINKS_SWEEP_KEY);
+	})();
+}
+
 function backupDatabase(sqlite: Database.Database, dbPath: string, tag: string): void {
 	if (dbPath === ':memory:' || !existsSync(dbPath)) return;
 	const dir = dirname(dbPath);
@@ -2190,6 +2225,7 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	sqlite.pragma('journal_mode = WAL');
 	sqlite.pragma('foreign_keys = ON');
 	sqlite.exec(DDL);
+	reshapeClaimLink(sqlite);
 	for (const sql of ALTER_MIGRATIONS) {
 		try {
 			sqlite.exec(sql);

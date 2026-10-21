@@ -69,7 +69,7 @@ export class TidalHybrid {
 		const derived = this.db
 			.select({ id: claimLink.sourceTrackId })
 			.from(claimLink)
-			.where(and(eq(claimLink.trackId, trackId), eq(claimLink.source, 'tidal')))
+			.where(and(eq(claimLink.trackId, trackId), eq(claimLink.source, 'tidal'), eq(claimLink.rank, 0)))
 			.get();
 		if (derived) {
 			hlog.debug('already matched by the account', { tidalId: derived.id });
@@ -232,9 +232,11 @@ export class TidalHybrid {
 			)
 			// Already matched by another device of the account (a derived
 			// link, claim-links.ts): skipped, like an own link — no re-crawl.
+			// The primary only (rank 0): a recording with several Tidal ids
+			// must still join once per row.
 			.leftJoin(
 				claimLink,
-				and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'tidal'))
+				and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'tidal'), eq(claimLink.rank, 0))
 			)
 			.where(and(
 				eq(playlistTrack.playlistId, playlistId),

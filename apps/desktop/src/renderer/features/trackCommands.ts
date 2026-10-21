@@ -196,10 +196,13 @@ function deriveSourceUrl(source: string, id: string): string | null {
 // `sources`; this only runs on click to get the actual URL.
 async function resolveTrackSourceUrls(trackId: string): Promise<{ spotifyUrl?: string; tidalUrl?: string; beatportUrl?: string }> {
 	const links = await tracksApi.sourceLinks(trackId).catch(() => []);
+	// Core lists a provider's primary first (own links, then the claim-derived
+	// ones by rank) — a row may know several ids of one provider, and the
+	// first is the one to open.
 	const bySource = new Map<string, string>();
 	for (const l of links) {
 		const url = l.url ?? deriveSourceUrl(l.source, l.sourceTrackId);
-		if (url) bySource.set(l.source, url);
+		if (url && !bySource.has(l.source)) bySource.set(l.source, url);
 	}
 	return { spotifyUrl: bySource.get('spotify'), tidalUrl: bySource.get('tidal'), beatportUrl: bySource.get('beatport') };
 }

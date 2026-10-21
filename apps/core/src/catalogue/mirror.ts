@@ -170,21 +170,43 @@ export function markEntry(raw: Raw, audioHash: string, unit: string, variant: st
 }
 
 // Hashes with something still to look at under the given keys, joined to a
-// live local file: an entry nobody here can use waits for one to appear.
-// `exclude` keeps one pass from picking the same hashes again.
-export function pendingHydrateHashes(raw: Raw, keys: readonly UnitKey[], limit: number, exclude: ReadonlySet<string>): string[] {
+// live local file or to a live row without one whose recording claims the
+// hash (local.ts readFilelessTracksByHash: a remote or streaming-only row
+// takes the account's analysis through its recording's audio-hash claim):
+// an entry nobody here can use waits for one to appear. `exclude` keeps one
+// pass from picking the same hashes again. `cursor` (the pass's position in
+// remote_rev order) makes each call read only entries after the last one it
+// took: the earlier form re-scanned the pass's every hash through a NOT IN
+// list that grew to thousands of bound values, and cost 157 ms a call by the
+// end of a fresh device's hydrate (2026-10-21).
+export function pendingHydrateHashes(raw: Raw, keys: readonly UnitKey[], limit: number, exclude: ReadonlySet<string>, cursor: { rev: number } = { rev: -1 }): string[] {
 	if (keys.length === 0) return [];
 	const keyClause = keys.map(() => `(ce.unit = ? AND ce.variant = ?)`).join(' OR ');
 	const params: unknown[] = keys.flatMap((k) => [k.unit, k.variant]);
-	const ex = [...exclude];
-	const exClause = ex.length > 0 ? `AND ce.audio_hash NOT IN (${ex.map(() => '?').join(',')})` : '';
-	const rows = raw.prepare(`SELECT DISTINCT ce.audio_hash AS h FROM catalogue_entry ce
-		WHERE ce.local_state = 'remote' AND (${keyClause}) ${exClause}
-			AND EXISTS (SELECT 1 FROM source_link sl JOIN track t ON t.id = sl.track_id
-				WHERE sl.audio_hash = ce.audio_hash AND sl.source = 'local' AND sl.missing_at IS NULL AND t.deleted_at IS NULL)
-		ORDER BY ce.remote_rev
-		LIMIT ?`).all(...params, ...ex, limit) as Array<{ h: string }>;
-	return rows.map((r) => r.h);
+	// A hash holds a handful of entries (one per unit), so this many rows
+	// usually name `limit` hashes; a short page reads on.
+	const page = limit * 8;
+	const out: string[] = [];
+	const taken = new Set<string>();
+	for (;;) {
+		const rows = raw.prepare(`SELECT ce.audio_hash AS h, ce.remote_rev AS r FROM catalogue_entry ce
+			WHERE ce.local_state = 'remote' AND ce.remote_rev > ? AND (${keyClause})
+				AND (EXISTS (SELECT 1 FROM source_link sl JOIN track t ON t.id = sl.track_id
+						WHERE sl.audio_hash = ce.audio_hash AND sl.source = 'local' AND sl.missing_at IS NULL AND t.deleted_at IS NULL)
+					OR EXISTS (SELECT 1 FROM sync_state c JOIN track t ON t.recording_id = c.recording_id
+						WHERE c.map = 'claims' AND c.parent_id = 'audio_hash:' || ce.audio_hash AND t.deleted_at IS NULL AND t.derived_from_track_id IS NULL
+							AND NOT EXISTS (SELECT 1 FROM source_link s2 WHERE s2.track_id = t.id AND s2.source = 'local' AND s2.missing_at IS NULL)))
+			ORDER BY ce.remote_rev
+			LIMIT ?`).all(cursor.rev, ...params, page) as Array<{ h: string; r: number }>;
+		for (const row of rows) {
+			if (exclude.has(row.h) || taken.has(row.h)) { cursor.rev = row.r; continue; }
+			if (out.length >= limit) return out;
+			out.push(row.h);
+			taken.add(row.h);
+			cursor.rev = row.r;
+		}
+		if (rows.length < page || out.length >= limit) return out;
+	}
 }
 
 export type MirrorCounts = { items: number; bytes: number; reused: number; uploaded: number };

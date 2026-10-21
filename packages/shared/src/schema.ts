@@ -1575,10 +1575,15 @@ export const trackRemotePending = sqliteTable('track_remote_pending', {
 // readers that may use one (display, Open-in, the hybrid matcher's
 // "already matched") opt in by reading this table.
 //
-// One row per (row, provider) at most: the recording's best claim of that
-// kind (highest confidence, then latest). Never where the row has its own
-// source_link for the provider — an own link always wins (migrate.ts
-// trigger deletes the derived one when it lands).
+// Every id the recording's claims name for a provider, one row each (a
+// merged recording holds several: 1,262 main-library tracks carry more than
+// one Spotify id, 2026-10-21 audit item 6a — keeping one per provider lost
+// the rest on every other device). `rank` orders them, 0 = the primary that
+// Open-in and the Edit field show: highest confidence, then latest, then
+// smallest id, so every device picks the same one. Never an id the row has
+// its own source_link for — an own link always wins, per id (migrate.ts
+// trigger deletes that derived row when the own one lands); the row's other
+// claimed ids for the provider stay listed.
 export const claimLink = sqliteTable(
 	'claim_link',
 	{
@@ -1590,9 +1595,10 @@ export const claimLink = sqliteTable(
 		// The recording the claim was read from — the row's at derivation
 		// time; a rebind (merge) re-derives.
 		recordingId: text('recording_id').notNull(),
+		rank: integer('rank').notNull().default(0),
 	},
 	(t) => ({
-		pk: primaryKey({ columns: [t.trackId, t.source] }),
+		pk: primaryKey({ columns: [t.trackId, t.source, t.sourceTrackId] }),
 		recordingIdx: index('claim_link_recording_idx').on(t.recordingId),
 	})
 );

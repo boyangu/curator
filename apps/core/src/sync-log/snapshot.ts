@@ -26,6 +26,7 @@ import { drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
 import { applyTrackMerge } from '../library/merge-tracks.js';
 import { markRecordsComplete } from './apply.js';
 import { project } from './project.js';
+import { settlePlaylistsAsync } from './remote-rows.js';
 import { STATE_MAPS, SyncStateStore, type StateMap } from './store.js';
 
 type Raw = Database.Database;
@@ -127,11 +128,23 @@ export type SnapshotLoadResult = {
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
+// Each transaction aims at this long on the main loop, well under the 100 ms
+// a slice may take: a record's cost varies within a map too (a commit that
+// checkpoints the WAL). Fixed chunks of 2,000 records measured 3.0-3.7 s for
+// one slice on the real library (2026-10-21 audit): the cost per record
+// differs a hundredfold between maps.
+const SNAPSHOT_SLICE_MS = 40;
+const FIRST_CHUNK = 100;
+const MIN_CHUNK = 10;
+
+export type SnapshotSlice = { phase: 'merges' | 'records'; map: string; records: number; ms: number };
+
 export async function loadSnapshot(
 	raw: Raw,
 	records: readonly SnapshotRecord[],
-	opts: { chunk?: number; onProgress?: (p: { done: number; total: number }) => void } = {},
+	opts: { chunk?: number; onProgress?: (p: { done: number; total: number }) => void; onSlice?: (s: SnapshotSlice) => void } = {},
 ): Promise<SnapshotLoadResult> {
+	// `chunk`: the most records one transaction takes (tests pin it small).
 	const chunk = Math.max(1, opts.chunk ?? 2_000);
 	const db = drizzle(raw, { schema });
 	const mergeRows = (loser: string, winner: string): void => { applyTrackMerge(db, raw, winner, loser, { emit: false }); };
@@ -143,44 +156,68 @@ export async function loadSnapshot(
 	let maxSliceMs = 0;
 	let done = 0;
 
+	// Playlist positions and counts are restamped once per playlist after the
+	// last slice (remote-rows.ts settlePlaylistsAsync), not in every slice
+	// that adds one of their rows.
+	const deferred = new Set<string>();
+
+	// Slices sized by time: the next one's size aims at SNAPSHOT_SLICE_MS
+	// from the last one's cost, never spans two maps (a tombstone join is a
+	// clock compare, a playlist row a projection), and each map starts small.
+	const sliced = async <T>(items: readonly T[], mapOf: (t: T) => string, phase: SnapshotSlice['phase'], run: (slice: readonly T[]) => void): Promise<void> => {
+		let size = FIRST_CHUNK;
+		for (let i = 0; i < items.length;) {
+			const map = mapOf(items[i]!);
+			let end = i + 1;
+			while (end < items.length && end - i < size && mapOf(items[end]!) === map) end++;
+			const slice = items.slice(i, end);
+			const t0 = performance.now();
+			run(slice);
+			const ms = performance.now() - t0;
+			chunks++;
+			done += slice.length;
+			maxSliceMs = Math.max(maxSliceMs, ms);
+			opts.onSlice?.({ phase, map, records: slice.length, ms });
+			opts.onProgress?.({ done, total: records.length });
+			i = end;
+			size = i < items.length && mapOf(items[i]!) !== map
+				? FIRST_CHUNK
+				: Math.max(MIN_CHUNK, Math.min(chunk, Math.ceil(size * 1.5), Math.round(slice.length * SNAPSHOT_SLICE_MS / Math.max(ms, 1))));
+			await yieldToLoop();
+		}
+	};
+
 	// 1. Merges and artist alias rules, as ops through the reducer (alias
-	// rebuilds + fold of local loser records), in one transaction: there are
-	// few of them. The rules' credit rewrite is queued and drained after.
-	const merges = records.filter((r) => r.map === 'merges' || r.map === 'artistAliases');
-	if (merges.length > 0) {
-		const t0 = performance.now();
+	// rebuilds + fold of local loser records), in order, each slice its own
+	// transaction (3,521 merges on the real library: one transaction for
+	// all of them held the loop for seconds). The rules' credit rewrite is
+	// queued and drained after.
+	const ops = [
+		...records.filter((r) => r.map === 'merges').map((r) => mergeOp(r.key, r.value as MergeRecord)),
+		...records.filter((r) => r.map === 'artistAliases').map((r) => artistAliasOp(r.key, r.value as ArtistAliasRecord)),
+	];
+	await sliced(ops, (o) => o.entity, 'merges', (slice) => {
 		raw.transaction(() => {
 			const store = new SyncStateStore(raw);
 			const refs: EntityRef[] = [];
-			const ops = [
-				...merges.filter((r) => r.map === 'merges').map((r) => mergeOp(r.key, r.value as MergeRecord)),
-				...merges.filter((r) => r.map === 'artistAliases').map((r) => artistAliasOp(r.key, r.value as ArtistAliasRecord)),
-			];
-			store.prefetch(ops);
-			for (const op of ops) {
+			store.prefetch(slice);
+			for (const op of slice) {
 				store.touch(op);
 				refs.push(...applyOp(store.state, op).changed);
 			}
 			const flushed = store.flush();
-			const s = project(raw, store, refs, flushed, { mergeRows });
+			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred });
 			for (const t of s.tracksTouched) tracks.add(t);
 			for (const p of s.playlistsTouched) playlists.add(p);
 			changedRefs.push(...refs);
 			changed += refs.length;
 		})();
-		chunks++;
-		done += merges.length;
-		maxSliceMs = Math.max(maxSliceMs, performance.now() - t0);
-		opts.onProgress?.({ done, total: records.length });
-		await yieldToLoop();
-	}
+	});
 
 	// 2. Everything else, in projection order.
 	const rank = new Map(LOAD_ORDER.map((m, i) => [m, i]));
 	const rest = records.filter((r) => r.map !== 'merges' && r.map !== 'artistAliases').sort((a, b) => (rank.get(a.map) ?? 99) - (rank.get(b.map) ?? 99));
-	for (let i = 0; i < rest.length; i += chunk) {
-		const slice = rest.slice(i, i + chunk);
-		const t0 = performance.now();
+	await sliced(rest, (r) => r.map, 'records', (slice) => {
 		raw.transaction(() => {
 			const store = new SyncStateStore(raw);
 			const refs: EntityRef[] = [];
@@ -196,19 +233,15 @@ export async function loadSnapshot(
 				}
 			}
 			const flushed = store.flush();
-			const s = project(raw, store, refs, flushed, { mergeRows });
+			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred });
 			for (const t of s.tracksTouched) tracks.add(t);
 			for (const p of s.playlistsTouched) playlists.add(p);
 			changedRefs.push(...refs);
 			changed += refs.length;
 		})();
-		chunks++;
-		done += slice.length;
-		maxSliceMs = Math.max(maxSliceMs, performance.now() - t0);
-		opts.onProgress?.({ done, total: records.length });
-		if (i + chunk < rest.length) await yieldToLoop();
-	}
+	});
 
+	maxSliceMs = Math.max(maxSliceMs, await settlePlaylistsAsync(raw, deferred));
 	// Every visible row now came through the op log's records.
 	markRecordsComplete(raw);
 	// Credits the snapshot's alias rules rename, in yielding chunks.

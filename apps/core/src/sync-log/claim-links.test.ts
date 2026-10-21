@@ -67,8 +67,18 @@ const claim = (device: string, rec: string, kind: string, value: string, confide
 	op(device, 'recording_claim', rec, 'add', { kind, value, confidence }, ts);
 const remoteRec = (i: number): string => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
 
-const linksOf = (raw: Database.Database, trackId: string): Record<string, string> =>
-	Object.fromEntries((claimLinksOf(raw, [trackId]).get(trackId) ?? []).map((l) => [l.source, l.sourceTrackId]));
+// The primary derived id per provider (the first claimLinksOf lists), and
+// every derived id per provider in rank order.
+const linksOf = (raw: Database.Database, trackId: string): Record<string, string> => {
+	const out: Record<string, string> = {};
+	for (const l of claimLinksOf(raw, [trackId]).get(trackId) ?? []) out[l.source] ??= l.sourceTrackId;
+	return out;
+};
+const allLinksOf = (raw: Database.Database, trackId: string): Record<string, string[]> => {
+	const out: Record<string, string[]> = {};
+	for (const l of claimLinksOf(raw, [trackId]).get(trackId) ?? []) (out[l.source] ??= []).push(l.sourceTrackId);
+	return out;
+};
 
 // ── what a row gets ─────────────────────────────────────────────────────────
 
@@ -86,9 +96,38 @@ describe('claim links: derivation', () => {
 			claim('dev-x', R('mine'), 'spotify', 'sp-theirs'), claim('dev-x', R('mine'), 'tidal', 'td-theirs'),
 		]);
 		expect(linksOf(raw, remoteTrackId(rec))).toEqual({ spotify: 'sp1', tidal: 'td1', beatport: '123' });
-		// The own Spotify link wins; Tidal comes from the account.
-		expect(linksOf(raw, 'mine')).toEqual({ tidal: 'td-theirs' });
+		// The own Spotify link wins for its own id only: the account's other
+		// Spotify id is listed beside it, and Tidal comes from the account.
+		expect(allLinksOf(raw, 'mine')).toEqual({ spotify: ['sp-theirs'], tidal: ['td-theirs'] });
 		expect(claimLinkPendingCount(raw)).toBe(0);
+	});
+
+	it('holds every claimed id of a provider, ranked; an own link takes out its id alone (audit 6a)', () => {
+		const { raw } = freshDb();
+		const rec = remoteRec(9);
+		applyOps(raw, [
+			created('dev-x', rec), op('dev-x', 'library_track', rec, 'set-meta', meta('Merged')),
+			claim('dev-x', rec, 'spotify', 'sp-b', 1, 1_760_000_000_100),
+			claim('dev-x', rec, 'spotify', 'sp-a', 1, 1_760_000_000_200),
+			claim('dev-y', rec, 'spotify', 'sp-c', 0.9, 1_770_000_000_000),
+			claim('dev-x', rec, 'tidal', 'td-1', 1, 1_760_000_000_300), claim('dev-x', rec, 'tidal', 'td-2', 1, 1_760_000_000_400),
+		]);
+		const id = remoteTrackId(rec);
+		// Confidence first, then the latest, then the smallest value.
+		expect(allLinksOf(raw, id)).toEqual({ spotify: ['sp-a', 'sp-b', 'sp-c'], tidal: ['td-2', 'td-1'] });
+		expect(raw.prepare(`SELECT rank FROM claim_link WHERE track_id = ? AND source = 'spotify' ORDER BY rank`).pluck().all(id)).toEqual([0, 1, 2]);
+		// This device ingests the primary: that id leaves claim_link, the rest
+		// re-rank (queued by the trigger, drained by the next derivation).
+		link(raw, id, 'spotify', 'sp-a');
+		deriveClaimLinks(raw, raw.prepare(`SELECT recording_id FROM claim_link_pending`).pluck().all() as string[]);
+		expect(allLinksOf(raw, id).spotify).toEqual(['sp-b', 'sp-c']);
+		expect(raw.prepare(`SELECT rank FROM claim_link WHERE track_id = ? AND source = 'spotify' ORDER BY rank`).pluck().all(id)).toEqual([0, 1]);
+		// Dismissing one id vetoes that id only.
+		expect(dismissClaimLink(raw, id, 'spotify', 'sp-c')).toBe(1);
+		expect(allLinksOf(raw, id).spotify).toEqual(['sp-b']);
+		expect(allLinksOf(raw, id).tidal).toEqual(['td-2', 'td-1']);
+		// The list's decoration names each provider once.
+		expect([...new Set((claimLinksOf(raw, [id]).get(id) ?? []).map((l) => l.source))]).toEqual(['spotify', 'tidal']);
 	});
 
 	it('picks the highest confidence, then the latest claim, the same on every device', () => {
@@ -99,9 +138,11 @@ describe('claim links: derivation', () => {
 			claim('dev-y', R('t'), 'tidal', 'td-exact-old', 1, 1_760_000_000_001),
 		]);
 		expect(linksOf(raw, 't').tidal).toBe('td-exact-old');
-		// A user's correction on another device: a newer exact claim.
+		// A user's correction on another device: a newer exact claim. It takes
+		// the primary; the older ids stay listed (claims are append-only).
 		applyOps(raw, [claim('dev-y', R('t'), 'tidal', 'td-corrected', 1, 1_771_000_000_000)]);
 		expect(linksOf(raw, 't').tidal).toBe('td-corrected');
+		expect(allLinksOf(raw, 't').tidal).toEqual(['td-corrected', 'td-exact-old', 'td-fuzzy-new']);
 	});
 
 	it('a derived WAV copy gets none', () => {
@@ -155,17 +196,18 @@ describe('claim links: kept in step', () => {
 		expect(raw.prepare(`SELECT DISTINCT recording_id FROM claim_link WHERE track_id = 'mine'`).pluck().all()).toEqual([winner]);
 	});
 
-	it('an own link dropped on purpose is not derived back; another claim of that provider may stand in', () => {
+	it('an own link dropped on purpose is not derived back; the provider\'s other ids stay listed', () => {
 		const { raw } = freshDb();
 		insertTrack(raw, 't');
 		link(raw, 't', 'spotify', 'sp-wrong');
 		applyOps(raw, [claim('dev-x', R('t'), 'spotify', 'sp-wrong'), claim('dev-y', R('t'), 'spotify', 'sp-other', 0.9)]);
-		expect(linksOf(raw, 't')).toEqual({});
+		// The own link wins for its id; the other claimed id is listed.
+		expect(allLinksOf(raw, 't')).toEqual({ spotify: ['sp-other'] });
 		raw.prepare(`DELETE FROM source_link WHERE track_id = 't'`).run();
 		deriveClaimLinks(raw, raw.prepare(`SELECT recording_id FROM claim_link_pending`).pluck().all() as string[]);
-		expect(linksOf(raw, 't')).toEqual({ spotify: 'sp-other' });
-		// The user hides the stand-in too (Edit screen ×): nothing left.
-		expect(dismissClaimLink(raw, 't', 'spotify')).toBe(true);
+		expect(allLinksOf(raw, 't')).toEqual({ spotify: ['sp-other'] });
+		// The user clears the provider (Edit screen ×): nothing left.
+		expect(dismissClaimLink(raw, 't', 'spotify')).toBe(1);
 		expect(linksOf(raw, 't')).toEqual({});
 		// A later claim batch for the recording keeps both dismissed.
 		applyOps(raw, [claim('dev-x', R('t'), 'beatport', '77', 0.7)]);
@@ -188,6 +230,44 @@ describe('claim links: kept in step', () => {
 });
 
 // ── the sweep ───────────────────────────────────────────────────────────────
+
+describe('claim links: the table of the first shape (one id per provider)', () => {
+	it('migrate drops it with its per-provider triggers, the sweep runs again and fills every id', async () => {
+		const { raw } = freshDb('old-shape');
+		const path = raw.name;
+		insertTrack(raw, 't');
+		applyOps(raw, [claim('dev-x', R('t'), 'spotify', 'sp-1'), claim('dev-x', R('t'), 'spotify', 'sp-2')]);
+		// A database the 2026-10-21 build left: the old table holding one id
+		// per provider, the old triggers, the sweep done.
+		raw.exec(`DROP TRIGGER claim_link_own_insert; DROP TRIGGER claim_link_own_update; DROP TABLE claim_link`);
+		raw.exec(`CREATE TABLE claim_link (track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE, source TEXT NOT NULL, source_track_id TEXT NOT NULL,
+			recording_id TEXT NOT NULL, PRIMARY KEY (track_id, source)) WITHOUT ROWID`);
+		raw.exec(`CREATE TRIGGER claim_link_own_insert AFTER INSERT ON source_link WHEN NEW.source IN ('spotify', 'tidal', 'beatport')
+			BEGIN DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source; END`);
+		raw.prepare(`INSERT INTO claim_link (track_id, source, source_track_id, recording_id) VALUES ('t', 'spotify', 'sp-2', ?)`).run(R('t'));
+		raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1)`).run(CLAIM_LINKS_SWEEP_KEY);
+		raw.close();
+		handles.splice(handles.indexOf(raw), 1);
+
+		migrate(path);
+		const { sqlite } = createDb(path);
+		handles.push(sqlite);
+		expect((sqlite.prepare(`SELECT name FROM pragma_table_info('claim_link')`).pluck().all() as string[])).toContain('rank');
+		expect(sqlite.prepare(`SELECT count(*) FROM claim_link`).pluck().get()).toBe(0);
+		expect(claimLinksSwept(sqlite)).toBe(false);
+		expect(sqlite.prepare(`SELECT sql FROM sqlite_master WHERE name = 'claim_link_own_insert'`).pluck().get()).toContain('source_track_id = NEW.source_track_id');
+		await sweepClaimLinksAsync(sqlite);
+		expect(allLinksOf(sqlite, 't')).toEqual({ spotify: ['sp-2', 'sp-1'] });
+		// A second migrate leaves the new table alone.
+		sqlite.close();
+		handles.splice(handles.indexOf(sqlite), 1);
+		migrate(path);
+		const again = createDb(path).sqlite;
+		handles.push(again);
+		expect(again.prepare(`SELECT count(*) FROM claim_link`).pluck().get()).toBe(2);
+		expect(claimLinksSwept(again)).toBe(true);
+	});
+});
 
 describe('claim links: the one-time sweep and the drain', () => {
 	it('derives every row of a library that had claims before, in slices, once; emits nothing', async () => {

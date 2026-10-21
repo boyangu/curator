@@ -85,6 +85,8 @@ import { derivePendingCount, drainTrackDerivationsAsync, materializeSwept, remot
 import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
 import { claimLinkPendingCount, claimLinksSwept, drainClaimLinksAsync, sweepClaimLinksAsync } from './claim-links.js';
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
+import { healPlayHistoryAsync, playHealPending } from './play-heal.js';
+import { reconcileProviderClaimsAsync } from './claim-reconcile.js';
 import {
 	defaultMasterDevice, drainTrackMetaAsync, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
 } from './track-meta.js';
@@ -1025,6 +1027,28 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		emitApplied(tracks, playlists, []);
 	};
 
+	// Plays a projection left without their track (play-heal.ts), once, after
+	// the remote rows above exist.
+	const healPlayHistory = async (): Promise<void> => {
+		if (!playHealPending(raw) || !firstPullDone(raw) || !recordsComplete(raw)) return;
+		const r = await healPlayHistoryAsync(raw);
+		if (r.relinked > 0) slog.info('play history: re-linked to tracks', { events: r.events, relinked: r.relinked, sessions: r.sessions, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+	};
+
+	// Provider links this device holds that no claim states yet
+	// (claim-reconcile.ts), once a session: the one-time claims backfill ran
+	// at a single instant, and a link written after it by a path that did
+	// not claim stayed invisible to every other device. Only once the
+	// account's records are here (first pull): before it, every link of a
+	// device joining an existing library would look unclaimed.
+	let claimsReconciled = false;
+	const reconcileClaims = async (): Promise<void> => {
+		if (claimsReconciled || !initialPushDone() || claimsBackfillPending(raw) || !recordsComplete(raw) || !firstPullDone(raw)) return;
+		const r = await reconcileProviderClaimsAsync(raw);
+		claimsReconciled = true;
+		if (r.emitted > 0) slog.info('provider claims: stated links no claim carried', { emitted: r.emitted, bySource: r.bySource, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+	};
+
 	const stage = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
 		try { await fn(); } catch (err) { slog.warn(`${name} failed; retrying next cycle`, undefined, err); }
 	};
@@ -1102,6 +1126,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		try {
 			await ensureRegistered(session);
 			await runInitialPush();
+			await stage('provider claims', reconcileClaims);
 			// Claims made here since the last cycle (and by the backfills just
 			// above) resolve before the push carries them.
 			await resolveIdentities();
@@ -1135,6 +1160,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			await resolveIdentities();
 			await sweepStreamingDuplicates();
 			await stage('remote rows', settleRemoteRows);
+			await stage('play history heal', healPlayHistory);
 			// The pull was what told this session the server reads v3 (the
 			// push before it had nothing to send): the meta stage runs now,
 			// and one more pull brings the cursor back to the head past this

@@ -8,9 +8,12 @@
 // The claims already carry them: every device states the provider ids its
 // rows hold (`recording_claim` kind spotify / tidal / beatport; the streaming
 // upserts, the hybrid matcher, enrichment, the Edit screen, the claims
-// backfill). This materialises, per row of a recording, the best claim of
-// each provider kind the row has no own link for, into claim_link — a table
-// of its own (schema.ts claimLink says why it is not source_link).
+// backfill). This materialises, per row of a recording, every claimed id of
+// each provider kind that the row holds no own link of, into claim_link — a
+// table of its own (schema.ts claimLink says why it is not source_link).
+// Every id, not one per provider: a merged recording carries several (the
+// 2026-10-21 audit: 1,324 Spotify and 173 Tidal ids of the main library were
+// lost to a one-per-provider collapse on every other device).
 //
 // What a derived link is for: display (Edit screen URLs, a muted SRC pip,
 // Open-in / Copy URL) and the hybrid matcher's "already matched". What it
@@ -21,11 +24,13 @@
 // the record, and a derived link restated as a claim would be this device
 // vouching for a track it never ingested.
 //
-// Which claim: the highest confidence (1 = minted from / found by that id,
-// 0.9 an ISRC bind, 0.7 a content bind), then the latest — claims are
-// append-only, so a changed link shows as a newer claim — then the smallest
-// value, so every device picks the same one. A value this device dropped
-// from the row on purpose (claim_link_veto) is skipped.
+// Which one is primary (rank 0: what Open-in and the Edit field show): the
+// highest confidence (1 = minted from / found by that id, 0.9 an ISRC bind,
+// 0.7 a content bind), then the latest — claims are append-only, so a
+// changed link shows as a newer claim — then the smallest value, so every
+// device picks the same one. A value this device dropped from the row on
+// purpose (claim_link_veto) is skipped, and so is a value the row holds as
+// its own link (an own link wins, per id).
 //
 // Kept in step by: the projection (project.ts queues every recording whose
 // claims a batch changed, and both sides of a merge), triggers on track (a
@@ -112,38 +117,46 @@ function deriveChunk(raw: Raw, recs: readonly string[]): string[] {
 	const rows = raw.prepare(`SELECT id, recording_id AS rec FROM track WHERE recording_id IN (${marks(recs.length)}) AND derived_from_track_id IS NULL`)
 		.all(...recs) as Array<{ id: string; rec: string }>;
 	const ids = rows.map((r) => r.id);
+	// Keyed `${track}\0${source}\0${id}`: an own link and a veto exclude that
+	// id only.
+	const key3 = (t: string, s: string, v: string): string => `${t}\u0000${s}\u0000${v}`;
 	const own = new Set<string>();
 	const veto = new Set<string>();
-	const have = new Map<string, { value: string; rec: string }>();
+	const have = new Map<string, { track: string; source: string; value: string; rank: number; rec: string }>();
 	if (ids.length > 0) {
-		for (const l of raw.prepare(`SELECT track_id AS t, source AS s FROM source_link WHERE track_id IN (${marks(ids.length)}) AND source IN ('spotify', 'tidal', 'beatport')`)
-			.all(...ids) as Array<{ t: string; s: string }>) own.add(`${l.t}\u0000${l.s}`);
+		for (const l of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM source_link WHERE track_id IN (${marks(ids.length)}) AND source IN ('spotify', 'tidal', 'beatport')`)
+			.all(...ids) as Array<{ t: string; s: string; v: string }>) own.add(key3(l.t, l.s, l.v));
 		for (const v of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link_veto WHERE track_id IN (${marks(ids.length)})`)
-			.all(...ids) as Array<{ t: string; s: string; v: string }>) veto.add(`${v.t}\u0000${v.s}\u0000${v.v}`);
-		for (const l of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v, recording_id AS rec FROM claim_link WHERE track_id IN (${marks(ids.length)})`)
-			.all(...ids) as Array<{ t: string; s: string; v: string; rec: string }>) have.set(`${l.t}\u0000${l.s}`, { value: l.v, rec: l.rec });
+			.all(...ids) as Array<{ t: string; s: string; v: string }>) veto.add(key3(v.t, v.s, v.v));
+		for (const l of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v, recording_id AS rec, rank FROM claim_link WHERE track_id IN (${marks(ids.length)})`)
+			.all(...ids) as Array<{ t: string; s: string; v: string; rec: string; rank: number }>) have.set(key3(l.t, l.s, l.v), { track: l.t, source: l.s, value: l.v, rank: l.rank, rec: l.rec });
 	}
 
-	const put = raw.prepare(`INSERT INTO claim_link (track_id, source, source_track_id, recording_id) VALUES (?, ?, ?, ?)
-		ON CONFLICT(track_id, source) DO UPDATE SET source_track_id = excluded.source_track_id, recording_id = excluded.recording_id`);
-	const drop = raw.prepare(`DELETE FROM claim_link WHERE track_id = ? AND source = ?`);
+	const put = raw.prepare(`INSERT INTO claim_link (track_id, source, source_track_id, recording_id, rank) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(track_id, source, source_track_id) DO UPDATE SET recording_id = excluded.recording_id, rank = excluded.rank`);
+	const drop = raw.prepare(`DELETE FROM claim_link WHERE track_id = ? AND source = ? AND source_track_id = ?`);
+	const want = new Set<string>();
+	const changedRows = new Set<string>();
 	for (const row of rows) {
-		let changed = false;
 		const kinds = byRec.get(row.rec);
 		for (const source of CLAIM_LINK_SOURCES) {
-			const key = `${row.id}\u0000${source}`;
-			const cur = have.get(key);
-			const pick = own.has(key) ? undefined : kinds?.get(source)?.find((c) => !veto.has(`${key}\u0000${c.value}`));
-			if (!pick) {
-				if (cur) { drop.run(row.id, source); changed = true; }
-				continue;
+			let rank = 0;
+			for (const c of kinds?.get(source) ?? []) {
+				const key = key3(row.id, source, c.value);
+				if (want.has(key) || own.has(key) || veto.has(key)) continue;
+				want.add(key);
+				const cur = have.get(key);
+				if (!cur || cur.rank !== rank || cur.rec !== row.rec) { put.run(row.id, source, c.value, row.rec, rank); changedRows.add(row.id); }
+				rank++;
 			}
-			if (cur && cur.value === pick.value && cur.rec === row.rec) continue;
-			put.run(row.id, source, pick.value, row.rec);
-			changed = true;
 		}
-		if (changed) touched.push(row.id);
 	}
+	for (const [key, cur] of have) {
+		if (want.has(key)) continue;
+		drop.run(cur.track, cur.source, cur.value);
+		changedRows.add(cur.track);
+	}
+	touched.push(...changedRows);
 	// A row rebound away from one of these recordings keeps nothing derived
 	// from it (the rebind trigger drops them too; this covers a raw handle
 	// that wrote the row before the trigger existed).
@@ -227,7 +240,10 @@ export function claimLinksSwept(raw: Raw): boolean {
 // between. The gate key is set only by a run that finished: an interrupted
 // one starts over (each page is idempotent and writes only differences).
 export async function sweepClaimLinksAsync(raw: Raw, opts: { page?: number } = {}): Promise<ClaimLinkRun> {
-	const page = Math.max(1, opts.page ?? 400);
+	// Sized by time unless `page` pins it (tests): every id per provider
+	// made a page's cost vary with how many each recording carries.
+	const fixed = opts.page !== undefined;
+	let page = Math.max(1, opts.page ?? 200);
 	const out: ClaimLinkRun = { recordings: 0, tracks: [], chunks: 0, maxSliceMs: 0 };
 	const tracks = new Set<string>();
 	const next = raw.prepare(`SELECT DISTINCT recording_id FROM track WHERE recording_id > ? ORDER BY recording_id LIMIT ?`).pluck();
@@ -239,7 +255,9 @@ export async function sweepClaimLinksAsync(raw: Raw, opts: { page?: number } = {
 		if (recs.length === 0) break;
 		after = recs[recs.length - 1]!;
 		const changed = raw.transaction(() => deriveClaimLinks(raw, recs))();
-		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);
+		const ms = performance.now() - t0;
+		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
+		if (!fixed) page = Math.max(20, Math.min(800, Math.ceil(page * 1.5), Math.round(recs.length * 40 / Math.max(ms, 1))));
 		out.recordings += recs.length;
 		out.chunks++;
 		for (const t of changed) tracks.add(t);
@@ -263,12 +281,13 @@ function hasProviderClaims(raw: Raw): boolean {
 export type ClaimLinkRead = { source: ClaimLinkSource; sourceTrackId: string };
 
 // The derived links of these rows, batched (500 per IN list, like every
-// decorate read in service.ts).
+// decorate read in service.ts); each row's in provider, then rank order, so
+// the first of a provider is its primary.
 export function claimLinksOf(raw: Raw, trackIds: readonly string[]): Map<string, ClaimLinkRead[]> {
 	const out = new Map<string, ClaimLinkRead[]>();
 	for (let i = 0; i < trackIds.length; i += 500) {
 		const chunk = trackIds.slice(i, i + 500);
-		for (const r of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link WHERE track_id IN (${marks(chunk.length)})`)
+		for (const r of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link WHERE track_id IN (${marks(chunk.length)}) ORDER BY track_id, source, rank, source_track_id`)
 			.all(...chunk) as Array<{ t: string; s: ClaimLinkSource; v: string }>) {
 			let list = out.get(r.t);
 			if (!list) out.set(r.t, (list = []));
@@ -278,15 +297,22 @@ export function claimLinksOf(raw: Raw, trackIds: readonly string[]): Map<string,
 	return out;
 }
 
-// Drop a row's derived link for one provider and keep it dropped (the user
-// cleared it on the Edit screen). Returns whether one was there.
-export function dismissClaimLink(raw: Raw, trackId: string, source: string): boolean {
-	const cur = raw.prepare(`SELECT source_track_id FROM claim_link WHERE track_id = ? AND source = ?`).pluck().get(trackId, source) as string | undefined;
-	if (cur === undefined) return false;
-	raw.prepare(`INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id) VALUES (?, ?, ?)`).run(trackId, source, cur);
-	raw.prepare(`DELETE FROM claim_link WHERE track_id = ? AND source = ?`).run(trackId, source);
-	// Another claim of that provider may stand in for it.
+// Drop a row's derived links for one provider and keep them dropped, each id
+// vetoed on its own: the user cleared the provider on the Edit screen, so
+// every id it listed goes and none stands in for the cleared one.
+// `sourceTrackId` narrows it to that one id. Returns how many were there. A
+// claim of a new id that arrives later is still derived — vetoes name ids,
+// not the provider.
+export function dismissClaimLink(raw: Raw, trackId: string, source: string, sourceTrackId?: string): number {
+	const ids = (sourceTrackId !== undefined
+		? raw.prepare(`SELECT source_track_id FROM claim_link WHERE track_id = ? AND source = ? AND source_track_id = ?`).pluck().all(trackId, source, sourceTrackId)
+		: raw.prepare(`SELECT source_track_id FROM claim_link WHERE track_id = ? AND source = ?`).pluck().all(trackId, source)) as string[];
+	if (ids.length === 0) return 0;
+	const veto = raw.prepare(`INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id) VALUES (?, ?, ?)`);
+	const drop = raw.prepare(`DELETE FROM claim_link WHERE track_id = ? AND source = ? AND source_track_id = ?`);
+	for (const id of ids) { veto.run(trackId, source, id); drop.run(trackId, source, id); }
+	// What remains of the provider (one id narrowed out) re-ranks.
 	const rec = raw.prepare(`SELECT recording_id FROM track WHERE id = ?`).pluck().get(trackId) as string | undefined;
 	if (rec) deriveClaimLinks(raw, [rec]);
-	return true;
+	return ids.length;
 }

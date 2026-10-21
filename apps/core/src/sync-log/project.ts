@@ -79,7 +79,13 @@ export function project(
 	flushed: FlushResult,
 	// remoteCreateBudget: remote rows this call may make (remote-rows.ts
 	// INLINE_CREATE_ROWS by default; the pending drain passes its slice).
-	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string>; remoteCreateBudget?: number } = {},
+	// deferPositions: the playlists whose positions and counts this call
+	// would restamp are added here instead, for a caller that projects in
+	// many small slices and settles each playlist once at the end
+	// (remote-rows.ts settlePlaylistsAsync): restamping a 700-row playlist in
+	// every slice that adds one of its rows is what made the remote-row drain
+	// hold the loop for 846 ms (2026-10-21 audit).
+	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string>; remoteCreateBudget?: number; deferPositions?: Set<string> } = {},
 ): ProjectSummary {
 	const state = store.state;
 	const now = Date.now();
@@ -317,8 +323,13 @@ export function project(
 			.run(key, JSON.stringify(cell.value), now);
 	}
 
+	// Sessions and events are loaded like every other record (ensure): a
+	// projection over refs it did not join itself — a remote row's adoption,
+	// a bound import, the play-history heal — runs on a fresh store, and
+	// reading the map alone skipped every one of them (the 2026-10-21 audit:
+	// 29,701 of 30,185 plays left without their track on a fresh device).
 	for (const id of ids('play_session')) {
-		const r = state.playSessions.get(id);
+		const r = store.ensure('playSessions', id) as LwwRecord | undefined;
 		if (!r || r.created === null) continue;
 		const rbId = field<string | null>(r, 'rb_history_id', null);
 		if (rbId && raw.prepare(`SELECT 1 FROM play_session WHERE rb_history_id = ? AND id != ?`).get(rbId, id)) {
@@ -380,8 +391,16 @@ export function project(
 	const providerTrackId = raw.prepare(`SELECT source_track_id FROM source_link WHERE track_id = ? AND source = ? LIMIT 1`);
 	// Inserts park on distinct negative positions (the unique (playlist,
 	// position) index), recomputePositions then restamps 0..n-1. Its own
-	// parking spots are -1..-n, so these start well below.
-	let parked = -1_000_000;
+	// parking spots are -1..-n, so these start well below — and below any
+	// row an earlier deferred call (hooks.deferPositions) left parked.
+	const parkedNext = new Map<string, number>();
+	const parkedMin = raw.prepare(`SELECT MIN(position) FROM playlist_track WHERE playlist_id = ?`).pluck();
+	const park = (pid: string): number => {
+		let v = parkedNext.get(pid);
+		if (v === undefined) v = Math.min(-1_000_000, ((parkedMin.get(pid) as number | null) ?? 0) - 1);
+		parkedNext.set(pid, v - 1);
+		return v;
+	};
 	for (const id of ids('playlist_track')) {
 		const rec = store.ensure('playlistTracks', id) as PlaylistTrackRecord | undefined;
 		store.ensureTombstone(tombstoneKey('playlist_track', id));
@@ -407,7 +426,7 @@ export function project(
 				const provider = src === 'spotify' || src === 'tidal'
 					? (providerTrackId.get(t, src) as { source_track_id: string } | undefined)?.source_track_id
 					: undefined;
-				memberInsert.run(id, pid, t, key, parked--, rec!.added!.ts, provider ?? t);
+				memberInsert.run(id, pid, t, key, park(pid), rec!.added!.ts, provider ?? t);
 				playlistsTouched.add(pid);
 			}
 			tracksTouched.add(t!);
@@ -438,6 +457,7 @@ export function project(
 	}
 
 	for (const id of ids('play_event')) {
+		store.ensure('playEvents', id);
 		const cell = state.playEvents.get(id);
 		if (!cell) continue;
 		const e = cell.value;
@@ -517,6 +537,7 @@ export function project(
 
 	// ── 6. derived: positions + counts for every playlist touched ────────
 	for (const pid of playlistsTouched) {
+		if (hooks.deferPositions) { hooks.deferPositions.add(pid); continue; }
 		if (!exists('playlist', pid)) continue;
 		recomputePositions(raw, pid);
 		raw.prepare(`UPDATE playlist SET track_count = (SELECT count(*) FROM playlist_track WHERE playlist_id = ?), updated_at = ? WHERE id = ?`).run(pid, now, pid);

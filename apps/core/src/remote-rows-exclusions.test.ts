@@ -34,7 +34,7 @@ import { SpotifySync } from './sync/spotify.js';
 import { TidalDownloader } from './sync/download-orchestrator.js';
 import { LibrarySink } from './enrich/sinks/library-sink.js';
 import { planCreateForTracks } from './rekordbox/create-phase.js';
-import { AnalysisQueue, splitRemoteRows } from './analyzer/queue.js';
+import { AnalysisQueue, splitFileless } from './analyzer/queue.js';
 import type { AnalyzerSidecar } from './analyzer/sidecar.js';
 import { planPlaylistConversion, type WavConvertDeps } from './wav/convert-run.js';
 import { sqliteLibraryPort } from './mir/library-port.js';
@@ -276,23 +276,33 @@ describe('rekordbox: no content is created for a remote row', () => {
 
 // ── analysis (analyzer/queue.ts, service.ts enqueueAnalysis) ────────────────
 
-describe('analysis: a remote row is never queued', () => {
-	it('splitRemoteRows partitions in input order', () => {
+describe('analysis: a file-less row is never queued', () => {
+	it('splitFileless partitions in input order', () => {
 		seedRemote('r1');
 		seedTrack('o1');
+		seedLocalLink('o1', join(dir, 'o1.flac'));
 		seedTrack('o2');
-		expect(splitRemoteRows(db, ['o2', 'r1', 'o1', 'missing'])).toEqual({ own: ['o2', 'o1', 'missing'], remote: ['r1'] });
-		expect(splitRemoteRows(db, [])).toEqual({ own: [], remote: [] });
+		seedLocalLink('o2', join(dir, 'o2.flac'));
+		// An own row with no file: a streaming-only row, and one whose file
+		// the watcher flagged missing.
+		seedTrack('s1');
+		seedTrack('m1');
+		seedLocalLink('m1', join(dir, 'm1.flac'));
+		sqlite.prepare(`UPDATE source_link SET missing_at = 1 WHERE track_id = 'm1'`).run();
+		expect(splitFileless(db, ['o2', 'r1', 's1', 'o1', 'm1', 'missing'])).toEqual({ own: ['o2', 'o1', 'missing'], fileless: ['r1', 's1', 'm1'] });
+		expect(splitFileless(db, [])).toEqual({ own: [], fileless: [] });
 	});
 
-	it('enqueue drops remote ids: no job row that could never dispatch', () => {
+	it('enqueue drops remote and file-less ids: no job row that could never dispatch', () => {
 		seedRemote('remote');
 		seedTrack('own');
+		seedLocalLink('own', join(dir, 'own.flac'));
+		seedTrack('streaming');
 		const sidecar = { analyze: () => new Promise(() => {}), cancel: () => {}, on: () => {}, off: () => {} } as unknown as AnalyzerSidecar;
 		const queue = new AnalysisQueue(db, sidecar, { peaksDir: join(dir, 'peaks') });
 		queue.setAutoEnabled(false);
-		queue.enqueue(['remote', 'own'], { priority: 0 });
-		queue.enqueue(['remote'], { priority: 100, force: true });
+		queue.enqueue(['remote', 'own', 'streaming'], { priority: 0 });
+		queue.enqueue(['remote', 'streaming'], { priority: 100, force: true });
 		expect(sqlite.prepare(`SELECT track_id FROM analysis_job ORDER BY track_id`).pluck().all()).toEqual(['own']);
 	});
 });

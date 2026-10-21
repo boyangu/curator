@@ -68,14 +68,20 @@ const ownLinks = (d: Desktop): Record<string, Record<string, string>> => group(d
 	`SELECT t.recording_id AS rec, l.source, l.source_track_id AS value FROM source_link l JOIN track t ON t.id = l.track_id
 	WHERE l.source IN ('spotify', 'tidal', 'beatport') AND t.deleted_at IS NULL`));
 const derivedLinks = (d: Desktop): Record<string, Record<string, string>> => group(d.all<{ rec: string; source: string; value: string }>(
-	`SELECT t.recording_id AS rec, c.source, c.source_track_id AS value FROM claim_link c JOIN track t ON t.id = c.track_id WHERE t.deleted_at IS NULL`));
+	`SELECT t.recording_id AS rec, c.source, c.source_track_id AS value FROM claim_link c JOIN track t ON t.id = c.track_id WHERE t.deleted_at IS NULL AND c.rank = 0`));
 function group(rows: Array<{ rec: string; source: string; value: string }>): Record<string, Record<string, string>> {
 	const out: Record<string, Record<string, string>> = {};
 	for (const r of rows) (out[r.rec] ??= {})[r.source] = r.value;
 	return out;
 }
+// The primary per provider (rank 0), and every id per provider in rank order.
 const derivedOf = (d: Desktop, trackId: string): Record<string, string> =>
-	Object.fromEntries(d.all<{ source: string; v: string }>(`SELECT source, source_track_id AS v FROM claim_link WHERE track_id = ?`, trackId).map((r) => [r.source, r.v]));
+	Object.fromEntries(d.all<{ source: string; v: string }>(`SELECT source, source_track_id AS v FROM claim_link WHERE track_id = ? AND rank = 0`, trackId).map((r) => [r.source, r.v]));
+const allDerivedOf = (d: Desktop, trackId: string): Record<string, string[]> => {
+	const out: Record<string, string[]> = {};
+	for (const r of d.all<{ source: string; v: string }>(`SELECT source, source_track_id AS v FROM claim_link WHERE track_id = ? ORDER BY source, rank`, trackId)) (out[r.source] ??= []).push(r.v);
+	return out;
+};
 const rowOf = (d: Desktop, t: string): string => d.trackId(R(t))!;
 const opsOf = async (d: Desktop, filter: (o: { entity: string; kind: string }) => boolean): Promise<unknown[]> => {
 	const id = await d.deviceId();
@@ -132,6 +138,9 @@ describe('provider links reach a second desktop as claim-derived links', () => {
 		await a.svc.mergeTracks('trk-4', 'trk-5');
 		await rig.settle();
 		expect(derivedOf(b, rowOf(b, 'trk-3')).tidal).toBe('3003');
+		// The replaced id stays listed below it: claims are append-only, and a
+		// removal reaching other devices waits for a claim-remove op (v4).
+		expect(allDerivedOf(b, rowOf(b, 'trk-3')).tidal).toEqual(['3003', 'td3']);
 		// The loser's remote row is gone with its links; the survivor took them.
 		expect(b.one(`SELECT count(*) FROM track WHERE recording_id = ?`, R('trk-5'))).toBe(0);
 		expect(b.one(`SELECT count(*) FROM claim_link WHERE recording_id = ?`, R('trk-5'))).toBe(0);

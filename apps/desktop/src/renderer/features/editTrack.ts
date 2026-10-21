@@ -155,6 +155,7 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 	set('tidalUrl', '');
 	set('beatportUrl', '');
 	deps.getModal()?.setDerivedUrls([]);
+	deps.getModal()?.setOtherUrls({});
 	(form.elements.namedItem('title') as HTMLInputElement | null)?.focus();
 	(form.elements.namedItem('title') as HTMLInputElement | null)?.select();
 
@@ -173,7 +174,17 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 					default:         return '';
 				}
 			};
-			const byS = new Map(links.map((l) => [l.source, l.url ?? derive(l.source, l.sourceTrackId)]));
+			// Core lists a provider's primary first (own links, then the
+			// claim-derived ones by rank): the field shows it, the rest are
+			// listed under the field.
+			const byS = new Map<string, string>();
+			const firstOf = new Map<string, (typeof links)[number]>();
+			const others: Record<string, string[]> = {};
+			for (const l of links) {
+				const url = l.url ?? derive(l.source, l.sourceTrackId);
+				if (!firstOf.has(l.source)) { firstOf.set(l.source, l); byS.set(l.source, url); }
+				else if (url && url !== byS.get(l.source)) (others[`${l.source}Url`] ??= []).push(url);
+			}
 			initialUrls = {
 				spotify:  byS.get('spotify')  ?? '',
 				tidal:    byS.get('tidal')    ?? '',
@@ -187,7 +198,8 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 			// own link, so leaving one alone saves nothing; editing it sets this
 			// device's own link, and clearing it hides it on this device (core
 			// deleteTrackSourceLink dismisses a derived link).
-			deps.getModal()?.setDerivedUrls(links.filter((l) => l.derived).map((l) => `${l.source}Url`));
+			deps.getModal()?.setDerivedUrls([...firstOf.values()].filter((l) => l.derived).map((l) => `${l.source}Url`));
+			deps.getModal()?.setOtherUrls(others);
 		}
 	} catch (err) {
 		slog.warn('failed to load source links', undefined, err);

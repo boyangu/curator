@@ -63,6 +63,7 @@ import { persistAnalysisResult } from '../analyzer/persist.js';
 import type { AnalysisCatalogueHook, CataloguePrepared } from '../analyzer/queue.js';
 import type { AnalyzeOptions } from '../analyzer/sidecar.js';
 import { CloudTransportError } from '../sync-log/client.js';
+import { masterDevice } from '../sync-log/track-meta.js';
 import {
 	PEAKS_HI,
 	acceptable,
@@ -74,6 +75,8 @@ import {
 	partialResult,
 	peaksPath,
 	presentLocally,
+	readFilelessTrack,
+	readFilelessTracksByHash,
 	readLocalTrack,
 	readLocalTracks,
 	readLocalTracksByHash,
@@ -98,6 +101,7 @@ import {
 	writeInventoryRev,
 	type MirrorCounts,
 } from './mirror.js';
+import { stmt as stmtCache } from './stmt.js';
 import { coverage, jobNeeds, remainingWork, skipCovered } from './needs.js';
 import {
 	CatalogueBlobError,
@@ -321,6 +325,9 @@ type HydratePlan = {
 	retry: Set<string>;
 	tmpFiles: string[];
 	skippedGuard: number;
+	// File-less rows left out because their recording claims several hashes
+	// and the master device's pick is not determinable (local.ts claimedHashes).
+	skippedAmbiguous: number;
 };
 
 export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
@@ -594,9 +601,18 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	// narrows to one track (prepare) and leaves the mirror's verdicts alone,
 	// since other tracks with the hash may still lack the unit.
 	const fetchPlan = async (hashes: readonly string[], items: LookupMap, keys: readonly UnitKey[], onlyTrack: string | null): Promise<HydratePlan> => {
-		const plan: HydratePlan = { tracks: new Map(), marks: [], retry: new Set(), tmpFiles: [], skippedGuard: 0 };
+		const plan: HydratePlan = { tracks: new Map(), marks: [], retry: new Set(), tmpFiles: [], skippedGuard: 0, skippedAmbiguous: 0 };
 		const keySet = new Set(keys.map(keyId));
 		const byHash = slice(() => readLocalTracksByHash(raw, hashes), 'plan:read');
+		// Rows without the file take the account's analysis too, through
+		// their recording's audio-hash claim (the 2026-10-21 audit: a fresh
+		// device restored none of 5,101 analysed recordings). Not for prepare
+		// (`onlyTrack`): that is an analysis job, which only a file can have.
+		const fileless = onlyTrack ? null : slice(() => readFilelessTracksByHash(raw, hashes, masterDevice(raw)), 'plan:fileless');
+		if (fileless) {
+			plan.skippedAmbiguous = fileless.ambiguousRecordings;
+			for (const [h, list] of fileless.byHash) byHash.set(h, [...(byHash.get(h) ?? []), ...list]);
+		}
 		const blobWanted = new Map<string, { item: StoredCatalogueItem; tracks: LocalTrack[] }>();
 		const entries = slice(() => readEntries(raw, hashes), 'plan:entries');
 		slice(() => {
@@ -621,6 +637,8 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 					const needing: LocalTrack[] = [];
 					for (const t of cands) {
 						if (!trusted(t)) continue;
+						// A print belongs to a file; a row without one takes none.
+						if (t.fileless && item.unit === 'fingerprint') continue;
 						if (presentLocally(t, k, peaksDir)) { had = true; continue; }
 						if (!durationMatches(t, item.durationSec)) { guard = true; plan.skippedGuard++; continue; }
 						applied = true;
@@ -637,7 +655,10 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 					if (applied || had) {
 						// Peaks are marked once their file is in place (below).
 						if (item.unit !== 'peaks' || needing.length === 0) plan.marks.push({ hash, key: k, version: item.version, state: 'hydrated' });
-					} else if (guard || cands.length > 0) {
+					} else if (guard || cands.length > 0 || fileless?.ambiguous.has(hash)) {
+						// Looked at and not usable here (a file-less row of an
+						// ambiguous recording included): not asked again until a
+						// newer version, so no pass re-asks the server for it.
 						plan.marks.push({ hash, key: k, version: item.version, state: 'skipped' });
 					} else {
 						plan.retry.add(hash);
@@ -688,6 +709,19 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 
 	// ── hydrate: commit phase ───────────────────────────────────────────
 
+	// track.bpm and track.key_camelot from a pulled rhythm / key unit, where
+	// the row has none: on a device without the source that filled them (a
+	// rekordbox or Beatport link), the pulled analysis is the only tempo and
+	// key it can show (2026-10-21 audit: hydrate never wrote bpm). A fill
+	// only — a value the row has is the user's or its source's, and wins.
+	const fillTrackMirrors = (trackId: string, items: readonly StoredCatalogueItem[]): void => {
+		for (const it of items) {
+			if (it.unit === 'rhythm' && it.data.bpm > 0) stmtOf(`UPDATE track SET bpm = ? WHERE id = ? AND bpm IS NULL`).run(it.data.bpm, trackId);
+			else if (it.unit === 'key' && it.data.camelot) stmtOf(`UPDATE track SET key_camelot = ? WHERE id = ? AND key_camelot IS NULL`).run(it.data.camelot, trackId);
+		}
+	};
+	const stmtOf = (sql: string) => stmtCache(raw, sql);
+
 	// Peaks files land first (temp → rename, never over a file that appeared
 	// meanwhile — the analyzer may have written its own), then the inline
 	// units go through the analyzer's persist path, re-checking presence
@@ -725,11 +759,15 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				const t0 = performance.now();
 				while (i < todo.length && (performance.now() - t0 < COMMIT_SLICE_MS)) {
 					const ta = todo[i++]!;
-					const t = readLocalTrack(raw, ta.t.trackId);
-					if (!t || !t.path || t.hash !== ta.t.hash || !trusted(t)) continue;
-					const items = ta.inline.filter((it) => !presentLocally(t, { unit: it.unit, variant: it.variant }, peaksDir));
+					const t = ta.t.fileless ? readFilelessTrack(raw, ta.t.trackId, ta.t.hash!) : readLocalTrack(raw, ta.t.trackId);
+					if (!t || (!t.fileless && !t.path) || t.hash !== ta.t.hash || !trusted(t)) continue;
+					const items = ta.inline.filter((it) => !presentLocally(t, { unit: it.unit, variant: it.variant }, peaksDir) && !(t.fileless && it.unit === 'fingerprint'));
 					if (items.length === 0) continue;
-					persistAnalysisResult(db, partialResult(t, items), t.path, { audioHash: t.hash });
+					// The persist path, as on the device that has the file: the
+					// Curator slot, its track mirrors, the stamp. `path` names the
+					// link a fingerprint lands on; a file-less row takes none.
+					persistAnalysisResult(db, partialResult(t, items), t.path ?? '', { audioHash: t.hash });
+					fillTrackMirrors(t.trackId, items);
 					units += items.length;
 					landed.add(t.trackId);
 				}
@@ -788,9 +826,10 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		const phases = [keys.filter((k) => keyId(k) !== keyId(PEAKS_HI)), keys.filter((k) => keyId(k) === keyId(PEAKS_HI))].filter((p) => p.length > 0);
 		for (const phase of phases) {
 			const passed = new Set<string>();
+			const cursor = { rev: -1 };
 			for (;;) {
 				if (!usable()) return;
-				const hashes = slice(() => pendingHydrateHashes(raw, phase, cfg.hydrateBatch, passed), 'pending');
+				const hashes = slice(() => pendingHydrateHashes(raw, phase, cfg.hydrateBatch, passed, cursor), 'pending');
 				if (hashes.length === 0) break;
 				const t0 = performance.now();
 				activity = 'hydrating';
@@ -798,6 +837,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				const items = await lookup(hashes, phase);
 				const plan = await fetchPlan(hashes, items, phase, null);
 				const r = await commitPlan(plan);
+				if (plan.skippedAmbiguous > 0) clog.info('hydrate: rows without the file skipped — their recording claims several audio hashes and the master device\'s is not determinable', { recordings: plan.skippedAmbiguous });
 				for (const h of plan.retry) passed.add(h);
 				// A hash whose verdicts did not move it off 'remote' (no usable
 				// track yet) must not be picked again in this pass.

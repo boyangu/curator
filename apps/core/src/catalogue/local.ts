@@ -81,6 +81,11 @@ export type LocalTrack = {
 	// The single live local link (null: none, or more than one).
 	path: string | null;
 	hash: string | null;
+	// A row with no file here (a remote row, a streaming-only row) whose
+	// hash is its recording's audio-hash claim, not a link's
+	// (readFilelessTracksByHash). Hydrate-only: it never uploads, never takes
+	// a fingerprint (that belongs to a file) and is never analysed.
+	fileless?: boolean;
 	fingerprint: string | null;
 	fingerprintDurationSec: number | null;
 	// Decoded duration when analysed, else what the tags/parser said.
@@ -197,6 +202,122 @@ export function readLocalTracksByHash(raw: Raw, hashes: readonly string[]): Map<
 		else byHash.set(t.hash, [t]);
 	}
 	return byHash;
+}
+
+// ── file-less rows (2026-10-21 audit item 3) ────────────────────────────────
+// A device without the file — a fresh second desktop, a streaming-only row —
+// still knows which audio the account analysed for a recording: the
+// recording's `audio_hash` claims (every device that holds the file states
+// one). Exactly one hash names it. Several (a re-encoded or second copy
+// merged into the recording) name it only if the master device
+// (track-meta.ts masterDevice) claimed exactly one of them — its file is the
+// one the account's metadata comes from; otherwise the recording is
+// ambiguous and skipped, the same rule a track with two live files follows.
+
+export type ClaimedHash = { hash: string | null; ambiguous: boolean };
+
+export function claimedHashes(raw: Raw, recordingIds: readonly string[], master: string | null): Map<string, ClaimedHash> {
+	const out = new Map<string, ClaimedHash>();
+	for (let i = 0; i < recordingIds.length; i += IN_CHUNK) {
+		const chunk = recordingIds.slice(i, i + IN_CHUNK);
+		// `+map`: through the recording index (the claims map is ~100k rows).
+		const rows = raw.prepare(`SELECT recording_id AS rec, substr(parent_id, 12) AS hash, json_extract(value, '$.cell.clock.device') AS dev
+			FROM sync_state WHERE recording_id IN (${chunk.map(() => '?').join(',')}) AND +map = 'claims'
+				AND parent_id >= 'audio_hash:' AND parent_id < 'audio_hash;'`).all(...chunk) as Array<{ rec: string; hash: string; dev: string | null }>;
+		const by = new Map<string, Array<{ hash: string; dev: string | null }>>();
+		for (const r of rows) { let l = by.get(r.rec); if (!l) by.set(r.rec, (l = [])); l.push(r); }
+		for (const [rec, list] of by) {
+			const all = new Set(list.map((c) => c.hash));
+			if (all.size === 1) { out.set(rec, { hash: [...all][0]!, ambiguous: false }); continue; }
+			const mine = new Set(list.filter((c) => master !== null && c.dev === master).map((c) => c.hash));
+			out.set(rec, mine.size === 1 ? { hash: [...mine][0]!, ambiguous: false } : { hash: null, ambiguous: true });
+		}
+	}
+	return out;
+}
+
+const HAS_LIVE_FILE = `EXISTS (SELECT 1 FROM source_link s WHERE s.track_id = t.id AND s.source = 'local' AND s.missing_at IS NULL)`;
+
+function asFileless(t: LocalTrack, hash: string): LocalTrack {
+	return { ...t, path: null, hash, fingerprint: null, fingerprintDurationSec: null, fileless: true, has: { ...t.has, fingerprint: false } };
+}
+
+// Live catalogue rows without a live local file whose recording's claimed
+// hash is one of `hashes`. `ambiguous`: hashes some recording claims but
+// whose rows here cannot take (several hashes and no master pick, or the
+// master's pick is another of them) — the caller marks them rather than
+// looking again every pass.
+export function readFilelessTracksByHash(raw: Raw, hashes: readonly string[], master: string | null): { byHash: Map<string, LocalTrack[]>; ambiguous: Set<string>; ambiguousRecordings: number } {
+	const byHash = new Map<string, LocalTrack[]>();
+	const ambiguous = new Set<string>();
+	if (hashes.length === 0) return { byHash, ambiguous, ambiguousRecordings: 0 };
+	const alias = new Map<string, string>();
+	const claimants = new Map<string, Set<string>>();
+	for (let i = 0; i < hashes.length; i += IN_CHUNK) {
+		const chunk = hashes.slice(i, i + IN_CHUNK);
+		for (const r of raw.prepare(`SELECT substr(parent_id, 12) AS hash, recording_id AS rec FROM sync_state
+			WHERE map = 'claims' AND parent_id IN (${chunk.map(() => '?').join(',')})`).all(...chunk.map((h) => `audio_hash:${h}`)) as Array<{ hash: string; rec: string | null }>) {
+			if (!r.rec) continue;
+			let s = claimants.get(r.rec);
+			if (!s) claimants.set(r.rec, (s = new Set()));
+			s.add(r.hash);
+		}
+	}
+	if (claimants.size === 0) return { byHash, ambiguous, ambiguousRecordings: 0 };
+	const recs = [...claimants.keys()];
+	for (let i = 0; i < recs.length; i += IN_CHUNK) {
+		const chunk = recs.slice(i, i + IN_CHUNK);
+		for (const r of raw.prepare(`SELECT loser, winner FROM recording_alias WHERE loser IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as Array<{ loser: string; winner: string }>) alias.set(r.loser, r.winner);
+	}
+	const live = [...new Set(recs.map((r) => alias.get(r) ?? r))];
+	const rowsOf = new Map<string, string[]>();
+	for (let i = 0; i < live.length; i += IN_CHUNK) {
+		const chunk = live.slice(i, i + IN_CHUNK);
+		for (const r of raw.prepare(`SELECT t.id, t.recording_id AS rec FROM track t WHERE t.recording_id IN (${chunk.map(() => '?').join(',')})
+			AND t.deleted_at IS NULL AND +t.derived_from_track_id IS NULL AND NOT ${HAS_LIVE_FILE}`).all(...chunk) as Array<{ id: string; rec: string }>) {
+			let l = rowsOf.get(r.rec);
+			if (!l) rowsOf.set(r.rec, (l = []));
+			l.push(r.id);
+		}
+	}
+	if (rowsOf.size === 0) return { byHash, ambiguous, ambiguousRecordings: 0 };
+	const resolved = claimedHashes(raw, [...rowsOf.keys()], master);
+	const want = new Set(hashes);
+	const hashOfTrack = new Map<string, string>();
+	let ambiguousRecordings = 0;
+	// The requested hashes each (resolved) recording claims.
+	const requested = new Map<string, Set<string>>();
+	for (const [claimant, hs] of claimants) {
+		const rec = alias.get(claimant) ?? claimant;
+		let set = requested.get(rec);
+		if (!set) requested.set(rec, (set = new Set()));
+		for (const h of hs) set.add(h);
+	}
+	for (const [rec, ids] of rowsOf) {
+		const c = resolved.get(rec);
+		if (!c) continue;
+		if (c.ambiguous || !c.hash) ambiguousRecordings++;
+		// Every requested hash of this recording other than the one it takes.
+		for (const h of requested.get(rec) ?? []) if (h !== c.hash) ambiguous.add(h);
+		if (c.hash && want.has(c.hash)) for (const id of ids) hashOfTrack.set(id, c.hash);
+	}
+	for (const t of readLocalTracks(raw, [...hashOfTrack.keys()])) {
+		const hash = hashOfTrack.get(t.trackId)!;
+		const list = byHash.get(hash);
+		if (list) list.push(asFileless(t, hash));
+		else byHash.set(hash, [asFileless(t, hash)]);
+	}
+	// A hash one recording serves cleanly is not ambiguous for the pass.
+	for (const h of byHash.keys()) ambiguous.delete(h);
+	return { byHash, ambiguous, ambiguousRecordings };
+}
+
+// One file-less row again, at commit time, under the hash its plan used:
+// null once a live file has arrived (the file's own rules take over).
+export function readFilelessTrack(raw: Raw, trackId: string, hash: string): LocalTrack | null {
+	if (stmt(raw, `SELECT 1 FROM track t WHERE t.id = ? AND ${HAS_LIVE_FILE}`).get(trackId) !== undefined) return null;
+	const t = readLocalTrack(raw, trackId);
+	return t ? asFileless(t, hash) : null;
 }
 
 // The row may be added to, and shared, under the file's hash.

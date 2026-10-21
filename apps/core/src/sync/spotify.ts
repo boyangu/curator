@@ -866,8 +866,9 @@ export class SpotifySync {
 			// Already matched on Beatport by another device of the account (a
 			// claim-derived link, sync-log/claim-links.ts): skipped like a
 			// matched track, so the bulk pass never re-crawls what the account
-			// already found. The per-track actions below still enrich it.
-			.leftJoin(claimLink, and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'beatport')))
+			// already found. The per-track actions below still enrich it. The
+			// primary only (rank 0), so a row with several ids joins once.
+			.leftJoin(claimLink, and(eq(claimLink.trackId, track.id), eq(claimLink.source, 'beatport'), eq(claimLink.rank, 0)))
 			.where(and(
 				eq(playlistTrack.playlistId, playlistRowId),
 				isNull(track.bpm),

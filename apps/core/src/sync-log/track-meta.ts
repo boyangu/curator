@@ -54,9 +54,12 @@ export const TRACK_META_FEATURE: SyncFeature = 'track_meta';
 
 // One-time: every own row is queued once the server first reads v3 (a
 // library whose rows predate the triggers). Also the "launch sweep"
-// fallback: bumping the value re-queues every row, and the digest baseline
-// keeps that to the rows whose meta really differs.
-export const TRACK_META_BACKFILL_KEY = 'sync.backfill.track_meta_at';
+// fallback: a new key name re-queues every row, and the digest baseline
+// keeps that to the rows whose meta really differs. v2 (2026-10-21): the
+// cover now falls back to the Spotify payload's album art (trackMetaOf), so
+// the ~23k rows that only ever showed a cover through that fallback state
+// it once.
+export const TRACK_META_BACKFILL_KEY = 'sync.backfill.track_meta_v2_at';
 
 export function serverReadsTrackMeta(features: readonly SyncFeature[] | null | undefined): boolean {
 	return !!features?.includes(TRACK_META_FEATURE);
@@ -99,7 +102,13 @@ export function httpCover(url: string | null | undefined): string | null {
 }
 
 // Null when the row cannot ride an op (a credit list past the payload cap).
-export function trackMetaOf(row: MetaRow, sources: ReadonlySet<string>): TrackMeta | null {
+// `payloadCover`: the row's Spotify payload art (`album.images[0]`, the
+// 640 px one), for a row whose cover_url was never filled — the same
+// fallback the track list shows (service.ts getTrackCoverUrl), which every
+// other device could not, having no payload (23,396 rows of the main
+// library, 2026-10-21 audit item 5). A Tidal payload carries no image (its
+// album is `{ id, title }`).
+export function trackMetaOf(row: MetaRow, sources: ReadonlySet<string>, payloadCover: string | null = null): TrackMeta | null {
 	const base = artistsBaseOf({ artists: (row.artists ?? '[]') as never, artists_base: row.artists_base });
 	const artists: TrackArtist[] = base
 		.filter((a) => a && typeof a.name === 'string' && a.name.length > 0)
@@ -114,7 +123,7 @@ export function trackMetaOf(row: MetaRow, sources: ReadonlySet<string>): TrackMe
 		release_date: str(row.release_date),
 		label: str(row.label),
 		genre: str(row.genre),
-		cover_url: httpCover(row.cover_url),
+		cover_url: httpCover(row.cover_url) ?? httpCover(payloadCover),
 		track_number: count(row.track_number),
 		disc_number: count(row.disc_number),
 	};
@@ -161,7 +170,18 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 		const rowMarks = rowIds.map(() => '?').join(',');
 		const sources = new Map<string, Set<string>>();
 		const seenDigest = new Map<string, string>();
+		const payloadCovers = new Map<string, string>();
 		if (rowIds.length > 0) {
+			// Only for rows with no http cover of their own: json_extract on a few
+			// hundred payloads, not a parse of each. json_valid guards one
+			// malformed payload from failing the chunk. Of a row's several
+			// Spotify links (a merged track), the one getTrackCoverUrl shows:
+			// the first through the (track_id, source) index, lowest rowid.
+			for (const c of raw.prepare(`SELECT s.track_id, json_extract(s.payload, '$.album.images[0].url') AS url FROM source_link s JOIN track t ON t.id = s.track_id
+				WHERE s.track_id IN (${rowMarks}) AND s.source = 'spotify' AND (t.cover_url IS NULL OR t.cover_url NOT LIKE 'http%') AND s.payload IS NOT NULL AND json_valid(s.payload)
+				ORDER BY s.rowid`).all(...rowIds) as Array<{ track_id: string; url: unknown }>) {
+				if (typeof c.url === 'string' && !payloadCovers.has(c.track_id)) payloadCovers.set(c.track_id, c.url);
+			}
 			for (const s of raw.prepare(`SELECT track_id, source FROM source_link WHERE track_id IN (${rowMarks})`).all(...rowIds) as Array<{ track_id: string; source: string }>) {
 				let set = sources.get(s.track_id);
 				if (!set) sources.set(s.track_id, (set = new Set()));
@@ -181,7 +201,7 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 			if (aliased.has(rec)) continue;
 			const row = primary.get(rec);
 			if (!row) continue;
-			const meta = trackMetaOf(row, sources.get(row.id) ?? new Set());
+			const meta = trackMetaOf(row, sources.get(row.id) ?? new Set(), payloadCovers.get(row.id) ?? null);
 			if (!meta) { tooLarge++; continue; }
 			const digest = digestOf(rec, meta);
 			if (seenDigest.get(`${row.id}\u0000${rec}`) === digest) continue;
@@ -198,15 +218,23 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-// The yielding driver: chunks of 500 rows (~10-30 ms each measured on a
-// generated 40k library, see track-meta.test.ts), a yield between.
+// The yielding driver, a yield between chunks. Sized by time: a row whose
+// digest is unchanged costs a few reads, one that emits costs an op (~2.5 ms
+// on the real library — the v2 backfill's 100-row chunks of 23k covers
+// measured 264 ms, 2026-10-21), so the next chunk aims at META_SLICE_MS from
+// the last one's cost. `chunk` pins a fixed size (tests).
+const META_SLICE_MS = 40;
 export async function drainTrackMetaAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean } } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
+	const fixed = opts.chunk !== undefined;
+	let size = Math.max(1, opts.chunk ?? 20);
 	for (;;) {
 		if (opts.signal?.aborted) break;
 		const t0 = performance.now();
-		const r = drainTrackMeta(raw, { max: opts.chunk });
-		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);
+		const r = drainTrackMeta(raw, { max: size });
+		const ms = performance.now() - t0;
+		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
+		if (!fixed && r.rows > 0) size = Math.max(5, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * META_SLICE_MS / Math.max(ms, 1))));
 		if (r.rows === 0) break;
 		out.chunks++;
 		out.rows += r.rows;
