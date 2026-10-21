@@ -11,6 +11,19 @@ export type AccountDevice = Awaited<ReturnType<typeof accountApi.devices>>[numbe
 
 export type Tone = 'ok' | 'warn' | 'error';
 
+// "12s ago" / "6m ago" / "3h ago" / "2d ago": the compact form the status
+// lines tick every second, so it must not jump between wordings.
+export function fmtAgo(ms: number | null, now = Date.now()): string {
+	if (!ms) return 'never';
+	const s = Math.max(0, Math.floor((now - ms) / 1000));
+	if (s < 60) return `${s}s ago`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ago`;
+	const h = Math.floor(m / 60);
+	if (h < 24) return `${h}h ago`;
+	return `${Math.floor(h / 24)}d ago`;
+}
+
 export function fmtWhen(ms: number | null, now = Date.now()): string {
 	if (!ms) return 'never';
 	const ago = now - ms;
@@ -29,10 +42,12 @@ export function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null, now 
 	if (s.initialPush) return { text: `Uploading your library… ${s.initialPush.done.toLocaleString()} of about ${s.initialPush.estimate.toLocaleString()} changes`, tone: 'ok' };
 	if (s.bootstrap) return { text: `Downloading your library… ${s.bootstrap.done.toLocaleString()} of ${s.bootstrap.total.toLocaleString()}`, tone: 'ok' };
 	if (s.lastError) return { text: `${s.lastError}${s.pending > 0 ? ` · ${s.pending.toLocaleString()} changes waiting` : ''}`, tone: 'error' };
-	if (s.running) return { text: 'Syncing…', tone: 'ok' };
-	const last = Math.max(s.lastPushAt ?? 0, s.lastPullAt ?? 0) || null;
-	if (s.pending > 0) return { text: `${s.pending.toLocaleString()} changes waiting to sync · last synced ${fmtWhen(last, now)}`, tone: 'ok' };
-	return { text: `Up to date · last synced ${fmtWhen(last, now)}`, tone: 'ok' };
+	// "Syncing…" only while changes actually move; a routine check (every
+	// minute or on focus) moves nothing and must not flip the label.
+	if (s.transferring) return { text: 'Syncing…', tone: 'ok' };
+	const checked = s.lastCheckedAt ?? (Math.max(s.lastPushAt ?? 0, s.lastPullAt ?? 0) || null);
+	if (s.pending > 0) return { text: `${s.pending.toLocaleString()} changes waiting to sync · last checked ${fmtAgo(checked, now)}`, tone: 'ok' };
+	return { text: `Up to date · last checked ${fmtAgo(checked, now)}`, tone: 'ok' };
 }
 
 // What the signed-in panel offers. A revoked computer is refused by the

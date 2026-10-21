@@ -350,6 +350,8 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 
 	let lastError: string | null = null;
 	let lastHydrateAt: number | null = null;
+	// The last completed inventory + hydrate pass, moved or not ("last checked").
+	let lastCheckedAt: number | null = null;
 	let lastUploadAt: number | null = null;
 	let activity: CatalogueStatus['activity'] = null;
 	let waitingFor: string | null = null;
@@ -402,6 +404,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 			activity,
 			lastHydrateAt,
 			lastUploadAt,
+			lastCheckedAt,
 			lastError,
 			nextRetryAt,
 		};
@@ -833,11 +836,13 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				do {
 					cycleAgain = false;
 					if (!usable() || !ensureAccount()) break;
-					activity = 'inventory';
-					emitStatus();
+					// Checking the inventory is not shown as activity: it runs on
+					// every wake and would make the label flicker. Only a hydrate
+					// or an upload that moves something is.
 					try {
 						await syncInventory();
 						await hydrateAll();
+						lastCheckedAt = Date.now();
 						succeeded();
 					} catch (err) {
 						fail('catalogue pass', err);
@@ -1123,6 +1128,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 				return;
 			}
 			uploadingBackfill = true;
+			if (activity !== 'uploading') { activity = 'uploading'; emitStatus(); }
 			const r = await uploadTracks(ids);
 			backfillUploaded = { items: backfillUploaded.items + r.items, bytes: backfillUploaded.bytes + r.bytes };
 			backfillCursor = ids[ids.length - 1]!;
@@ -1145,8 +1151,10 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		if (!canUpload()) return;
 		const ids = [...kicked];
 		kicked.clear();
-		activity = 'uploading';
-		emitStatus();
+		if (ids.length > 0) {
+			activity = 'uploading';
+			emitStatus();
+		}
 		let done = 0;
 		try {
 			for (let i = 0; i < ids.length; i += UPLOAD_PAGE) {

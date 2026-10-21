@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CloudSyncStatusReport } from '@curator/core';
 import {
-	accountActions, deviceRows, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM,
+	accountActions, deviceRows, fmtAgo, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM,
 	type AccountDevice, type AccountStatus,
 } from './accountModel.js';
 
@@ -12,7 +12,7 @@ const account: AccountStatus = { signedIn: true, email: 'dj@example.test', userI
 function status(patch: Partial<CloudSyncStatusReport> = {}): CloudSyncStatusReport {
 	return {
 		enabled: true, signedIn: true, userId: 'u1', email: 'dj@example.test', deviceId: 'this', pending: 0, rejected: 0,
-		lastPushAt: NOW - 30_000, lastPullAt: NOW - 30_000, lastSeq: 10, lastError: null, needsUpdate: false, revoked: false, boundUserId: 'u1',
+		lastPushAt: NOW - 30_000, lastPullAt: NOW - 30_000, lastCheckedAt: NOW - 12_000, lastChangedAt: NOW - 360_000, transferring: false, lastSeq: 10, lastError: null, needsUpdate: false, revoked: false, boundUserId: 'u1',
 		initialPushDone: true, initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
 		poll: { policy: { activeSec: 60, idleSec: 600, idleAfterSec: 600 }, active: true, nextPollAt: null },
 		...patch,
@@ -103,5 +103,24 @@ describe('account panel: library across devices', () => {
 	it('explains the master in one sentence, and why it is unavailable', () => {
 		expect(MASTER_HINT).toMatch(/win on your other devices/);
 		expect(MASTER_UNAVAILABLE).toMatch(/doesn’t share track details/);
+	});
+});
+
+describe('account panel: the library status line', () => {
+	it('reads "last checked" in s/m/h/d and never says syncing for a quiet check', () => {
+		expect(syncLine(account, status({ running: true }), NOW)).toEqual({ text: 'Up to date · last checked 12s ago', tone: 'ok' });
+		expect(syncLine(account, status({ lastCheckedAt: NOW - 6 * 60_000 }), NOW).text).toBe('Up to date · last checked 6m ago');
+		expect(syncLine(account, status({ pending: 4 }), NOW).text).toBe('4 changes waiting to sync · last checked 12s ago');
+	});
+	it('says syncing only while changes actually move', () => {
+		expect(syncLine(account, status({ running: true, transferring: true }), NOW)).toEqual({ text: 'Syncing…', tone: 'ok' });
+	});
+	it('formats the compact relative time', () => {
+		expect(fmtAgo(null, NOW)).toBe('never');
+		expect(fmtAgo(NOW - 59_000, NOW)).toBe('59s ago');
+		expect(fmtAgo(NOW - 61_000, NOW)).toBe('1m ago');
+		expect(fmtAgo(NOW - 3 * 3_600_000, NOW)).toBe('3h ago');
+		expect(fmtAgo(NOW - 2 * 86_400_000, NOW)).toBe('2d ago');
+		expect(fmtAgo(NOW + 5_000, NOW)).toBe('0s ago');
 	});
 });

@@ -24,7 +24,7 @@ import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
 import {
-	accountActions, deviceRows, DEVICES_HINT, fmtWhen, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, revokeConfirm,
+	accountActions, deviceRows, DEVICES_HINT, fmtAgo, fmtWhen, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, revokeConfirm,
 	SIGN_OUT_OTHERS_CONFIRM, syncLine, UNLINK_CONFIRM,
 	type AccountDevice, type AccountStatus, type ConfirmText,
 } from './accountModel.js';
@@ -59,6 +59,9 @@ let codeSentTo: string | null = null;
 let busy = false;
 let formError: string | null = null;
 let unsubscribeLibrary: (() => void) | null = null;
+// Ticks the relative times ("last checked 12s ago") once a second by
+// patching the two status lines in place, never re-rendering the panel.
+let clockTimer: ReturnType<typeof setInterval> | null = null;
 // The master selector's own state: a change in flight, and its refusal
 // (sync off, server too old) shown under it rather than as a toast.
 let masterBusy = false;
@@ -158,12 +161,13 @@ function catalogueLine(c: CatalogueStatus): { text: string; tone: 'ok' | 'warn' 
 	if (c.serverOffers === false) return { text: 'Your sync server does not offer shared analysis yet.', tone: 'warn' };
 	if (c.serverOffers === null) return { text: 'Waiting for the first sync to learn what the server offers…', tone: 'ok' };
 	if (c.lastError) return { text: c.lastError, tone: 'error' };
-	if (c.activity === 'inventory') return { text: 'Checking what your other computers analysed…', tone: 'ok' };
+	// Like the library line: activity only while analysis actually moves;
+	// a routine check of what the other computers hold is not shown.
 	if (c.activity === 'hydrating') return { text: 'Taking analysis from your other computers…', tone: 'ok' };
 	if (c.activity === 'uploading') return { text: 'Uploading analysis…', tone: 'ok' };
 	if (c.entitled === false) return { text: 'Reusing analysis works; uploading needs your account to be enabled for shared analysis.', tone: 'warn' };
-	const last = Math.max(c.lastHydrateAt ?? 0, c.lastUploadAt ?? 0) || null;
-	return { text: last ? `Up to date · last change ${fmtWhen(last)}` : 'Up to date', tone: 'ok' };
+	const checked = c.lastCheckedAt ?? (Math.max(c.lastHydrateAt ?? 0, c.lastUploadAt ?? 0) || null);
+	return { text: checked ? `Up to date · last checked ${fmtAgo(checked)}` : 'Up to date', tone: 'ok' };
 }
 
 function catalogueFacts(c: CatalogueStatus): { account: string; device: string; backfill: string | null } {
@@ -627,6 +631,11 @@ export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribe?.();
 	unsubscribeCatalogue?.();
 	unsubscribeLibrary?.();
+	if (clockTimer) clearInterval(clockTimer);
+	clockTimer = setInterval(() => {
+		if (!host.isConnected) { if (clockTimer) clearInterval(clockTimer); clockTimer = null; return; }
+		if (account?.signedIn && sync) patchSignedIn(host, account, sync);
+	}, 1000);
 	formError = null;
 	masterError = null;
 	unsubscribeLibrary = onAccountLibraryInfo(() => {
@@ -651,15 +660,20 @@ export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribe = cloudSyncApi.onStatus((s) => {
 		if (!host.isConnected) { unsubscribe?.(); unsubscribe = null; return; }
 		const wasSignedIn = account?.signedIn ?? false;
+		const prev = sync;
 		sync = s;
 		// A sign-in / sign-out arrives as a status change: refetch the account
 		// then. Otherwise only the signed-in view repaints (see header).
 		if (s.signedIn !== wasSignedIn) void refresh(host);
 		else if (wasSignedIn && account) {
+			// Routine statuses (every check, every minute) patch the live lines
+			// in place; only a change of what the panel shows re-renders it — a
+			// full re-render on each tick made the screen jump.
+			const structural = prev === null || prev.revoked !== s.revoked || prev.enabled !== s.enabled || !host.querySelector('[data-ac-sync-line]');
 			// A focused selector counts too: a re-render would close its dropdown.
 			const typing = (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLSelectElement) && host.contains(document.activeElement);
-			if (typing) patchSignedIn(host, account, s);
-			else render(host);
+			if (structural && !typing) render(host);
+			else patchSignedIn(host, account, s);
 		}
 	});
 	void refresh(host);

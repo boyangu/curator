@@ -91,6 +91,8 @@ export type CatalogueStatus = {
 	activity: 'inventory' | 'hydrating' | 'uploading' | null;
 	lastHydrateAt: number | null;
 	lastUploadAt: number | null;
+	// The last completed check with the server, whether or not anything moved.
+	lastCheckedAt: number | null;
 	lastError: string | null;
 	nextRetryAt: number | null;
 };

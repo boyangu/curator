@@ -144,6 +144,14 @@ export type CloudSyncStatus = {
 	rejected: number;
 	lastPushAt: number | null;
 	lastPullAt: number | null;
+	// When the device last completed a check with the server (a pull, empty
+	// or not), and when a change last actually moved either way. The UI shows
+	// "last checked", and says "Syncing…" only while `transferring`: a check
+	// that moves nothing is not syncing, and every-minute polling must not
+	// make the label flicker.
+	lastCheckedAt: number | null;
+	lastChangedAt: number | null;
+	transferring: boolean;
 	lastSeq: number;
 	lastError: string | null;
 	needsUpdate: boolean;
@@ -298,6 +306,7 @@ type ClientState = {
 	registeredFor: string | null;
 	lastPushAt: number | null;
 	lastPullAt: number | null;
+	lastChangedAt?: number | null;
 	// Set when an own op was re-stamped by the server's clock clamp (named
 	// in a push result, or seen in its echo from an older server): remote
 	// writes applied before it may have lost locally to the unclamped stamp,
@@ -401,6 +410,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	let initialPushProgress: InitialPushProgress | null = null;
 	let bootstrapProgress: { done: number; total: number } | null = null;
 	let running = false;
+	// True only while changes are actually moving in this cycle (a push with
+	// ops, or a pull page that brought some); a quiet check never sets it.
+	let moving = false;
+	const markMoving = (): void => { if (!moving) { moving = true; emitStatus(); } };
 	let again = false;
 	let stopped = true;
 	let attempt = 0;
@@ -464,6 +477,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			rejected: c.rejected,
 			lastPushAt: st.lastPushAt,
 			lastPullAt: st.lastPullAt,
+			lastCheckedAt: st.lastPullAt,
+			lastChangedAt: st.lastChangedAt ?? null,
+			transferring: moving,
 			lastSeq: readCursor(raw).lastSeq,
 			lastError,
 			needsUpdate: pushRefused || heldCount(raw) > 0,
@@ -560,6 +576,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			ops.push(op);
 			bytes += size;
 		}
+		if (ops.length > 0) markMoving();
 		const res = await transport.sync.push({ deviceId, ops });
 		learnFeatures(res.features);
 		const rejected = new Map<string, RejectReason>(res.rejected.map((r) => [r.opId, r.reason]));
@@ -611,7 +628,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 		if (tally) { tally.pushed += nAcked; tally.rejected += nRejected; tally.held += nHeld; }
 		if (nRejected > 0) slog.warn('push: ops rejected', { count: nRejected, sample: res.rejected.slice(0, 5) });
-		patchClientState({ lastPushAt: Date.now() });
+		patchClientState(nAcked > 0 ? { lastPushAt: Date.now(), lastChangedAt: Date.now() } : { lastPushAt: Date.now() });
 		if (held === 'update_required') pushRefused = true;
 		if (held === 'device_revoked') markRevoked();
 		const full = rows.length === MAX_PUSH_OPS || ops.length < rows.length;
@@ -676,6 +693,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				const res = await pullPage(cursor.lastSeq);
 				out.received += res.ops.length;
 				if (tally) tally.pulled += res.ops.length;
+				if (res.ops.length > 0) markMoving();
 				// Bootstrap at most once per pull: a second hint after loading
 				// a snapshot would be a server bug, not a reason to loop.
 				if (res.snapshotSeq !== undefined && res.snapshotSeq > cursor.lastSeq && !out.bootstrapped) {
@@ -794,7 +812,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// Whatever landed before an error is reported, not lost.
 			emitApplied(tracks, playlists, entities);
 		}
-		patchClientState({ lastPullAt: Date.now() });
+		patchClientState(out.applied > 0 ? { lastPullAt: Date.now(), lastChangedAt: Date.now() } : { lastPullAt: Date.now() });
 		return out;
 	};
 
@@ -1152,6 +1170,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				} while (again && nextRetryAt === null);
 			} finally {
 				running = false;
+				moving = false;
 				inflight = null;
 				emitStatus();
 			}

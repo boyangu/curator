@@ -2211,7 +2211,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			available: false, settings: readCatalogueSettings(sqlite), signedIn: false, serverOffers: null, policy: null,
 			entitled: null, usage: null, account: { items: 0, bytes: 0 }, device: { reused: 0, uploaded: 0, pending: null },
 			backfill: { state: readCatalogueSettings(sqlite).backfill, uploadedItems: 0, uploadedBytes: 0, waitingFor: null },
-			activity: null, lastHydrateAt: null, lastUploadAt: null, lastError: null, nextRetryAt: null,
+			activity: null, lastHydrateAt: null, lastUploadAt: null, lastCheckedAt: null, lastError: null, nextRetryAt: null,
 		};
 
 	const accountLibraryInfo = (): AccountLibraryInfo => ({
@@ -2223,7 +2223,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		? { ...cloudClient.status(), enabled: true }
 		: {
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
-			lastPushAt: null, lastPullAt: null, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
+			lastPushAt: null, lastPullAt: null, lastCheckedAt: null, lastChangedAt: null, transferring: false, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
 			initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
 			poll: { policy: readPollPolicy(sqlite), active: true, nextPollAt: null },
 		};
