@@ -8,6 +8,7 @@ import {
 	SCHEMA_VERSION,
 	SYNC_FEATURES,
 	ZBootstrapInput,
+	ZSnapshotChunkInput,
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
@@ -19,6 +20,7 @@ import {
 	type DeviceInfo,
 	type PullResult,
 	type PushResult,
+	type SnapshotChunkResult,
 	type SyncFeature,
 } from '@curator/protocol';
 import { z } from 'zod';
@@ -26,7 +28,7 @@ import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
-import { bootstrap } from './sync/bootstrap.js';
+import { bootstrap, snapshotChunk } from './sync/bootstrap.js';
 import { pull } from './sync/pull.js';
 import { push } from './sync/push.js';
 import { authedProcedure, publicProcedure, rateLimit, router, type AppContext } from './trpc.js';
@@ -138,8 +140,16 @@ export const appRouter = router({
 			readDevice(ctx, input?.deviceId);
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
 			const r = await auditedRead(ctx, 'sync.bootstrap', () => bootstrap(ctx.deps.db, ctx.user.id, callerOf(ctx), input ?? {}));
-			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes: Buffer.byteLength(r.snapshot, 'base64') });
+			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes: r.chunked ? r.chunked.totalBytes : Buffer.byteLength(r.snapshot, 'base64'), chunked: !!r.chunked });
 			return r;
+		}),
+		// 'snapshot_chunks': the body of a chunked bootstrap, a piece a call.
+		// The pull bucket, like the bootstrap it belongs to (a 40 MB body is
+		// ~10 pieces); not audited per piece — the bootstrap was.
+		snapshotChunk: authedProcedure.input(ZSnapshotChunkInput).query(async ({ ctx, input }): Promise<SnapshotChunkResult> => {
+			readDevice(ctx, input.deviceId);
+			rateLimit(ctx, 'pull', pullKey(ctx.user));
+			return auditedRead(ctx, 'sync.bootstrap', () => snapshotChunk(ctx.deps.db, ctx.user.id, callerOf(ctx), input));
 		}),
 	}),
 

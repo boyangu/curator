@@ -44,8 +44,10 @@ import {
 	type PushInput,
 	type PushResult,
 	type RegisterDeviceInput,
+	type SnapshotChunkResult,
 } from '@curator/protocol';
 import { mainLog } from '../log.js';
+import { readSnapshotBody } from './snapshot-chunks.js';
 import type { CloudAccount } from './account.js';
 
 const gunzipAsync = promisify(gunzip);
@@ -58,6 +60,7 @@ const PROCS = {
 	push: { path: 'sync.push', type: 'mutation' },
 	pull: { path: 'sync.pull', type: 'query' },
 	bootstrap: { path: 'sync.bootstrap', type: 'query' },
+	snapshotChunk: { path: 'sync.snapshotChunk', type: 'query' },
 	registerDevice: { path: 'account.registerDevice', type: 'mutation' },
 	devices: { path: 'account.devices', type: 'query' },
 	revokeDevice: { path: 'account.revokeDevice', type: 'mutation' },
@@ -122,6 +125,7 @@ function mapError(err: unknown): CloudTransportError {
 		// The server is older than this client's ops (a deploy-order slip):
 		// retry later, the ops stay pending.
 		if (reason === 'server_outdated') return new CloudTransportError('server', reason, retryMs);
+		if (reason === 'snapshot_gone') return new CloudTransportError('server', reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
 		if (status >= 500) return new CloudTransportError('server', `HTTP ${status}`);
 		if (status >= 400) return new CloudTransportError('bad_request', reason ?? `HTTP ${status}`);
@@ -265,11 +269,27 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 		// synchronous step (~100–300 ms for a 40k-track library, once).
 		// `input` only when the server offers 'device_reads' (the sync client
 		// decides); without it an older server's input-less query is sent.
+		// `chunked` ('snapshot_chunks', the sync client asks): the answer names
+		// the body's size and it is read in MAX_SNAPSHOT_CHUNK_BYTES pieces,
+		// each a small request. A newer snapshot pruning this one mid-read
+		// (`snapshot_gone`) starts over from the new one, a few times at most.
 		async bootstrap(input?: BootstrapInput) {
-			const res = await call<BootstrapResult>(PROCS.bootstrap, input);
-			if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
-			const json = await gunzipAsync(Buffer.from(res.snapshot, 'base64'), { maxOutputLength: MAX_INFLATED_BYTES });
-			return { snapshotSeq: res.snapshotSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
+			for (let attempt = 0; ; attempt++) {
+				const res = await call<BootstrapResult>(PROCS.bootstrap, input);
+				if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
+				let body: Buffer;
+				try {
+					body = await readSnapshotBody(res, (offset, length) => call<SnapshotChunkResult>(PROCS.snapshotChunk, {
+						...(input?.deviceId !== undefined ? { deviceId: input.deviceId } : {}),
+						snapshotSeq: res.snapshotSeq, offset, length,
+					}), MAX_INFLATED_BYTES);
+				} catch (err) {
+					if (err instanceof CloudTransportError && err.message === 'snapshot_gone' && attempt < 3) continue;
+					throw err;
+				}
+				const json = await gunzipAsync(body, { maxOutputLength: MAX_INFLATED_BYTES });
+				return { snapshotSeq: res.snapshotSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
+			}
 		},
 		account: {
 			registerDevice: (input: RegisterDeviceInput) => call<{ ok: true }>(PROCS.registerDevice, input),

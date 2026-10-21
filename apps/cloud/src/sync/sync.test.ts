@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { MAX_PUSH_OPS, MAX_PULL_OPS, SCHEMA_VERSION, SYNC_FEATURES, trackTagEntityId } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestApp, errorReason, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
+import { buildSnapshot } from '../snapshot/job.js';
+import { decodeSnapshotBase64 } from '../snapshot/codec.js';
 import { hasUnstorableText } from './push.js';
 
 let app: TestApp;
@@ -227,6 +229,73 @@ describe('protocol v2 kinds', () => {
 	});
 });
 
+describe('protocol v4 kinds (the zero-loss release)', () => {
+	const attrs = {
+		source: 'local' as const, bpm: 122.5, key_camelot: '8A', key_source: 'rekordbox' as const, explicit: false,
+		mbid: null, copyright: null, play_count: 79, provider_refs: [], artist_names: ['Bonobo'],
+	};
+	const cueBody = { slot: 1, kind: 'hot' as const, position_sec: 10, length_sec: null, color: null, name: null };
+	const event = {
+		session_id: randomUUID(), recording_id: randomUUID(), source: 'rekordbox' as const, played_at: 1_700_000_000_000, played_ms: null, duration_ms: null, max_position_ms: null,
+		played75: null, ended_reason: null, context_type: null, context_id: null, track_no: 1, rb_song_history_id: '9',
+	};
+	const v4Ops = (deviceId: string) => {
+		const op = opsFor(deviceId);
+		const rec = randomUUID();
+		return [
+			op('library_track', 'set-attrs', rec, attrs),
+			op('library_track', 'set-cues-edited', rec, { at: 1_700_000_000_000 }),
+			op('library_track', 'set-curation', rec, { field: 'comment', value: 'ethnic, up' }),
+			op('library_track', 'set-rb-analysis', rec, { unit: 'bpm', value: 120.0006 }),
+			op('library_track', 'set-rb-analysis', rec, { unit: 'key_strength', value: 0.61 }),
+			op('recording_claim', 'add', rec, { kind: 'traxsource', value: '7574432', confidence: 0.7 }),
+			op('cue', 'upsert2', `${rec}:1:hot`, { ...cueBody, origin: 'rekordbox' }),
+			op('play_event', 'append2', randomUUID(), { ...event, rb_content_id: '98765', source_track_id: null }),
+			op('playlist', 'set-attrs', randomUUID(), { hybrid_tidal: true, position: 5, mark: 'R' }),
+			op('playlist_folder', 'set-attrs', randomUUID(), { position: 2 }),
+			op('feed_item', 'set-state', 'isrc:GB0000000001', { state: 'archived' }),
+			op('feed_item', 'mark-played', 'spotify:track:abc', { at: 1_700_000_000_000 }),
+			op('feed_item', 'mark-listened', 'spotify:album:xyz', { source_track_id: 'abc' }),
+			op('feed_suppression', 'set', 'artist:ar1', { scope: 'artist', active: true }),
+			op('album', 'set-meta', 'spotify:al1', { album_type: 'album', total_tracks: 12, release_date: '2022', label: 'Ninja Tune', upc: '1', cover_url: null, artists: ['Bonobo'], various: false }),
+		];
+	};
+
+	it('advertises zero_loss_v4, accepts every v4 kind, claim kind and unit, and pulls them back as sent (no migration: ops are jsonb)', async () => {
+		const { deviceId, api } = await app.signIn();
+		const ops = v4Ops(deviceId);
+		expect(ops.every((o) => o.schema_version === 4)).toBe(true);
+		const res = await api.sync.push.mutate({ deviceId, ops });
+		expect(res).toMatchObject({ accepted: ops.length, rejected: [] });
+		expect(res.features).toContain('zero_loss_v4');
+		const pulled = await api.sync.pull.query({ afterSeq: 0 });
+		expect(pulled.features).toContain('zero_loss_v4');
+		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, 4]));
+	});
+
+	it('rejects every one of them stamped v3: a v3 client must hold them aside, not stop', async () => {
+		const { deviceId, api } = await app.signIn();
+		const ops = v4Ops(deviceId).map((o) => ({ ...o, schema_version: 3 }));
+		const res = await api.sync.push.mutate({ deviceId, ops });
+		expect(res.accepted).toBe(0);
+		expect(res.rejected.map((r) => r.reason)).toEqual(ops.map(() => 'invalid_payload'));
+	});
+
+	it('folds them into the snapshot: a bootstrap carries the feed decisions and releases (new maps) and the attribute cells', async () => {
+		const { deviceId, api, userId } = await app.signIn();
+		const ops = v4Ops(deviceId);
+		await api.sync.push.mutate({ deviceId, ops });
+		const built = await buildSnapshot(app.db, userId);
+		expect(built.status).toBe('built');
+		const state = await decodeSnapshotBase64((await api.sync.bootstrap.query()).snapshot);
+		expect(state.feedItems.get('isrc:GB0000000001')?.fields['state']?.value).toBe('archived');
+		expect(state.feedSuppressions.get('artist:ar1')?.fields['active']?.value).toBe(true);
+		expect(state.albums.get('spotify:al1')?.fields['label']?.value).toBe('Ninja Tune');
+		const rec = ops[0]!.entity_id;
+		expect(Object.keys(state.libraryTracks.get(rec)!.fields).sort()).toEqual([`attrs.${deviceId}`, 'cues_edited_at', 'curation.comment', 'rb.bpm', 'rb.key_strength']);
+	});
+});
+
 describe('protocol v3 kinds', () => {
 	const meta = { source: 'local' as const, title: 'Lilac', artists: [{ name: 'Bonobo' }], album_title: null, duration_sec: 312, isrc: null, release_date: null, label: null, genre: null, cover_url: 'https://i.scdn.co/image/x' };
 
@@ -243,7 +312,7 @@ describe('protocol v3 kinds', () => {
 		expect(res.features).toContain('track_meta');
 		const pulled = await api.sync.pull.query({ afterSeq: 0 });
 		expect(pulled.features).toContain('track_meta');
-		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, 3]));
+		expect(pulled.ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.entity, o.kind, o.entity_id, o.payload, SCHEMA_VERSION]));
 	});
 
 	it('rejects either stamped v2 (a v2 client must hold them aside, not stop) and a non-http cover', async () => {

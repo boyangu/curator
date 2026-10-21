@@ -92,6 +92,7 @@ const URL_FIELDS: FieldDef[] = [
 	{ name: 'spotifyUrl',  label: 'Spotify',  placeholder: 'https://open.spotify.com/track/…' },
 	{ name: 'tidalUrl',    label: 'Tidal',    placeholder: 'https://tidal.com/browse/track/…' },
 	{ name: 'beatportUrl', label: 'Beatport', placeholder: 'https://www.beatport.com/track/…/…' },
+	{ name: 'traxsourceUrl', label: 'Traxsource', placeholder: 'https://www.traxsource.com/track/…/…' },
 ];
 
 // Fields wired to a <datalist> for autocomplete → the input's `list` attribute

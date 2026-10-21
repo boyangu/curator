@@ -24,6 +24,7 @@
 	--src-spotify:   oklch(0.72 0.20 145);
 	--src-tidal:     var(--fg);
 	--src-beatport:  oklch(0.78 0.17 60);
+	--src-traxsource: oklch(0.70 0.14 230);
 	--src-rekordbox: oklch(0.68 0.21 25);
 	--src-local:     var(--fg-2);
 	--hot:       oklch(0.72 0.20 25);
@@ -1286,6 +1287,7 @@ td.key        { text-align: center; }
 .src-pip[data-src="spotify"]   { background: var(--src-spotify); }
 .src-pip[data-src="tidal"]     { background: var(--src-tidal); }
 .src-pip[data-src="beatport"]  { background: var(--src-beatport); }
+.src-pip[data-src="traxsource"] { background: var(--src-traxsource); }
 .src-pip[data-src="rekordbox"] { background: var(--src-rekordbox); }
 .src-pip[data-src="local"]     { background: var(--src-local); }
 /* Blink the local pip while the analyzer is working this track — same pulse +
@@ -1387,6 +1389,7 @@ td.added, td.rel { color: var(--fg-1); font-size: 12px; }
 .src-marks i[data-src="spotify"]   { background: var(--src-spotify); }
 .src-marks i[data-src="tidal"]     { background: var(--src-tidal); }
 .src-marks i[data-src="beatport"]  { background: var(--src-beatport); }
+.src-marks i[data-src="traxsource"] { background: var(--src-traxsource); }
 .src-marks i[data-src="rekordbox"] { background: var(--src-rekordbox); }
 .trk.row-analyzing .src-marks i[data-src="local"] { animation: pulse 1.4s ease-in-out infinite; }
 /* Claim-derived provider (Track.claimSources): known from the account, not
@@ -1395,6 +1398,7 @@ td.added, td.rel { color: var(--fg-1); font-size: 12px; }
 .src-pip--derived[data-src="spotify"], .src-marks i.src-derived[data-src="spotify"]   { --derived-c: var(--src-spotify); }
 .src-pip--derived[data-src="tidal"], .src-marks i.src-derived[data-src="tidal"]       { --derived-c: var(--src-tidal); }
 .src-pip--derived[data-src="beatport"], .src-marks i.src-derived[data-src="beatport"] { --derived-c: var(--src-beatport); }
+.src-pip--derived[data-src="traxsource"], .src-marks i.src-derived[data-src="traxsource"] { --derived-c: var(--src-traxsource); }
 /* Remote row ("not on this device", track.remoteOnly): one hollow mark in the
    SRC slot, outlined in the colour of how the holding device has it, and a
    dimmed cover — the row still rates/tags/organises, it just can't play here. */
@@ -1496,6 +1500,9 @@ tr.row-playing.has-cover-meter td.idx .idx-eq { display: none; }
 .table tbody tr.row-playing .l2 { color: var(--fg-1); }
 .table tbody tr.row-playing td.title,
 .table tbody tr.row-playing td.title2 .l1 .t-name { font-weight: 500; }
+/* The well's white text must not bleed onto the yellow similarity fill. */
+.table tbody tr.row-playing td.sim-hl,
+.table tbody tr.row-playing .sim-cell.sim-hl { color: #000; }
 /* Playing + selected: selection's fill and left bar win, the well's edge
    shadows stay. */
 .table tbody tr.row-playing.selected,

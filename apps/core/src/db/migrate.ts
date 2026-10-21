@@ -10,6 +10,7 @@ import { normalizeIsrc } from '@curator/library-logic';
 import { upsertArtistLinksRaw } from '../library/artist-links.js';
 import { keyToCamelot } from '../enrich/keys.js';
 import { syncTrackArtistsRaw } from '../library/artists.js';
+import { queueRoleMergeRederive } from '../library/artist-alias.js';
 import { albumBackfillOrderRaw, repairAlbumTablesRaw, syncTrackAlbumsRaw } from '../library/albums.js';
 import type { Logger } from '@curator/shared/log';
 import { log, setCoreLogger } from '../log.js';
@@ -1144,6 +1145,120 @@ const ALTER_MIGRATIONS: string[] = [
 	// now take another claim's id for that provider (re-derive).
 	`CREATE TRIGGER IF NOT EXISTS claim_link_own_delete AFTER DELETE ON source_link
 		WHEN OLD.source IN ('spotify', 'tidal', 'beatport') AND EXISTS (SELECT 1 FROM track WHERE id = OLD.track_id)
+		BEGIN
+			INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id) VALUES (OLD.track_id, OLD.source, OLD.source_track_id);
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT t.recording_id FROM track t WHERE t.id = OLD.track_id AND t.derived_from_track_id IS NULL
+					AND EXISTS (SELECT 1 FROM sync_state s WHERE s.recording_id = t.recording_id AND +s.map = 'claims');
+		END`,
+	// ── protocol v4 (the 2026-10-21 zero-loss release) ─────────────────────
+	// Track attributes — see track.attrsAdopted, trackAttrsDirty,
+	// trackAttrsSeen and trackProviderRef in schema.ts. All start empty; the
+	// v4 backfill (sync-log/track-attrs.ts TRACK_ATTRS_BACKFILL_KEY) queues
+	// every own row once the server reads v4.
+	`ALTER TABLE track ADD COLUMN attrs_adopted TEXT`,
+	`CREATE TABLE IF NOT EXISTS track_attrs_dirty (track_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS track_attrs_seen (
+		track_id TEXT PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE,
+		recording_id TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		seen_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS track_provider_ref (
+		track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		ord INTEGER NOT NULL,
+		source TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		PRIMARY KEY (track_id, ord)
+	)`,
+	// Triggers like track_meta_dirty's, for the same reason, but with an
+	// upsert clause instead of INSERT OR IGNORE: an outer UPSERT (the
+	// rekordbox importer's playlist write, a source_link refresh) overrides a
+	// trigger's OR IGNORE with its own ABORT, and a row already marked would
+	// then fail the user's write. tempo, key,
+	// comment and colour arrive through the rekordbox importer (which does not
+	// bump updated_at), the enrichers, the streaming upserts, the Edit
+	// screen's URL paste, merges and the catalogue hydrate. A provider
+	// listing's payload (release ids, artist ids) and its links (key source)
+	// are part of what a row states. attrs_adopted is in the list: what the
+	// row took from the account is stated as null, so a change of it is a
+	// change of the row's own values.
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_insert AFTER INSERT ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_update AFTER UPDATE OF recording_id, bpm, key_camelot, comment, color_label, explicit, mbid, copyright,
+		play_count, cues_edited_at, artists, artists_base, remote_only, attrs_adopted ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_insert AFTER INSERT ON source_link
+		WHEN NEW.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
+		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.track_id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_update AFTER UPDATE OF track_id, payload ON source_link
+		WHEN NEW.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
+		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (OLD.track_id), (NEW.track_id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_delete AFTER DELETE ON source_link
+		WHEN OLD.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
+		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (OLD.track_id) ON CONFLICT DO NOTHING; END`,
+	// Playlist / folder details — see playlistAttrsDirty / playlistAttrsSeen
+	// in schema.ts. `entity` is 'playlist' or 'playlist_folder'. The seen row
+	// is the baseline per field (what was last stated or projected), which
+	// both keeps a projected value from being stated back and keeps a local
+	// change the drain has not stated yet from being overwritten by an older
+	// pulled one (sync-log/playlist-attrs.ts).
+	`CREATE TABLE IF NOT EXISTS playlist_attrs_dirty (entity TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (entity, id)) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS playlist_attrs_seen (entity TEXT NOT NULL, id TEXT NOT NULL, attrs TEXT NOT NULL, PRIMARY KEY (entity, id)) WITHOUT ROWID`,
+	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_dirty_insert AFTER INSERT ON playlist
+		WHEN NEW.is_smart = 0 AND NEW.derived_from_playlist_id IS NULL
+		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist', NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_dirty_update AFTER UPDATE OF hybrid_tidal, position, mark, description, owner_name, owner_id, cover_url,
+		is_public, is_collaborative, is_hidden, followers ON playlist
+		WHEN NEW.is_smart = 0 AND NEW.derived_from_playlist_id IS NULL
+		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist', NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_seen_delete AFTER DELETE ON playlist
+		BEGIN DELETE FROM playlist_attrs_seen WHERE entity = 'playlist' AND id = OLD.id; END`,
+	`CREATE TRIGGER IF NOT EXISTS folder_attrs_dirty_insert AFTER INSERT ON playlist_folder
+		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist_folder', NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS folder_attrs_dirty_update AFTER UPDATE OF position ON playlist_folder
+		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist_folder', NEW.id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS folder_attrs_seen_delete AFTER DELETE ON playlist_folder
+		BEGIN DELETE FROM playlist_attrs_seen WHERE entity = 'playlist_folder' AND id = OLD.id; END`,
+	// Feed decisions that arrived for feed.db — see feedSyncPending in
+	// schema.ts. feed.db is another database (the feed store's own
+	// connection), so the projection queues the keys here, in the apply
+	// transaction, and the feed side applies them (feed/sync.ts).
+	`CREATE TABLE IF NOT EXISTS feed_sync_pending (map TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (map, key)) WITHOUT ROWID`,
+	// The master's display spelling of uncurated artists — see artistSpelling
+	// in schema.ts. Filled by the attrs projection; the artist seam mints a
+	// new artist with it.
+	`CREATE TABLE IF NOT EXISTS artist_spelling (name_ascii TEXT PRIMARY KEY, name TEXT NOT NULL) WITHOUT ROWID`,
+	// A track's curation baseline — see trackCurationSeen in schema.ts.
+	`CREATE TABLE IF NOT EXISTS track_curation_seen (track_id TEXT PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE, seen TEXT NOT NULL)`,
+	// When this device's own row last had its comment / colour written, by any
+	// writer — the time a curation op carries, so two devices' offline edits
+	// resolve by when they were MADE, not by which device synced last
+	// (track-curation.ts). julianday('now') is millisecond-precise.
+	`CREATE TABLE IF NOT EXISTS track_curation_edit (track_id TEXT PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE, comment_at INTEGER, color_label_at INTEGER)`,
+	`CREATE TRIGGER IF NOT EXISTS track_curation_edit_comment AFTER UPDATE OF comment ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL AND OLD.comment IS NOT NEW.comment
+		BEGIN INSERT INTO track_curation_edit (track_id, comment_at) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+			ON CONFLICT(track_id) DO UPDATE SET comment_at = excluded.comment_at; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_curation_edit_colour AFTER UPDATE OF color_label ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL AND OLD.color_label IS NOT NEW.color_label
+		BEGIN INSERT INTO track_curation_edit (track_id, color_label_at) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+			ON CONFLICT(track_id) DO UPDATE SET color_label_at = excluded.color_label_at; END`,
+	// The v4 claim-link providers (claim-links.ts CLAIM_LINK_SOURCES): the same
+	// own-link-wins rules as the three above, under their own trigger names so
+	// the v3 triggers stay as they are.
+	`CREATE TRIGGER IF NOT EXISTS claim_link_own_insert_v4 AFTER INSERT ON source_link
+		WHEN NEW.source IN ('traxsource', 'musicbrainz', 'discogs')
+		BEGIN
+			DELETE FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+			DELETE FROM claim_link_veto WHERE track_id = NEW.track_id AND source = NEW.source AND source_track_id = NEW.source_track_id;
+			INSERT OR IGNORE INTO claim_link_pending (recording_id)
+				SELECT recording_id FROM claim_link WHERE track_id = NEW.track_id AND source = NEW.source LIMIT 1;
+		END`,
+	`CREATE TRIGGER IF NOT EXISTS claim_link_own_delete_v4 AFTER DELETE ON source_link
+		WHEN OLD.source IN ('traxsource', 'musicbrainz', 'discogs') AND EXISTS (SELECT 1 FROM track WHERE id = OLD.track_id)
 		BEGIN
 			INSERT OR IGNORE INTO claim_link_veto (track_id, source, source_track_id) VALUES (OLD.track_id, OLD.source, OLD.source_track_id);
 			INSERT OR IGNORE INTO claim_link_pending (recording_id)
@@ -2310,6 +2425,9 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// Stamp existing analysis rows with the audio they describe, so the
 	// catalogue can share them. One-shot, gated; touches only the new column.
 	backfillAnalysisAudioHash(sqlite);
+	// Credits re-derived once under the role-merging alias map (library/
+	// artist-alias.ts mapCredits): queued here, drained by the sync client.
+	queueRoleMergeRederive(sqlite);
 	sqlite.close();
 }
 

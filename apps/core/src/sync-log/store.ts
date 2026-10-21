@@ -66,6 +66,10 @@ export const STATE_MAPS = [
 	'upstreamAcks',
 	'merges',
 	'artistAliases',
+	// Since protocol v4.
+	'feedItems',
+	'feedSuppressions',
+	'albums',
 ] as const;
 export type StateMap = (typeof STATE_MAPS)[number];
 
@@ -434,6 +438,9 @@ export class SyncStateStore {
 			case 'upstream': w.records.push(['upstreamAcks', op.entity_id]); return w;
 			// Its remove is a null rule in the record, not a tombstone.
 			case 'artist_alias': w.records.push(['artistAliases', op.entity_id]); return w;
+			case 'feed_item': w.records.push(['feedItems', op.entity_id]); return w;
+			case 'feed_suppression': w.records.push(['feedSuppressions', op.entity_id]); return w;
+			case 'album': w.records.push(['albums', op.entity_id]); return w;
 			case 'recording':
 				// The fold moves the loser's records onto whatever the loser
 				// resolves to after the alias rebuild — the winner or the end of
@@ -519,6 +526,9 @@ export class SyncStateStore {
 			case 'playlistFolders':
 			case 'pinnedSearches':
 			case 'playSessions':
+			case 'feedItems':
+			case 'feedSuppressions':
+			case 'albums':
 			case 'libraryTracks': {
 				const inc = incoming as LwwRecord;
 				const id = name === 'libraryTracks' ? R(key) : key;

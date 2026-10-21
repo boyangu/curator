@@ -116,6 +116,40 @@ const SAMPLES: [Entity, string, string, unknown][] = [
 	['upstream', 'ack', U(60), { provider: 'spotify', status: 'pushed' }],
 	['artist_alias', 'set', 'benbohmer', { from: 'Ben Bohmer', to: 'Ben Böhmer', to_key: 'benbohmer' }],
 	['artist_alias', 'remove', 'bohmer', {}],
+	// v4
+	['playlist', 'set-attrs', PL, { hybrid_tidal: true, position: 14, mark: 'R', description: null, cover_url: 'https://i.scdn.co/image/x', is_public: false }],
+	['playlist_folder', 'set-attrs', U(21), { position: 3 }],
+	[
+		'library_track',
+		'set-attrs',
+		REC_A,
+		{
+			source: 'local', bpm: 122.5, key_camelot: '8A', key_source: 'rekordbox', explicit: false,
+			mbid: null, copyright: null, play_count: 79,
+			provider_refs: [{
+				source: 'spotify', album: { id: '4aawyAB9vmqN3uQ7FjRGTy', name: 'Fragments', artists: ['Bonobo'], release_date: '2022-01-14', cover_url: 'https://i.scdn.co/image/ab67', album_type: 'album', total_tracks: 12 },
+				artists: [{ name: 'Bonobo', id: '0cmWgDlu9CwTgxPhf403hb' }], track_number: 3, disc_number: 1,
+			}],
+			artist_names: ['Bonobo'],
+		},
+	],
+	['library_track', 'set-cues-edited', REC_A, { at: 1_700_000_000_000 }],
+	['library_track', 'set-curation', REC_A, { field: 'comment', value: 'ethnic, up' }],
+	['cue', 'upsert2', cueEntityId(REC_A, 3, 'hot'), { slot: 3, kind: 'hot', position_sec: 61.5, length_sec: null, color: '#28e214', name: 'Drop', origin: 'rekordbox' }],
+	[
+		'play_event',
+		'append2',
+		U(42),
+		{
+			session_id: SESSION, recording_id: REC_A, source: 'rekordbox', played_at: 1_700_000_000_000, played_ms: null, duration_ms: null, max_position_ms: null,
+			played75: null, ended_reason: null, context_type: null, context_id: null, track_no: 4, rb_song_history_id: '123', rb_content_id: '98765', source_track_id: null,
+		},
+	],
+	['feed_item', 'set-state', 'spotify:album:4aawyAB9vmqN3uQ7FjRGTy', { state: 'archived' }],
+	['feed_item', 'mark-played', 'isrc:GBCFB2100001', { at: 1_700_000_000_000 }],
+	['feed_item', 'mark-listened', 'spotify:album:4aawyAB9vmqN3uQ7FjRGTy', { source_track_id: '7mCHjSQsqvTMfRotUfNob5' }],
+	['feed_suppression', 'set', 'artist:0cmWgDlu9CwTgxPhf403hb', { scope: 'artist', active: true }],
+	['album', 'set-meta', 'spotify:4aawyAB9vmqN3uQ7FjRGTy', { album_type: 'album', total_tracks: 12, release_date: '2022-01-14', label: 'Ninja Tune', upc: '5054429150000', cover_url: null, artists: ['Bonobo'], various: false }],
 ];
 
 describe('every (entity, kind) parses', () => {
@@ -251,7 +285,6 @@ describe('protocol v3: set-meta and the master device setting', () => {
 	const meta = { source: 'local', title: 'T', artists: [{ name: 'A' }], album_title: null, duration_sec: 300, isrc: null, release_date: null, label: null, genre: null, cover_url: null };
 
 	it('stamps set-meta and the master setting v3, every older kind and key as before', () => {
-		expect(SCHEMA_VERSION).toBe(3);
 		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
 		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-meta' })).toBe(3);
 		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-state' })).toBe(2);
@@ -277,5 +310,74 @@ describe('protocol v3: set-meta and the master device setting', () => {
 		expect(bad({ source: 'rekordbox' })).toBe(false);
 		expect(bad({ extra: 1 })).toBe(false);
 		expect(bad({ track_number: null, disc_number: 2 })).toBe(true);
+	});
+});
+
+describe('protocol v4: the zero-loss additions', () => {
+	const sample = (e: string, k: string) => SAMPLES.find(([se, sk]) => se === e && sk === k)!;
+	const V4_KINDS = [
+		['library_track', 'set-attrs'], ['library_track', 'set-cues-edited'], ['library_track', 'set-curation'], ['cue', 'upsert2'], ['play_event', 'append2'],
+		['playlist', 'set-attrs'], ['playlist_folder', 'set-attrs'], ['feed_item', 'set-state'], ['feed_item', 'mark-played'],
+		['feed_item', 'mark-listened'], ['feed_suppression', 'set'], ['album', 'set-meta'],
+	] as const;
+
+	it('is v4 with the minimum unchanged; every v4 kind is stamped 4 and every older kind keeps its version', () => {
+		expect(SCHEMA_VERSION).toBe(4);
+		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
+		for (const [e, k] of V4_KINDS) expect(opSchemaVersion({ entity: e, kind: k }), `${e}.${k}`).toBe(4);
+		expect(opSchemaVersion({ entity: 'cue', kind: 'upsert' })).toBe(1);
+		expect(opSchemaVersion({ entity: 'play_event', kind: 'append' })).toBe(1);
+		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-meta' })).toBe(3);
+	});
+
+	it('stamps the new claim kinds and rekordbox units 4, the old ones as before', () => {
+		const claim = (kind: string) => opSchemaVersion({ entity: 'recording_claim', kind: 'add', payload: { kind, value: 'x', confidence: 1 } });
+		for (const k of ['traxsource', 'musicbrainz', 'discogs']) expect(claim(k), k).toBe(4);
+		for (const k of ['isrc', 'audio_hash', 'fingerprint', 'spotify', 'tidal', 'beatport']) expect(claim(k), k).toBe(1);
+		const unit = (u: string) => opSchemaVersion({ entity: 'library_track', kind: 'set-rb-analysis', payload: { unit: u, value: null } });
+		for (const u of ['bpm', 'key_strength']) expect(unit(u), u).toBe(4);
+		for (const u of ['grid', 'key', 'segments']) expect(unit(u), u).toBe(1);
+	});
+
+	it('refuses any of them stamped below v4: a v3 client must hold them, not reject them', () => {
+		for (const [e, k] of V4_KINDS) {
+			const [, , id, p] = sample(e, k);
+			const raw = { ...envelope(e, k, id, p), schema_version: 3 };
+			expect(safeParseOp(raw), `${e}.${k}`).toMatchObject({ ok: false, error: { reason: 'invalid_payload' } });
+			expect(safeParseOp({ ...raw, schema_version: 4 }).ok, `${e}.${k}`).toBe(true);
+		}
+		const tx = { ...envelope('recording_claim', 'add', REC_A, { kind: 'traxsource', value: '7574432', confidence: 1 }), schema_version: 3 };
+		expect(safeParseOp(tx).ok).toBe(false);
+		expect(safeParseOp({ ...tx, schema_version: 4 }).ok).toBe(true);
+		const bpm = { ...envelope('library_track', 'set-rb-analysis', REC_A, { unit: 'bpm', value: 120.0006 }), schema_version: 1 };
+		expect(safeParseOp(bpm).ok).toBe(false);
+		expect(safeParseOp({ ...bpm, schema_version: 4 }).ok).toBe(true);
+	});
+
+	it('keeps the old payloads strict: a v3 cue upsert with an origin, or a v1 append with references, is refused', () => {
+		const [, , cid, cp] = sample('cue', 'upsert');
+		expect(safeParseOp(envelope('cue', 'upsert', cid, { ...(cp as object), origin: 'rekordbox' })).ok).toBe(false);
+		const [, , eid, ep] = sample('play_event', 'append');
+		expect(safeParseOp(envelope('play_event', 'append', eid, { ...(ep as object), rb_content_id: '1' })).ok).toBe(false);
+		const [, , mid, mp] = sample('library_track', 'set-meta');
+		expect(safeParseOp(envelope('library_track', 'set-meta', mid, { ...(mp as object), bpm: 120 })).ok).toBe(false);
+	});
+
+	it('validates the v4 shapes', () => {
+		const ok = (e: Entity, k: string, id: string, p: unknown) => safeParseOp(envelope(e, k, id, p)).ok;
+		expect(ok('playlist', 'set-attrs', PL, {})).toBe(false);
+		expect(ok('playlist', 'set-attrs', PL, { cover_url: 'file:///x.jpg' })).toBe(false);
+		expect(ok('playlist', 'set-attrs', PL, { position: 1.5 })).toBe(false);
+		expect(ok('album', 'set-meta', 'deezer:1', { album_type: null, total_tracks: null, release_date: null, label: null, upc: null, cover_url: null, artists: [], various: false })).toBe(false);
+		expect(ok('feed_item', 'set-state', 'x'.repeat(257), { state: 'archived' })).toBe(false);
+		expect(ok('feed_suppression', 'set', 'artist:1', { scope: 'genre', active: true })).toBe(false);
+		const [, , aid, ap] = sample('library_track', 'set-attrs');
+		expect(ok('library_track', 'set-attrs', aid, { ...(ap as object), bpm: 0 })).toBe(false);
+		expect(ok('library_track', 'set-attrs', aid, { ...(ap as object), play_count: -1 })).toBe(false);
+		// Curation is not an attribute: set-attrs refuses it.
+		expect(ok('library_track', 'set-attrs', aid, { ...(ap as object), comment: 'x' })).toBe(false);
+		expect(ok('library_track', 'set-curation', aid, { field: 'color_label', value: null })).toBe(true);
+		expect(ok('library_track', 'set-curation', aid, { field: 'comment', value: '' })).toBe(false);
+		expect(ok('library_track', 'set-curation', aid, { field: 'rating', value: 3 })).toBe(false);
 	});
 });

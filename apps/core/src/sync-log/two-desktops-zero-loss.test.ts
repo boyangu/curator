@@ -66,7 +66,7 @@ describe('audit 1 — plays stay linked to their tracks on another device', () =
 	it('adopt: a recording whose row arrives after its plays (a bound import) shows them', async () => {
 		// A v2 server: records, no meta, so no remote rows — the plays are
 		// projected with no track to land on.
-		rig.cloud.features = rig.cloud.features.filter((f) => f !== 'track_meta');
+		rig.cloud.features = rig.cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
 		const a = await rig.desktop('a', { catalogue: ['trk-0', 'trk-1'] });
 		await playAll(a, ['trk-0', 'trk-1']);
 		await rig.settle();

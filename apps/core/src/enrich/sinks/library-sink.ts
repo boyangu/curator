@@ -109,12 +109,14 @@ export class LibrarySink {
 						fetchedAt: new Date(),
 					})
 					.run();
-				// A Beatport match is the account's claim for the row's
-				// recording, so the other devices show the link (and their bulk
-				// enrichment skips it) without crawling again
-				// (sync-log/claim-links.ts). Fuzzy by nature (0.7); identity
-				// never merges on beatport claims. Traxsource has no claim kind.
-				if (source === 'beatport') addClaims(this.db, trackId, [{ kind: 'beatport', value: link.sourceTrackId, confidence: 0.7 }]);
+				// A Beatport or Traxsource match is the account's claim for the
+				// row's recording, so the other devices show the link (and their
+				// bulk enrichment skips it) without crawling again
+				// (sync-log/claim-links.ts). Fuzzy by nature (0.7); identity never
+				// merges on either (identity.ts AUTO_MERGE_CLAIM_KINDS). The
+				// traxsource kind is protocol v4: addClaims holds it back from a
+				// v3 server and the claims reconcile states it later.
+				if (source === 'beatport' || source === 'traxsource') addClaims(this.db, trackId, [{ kind: source, value: link.sourceTrackId, confidence: 0.7 }]);
 			}
 		}
 

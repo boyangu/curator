@@ -227,12 +227,12 @@ export interface TrackListHandle {
 
 // Source markers, in a fixed order. `rekordbox` comes from rekordbox_link
 // (decorateTracks unions it into `sources`).
-const SOURCE_ORDER = ['spotify', 'tidal', 'beatport', 'rekordbox', 'local'] as const;
+const SOURCE_ORDER = ['spotify', 'tidal', 'beatport', 'traxsource', 'rekordbox', 'local'] as const;
 const SOURCE_NAMES: Record<(typeof SOURCE_ORDER)[number], string> = {
-	spotify: 'Spotify', tidal: 'Tidal', beatport: 'Beatport', rekordbox: 'Rekordbox', local: 'Local file',
+	spotify: 'Spotify', tidal: 'Tidal', beatport: 'Beatport', traxsource: 'Traxsource', rekordbox: 'Rekordbox', local: 'Local file',
 };
 // Claim-derived providers (Track.claimSources), in the same order.
-const DERIVED_ORDER = ['spotify', 'tidal', 'beatport'] as const;
+const DERIVED_ORDER = ['spotify', 'tidal', 'beatport', 'traxsource'] as const;
 const DERIVED_NOTE = '(from your account — linked on another device)';
 function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: readonly (typeof DERIVED_ORDER)[number][]): string {
 	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${DERIVED_NOTE}`)];

@@ -54,7 +54,7 @@ class FakeStore {
 
 function trackItem(id: string, title: string, extra?: Partial<FeedItem>): FeedItem {
 	return {
-		id, type: 'track', source: 'spotify', sourceId: id,
+		id, dedupeKey: `spotify:track:${id}`, type: 'track', source: 'spotify', sourceId: id,
 		payload: { title, artists: ['A'] },
 		origin: null, publishedAt: null, fetchedAt: 0, score: 0,
 		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null,
@@ -64,7 +64,7 @@ function trackItem(id: string, title: string, extra?: Partial<FeedItem>): FeedIt
 
 function albumItem(id: string, refs: { sourceTrackId: string; title: string }[]): FeedItem {
 	return {
-		id, type: 'album', source: 'spotify', sourceId: id,
+		id, dedupeKey: `spotify:album:${id}`, type: 'album', source: 'spotify', sourceId: id,
 		payload: { title: id, artists: ['A'], tracks: refs.map((r) => ({ ...r, artists: ['A'], durationSec: 100 })) },
 		origin: null, publishedAt: null, fetchedAt: 0, score: 0,
 		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null,

@@ -186,6 +186,7 @@ function deriveSourceUrl(source: string, id: string): string | null {
 		case 'spotify':  return `https://open.spotify.com/track/${id}`;
 		case 'tidal':    return `https://tidal.com/browse/track/${id}`;
 		case 'beatport': return `https://www.beatport.com/track/-/${id}`;
+		case 'traxsource': return `https://www.traxsource.com/track/${id}`;
 		default:         return null;
 	}
 }
@@ -194,7 +195,7 @@ function deriveSourceUrl(source: string, id: string): string | null {
 // and the claim-derived ids for providers it has no own link for.
 // Availability of the open-* commands is already decided synchronously from
 // `sources`; this only runs on click to get the actual URL.
-async function resolveTrackSourceUrls(trackId: string): Promise<{ spotifyUrl?: string; tidalUrl?: string; beatportUrl?: string }> {
+async function resolveTrackSourceUrls(trackId: string): Promise<{ spotifyUrl?: string; tidalUrl?: string; beatportUrl?: string; traxsourceUrl?: string }> {
 	const links = await tracksApi.sourceLinks(trackId).catch(() => []);
 	// Core lists a provider's primary first (own links, then the claim-derived
 	// ones by rank) — a row may know several ids of one provider, and the
@@ -204,7 +205,7 @@ async function resolveTrackSourceUrls(trackId: string): Promise<{ spotifyUrl?: s
 		const url = l.url ?? deriveSourceUrl(l.source, l.sourceTrackId);
 		if (url && !bySource.has(l.source)) bySource.set(l.source, url);
 	}
-	return { spotifyUrl: bySource.get('spotify'), tidalUrl: bySource.get('tidal'), beatportUrl: bySource.get('beatport') };
+	return { spotifyUrl: bySource.get('spotify'), tidalUrl: bySource.get('tidal'), beatportUrl: bySource.get('beatport'), traxsourceUrl: bySource.get('traxsource') };
 }
 
 // Enqueue N tracks for Tidal download, enabling downloads on demand, then
@@ -492,6 +493,14 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		id: 'open-beatport', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'beatport'), iconHtml: ICON_BEATPORT,
 		label: () => 'Open in **Beatport**',
 		run: async (c) => { const { beatportUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id); if (beatportUrl) shellApi.openExternal(beatportUrl); },
+	},
+	{
+		// A Traxsource link (the enricher's match, or one another device made:
+		// a protocol v4 claim). No search entry — Traxsource is a fallback
+		// store, not a place users browse from here.
+		id: 'open-traxsource', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'traxsource'),
+		label: () => 'Open in **Traxsource**',
+		run: async (c) => { const { traxsourceUrl } = await resolveTrackSourceUrls(c.tracks[0]!.id); if (traxsourceUrl) shellApi.openExternal(traxsourceUrl); },
 	},
 	{
 		id: 'search-beatport', group: 'open', isAvailable: (c) => single(c) && noneKnow(c, 'beatport'), iconHtml: ICON_BEATPORT,

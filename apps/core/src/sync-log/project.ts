@@ -52,8 +52,13 @@ import { log } from '../log.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot, type RbSlotPatch } from '../rekordbox/rb-slot.js';
 import { claimLinkPendingAtMost, drainClaimLinksRaw, INLINE_CLAIM_LINK_RECORDINGS, queueClaimLinks } from './claim-links.js';
 import { adoptRefs, derivePendingCount, drainTrackDerivations, dropRemoteRow, INLINE_CREATE_ROWS, INLINE_DERIVE_ROWS, materializeRemoteRows, requestRematerialize } from './remote-rows.js';
-import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, rbSegmentsValue } from './rows.js';
+import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, RB_UNITS_V4, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
+import { projectPlaylistAttrs } from './playlist-attrs.js';
+import { projectTrackAttrs } from './track-attrs.js';
+import { projectCuration } from './track-curation.js';
+import { masterDevice } from './track-meta.js';
+import { applySyncedAlbumMetaRaw } from '../library/albums.js';
 
 type Raw = Database.Database;
 
@@ -260,6 +265,7 @@ export function project(
 				ON CONFLICT(id) DO UPDATE SET source = excluded.source, source_id = excluded.source_id,
 					parent_folder_id = excluded.parent_folder_id, name = excluded.name, name_ascii = excluded.name_ascii, updated_at = ?`)
 				.run(id, link?.source ?? 'local', link?.source_id ?? id, field(r, 'parent_folder_id', null), name, searchFold(name), now);
+			projectPlaylistAttrs(raw, 'playlist_folder', id, r);
 		} else {
 			raw.prepare(`UPDATE playlist SET parent_folder_id = NULL WHERE parent_folder_id = ?`).run(id);
 			raw.prepare(`UPDATE playlist_folder SET parent_folder_id = NULL WHERE parent_folder_id = ?`).run(id);
@@ -294,6 +300,8 @@ export function project(
 					source === 'spotify' || source === 'tidal' ? 'pending' : 'synced',
 					now,
 				);
+			// v4: hybrid toggle, sidebar position, mark, provider details.
+			projectPlaylistAttrs(raw, 'playlist', id, r);
 		} else if (was) {
 			raw.prepare(`DELETE FROM playlist_track WHERE playlist_id = ?`).run(id);
 			raw.prepare(`DELETE FROM playlist WHERE id = ?`).run(id);
@@ -446,10 +454,15 @@ export function project(
 		if (!t) continue;
 		if (rec && cueAlive(state, key)) {
 			const b = rec.cell.value;
-			raw.prepare(`INSERT INTO cue (id, track_id, slot, position_sec, length_sec, color, name, kind, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'curator')
+			// The origin when the record states one (v4 upsert2): a cue another
+			// desktop imported from its rekordbox stays a rekordbox cue here,
+			// which this device's own rekordbox import may replace. Without one
+			// a new cue is Curator's and an existing row keeps its own.
+			const origin = b.origin === 'rekordbox' || b.origin === 'curator' ? b.origin : null;
+			raw.prepare(`INSERT INTO cue (id, track_id, slot, position_sec, length_sec, color, name, kind, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'curator'))
 				ON CONFLICT(track_id, slot, kind) DO UPDATE SET position_sec = excluded.position_sec, length_sec = excluded.length_sec,
-					color = excluded.color, name = excluded.name`)
-				.run(randomUUID(), t, rec.slot, b.position_sec, b.length_sec, b.color, b.name, rec.kind);
+					color = excluded.color, name = excluded.name, origin = COALESCE(?, origin)`)
+				.run(randomUUID(), t, rec.slot, b.position_sec, b.length_sec, b.color, b.name, rec.kind, origin, origin);
 			tracksTouched.add(t);
 		} else if (raw.prepare(`DELETE FROM cue WHERE track_id = ? AND slot = ? AND kind = ?`).run(t, parts.slot, parts.kind).changes > 0) {
 			tracksTouched.add(t);
@@ -466,22 +479,29 @@ export function project(
 			summary.skipped.push({ entity: 'play_event', id, reason: 'rekordbox song history held by another event' });
 			continue;
 		}
+		// The play's own references (v4 append2) when the record states them;
+		// an older append leaves the row's as they are.
+		const rbContent = e.rb_content_id ?? null;
+		const sourceTrack = e.source_track_id ?? null;
 		raw.prepare(`INSERT INTO play_event (id, session_id, track_id, source, played_at, played_ms, duration_ms, max_position_ms, played75,
-				ended_reason, context_type, context_id, track_no, rb_song_history_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				ended_reason, context_type, context_id, track_no, rb_song_history_id, rb_content_id, source_track_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, track_id = excluded.track_id, source = excluded.source,
 				played_at = excluded.played_at, played_ms = excluded.played_ms, duration_ms = excluded.duration_ms,
 				max_position_ms = excluded.max_position_ms, played75 = excluded.played75, ended_reason = excluded.ended_reason,
 				context_type = excluded.context_type, context_id = excluded.context_id, track_no = excluded.track_no,
-				rb_song_history_id = excluded.rb_song_history_id`)
+				rb_song_history_id = excluded.rb_song_history_id,
+				rb_content_id = COALESCE(excluded.rb_content_id, rb_content_id), source_track_id = COALESCE(excluded.source_track_id, source_track_id)`)
 			.run(id, e.session_id, trackFor(e.recording_id), e.source, e.played_at, e.played_ms, e.duration_ms, e.max_position_ms,
-				e.played75 === null ? null : e.played75 ? 1 : 0, e.ended_reason, e.context_type, e.context_id, e.track_no, e.rb_song_history_id);
+				e.played75 === null ? null : e.played75 ? 1 : 0, e.ended_reason, e.context_type, e.context_id, e.track_no, e.rb_song_history_id, rbContent, sourceTrack);
 	}
 
 	// ── 5. library_track: rating, state, overrides, deleted_at, rb units ─
 	// Only fields the records hold are written: a recording with no rating
 	// cell keeps whatever the local row had before the op log existed.
 	const trackRows = raw.prepare(`SELECT id, rating, state, overrides, deleted_at, artists FROM track WHERE recording_id = ?`);
+	let masterId: string | null | undefined;
+	const master = (): string | null => (masterId === undefined ? (masterId = masterDevice(raw)) : masterId);
 	const rbTargets = raw.prepare(`SELECT id FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL`).pluck();
 	for (const recId of ids('library_track')) {
 		const rec = store.ensure('libraryTracks', recId) as LwwRecord | undefined;
@@ -530,8 +550,37 @@ export function project(
 		// The rekordbox units, into the rb slot the importer writes. Only the
 		// catalogue row, never a derived WAV copy (its slot is copied locally
 		// when it is made).
-		if (RB_UNITS.some((u) => rec.fields[`rb.${u}`] !== undefined)) {
+		if ([...RB_UNITS, ...RB_UNITS_V4].some((u) => rec.fields[`rb.${u}`] !== undefined)) {
 			for (const id of rbTargets.all(recId) as string[]) if (projectRbUnits(raw, id, rec)) tracksTouched.add(id);
+		}
+		// v4 attributes and the cue-edit stamp, after the rb units: on a
+		// remote row the winner's key replaces the rb key's mirror
+		// (track-attrs.ts).
+		for (const t of projectTrackAttrs(raw, recId, rec, master())) tracksTouched.add(t);
+		// Comment and colour: LWW onto own and remote rows (track-curation.ts).
+		for (const t of projectCuration(raw, recId, rec)) tracksTouched.add(t);
+	}
+
+	// ── 5b. v4 entities without a track row: feed decisions, releases ────
+	// Feed decisions belong to feed.db, another database: the keys are queued
+	// here, in this transaction, for the feed side to apply (feed/sync.ts).
+	{
+		const fq = ids('feed_item').length + ids('feed_suppression').length > 0 ? raw.prepare(`INSERT OR IGNORE INTO feed_sync_pending (map, key) VALUES (?, ?)`) : null;
+		for (const k of ids('feed_item')) fq!.run('feedItems', k);
+		for (const k of ids('feed_suppression')) fq!.run('feedSuppressions', k);
+		// A release this device already links takes what its provider said
+		// (album-enrich's writes, library/albums.ts); one linked later takes it
+		// when the album seam links it.
+		for (const k of ids('album')) {
+			store.ensure('albums', k);
+			const at = k.indexOf(':');
+			if (at <= 0) continue;
+			const source = k.slice(0, at);
+			const providerId = k.slice(at + 1);
+			const albumId = raw.prepare(`SELECT album_id FROM album_link WHERE source = ? AND source_id = ?`).pluck().get(source, providerId) as string | undefined;
+			if (!albumId) continue;
+			const live = applySyncedAlbumMetaRaw(raw, albumId, source, providerId);
+			for (const t of raw.prepare(`SELECT id FROM track WHERE album_id = ?`).pluck().all(live) as string[]) tracksTouched.add(t);
 		}
 	}
 
@@ -613,6 +662,15 @@ function projectRbUnits(raw: Raw, trackId: string, rec: LwwRecord): boolean {
 				raw.prepare(`UPDATE track SET intro_length_sec = ?, outro_length_sec = ? WHERE id = ?`).run(introLengthSec, outroLengthSec, trackId);
 			}
 		}
+	}
+
+	// rekordbox's tempo and key confidence (v4 units).
+	for (const [unit, key] of [['bpm', 'bpm'], ['key_strength', 'keyStrength']] as const) {
+		const cell = rec.fields[`rb.${unit}`];
+		if (!cell) continue;
+		const v = typeof cell.value === 'number' && Number.isFinite(cell.value) ? cell.value : null;
+		const was = unit === 'bpm' ? cur?.rb_bpm : cur?.rb_key_strength;
+		if ((was ?? null) !== v) patch[key] = v;
 	}
 
 	if (Object.keys(patch).length > 0) {

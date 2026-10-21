@@ -39,6 +39,8 @@ import type {
 	LibraryTier,
 	FeedPage,
 	FeedRefreshResult,
+	FeedDecisionPort,
+	FeedRole,
 } from './types.js';
 import { resolveFeedMembership } from './types.js';
 import { log } from '../log.js';
@@ -99,6 +101,10 @@ export interface FeedServiceDeps {
 	// Default-deny gate for the live-account writes the feed makes (unfollow
 	// playlist/artist). Injected by createCoreService; omitted ⇒ those ops throw.
 	remoteWriteGate?: RemoteWriteGate;
+	// The account's op log (feed/sync.ts): every decision is stated there
+	// after feed.db holds it, and it says whether this device collects the
+	// feed. Absent ⇒ a standalone device: collects, states nothing.
+	decisions?: FeedDecisionPort;
 }
 
 export interface FeedService {
@@ -136,6 +142,8 @@ export interface FeedService {
 	// genre/label/bpm chips appear live. Returns an unsubscribe fn.
 	subscribeEnriched(cb: (item: FeedItem) => void): () => void;
 	startPolling(): void;
+	// Whether this device collects the feed (feed/sync.ts feedRole).
+	role(): FeedRole;
 	stop(): void;
 }
 
@@ -164,6 +172,11 @@ export const FEED_PRODUCER_IDS = {
 
 export function createFeedService(deps: FeedServiceDeps): FeedService {
 	const { store, auth, library } = deps;
+	const decisions = deps.decisions ?? null;
+	const role = (): FeedRole => decisions?.role() ?? { role: 'collector', masterDeviceId: null };
+	// Producers run on the collecting device only (feed/sync.ts): a follower's
+	// Refresh / Load More are refused, not silently empty.
+	const followerSkip = (): FeedRefreshResult | null => (role().role === 'follower' ? { producers: [], skipped: 'follower' } : null);
 	// Absent gate ⇒ default-deny (off-product construction can't unfollow remotely).
 	const remoteWriteGate = deps.remoteWriteGate ?? makeRemoteWriteGate(undefined);
 
@@ -403,11 +416,15 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			// next read. `dismissItemId` additionally removes one item — the
 			// multi-artist TRACK behind "Mute all artists", which should vanish.
 			if (action.kind === 'mute') {
-				for (const s of action.scopes) await store.addSuppression(s.scope, s.key);
+				for (const s of action.scopes) {
+					await store.addSuppression(s.scope, s.key);
+					decisions?.suppression(s.key, s.scope, true);
+				}
 				if (action.dismissItemId) {
 					const it = await store.getItem(action.dismissItemId);
 					if (it) {
 						await store.markState(it.id, 'dismissed');
+						decisions?.itemState(it.dedupeKey, 'dismissed');
 						await store.recordSignal({
 							itemId: it.id,
 							kind: 'dismiss',
@@ -425,12 +442,14 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// Don't regress expanded → seen when cards re-enter the viewport.
 					if (item.state === 'fresh' || (action.kind === 'expanded' && item.state === 'seen')) {
 						await store.markState(item.id, action.kind);
+						decisions?.itemState(item.dedupeKey, action.kind);
 					}
 					await store.recordSignal({ itemId: item.id, kind: action.kind === 'seen' ? 'impression' : 'expand' });
 					return { ok: true };
 				}
 				case 'played': {
 					await store.markPlayed(item.id);
+					decisions?.played(item.dedupeKey, item.playedAt ?? Date.now(), action.sourceTrackId ?? null);
 					await store.recordSignal({
 						itemId: item.id,
 						kind: 'listen',
@@ -445,6 +464,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// carries the track dims + auto-skips. No signal — it's a fact about
 					// the track, not a preference.
 					await store.markUnavailable(action.sourceTrackId);
+					decisions?.suppression(`track:${action.sourceTrackId}`, 'track', true);
 					return { ok: true };
 				}
 				case 'dismiss': {
@@ -452,18 +472,23 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// tuning data; the scope (when given) suppresses the whole
 					// artist/label/playlist from future pages.
 					await store.markState(item.id, 'dismissed');
+					decisions?.itemState(item.dedupeKey, 'dismissed');
 					await store.recordSignal({
 						itemId: item.id,
 						kind: 'dismiss',
 						value: action.scope ? { scope: `${action.scope.scope}:${action.scope.key}` } : null,
 					});
-					if (action.scope) await store.addSuppression(action.scope.scope, action.scope.key);
+					if (action.scope) {
+						await store.addSuppression(action.scope.scope, action.scope.key);
+						decisions?.suppression(action.scope.key, action.scope.scope, true);
+					}
 					return { ok: true };
 				}
 				case 'archive': {
 					// Explicit set-aside: leaves the main feed, lands on the
 					// Archived page, restorable. Kept as tuning data like dismiss.
 					await store.markState(item.id, 'archived');
+					decisions?.itemState(item.dedupeKey, 'archived');
 					await store.recordSignal({ itemId: item.id, kind: 'archive' });
 					return { ok: true };
 				}
@@ -472,6 +497,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// masquerade as new; ordering is by published/fetched time, so
 					// it returns to its chronological slot, not the top.
 					await store.markState(item.id, 'seen');
+					decisions?.itemState(item.dedupeKey, 'seen');
 					return { ok: true };
 				}
 				case 'interested': {
@@ -523,6 +549,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// tracks); only single-track items flip to promoted.
 					if (item.type === 'track') {
 						await store.markState(item.id, 'promoted', { promotedTrackId: trackId });
+						decisions?.itemState(item.dedupeKey, 'promoted', trackId);
 					}
 					return { ok: true, promotedTrackId: trackId };
 				}
@@ -534,6 +561,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					await library.unpromote(action.trackId);
 					if (item.type === 'track' && item.promotedTrackId === action.trackId) {
 						await store.clearPromotion(item.id);
+						decisions?.itemState(item.dedupeKey, 'seen');
 					}
 					return { ok: true };
 				}
@@ -582,12 +610,14 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			return { ok: true, removed };
 		},
 		async refresh() {
-			return scheduler.runAll();
+			return followerSkip() ?? scheduler.runAll();
 		},
 		async refreshProducer(producerId) {
-			return scheduler.refreshProducer(producerId);
+			return followerSkip() ?? scheduler.refreshProducer(producerId);
 		},
 		async loadMore(days) {
+			const skip = followerSkip();
+			if (skip) return skip;
 			const clamped = Math.min(Math.max(Math.round(days) || 7, 1), 60);
 			return scheduler.backfillAll(clamped);
 		},
@@ -599,12 +629,14 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			// Starts background timers only for auto-poll producers — currently a
 			// no-op (both Spotify producers are manual-only; see AUTO_POLL). Ingest
 			// runs on Refresh / Refresh-producer / Load More instead.
-			scheduler.start();
+			// A follower runs no producer, timers included (feed/sync.ts).
+			if (role().role === 'collector') scheduler.start();
 			// Drain any pre-existing backlog (items fetched before the enricher
 			// existed). Enrichment is Beatport-only, no Spotify quota, so it runs
 			// regardless of producer state.
 			enrichment.kick();
 		},
+		role,
 		stop() {
 			scheduler.stop();
 			enrichment.stop();

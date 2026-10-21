@@ -56,9 +56,9 @@ export const tracksApi = {
 	// preload `Api`) so downstream callers keep the exact types they had.
 	setOverrides: (trackId: string, patch: Parameters<typeof window.api['tracks:set-overrides']>[1]): ReturnType<typeof window.api['tracks:set-overrides']> =>
 		trpc.tracks.setOverrides.mutate([trackId, patch]) as ReturnType<typeof window.api['tracks:set-overrides']>,
-	setSourceLinks: (trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null }) =>
+	setSourceLinks: (trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null; traxsource?: string | null }) =>
 		trpc.tracks.setSourceLinks.mutate([trackId, urls]),
-	deleteSourceLink: (trackId: string, source: 'spotify' | 'tidal' | 'beatport') =>
+	deleteSourceLink: (trackId: string, source: 'spotify' | 'tidal' | 'beatport' | 'traxsource') =>
 		trpc.tracks.deleteSourceLink.mutate([trackId, source]),
 	// Track merge (Edit modal's "already linked" offer). Both carry Track rows
 	// with Date fields — same authoritative-type re-assertion as `list`.

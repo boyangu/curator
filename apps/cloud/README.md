@@ -214,7 +214,7 @@ Every refusal is audited (`read_from_revoked_device`, `push_from_revoked_device`
 
 ## Notes
 
-- **Snapshots in Postgres.** `curator.library_snapshot` holds the reducer's raw state, gzipped canonical JSON, three per user; `sync.bootstrap` returns the newest inline as base64. Moving them to R2 later changes only `bootstrap` and the job.
+- **Snapshots in Postgres.** `curator.library_snapshot` holds the reducer's raw state, gzipped canonical JSON, three per user; `sync.bootstrap` returns the newest inline as base64, or — to a client that asks `chunked: true` (feature `snapshot_chunks`) — its seq and size, and `sync.snapshotChunk` serves the body in pieces of at most 4 MiB (`substring` of the bytea, under the user's RLS). Measured 2026-10-21 on the main library at protocol v4: 227 MB of JSON, 36.7 MB gzipped. Storage was considered and rejected for now: the API holds no service key and the snapshot job runs with no user session to write a bucket as. Moving them to R2 later changes only `bootstrap`, `snapshotChunk` and the job.
 - **Protocol drift to fix** (`src/wire.ts`): the protocol's `BootstrapResult` says `snapshotUrl`, this server returns `{ snapshot, snapshotSeq, encoding }`; the protocol's `listDevices` is `account.devices` here; the snapshot decoder (`src/snapshot/codec.ts`) has to move into `packages/protocol` before a client can bootstrap.
 - **Rate limits** are in-memory per machine (10 pushes/s per device, 100 pulls/min per session, catalogue calls 20 burst / 5 per s per device), answered with `TOO_MANY_REQUESTS`, `data.retryAfterSec` and a `Retry-After` header.
 

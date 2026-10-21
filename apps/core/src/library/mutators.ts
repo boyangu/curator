@@ -27,7 +27,7 @@
 
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { isAccountSettingKey, keysBetween, rebalance, type JsonValue, type NewOp } from '@curator/protocol';
+import { CLAIM_KIND_SINCE, isAccountSettingKey, keysBetween, rebalance, type JsonValue, type NewOp, type PayloadOf } from '@curator/protocol';
 import { artistKey, searchFold } from '@curator/shared';
 import { appSetting, playlist as playlistTable, pinnedSearch as pinnedSearchTable, type NewPlaylist, type NewPlaylistTrack } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
@@ -35,6 +35,7 @@ import { rawOf } from './artists.js';
 import { appendRows, planReorderKeys, recomputePositions, type MemberDraft } from './playlist-order.js';
 import { captureEmitted, emitOps, type EmitOp } from '../sync-log/outbox.js';
 import { memberIdAllocator } from '../sync-log/stable-ids.js';
+import { emitV4 } from '../sync-log/features.js';
 import {
 	claimOp,
 	cueDeleteOp,
@@ -63,6 +64,7 @@ import {
 	rbUnitValue,
 	sameUnit,
 	RB_UNITS,
+	rbUnitsFor,
 	type RbUnit,
 	tagCreateOp,
 } from '../sync-log/rows.js';
@@ -340,15 +342,23 @@ export function emitHardDelete(db: Db, trackIds: readonly string[]): void {
 // (design: `recording_claim`).
 export type Claim = RecordingClaim;
 
-function claimOps(recordingId: string, claims: readonly Claim[]): EmitOp[] {
-	return claims.map((c) => claimOp(recordingId, c)).filter((op): op is NonNullable<typeof op> => op !== null);
+// A claim kind protocol v4 added (traxsource, musicbrainz, discogs) only once
+// the server reads v4 (features.ts): before that the push would fail whole.
+// What is skipped here the launch-time claims reconcile states later
+// (claim-reconcile.ts), from the link itself.
+function claimOps(raw: Raw, recordingId: string, claims: readonly Claim[]): EmitOp[] {
+	const v4 = claims.some((c) => CLAIM_KIND_SINCE.has(c.kind)) && emitV4(raw);
+	return claims
+		.filter((c) => v4 || !CLAIM_KIND_SINCE.has(c.kind))
+		.map((c) => claimOp(recordingId, c))
+		.filter((op): op is NonNullable<typeof op> => op !== null);
 }
 
 export function recordTrackCreated(db: Db, trackId: string, claims: readonly Claim[], addedAt: Date = new Date()): void {
 	tx(db, (raw) => {
 		const r = recordingOf(raw, trackId);
 		if (!r) return;
-		emitOps(raw, [{ entity: 'library_track', entity_id: r, kind: 'create', payload: { added_at: addedAt.getTime() } }, ...claimOps(r, claims)]);
+		emitOps(raw, [{ entity: 'library_track', entity_id: r, kind: 'create', payload: { added_at: addedAt.getTime() } }, ...claimOps(raw, r, claims)]);
 	});
 }
 
@@ -356,7 +366,7 @@ export function addClaims(db: Db, trackId: string, claims: readonly Claim[]): vo
 	if (claims.length === 0) return;
 	tx(db, (raw) => {
 		const r = recordingOf(raw, trackId);
-		if (r) emitOps(raw, claimOps(r, claims));
+		if (r) emitOps(raw, claimOps(raw, r, claims));
 	});
 }
 
@@ -914,9 +924,10 @@ export function recordCueChanges<T>(db: Db, trackIds: readonly string[], write: 
 		const before = new Map<string, CueRow[]>(trackIds.map((id) => [id, readCues(raw, id)]));
 		const result = write(raw);
 		const ops: EmitOp[] = [];
+		const v4 = emitV4(raw);
 		for (const [id, was] of before) {
 			const r = recordingOf(raw, id);
-			if (r) ops.push(...cueDiffOps(r, was, readCues(raw, id)));
+			if (r) ops.push(...cueDiffOps(r, was, readCues(raw, id), v4));
 		}
 		emitOps(raw, ops);
 		return result;
@@ -963,6 +974,7 @@ export function recordRbAnalysisChanges<T>(db: Db, written: ReadonlyMap<string, 
 		const before = new Map<string, RbSlotRow | null>([...written.keys()].map((id) => [id, readRbSlot(raw, id)]));
 		const result = write(raw);
 		const seen = seenStmts(raw);
+		const v4 = emitV4(raw);
 		const now = Date.now();
 		const ops: EmitOp[] = [];
 		let skipped = 0;
@@ -987,7 +999,7 @@ export function recordRbAnalysisChanges<T>(db: Db, written: ReadonlyMap<string, 
 			}
 			const r = recordingOf(raw, id);
 			if (!r) continue;
-			const diff = rbAnalysisDiffOps(r, was, after);
+			const diff = rbAnalysisDiffOps(r, was, after, v4);
 			ops.push(...diff.ops);
 			skipped += diff.skipped;
 		}
@@ -1007,7 +1019,7 @@ type SessionRow = { origin: string; kind: string; kind_source: string; name: str
 type EventRow = {
 	session_id: string; track_id: string | null; source: string; played_at: number | null; played_ms: number | null; duration_ms: number | null;
 	max_position_ms: number | null; played75: number | null; ended_reason: string | null; context_type: string | null; context_id: string | null;
-	track_no: number | null; rb_song_history_id: string | null;
+	track_no: number | null; rb_song_history_id: string | null; rb_content_id: string | null; source_track_id: string | null;
 };
 
 // Prepared once per handle: the history import and the initial push read
@@ -1020,7 +1032,7 @@ function playStmts(raw: Raw): { session: Database.Statement; event: Database.Sta
 		st = {
 			session: raw.prepare(`SELECT origin, kind, kind_source, name, started_at, ended_at, rb_history_id FROM play_session WHERE id = ?`),
 			event: raw.prepare(`SELECT session_id, track_id, source, played_at, played_ms, duration_ms, max_position_ms, played75, ended_reason,
-				context_type, context_id, track_no, rb_song_history_id FROM play_event WHERE id = ?`),
+				context_type, context_id, track_no, rb_song_history_id, rb_content_id, source_track_id FROM play_event WHERE id = ?`),
 		};
 		PLAY_STMTS.set(raw, st);
 	}
@@ -1049,28 +1061,34 @@ export function sessionAppendOp(raw: Raw, sessionId: string): EmitOp | null {
 const ENDED = new Set(['ended', 'replaced', 'stopped', 'queue_end', 'interrupted']);
 const nonNegInt = (v: number | null): number | null => (v == null || !Number.isFinite(v) ? null : Math.max(0, Math.round(v)));
 
-export function eventAppendOp(raw: Raw, eventId: string, recording: (trackId: string) => string | null = (t) => recordingOf(raw, t)): EmitOp | null {
+// Under v4 (`v4`, features.ts emitV4) a play that carries its own references
+// (an imported play's rekordbox content id, a Curator play's source track
+// id) rides as an append2 with them.
+export function eventAppendOp(raw: Raw, eventId: string, recording: (trackId: string) => string | null = (t) => recordingOf(raw, t), v4 = emitV4(raw)): EmitOp | null {
 	const e = playStmts(raw).event.get(eventId) as EventRow | undefined;
 	if (!e) return null;
+	const body = eventBody(e, recording);
+	const rbContent = e.rb_content_id ? String(e.rb_content_id).slice(0, 64) : null;
+	const sourceTrack = e.source_track_id ? String(e.source_track_id).slice(0, 2048) : null;
+	if (v4 && (rbContent || sourceTrack)) return { entity: 'play_event', entity_id: eventId, kind: 'append2', payload: { ...body, rb_content_id: rbContent, source_track_id: sourceTrack } };
+	return { entity: 'play_event', entity_id: eventId, kind: 'append', payload: body };
+}
+
+function eventBody(e: EventRow, recording: (trackId: string) => string | null): PayloadOf<'play_event', 'append'> {
 	return {
-		entity: 'play_event',
-		entity_id: eventId,
-		kind: 'append',
-		payload: {
-			session_id: e.session_id,
-			recording_id: e.track_id ? recording(e.track_id) : null,
-			source: e.source === 'spotify' || e.source === 'rekordbox' ? e.source : 'local',
-			played_at: nonNegInt(e.played_at),
-			played_ms: nonNegInt(e.played_ms),
-			duration_ms: nonNegInt(e.duration_ms),
-			max_position_ms: nonNegInt(e.max_position_ms),
-			played75: e.played75 == null ? null : !!e.played75,
-			ended_reason: e.ended_reason && ENDED.has(e.ended_reason) ? (e.ended_reason as 'ended') : null,
-			context_type: e.context_type,
-			context_id: e.context_id,
-			track_no: e.track_no == null ? null : Math.round(e.track_no),
-			rb_song_history_id: e.rb_song_history_id,
-		},
+		session_id: e.session_id,
+		recording_id: e.track_id ? recording(e.track_id) : null,
+		source: e.source === 'spotify' || e.source === 'rekordbox' ? e.source : 'local',
+		played_at: nonNegInt(e.played_at),
+		played_ms: nonNegInt(e.played_ms),
+		duration_ms: nonNegInt(e.duration_ms),
+		max_position_ms: nonNegInt(e.max_position_ms),
+		played75: e.played75 == null ? null : !!e.played75,
+		ended_reason: e.ended_reason && ENDED.has(e.ended_reason) ? (e.ended_reason as 'ended') : null,
+		context_type: e.context_type,
+		context_id: e.context_id,
+		track_no: e.track_no == null ? null : Math.round(e.track_no),
+		rb_song_history_id: e.rb_song_history_id,
 	};
 }
 
@@ -1195,10 +1213,11 @@ export function mergeRecordingRaw(raw: Raw, m: RecordingMergeInput): void {
 	// grafted when keep had none); the fold goes unit by unit by clock. Every
 	// unit is stated, absent ones as null, so the kept slot is what stands.
 	const slot = readRbSlot(raw, m.winnerTrackId);
-	for (const unit of RB_UNITS) { const op = rbUnitOp(winner, unit, rbUnitValue(slot, unit)); if (op) ops.push(op); }
+	const v4 = emitV4(raw);
+	for (const unit of rbUnitsFor(v4)) { const op = rbUnitOp(winner, unit, rbUnitValue(slot, unit)); if (op) ops.push(op); }
 	const cues = readCues(raw, m.winnerTrackId).filter((c) => c.slot >= 0);
 	const have = new Set(cues.map((c) => `${c.kind}:${c.slot}`));
-	for (const c of cues) ops.push(cueUpsertOp(winner, c));
+	for (const c of cues) ops.push(cueUpsertOp(winner, c, v4));
 	for (const c of m.loserCueSlots) if (c.slot >= 0 && !have.has(`${c.kind}:${c.slot}`)) ops.push(cueDeleteOp(winner, c.slot, c.kind));
 	for (const r of m.droppedMemberRows) {
 		if (!isDeviceLocalPlaylist(raw, r.playlistId)) ops.push({ entity: 'playlist_track', entity_id: r.id, kind: 'remove', payload: {} });
@@ -1215,5 +1234,5 @@ export function cueOpsFor(raw: Raw, trackId: string, slot: number, kind: 'hot' |
 	const r = recordingOf(raw, trackId);
 	if (!r || slot < 0) return [];
 	const c = readCues(raw, trackId).find((x) => x.slot === slot && x.kind === kind);
-	return [c ? cueUpsertOp(r, c) : cueDeleteOp(r, slot, kind)];
+	return [c ? cueUpsertOp(r, c, emitV4(raw)) : cueDeleteOp(r, slot, kind)];
 }

@@ -40,16 +40,21 @@ const STATE_KEYS = {
 	recordingAlias: true,
 	artistAliases: true,
 	artistAlias: true,
+	feedItems: true,
+	feedSuppressions: true,
+	albums: true,
 	tombstones: true,
 } as const satisfies Record<keyof LibraryState, true>;
 
 type StateKey = keyof typeof STATE_KEYS;
 
 // Maps added after format v1 was first written (protocol v2's artist
-// aliases). Adding a map is additive: an older reader ignores it, and a
-// snapshot an older server built simply has no rules, so a missing one
-// reads as empty instead of failing the bootstrap.
-const ADDED_MAPS: ReadonlySet<StateKey> = new Set(['artistAliases', 'artistAlias']);
+// aliases, v4's feed decisions and releases). Adding a map is additive: an
+// older reader ignores it, and a snapshot an older server built simply has
+// none of them, so a missing one reads as empty instead of failing the
+// bootstrap. (An older reader that ignored one has to re-read it once it
+// can: the desktop re-bootstraps once after its v4 upgrade.)
+const ADDED_MAPS: ReadonlySet<StateKey> = new Set(['artistAliases', 'artistAlias', 'feedItems', 'feedSuppressions', 'albums']);
 const KEYS = Object.keys(STATE_KEYS) as StateKey[];
 
 // Plain code-unit order: stable across runtimes, unlike localeCompare.

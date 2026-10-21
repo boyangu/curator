@@ -13,9 +13,10 @@
 // a remote row or a derived WAV copy — a claim from either would vouch for a
 // track this device does not hold), deleted rows included (their claims are
 // how a delete keeps another device from minting the track again), a row of
-// a merged-away recording skipped (its claims live on the winner). Only the
-// claim kinds protocol v3 knows: Traxsource ids wait for the v4 claim kind
-// (a v3 client would reject the op as invalid_payload rather than hold it).
+// a merged-away recording skipped (its claims live on the winner). The
+// Traxsource kind is protocol v4: stated only once the server reads v4
+// (`v4`; a v3 server would refuse the whole push), and the client runs the
+// reconcile again the first session it learns that.
 // Each claim carries the link's fetch time, as the backfill's do, so it
 // takes no precedence it did not have.
 //
@@ -29,19 +30,20 @@ import { claimOp } from './rows.js';
 type Raw = Database.Database;
 
 export const RECONCILED_CLAIM_SOURCES = ['spotify', 'tidal', 'beatport'] as const;
+export const RECONCILED_CLAIM_SOURCES_V4 = [...RECONCILED_CLAIM_SOURCES, 'traxsource'] as const;
 
 export type ClaimReconcileResult = { tracks: number; emitted: number; bySource: Record<string, number>; chunks: number; maxSliceMs: number };
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: number } = {}): Promise<ClaimReconcileResult> {
+export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: number; v4?: boolean } = {}): Promise<ClaimReconcileResult> {
 	const page = Math.max(1, opts.page ?? 400);
 	const out: ClaimReconcileResult = { tracks: 0, emitted: 0, bySource: {}, chunks: 0, maxSliceMs: 0 };
 	const tracks = raw.prepare(`SELECT rowid, id, recording_id FROM track
 		WHERE rowid > ? AND remote_only = 0 AND derived_from_track_id IS NULL AND recording_id IS NOT NULL ORDER BY rowid LIMIT ?`);
 	const aliased = raw.prepare(`SELECT 1 FROM recording_alias WHERE loser = ?`).pluck();
 	const claimed = raw.prepare(`SELECT 1 FROM sync_state WHERE map = 'claims' AND key = ?`).pluck();
-	const sourceList = RECONCILED_CLAIM_SOURCES.map((s) => `'${s}'`).join(', ');
+	const sourceList = (opts.v4 ? RECONCILED_CLAIM_SOURCES_V4 : RECONCILED_CLAIM_SOURCES).map((s) => `'${s}'`).join(', ');
 	for (let after = 0; ;) {
 		const t0 = performance.now();
 		const rows = tracks.all(after, page) as Array<{ rowid: number; id: string; recording_id: string }>;
@@ -51,7 +53,7 @@ export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: numb
 			const byTrack = new Map(rows.map((r) => [r.id, r.recording_id]));
 			const links = raw.prepare(`SELECT track_id, source, source_track_id, fetched_at FROM source_link
 				WHERE track_id IN (${rows.map(() => '?').join(',')}) AND source IN (${sourceList}) ORDER BY track_id, source, id`)
-				.all(...rows.map((r) => r.id)) as Array<{ track_id: string; source: 'spotify' | 'tidal' | 'beatport'; source_track_id: string; fetched_at: number | null }>;
+				.all(...rows.map((r) => r.id)) as Array<{ track_id: string; source: 'spotify' | 'tidal' | 'beatport' | 'traxsource'; source_track_id: string; fetched_at: number | null }>;
 			const ops: EmitOp[] = [];
 			const seen = new Set<string>();
 			for (const l of links) {

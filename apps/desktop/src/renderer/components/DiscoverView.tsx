@@ -230,6 +230,15 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// 'feed' = the live Discover feed; 'archived' = the set-aside list. The
 	// same card list/pager serves both, switching the source channel.
 	const [mode, setMode] = createSignal<'feed' | 'archived'>('feed');
+	// Who collects the feed (core feed/sync.ts): on a follower — another
+	// device is the account's master — no producer runs, so Refresh and Load
+	// more are hidden and the view says where the feed comes from. Read on
+	// mount and on every refresh (a master switch flips it).
+	const [follower, setFollower] = createSignal(false);
+	const loadRole = (): void => {
+		void window.api['feed:role']().then((r) => setFollower(r.role === 'follower')).catch(() => setFollower(false));
+	};
+	loadRole();
 	// itemId → detail for expanded album cards (null while loading).
 	const [expanded, setExpanded] = createSignal<Map<string, FeedItemDetail | null>>(new Map());
 	// sourceTrackIds confirmed region-unavailable. Seeded from the server flag
@@ -1511,7 +1520,12 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			<div class="feed-toolbar">
 				<span class="feed-toolbar__title">{mode() === 'archived' ? 'Archived' : 'Discover'}</span>
 				<span class="feed-toolbar__count">{total()} items</span>
-				<Show when={mode() === 'feed'}>
+				<Show when={mode() === 'feed' && follower()}>
+					<span class="feed-toolbar__count" title="Discover is collected on your account's main device. Archive, dismiss and mute decisions made there apply here, and yours sync back. Make this computer the main device in Settings → Account to collect here.">
+						Collected on your main device
+					</span>
+				</Show>
+				<Show when={mode() === 'feed' && !follower()}>
 					<button class="feed-toolbar__refresh" disabled={refreshing()} onClick={() => void refreshProducers()}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>
 						{refreshing() ? 'Refreshing…' : 'Refresh'}
@@ -1527,6 +1541,8 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						onClick={() => void refreshOneProducer('spotify-playlist-delta', 'Refresh Playlists')}>
 						{refreshingProducer() === 'spotify-playlist-delta' ? 'Refreshing…' : 'Refresh Playlists'}
 					</button>
+				</Show>
+				<Show when={mode() === 'feed'}>
 					<select class="feed-toolbar__filter" title="Filter by genre"
 						value={genreFilter() ?? ''} onChange={(e) => userApplyFilter('genre', e.currentTarget.value || null)}>
 						<option value="">All genres</option>
@@ -1550,7 +1566,11 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						<Show when={!loading()} fallback={<span>Loading…</span>}>
 							<Show when={mode() === 'archived'} fallback={<>
 								<span>Nothing here yet.</span>
-								<span class="feed-empty__sub">New tracks from playlists you follow and new releases from artists you follow on Spotify land here. Hit Refresh to poll now.</span>
+								<Show when={follower()} fallback={
+									<span class="feed-empty__sub">New tracks from playlists you follow and new releases from artists you follow on Spotify land here. Hit Refresh to poll now.</span>
+								}>
+									<span class="feed-empty__sub">Discover is collected on your account's main device; the archive, dismiss and mute decisions made there apply to the items here. To collect on this computer, make it the main device in Settings → Account.</span>
+								</Show>
 							</>}>
 								<span>No archived items.</span>
 								<span class="feed-empty__sub">Archive a card to set it aside here without deleting it.</span>
@@ -1564,7 +1584,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				{/* End-of-feed: everything fetched so far is loaded — offer to
 				    extend the history horizon. The days selector is the
 				    Discover "load more" setting (persisted). */}
-				<Show when={mode() === 'feed' && !nextCursor() && !loading()}>
+				<Show when={mode() === 'feed' && !follower() && !nextCursor() && !loading()}>
 					<div class="feed-loadmore">
 						<button class="feed-loadmore__btn" disabled={loadingMore()} onClick={() => void loadMoreHistory()}>
 							{loadingMore() ? `Loading ${loadMoreDays()} more days…` : `Load ${loadMoreDays()} more days`}
@@ -1594,7 +1614,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	const unsubEnriched = window.api.onFeedEnriched?.((item) => applyEnriched(item));
 	return {
 		destroy: () => { unsubEnriched?.(); dispose(); },
-		refresh: () => { void loadPage(true); },
+		refresh: () => { loadRole(); void loadPage(true); },
 		playNext: () => { void playNextFromLast(); },
 		markUnavailable: (itemId, sourceTrackId) => { void handleUnavailable(itemId, sourceTrackId); },
 		setNowPlaying: (sourceTrackId) => { setNowPlaying(sourceTrackId); },

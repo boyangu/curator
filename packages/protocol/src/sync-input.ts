@@ -6,7 +6,7 @@
 // the feature (cloud-service.ts `SYNC_FEATURES`).
 
 import { z } from 'zod';
-import type { BootstrapInput, PullInput } from './cloud-service.js';
+import { MAX_SNAPSHOT_CHUNK_BYTES, type BootstrapInput, type PullInput, type SnapshotChunkInput } from './cloud-service.js';
 
 export const ZDeviceId = z.string().min(1).max(128);
 
@@ -32,11 +32,23 @@ export const ZPullInput = z
 	});
 
 // `.optional()`: a client from before 'device_reads' sends no input at all.
-export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional() }).strict().optional();
+// `chunked` only to a server with 'snapshot_chunks'.
+export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional(), chunked: z.literal(true).optional() }).strict().optional();
+
+export const ZSnapshotChunkInput = z
+	.object({
+		deviceId: ZDeviceId.optional(),
+		snapshotSeq: ZSeq,
+		offset: ZSeq,
+		length: z.number().int().positive().max(MAX_SNAPSHOT_CHUNK_BYTES),
+	})
+	.strict();
 
 // The schema and the protocol type must describe the same input.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const _pullInputMatches: Same<z.infer<typeof ZPullInput>, PullInput> = true;
 const _bootstrapInputMatches: Same<z.infer<typeof ZBootstrapInput>, BootstrapInput | undefined> = true;
+const _chunkInputMatches: Same<z.infer<typeof ZSnapshotChunkInput>, SnapshotChunkInput> = true;
 void _pullInputMatches;
 void _bootstrapInputMatches;
+void _chunkInputMatches;

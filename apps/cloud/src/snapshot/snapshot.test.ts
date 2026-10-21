@@ -2,9 +2,9 @@
 // device on exactly the state it would reach by folding every op, compared
 // against the protocol's `applyOps` directly.
 
-import { applyOps, createLibraryState, materialize, type LibraryState, type Op, type StoredOp } from '@curator/protocol';
+import { applyOps, createLibraryState, materialize, MAX_SNAPSHOT_CHUNK_BYTES, type LibraryState, type Op, type StoredOp } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestApp, sampleLibrary, type TestApp } from '../test/harness.js';
+import { createTestApp, errorReason, sampleLibrary, type TestApp } from '../test/harness.js';
 import { deserializeLibraryState, serializeLibraryState } from '@curator/protocol';
 import { decodeSnapshotBase64 } from './codec.js';
 import { buildSnapshot, DEFAULT_DUE_OPTIONS, runDueSnapshots } from './job.js';
@@ -95,6 +95,39 @@ describe('snapshot job and bootstrap', () => {
 		const boot = await api.sync.bootstrap.query();
 		expect(boot.snapshotSeq).toBe(built.status === 'built' ? built.snapshotSeq : -1);
 		expect(serializeLibraryState(await decodeSnapshotBase64(boot.snapshot))).toBe(serializeLibraryState(foldAll(all.slice(0, cut))));
+	});
+
+	it('chunked bootstrap (snapshot_chunks): the size, then the body in pieces that join to the inline body', async () => {
+		const { userId, deviceId, api } = await app.signIn();
+		await api.sync.push.mutate({ deviceId, ops: sampleLibrary(deviceId, 6) });
+		const built = await buildSnapshot(app.db, userId);
+		expect(built.status).toBe('built');
+		const inline = await api.sync.bootstrap.query({ deviceId });
+		const head = await api.sync.bootstrap.query({ deviceId, chunked: true });
+		expect(head.snapshot).toBe('');
+		expect(head.snapshotSeq).toBe(inline.snapshotSeq);
+		const total = Buffer.from(inline.snapshot, 'base64').length;
+		expect(head.chunked).toEqual({ totalBytes: total });
+		// Small pieces, so the join is exercised (the real cap is 4 MiB).
+		const step = Math.max(1, Math.ceil(total / 5));
+		const parts: Buffer[] = [];
+		for (let offset = 0; offset < total; offset += step) {
+			const c = await api.sync.snapshotChunk.query({ deviceId, snapshotSeq: head.snapshotSeq, offset, length: step });
+			expect(c).toMatchObject({ snapshotSeq: head.snapshotSeq, offset, totalBytes: total });
+			parts.push(Buffer.from(c.data, 'base64'));
+		}
+		expect(Buffer.concat(parts).equals(Buffer.from(inline.snapshot, 'base64'))).toBe(true);
+		// Past the end: empty. A pruned (or unknown) seq: snapshot_gone.
+		expect((await api.sync.snapshotChunk.query({ deviceId, snapshotSeq: head.snapshotSeq, offset: total, length: 10 })).data).toBe('');
+		expect(await errorReason(api.sync.snapshotChunk.query({ deviceId, snapshotSeq: head.snapshotSeq + 999, offset: 0, length: 10 }))).toMatchObject({ reason: 'snapshot_gone' });
+		// A piece above the cap is refused by the input schema.
+		await expect(api.sync.snapshotChunk.query({ deviceId, snapshotSeq: head.snapshotSeq, offset: 0, length: MAX_SNAPSHOT_CHUNK_BYTES + 1 })).rejects.toThrow();
+		// An account with no snapshot answers inline, chunked asked or not.
+		const fresh = await app.signIn();
+		const empty = await fresh.api.sync.bootstrap.query({ deviceId: fresh.deviceId, chunked: true });
+		expect(empty.chunked).toBeUndefined();
+		expect(empty.snapshotSeq).toBe(0);
+		expect(empty.snapshot.length).toBeGreaterThan(0);
 	});
 
 	it('builds incrementally from the previous snapshot and prunes old ones', async () => {

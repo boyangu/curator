@@ -43,9 +43,13 @@ import type Database from 'better-sqlite3';
 
 type Raw = Database.Database;
 
-export const CLAIM_LINK_SOURCES = ['spotify', 'tidal', 'beatport'] as const;
+// traxsource / musicbrainz / discogs since protocol v4 (their claim kinds).
+// Display only, like Beatport: identity never merges on any of the four
+// non-streaming kinds.
+export const CLAIM_LINK_SOURCES = ['spotify', 'tidal', 'beatport', 'traxsource', 'musicbrainz', 'discogs'] as const;
 export type ClaimLinkSource = (typeof CLAIM_LINK_SOURCES)[number];
 const IS_SOURCE = new Set<string>(CLAIM_LINK_SOURCES);
+const SOURCE_LIST = CLAIM_LINK_SOURCES.map((s) => `'${s}'`).join(', ');
 
 export const CLAIM_LINKS_SWEEP_KEY = 'sync.claim_links_at';
 
@@ -56,6 +60,9 @@ export function claimLinkUrl(source: string, id: string): string | null {
 		case 'spotify': return `https://open.spotify.com/track/${id}`;
 		case 'tidal': return `https://tidal.com/browse/track/${id}`;
 		case 'beatport': return `https://www.beatport.com/track/-/${id}`;
+		case 'traxsource': return `https://www.traxsource.com/track/${id}`;
+		case 'musicbrainz': return `https://musicbrainz.org/recording/${id}`;
+		case 'discogs': return `https://www.discogs.com/release/${id}`;
 		default: return null;
 	}
 }
@@ -124,7 +131,7 @@ function deriveChunk(raw: Raw, recs: readonly string[]): string[] {
 	const veto = new Set<string>();
 	const have = new Map<string, { track: string; source: string; value: string; rank: number; rec: string }>();
 	if (ids.length > 0) {
-		for (const l of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM source_link WHERE track_id IN (${marks(ids.length)}) AND source IN ('spotify', 'tidal', 'beatport')`)
+		for (const l of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM source_link WHERE track_id IN (${marks(ids.length)}) AND source IN (${SOURCE_LIST})`)
 			.all(...ids) as Array<{ t: string; s: string; v: string }>) own.add(key3(l.t, l.s, l.v));
 		for (const v of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link_veto WHERE track_id IN (${marks(ids.length)})`)
 			.all(...ids) as Array<{ t: string; s: string; v: string }>) veto.add(key3(v.t, v.s, v.v));

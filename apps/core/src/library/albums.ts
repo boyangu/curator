@@ -58,7 +58,7 @@ interface RefRow {
 
 interface Stmts {
 	track: Database.Statement<[string], TrackRow>;
-	refs: Database.Statement<[string], RefRow>;
+	refs: Database.Statement<[string, string], RefRow>;
 	localPaths: Database.Statement<[string], { file_path: string | null }>;
 	albumById: Database.Statement<[string], AlbumRow>;
 	albumByKey: Database.Statement<[string], AlbumRow>;
@@ -88,6 +88,11 @@ function stmts(raw: Raw): Stmts {
 			track: raw.prepare(`SELECT id, album_title, overrides, artists, album_id, release_date, cover_url FROM track WHERE id = ?`),
 			// json_valid guards the extracts: one malformed payload must not
 			// abort a whole sync or the boot backfill.
+			// The row's own listings, then the ones the account's winning
+			// attributes carry for a row without any (track_provider_ref,
+			// sync-log/track-attrs.ts: written only for such a row), so a
+			// device without the Spotify link files the track under the same
+			// release as the one that has it.
 			refs: raw.prepare(`
 				SELECT source,
 					json_extract(payload, '$.album.id') AS album_id,
@@ -99,9 +104,14 @@ function stmts(raw: Raw): Stmts {
 					json_extract(payload, '$.album.total_tracks') AS total_tracks,
 					json_extract(payload, '$.track_number') AS track_number,
 					json_extract(payload, '$.disc_number') AS disc_number
-				FROM source_link
-				WHERE track_id = ? AND source IN ('spotify', 'tidal') AND payload IS NOT NULL AND json_valid(payload)
-				ORDER BY CASE source WHEN 'spotify' THEN 0 ELSE 1 END, fetched_at DESC`),
+				FROM (
+					SELECT source, payload, 0 AS derived, fetched_at, 0 AS ord FROM source_link
+					WHERE track_id = ? AND source IN ('spotify', 'tidal') AND payload IS NOT NULL AND json_valid(payload)
+					UNION ALL
+					SELECT source, payload, 1 AS derived, 0 AS fetched_at, ord FROM track_provider_ref
+					WHERE track_id = ? AND json_valid(payload)
+				)
+				ORDER BY derived, CASE source WHEN 'spotify' THEN 0 ELSE 1 END, fetched_at DESC, ord`),
 			// Live links only (missing_at IS NULL): a vanished file's folder is
 			// no evidence of where the track's release siblings live.
 			localPaths: raw.prepare(`SELECT file_path FROM source_link WHERE track_id = ? AND source = 'local' AND missing_at IS NULL`),
@@ -337,7 +347,7 @@ function deriveTrackAlbum(raw: Raw, s: Stmts, row: TrackRow): Derived {
 	const overridden = parseOverrides(row.overrides)?.albumTitle != null;
 	const refs = overridden
 		? []
-		: s.refs.all(row.id).filter((r) => r.album_id != null && String(r.album_id) !== '' && artistKey(r.album_name ?? '') === titleKey);
+		: s.refs.all(row.id, row.id).filter((r) => r.album_id != null && String(r.album_id) !== '' && artistKey(r.album_name ?? '') === titleKey);
 
 	const main = mainArtistName(row);
 	const mainId = main ? lookupArtistRaw(raw, main)?.id ?? null : null;
@@ -382,9 +392,18 @@ function deriveTrackAlbum(raw: Raw, s: Stmts, row: TrackRow): Derived {
 		}
 	}
 
-	for (const r of refs) s.linkIns.run(albumId, r.source, String(r.album_id), albumUrl(r.source, String(r.album_id)));
+	let linked = false;
+	for (const r of refs) if (s.linkIns.run(albumId, r.source, String(r.album_id), albumUrl(r.source, String(r.album_id))).changes > 0) linked = true;
 	const r0 = refs[0];
 	s.fillGaps.run(r0?.release_date ?? row.release_date ?? null, r0?.cover ?? row.cover_url ?? null, r0?.album_type ?? null, toIntOrNull(r0?.total_tracks), albumId);
+	// A release just linked that this device never asked its provider about:
+	// the account may already know what the provider says (album.set-meta).
+	if (linked) {
+		for (const r of refs) {
+			const live = applySyncedAlbumMetaRaw(raw, albumId, r.source, String(r.album_id));
+			if (live !== albumId) { albumId = live; break; }
+		}
+	}
 	const pos = refs.find((r) => r.track_number != null);
 	return { albumId, trackNumber: toIntOrNull(pos?.track_number), discNumber: toIntOrNull(pos?.disc_number) };
 }
@@ -404,6 +423,58 @@ export function syncTrackAlbumsRaw(raw: Raw, trackIds: readonly string[]): void 
 
 export function syncTrackAlbumsById(db: Db, trackIds: readonly string[]): void {
 	syncTrackAlbumsRaw(rawOf(db), trackIds);
+}
+
+// ── provider release metadata from the op log (protocol v4) ─────────────────
+
+// The record the account holds for a provider release (`album.set-meta`,
+// keyed `${source}:${id}`), or null.
+type AlbumMetaRecord = { album_type?: string | null; total_tracks?: number | null; release_date?: string | null; label?: string | null; upc?: string | null; cover_url?: string | null; artists?: string[]; various?: boolean };
+export function syncedAlbumMetaRaw(raw: Raw, source: string, providerId: string): { meta: AlbumMetaRecord; at: number } | null {
+	const json = raw.prepare(`SELECT value FROM sync_state WHERE map = 'albums' AND key = ?`).pluck().get(`${source}:${providerId}`) as string | undefined;
+	if (!json) return null;
+	try {
+		const rec = JSON.parse(json) as { fields?: Record<string, { value: unknown; clock: { ts: number } }> };
+		const meta: Record<string, unknown> = {};
+		let at = 0;
+		for (const [k, c] of Object.entries(rec.fields ?? {})) { meta[k] = c.value; at = Math.max(at, c.clock?.ts ?? 0); }
+		return { meta: meta as AlbumMetaRecord, at };
+	} catch {
+		return null;
+	}
+}
+
+// What another device's provider fill said about a release this device
+// links (album-enrich.ts applySpotifyAlbumRaw's writes, from the record
+// instead of the provider): artists through the seam (which may merge two
+// releases — the survivor's id is returned), the scalars provider-first,
+// and enriched_at so this device's own fill does not ask again. No-op when
+// the account holds nothing for it, or for an album already merged away.
+export function applySyncedAlbumMetaRaw(raw: Raw, albumId: string, source: string, providerId: string): string {
+	const rec = syncedAlbumMetaRaw(raw, source, providerId);
+	if (!rec) return albumId;
+	const live = raw.prepare(`SELECT id FROM album WHERE id = ? AND merged_into IS NULL`).get(albumId) as { id: string } | undefined;
+	if (!live) return albumId;
+	const m = rec.meta;
+	let id = albumId;
+	const names = (m.artists ?? []).map((n) => (typeof n === 'string' ? n.trim() : '')).filter(Boolean);
+	if (m.various) id = setAlbumArtistsRaw(raw, albumId, [], 'various');
+	else if (names.length > 0) id = setAlbumArtistsRaw(raw, albumId, names.map((n) => upsertArtistRaw(raw, n).id), 'source');
+	raw.prepare(`
+		UPDATE album SET
+			album_type = coalesce(?, album_type),
+			total_tracks = coalesce(?, total_tracks),
+			release_date = coalesce(?, release_date),
+			label = coalesce(?, label),
+			upc = coalesce(?, upc),
+			cover_url = coalesce(?, cover_url),
+			enriched_at = coalesce(enriched_at, ?),
+			updated_at = ?
+		WHERE id = ?`).run(
+		m.album_type ?? null, typeof m.total_tracks === 'number' ? m.total_tracks : null, m.release_date ?? null, m.label ?? null, m.upc ?? null,
+		m.cover_url ?? null, rec.at || Date.now(), Date.now(), id,
+	);
+	return id;
 }
 
 export function pruneAlbumRaw(raw: Raw, albumId: string): void {

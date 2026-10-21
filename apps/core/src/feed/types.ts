@@ -161,6 +161,10 @@ export interface FeedItemDraft {
 
 export interface FeedItem {
 	id: string;
+	// The item's identity on every device and in the cloud (`isrc:<ISRC>`,
+	// `spotify:track:<id>`, `spotify:album:<id>`): what synced decisions are
+	// keyed by (protocol v4 feed_item; feed/sync.ts). `id` is this device's.
+	dedupeKey: string;
 	type: FeedItemType;
 	source: StreamingSource;
 	sourceId: string;
@@ -334,6 +338,51 @@ export interface FeedActionResult {
 
 export interface FeedRefreshResult {
 	producers: { producerId: string; inserted: number; error: string | null }[];
+	// Set when nothing ran because another device collects the feed for the
+	// account (feed/sync.ts feedRole).
+	skipped?: 'follower';
+}
+
+// Who collects the Discover feed (decided 2026-10-21: the account's master
+// device runs the producers; every other device shows its decisions). A
+// device in no synced account, or with no master stated, is a collector.
+export type FeedRole = { role: 'collector' | 'follower'; masterDeviceId: string | null };
+
+// The decisions the op log carries for the feed (protocol v4 feed_item /
+// feed_suppression), as feed.db applies them. `promotedTrackId`: the local
+// track of the promoted recording, when this device holds one.
+export interface SyncedFeedItem {
+	dedupeKey: string;
+	state: FeedItemState | null;
+	stateAt: number | null;
+	promotedTrackId: string | null;
+	playedAt: number | null;
+	listened: string[];
+}
+export interface SyncedFeedSuppression {
+	key: string;
+	scope: FeedSuppressionScope | 'track';
+	active: boolean;
+	at: number;
+}
+
+// This device's own decisions as feed.db holds them, for the one-time
+// statement when the server first reads v4.
+export interface FeedDecisionsDump {
+	items: Array<{ dedupeKey: string; state: FeedItemState; at: number; promotedTrackId: string | null; playedAt: number | null }>;
+	listens: Array<{ dedupeKey: string; sourceTrackId: string; at: number }>;
+	suppressions: Array<{ key: string; scope: FeedSuppressionScope; at: number }>;
+	unavailable: Array<{ sourceTrackId: string; at: number }>;
+}
+
+// Where a feed decision goes once feed.db holds it: the account's op log
+// (feed/sync.ts), when this device syncs. All optional to the feed service —
+// a device that never signed in has none.
+export interface FeedDecisionPort {
+	itemState(dedupeKey: string, state: FeedItemState, promotedTrackId?: string | null): void;
+	played(dedupeKey: string, at: number, sourceTrackId: string | null): void;
+	suppression(key: string, scope: FeedSuppressionScope | 'track', active: boolean): void;
+	role(): FeedRole;
 }
 
 // Auth port — the only auth surface the feed service needs (Spotify token

@@ -24,7 +24,16 @@ import { isRbGridValue } from './rb-grid.js';
 // A v2 client holds both aside instead of stopping at them; a v2 server
 // refuses them, so a desktop emits either only when the server advertises
 // 'track_meta' (cloud-service.ts SYNC_FEATURES).
-export const SCHEMA_VERSION = 3;
+//
+// Version 4 (2026-10-21, the zero-data-loss release) is additive the same
+// way: every addition is a new kind, a new claim kind, a new rekordbox unit
+// or a new entity, each stamped 4 (KIND_SINCE, CLAIM_KIND_SINCE,
+// RB_UNIT_SINCE below), never a field added to a v1-v3 payload — those are
+// `.strict()`, so a v3 client would reject a widened op as invalid_payload
+// instead of holding it aside. A v3 server answers a v4 op `server_outdated`
+// for the whole push, so a desktop emits none before the server advertises
+// 'zero_loss_v4'.
+export const SCHEMA_VERSION = 4;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
 export const MAX_OP_PAYLOAD_BYTES = 16 * 1024;
@@ -48,6 +57,10 @@ export const ENTITIES = [
 	'recording',
 	'upstream',
 	'artist_alias',
+	// Since v4.
+	'feed_item',
+	'feed_suppression',
+	'album',
 ] as const;
 export type Entity = (typeof ENTITIES)[number];
 
@@ -60,6 +73,10 @@ const ZId = z.string().min(1);
 const ZUuid = z.string().uuid();
 const ZMs = z.number().int().nonnegative();
 const ZOrderKey = z.string().refine(isValidOrderKey, { message: 'invalid order key' });
+const ZCount = z.number().int().nonnegative();
+// A remote image or page only: a local path or data: URL means nothing on
+// another device.
+const ZHttpUrl = z.string().max(2048).regex(/^https?:\/\//i, { message: 'must be an http(s) url' });
 
 // Wire-safe JSON: no `undefined`, no functions, no cycles.
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -71,8 +88,11 @@ export const TAG_KINDS = ['system', 'user'] as const;
 export const PLAYLIST_SOURCES = ['spotify', 'tidal', 'rekordbox', 'local'] as const;
 export const CUE_KINDS = ['hot', 'memory'] as const;
 export type CueKind = (typeof CUE_KINDS)[number];
-export const RB_ANALYSIS_UNITS = ['grid', 'key', 'segments'] as const;
-export const CLAIM_KINDS = ['isrc', 'audio_hash', 'fingerprint', 'spotify', 'tidal', 'beatport'] as const;
+// 'bpm' and 'key_strength' since v4 (RB_UNIT_SINCE).
+export const RB_ANALYSIS_UNITS = ['grid', 'key', 'segments', 'bpm', 'key_strength'] as const;
+// 'traxsource', 'musicbrainz' and 'discogs' since v4 (CLAIM_KIND_SINCE).
+export const CLAIM_KINDS = ['isrc', 'audio_hash', 'fingerprint', 'spotify', 'tidal', 'beatport', 'traxsource', 'musicbrainz', 'discogs'] as const;
+export type ClaimKind = (typeof CLAIM_KINDS)[number];
 export const UPSTREAM_PROVIDERS = ['spotify', 'tidal', 'rekordbox'] as const;
 export const UPSTREAM_STATUSES = ['pushed', 'failed', 'skipped'] as const;
 export const PLAY_SESSION_ORIGINS = ['curator', 'rekordbox'] as const;
@@ -207,6 +227,35 @@ export const ZPlaylistSetSourceLink = defineOp('playlist', 'set-source-link', z.
 export const ZPlaylistSetFavourite = defineOp('playlist', 'set-favourite', z.object({ favourite: z.boolean() }).strict());
 export const ZPlaylistDelete = defineOp('playlist', 'delete', empty());
 
+// Since v4. The playlist's details beyond its name and place (the zero-loss
+// audit, item 10): the user's hybrid-Tidal toggle, its sidebar position (a
+// rekordbox playlist's Seq), its provider mark ('P' a streaming playlist,
+// '♡' Liked Songs, 'R' rekordbox) and what its provider says about it. Each
+// key is its own LWW field (the container rule), so a device states only
+// the ones that changed; a phone, which runs no provider read-sync, sees
+// what the desktops read. `position` is a plain integer, not an order key:
+// rekordbox owns the order (its Seq) and every desktop reads it from there.
+const playlistAttrs = {
+	hybrid_tidal: z.boolean().optional(),
+	position: z.number().int().optional(),
+	mark: z.string().min(1).max(8).nullable().optional(),
+	description: z.string().max(4096).nullable().optional(),
+	owner_name: z.string().max(512).nullable().optional(),
+	owner_id: z.string().max(256).nullable().optional(),
+	cover_url: ZHttpUrl.nullable().optional(),
+	is_public: z.boolean().nullable().optional(),
+	is_collaborative: z.boolean().nullable().optional(),
+	is_hidden: z.boolean().optional(),
+	followers: ZCount.nullable().optional(),
+};
+export const PLAYLIST_ATTR_FIELDS = Object.keys(playlistAttrs) as Array<keyof typeof playlistAttrs>;
+const notEmpty = { message: 'at least one field' };
+export const ZPlaylistSetAttrs = defineOp(
+	'playlist',
+	'set-attrs',
+	z.object(playlistAttrs).strict().refine((p) => Object.values(p).some((v) => v !== undefined), notEmpty),
+);
+
 // ── playlist_folder ─────────────────────────────────────────────────────────
 
 export const ZPlaylistFolderCreate = defineOp(
@@ -224,6 +273,9 @@ export const ZPlaylistFolderRename = defineOp('playlist_folder', 'rename', z.obj
 export const ZPlaylistFolderMoveToFolder = defineOp('playlist_folder', 'move-to-folder', z.object({ parent_folder_id: z.string().nullable() }).strict());
 export const ZPlaylistFolderSetSourceLink = defineOp('playlist_folder', 'set-source-link', z.object({ source_link: ZSourceLink.nullable() }).strict());
 export const ZPlaylistFolderDelete = defineOp('playlist_folder', 'delete', empty());
+// Since v4: a folder's sidebar position (rekordbox's Seq), like a playlist's.
+export const PLAYLIST_FOLDER_ATTR_FIELDS = ['position'] as const;
+export const ZPlaylistFolderSetAttrs = defineOp('playlist_folder', 'set-attrs', z.object({ position: z.number().int() }).strict());
 
 // ── playlist_track ──────────────────────────────────────────────────────────
 // `entity_id` is the membership row id. The add's `client_ts` doubles as the
@@ -288,7 +340,6 @@ export const ZLibraryTrackSetState = defineOp('library_track', 'set-state', z.ob
 // tie-break and for provenance.
 export const TRACK_META_SOURCES = ['local', 'spotify', 'tidal', 'other'] as const;
 export type TrackMetaSource = (typeof TRACK_META_SOURCES)[number];
-const ZCount = z.number().int().nonnegative();
 export const ZTrackMeta = z
 	.object({
 		source: z.enum(TRACK_META_SOURCES),
@@ -332,12 +383,122 @@ export const ZLibraryTrackSetOverride = defineOp('library_track', 'set-override'
 // `SegmentRecord` rows; the key is rekordbox's Camelot key. A unit whose op
 // would exceed MAX_OP_PAYLOAD_BYTES (a recorded mix's grid) is not emitted
 // and stays device-local.
+//
+// The two v4 units (RB_UNIT_SINCE): rekordbox's tempo and key confidence of
+// the rb slot (track_analysis.rb_bpm / rb_key_strength), which the player
+// shows when its analysis source is rekordbox.
+const ZRbScalar = z.number().finite().nullable();
 export const ZRbAnalysisUnit = z.discriminatedUnion('unit', [
 	z.object({ unit: z.literal('grid'), value: z.array(z.number()).refine(isRbGridValue, { message: 'not an rb grid (rb-grid.ts)' }).nullable() }).strict(),
 	z.object({ unit: z.literal('key'), value: z.string().nullable() }).strict(),
 	z.object({ unit: z.literal('segments'), value: z.array(z.record(ZJsonValue)).nullable() }).strict(),
+	z.object({ unit: z.literal('bpm'), value: ZRbScalar }).strict(),
+	z.object({ unit: z.literal('key_strength'), value: ZRbScalar }).strict(),
 ]);
 export const ZLibraryTrackSetRbAnalysis = defineOp('library_track', 'set-rb-analysis', ZRbAnalysisUnit);
+
+// Since v4. The rest of a device's own catalogue row that set-meta leaves
+// out (the 2026-10-21 zero-loss audit, items 2, 11 and 14): SOURCE data —
+// tempo, key, explicit flag, MusicBrainz id, copyright, what the row's
+// provider listings say about its release and artists — and one DEVICE
+// value, the rekordbox play counter (that machine's own count). The user's
+// curation of a track (comment, colour) is not here: it is last-write-wins
+// across every device (set-curation below), not master-wins. A kind of its own rather than wider set-meta: set-meta is
+// `.strict()` and v3, so a v3 client would reject a wider one instead of
+// holding it.
+//
+// Filed like set-meta under `attrs.<device_id>` (the envelope names the
+// device), and the view picks a cell by THE SAME RULE (state.ts
+// resolveTrackAttrs = resolveTrackMeta's: the master's cell, else best
+// source, then the later write). Overrides (bpm, key_camelot) still win on
+// read. What a device states is its row's OWN values: a value it took from
+// the account (adopted, see the desktop's track-attrs.ts) is stated as null,
+// so a device never echoes the master's value back as its own.
+//
+// `key_source`: where the row's key came from, as far as the device can tell
+// (no device stores a provenance column; the desktop infers it from the
+// rekordbox slot and its provider links). Provenance only — no rule reads it.
+// `provider_refs`: one per streaming listing the row holds (its Spotify /
+// Tidal links' payloads, compacted): the release id and what the provider
+// says about it, and the provider's ids for the credited artists — what lets
+// a device without those links group the track under the same album and
+// link its artists like the device that has them.
+// `artist_names`: how this device's artist table spells each credited
+// artist (its display name, first-seen unless the user renamed it): a
+// device creating the same uncurated artist from another listing would
+// otherwise keep whichever spelling it met first (the audit's 41 artists,
+// "Murat Uncuoğlu" vs "Murat Uncuoglu"); the master's spelling wins there.
+export const KEY_SOURCES = ['rekordbox', 'beatport', 'traxsource', 'tidal', 'tag', 'other'] as const;
+export const PROVIDER_REF_SOURCES = ['spotify', 'tidal'] as const;
+const ZProviderAlbum = z
+	.object({
+		id: z.string().min(1).max(128),
+		name: z.string().max(1024).nullable(),
+		artists: z.array(z.string().min(1).max(512)).max(32),
+		release_date: z.string().max(32).nullable(),
+		cover_url: ZHttpUrl.nullable(),
+		album_type: z.string().max(32).nullable(),
+		total_tracks: ZCount.nullable(),
+	})
+	.strict();
+export const ZProviderRef = z
+	.object({
+		source: z.enum(PROVIDER_REF_SOURCES),
+		album: ZProviderAlbum.nullable(),
+		artists: z.array(z.object({ name: z.string().min(1).max(512), id: z.string().min(1).max(128) }).strict()).max(32),
+		track_number: ZCount.nullable(),
+		disc_number: ZCount.nullable(),
+	})
+	.strict();
+export type ProviderRef = z.infer<typeof ZProviderRef>;
+export const ZTrackAttrs = z
+	.object({
+		source: z.enum(TRACK_META_SOURCES),
+		bpm: z.number().positive().max(1000).nullable(),
+		key_camelot: z.string().min(1).max(8).nullable(),
+		key_source: z.enum(KEY_SOURCES).nullable(),
+		explicit: z.boolean().nullable(),
+		mbid: z.string().min(1).max(64).nullable(),
+		copyright: z.string().min(1).max(1024).nullable(),
+		play_count: ZCount.nullable(),
+		provider_refs: z.array(ZProviderRef).max(8),
+		artist_names: z.array(z.string().min(1).max(512)).max(32),
+	})
+	.strict();
+export type TrackAttrs = z.infer<typeof ZTrackAttrs>;
+export const ZLibraryTrackSetAttrs = defineOp('library_track', 'set-attrs', ZTrackAttrs);
+
+// Since v4. When the user last edited this recording's cues in Curator
+// (track.cues_edited_at): the rekordbox exporter's "an empty cue list is a
+// real clear" guard. Account-wide, not per device and not master-wins: a
+// clear made on any device must reach every device's exporter, or that
+// device's rekordbox keeps the cues and its next import brings them back.
+// The reducer keeps the latest `at` (state.ts), so a device re-stating an
+// older stamp never lowers it.
+export const ZLibraryTrackSetCuesEdited = defineOp('library_track', 'set-cues-edited', z.object({ at: ZMs }).strict());
+
+// Since v4. The user's curation of a track that rides the track row rather
+// than an op of its own: its comment and its colour label (rekordbox's
+// Comments and Colour). One field per op, each its own LWW cell
+// (`curation.<field>`) like a rating or an override — the later edit wins
+// on every device, whichever device made it; there is no master here. A
+// device writes the winner onto its own row too, and its rekordbox exporter
+// carries it into that machine's rekordbox ("a tag set on the phone reaches
+// rekordbox eventually", decided 2026-10-21).
+//
+// The comment is the user's FREE TEXT only: rekordbox's "Add MyTag to
+// Comments" block (`… /* tag / tag */`, desktop rekordbox/tag-comment.ts) is
+// a per-machine derivation of the track's tags in that rekordbox's order,
+// and each device keeps and rebuilds its own. Carrying it would let two
+// machines that list the same tags in different orders rewrite each other's
+// comment forever.
+export const CURATION_FIELDS = ['comment', 'color_label'] as const;
+export type CurationField = (typeof CURATION_FIELDS)[number];
+export const ZCurationField = z.discriminatedUnion('field', [
+	z.object({ field: z.literal('comment'), value: z.string().min(1).max(8192).nullable() }).strict(),
+	z.object({ field: z.literal('color_label'), value: z.string().min(1).max(32).nullable() }).strict(),
+]);
+export const ZLibraryTrackSetCuration = defineOp('library_track', 'set-curation', ZCurationField);
 export const ZLibraryTrackDelete = defineOp('library_track', 'delete', empty());
 export const ZLibraryTrackUndelete = defineOp('library_track', 'undelete', empty());
 
@@ -362,6 +523,20 @@ export const ZCueUpsert = defineOp('cue', 'upsert', ZCueBody).refine((o) => {
 }, cueId);
 export const ZCueDelete = defineOp('cue', 'delete', empty()).refine((o) => parseCueEntityId(o.entity_id) !== null, cueId);
 
+// Since v4. The same whole-cue upsert plus where the cue came from
+// (`cue.origin`: rekordbox's import or a Curator edit). The rekordbox
+// importer replaces only rekordbox-origin cues, so a device that projected
+// another desktop's rekordbox cues as 'curator' (every cue before v4) would
+// keep stale copies beside its own import's. A kind of its own because
+// ZCueBody is strict; the reducer files both kinds in the same cue record,
+// so the later write of either wins the slot (an upsert without origin
+// leaves the origin unknown, and the projection keeps the row's own).
+export const CUE_ORIGINS = ['curator', 'rekordbox'] as const;
+export const ZCueUpsert2 = defineOp('cue', 'upsert2', ZCueBody.extend({ origin: z.enum(CUE_ORIGINS) }).strict()).refine((o) => {
+	const id = parseCueEntityId(o.entity_id);
+	return id !== null && id.slot === o.payload.slot && id.kind === o.payload.kind;
+}, cueId);
+
 // ── play_session / play_event ───────────────────────────────────────────────
 
 export const ZPlaySessionAppend = defineOp(
@@ -385,27 +560,35 @@ export const ZPlaySessionAppend = defineOp(
 // reclassifying a session as set/prep), which is a per-field LWW write.
 export const ZPlaySessionSetKind = defineOp('play_session', 'set-kind', z.object({ kind: z.enum(['set', 'prep']) }).strict());
 
-export const ZPlayEventAppend = defineOp(
+const ZPlayEventBody = z
+	.object({
+		session_id: ZId,
+		// Null for plays with no library identity (feed previews).
+		recording_id: ZId.nullable(),
+		source: z.enum(PLAY_SOURCES),
+		played_at: ZMs.nullable(),
+		played_ms: z.number().int().nonnegative().nullable(),
+		duration_ms: z.number().int().nonnegative().nullable(),
+		max_position_ms: z.number().int().nonnegative().nullable(),
+		played75: z.boolean().nullable(),
+		ended_reason: z.enum(PLAY_ENDED_REASONS).nullable(),
+		context_type: z.string().nullable(),
+		context_id: z.string().nullable(),
+		track_no: z.number().int().nullable(),
+		rb_song_history_id: z.string().nullable(),
+	})
+	.strict();
+export const ZPlayEventAppend = defineOp('play_event', 'append', ZPlayEventBody);
+// Since v4. The same append plus the play's own source references: the
+// rekordbox DjmdContent id an imported play names (what re-links a play to
+// its track on a device whose rekordbox holds it) and the source track id a
+// Curator play was made from (a Spotify id or file path). The event record
+// is whole-value LWW, so a later append2 of an event restates its body with
+// the references; an append without them after it leaves them unknown.
+export const ZPlayEventAppend2 = defineOp(
 	'play_event',
-	'append',
-	z
-		.object({
-			session_id: ZId,
-			// Null for plays with no library identity (feed previews).
-			recording_id: ZId.nullable(),
-			source: z.enum(PLAY_SOURCES),
-			played_at: ZMs.nullable(),
-			played_ms: z.number().int().nonnegative().nullable(),
-			duration_ms: z.number().int().nonnegative().nullable(),
-			max_position_ms: z.number().int().nonnegative().nullable(),
-			played75: z.boolean().nullable(),
-			ended_reason: z.enum(PLAY_ENDED_REASONS).nullable(),
-			context_type: z.string().nullable(),
-			context_id: z.string().nullable(),
-			track_no: z.number().int().nullable(),
-			rb_song_history_id: z.string().nullable(),
-		})
-		.strict(),
+	'append2',
+	ZPlayEventBody.extend({ rb_content_id: z.string().min(1).max(64).nullable(), source_track_id: z.string().min(1).max(2048).nullable() }).strict(),
 );
 
 // ── pinned_search ───────────────────────────────────────────────────────────
@@ -521,6 +704,68 @@ export const ZArtistAliasSet = defineOp(
 );
 export const ZArtistAliasRemove = defineOp('artist_alias', 'remove', empty());
 
+// ── feed_item / feed_suppression ────────────────────────────────────────────
+// Since v4. The Discover feed's user decisions (the zero-loss audit, item 9;
+// decided 2026-10-21: the master device collects the feed for now, its
+// decisions sync to every device, and a later cloud feed owns them). They
+// are account-level records keyed by ids every device and the cloud derive
+// alike — never a device's feed.db row id:
+//   feed_item         `entity_id` = the item's dedupe key: `isrc:<ISRC>`,
+//                     `spotify:track:<id>` or `spotify:album:<id>`.
+//   feed_suppression  `entity_id` = the suppression key: `artist:<id>`,
+//                     `playlist:<id>`, `label:<…>`, `source:<…>`, or
+//                     `track:<spotify id>` (a track marked unavailable).
+// Per-field LWW records (the container rule without a create: a decision
+// about an item a device has not collected yet is kept and applies when the
+// item shows up there).
+
+export const FEED_ITEM_STATES = ['fresh', 'seen', 'expanded', 'promoted', 'dismissed', 'archived'] as const;
+export const FEED_SUPPRESSION_SCOPES = ['artist', 'label', 'playlist', 'source', 'track'] as const;
+const ZFeedKey = z.string().min(1).max(256);
+const feedKey = { message: 'entity_id must be a feed key (≤ 256 chars)' };
+
+// `promoted_recording_id`: the library recording a promote made (a recording
+// id, not the device's track id), or null when a promotion was undone.
+export const ZFeedItemSetState = defineOp(
+	'feed_item',
+	'set-state',
+	z.object({ state: z.enum(FEED_ITEM_STATES), promoted_recording_id: ZId.nullable().optional() }).strict(),
+).refine((o) => ZFeedKey.safeParse(o.entity_id).success, feedKey);
+export const ZFeedItemMarkPlayed = defineOp('feed_item', 'mark-played', z.object({ at: ZMs }).strict()).refine((o) => ZFeedKey.safeParse(o.entity_id).success, feedKey);
+// One track of the item listened to (an album's tracklist shows them): a
+// set, one field per track id.
+export const ZFeedItemMarkListened = defineOp('feed_item', 'mark-listened', z.object({ source_track_id: z.string().min(1).max(64) }).strict()).refine((o) => ZFeedKey.safeParse(o.entity_id).success, feedKey);
+export const ZFeedSuppressionSet = defineOp(
+	'feed_suppression',
+	'set',
+	z.object({ scope: z.enum(FEED_SUPPRESSION_SCOPES), active: z.boolean() }).strict(),
+).refine((o) => ZFeedKey.safeParse(o.entity_id).success, feedKey);
+
+// ── album ───────────────────────────────────────────────────────────────────
+// Since v4. A release as its provider describes it (the Spotify album fill:
+// album artists, type, size, label, UPC, cover, date), keyed by the provider
+// album id (`entity_id` = `spotify:<id>` / `tidal:<id>`), so a device that
+// cannot ask the provider (no token, the phone) shows the same album the one
+// that asked does. Per-field LWW; `artists` are the provider's album artist
+// names (`various` when it lists "Various Artists").
+const albumId = { message: 'entity_id must be `${source}:${albumId}`' };
+export const ZAlbumSetMeta = defineOp(
+	'album',
+	'set-meta',
+	z
+		.object({
+			album_type: z.string().max(32).nullable(),
+			total_tracks: ZCount.nullable(),
+			release_date: z.string().max(32).nullable(),
+			label: z.string().max(1024).nullable(),
+			upc: z.string().max(64).nullable(),
+			cover_url: ZHttpUrl.nullable(),
+			artists: z.array(z.string().min(1).max(512)).max(64),
+			various: z.boolean(),
+		})
+		.strict(),
+).refine((o) => /^(spotify|tidal):[^:\s]{1,128}$/.test(o.entity_id), albumId);
+
 // ── the union ───────────────────────────────────────────────────────────────
 
 export const OP_SCHEMAS = [
@@ -536,11 +781,13 @@ export const OP_SCHEMAS = [
 	ZPlaylistSetSourceLink,
 	ZPlaylistSetFavourite,
 	ZPlaylistDelete,
+	ZPlaylistSetAttrs,
 	ZPlaylistFolderCreate,
 	ZPlaylistFolderRename,
 	ZPlaylistFolderMoveToFolder,
 	ZPlaylistFolderSetSourceLink,
 	ZPlaylistFolderDelete,
+	ZPlaylistFolderSetAttrs,
 	ZPlaylistTrackAdd,
 	ZPlaylistTrackMove,
 	ZPlaylistTrackRemove,
@@ -552,13 +799,18 @@ export const OP_SCHEMAS = [
 	ZLibraryTrackSetMeta,
 	ZLibraryTrackSetOverride,
 	ZLibraryTrackSetRbAnalysis,
+	ZLibraryTrackSetAttrs,
+	ZLibraryTrackSetCuesEdited,
+	ZLibraryTrackSetCuration,
 	ZLibraryTrackDelete,
 	ZLibraryTrackUndelete,
 	ZCueUpsert,
+	ZCueUpsert2,
 	ZCueDelete,
 	ZPlaySessionAppend,
 	ZPlaySessionSetKind,
 	ZPlayEventAppend,
+	ZPlayEventAppend2,
 	ZPinnedSearchCreate,
 	ZPinnedSearchRename,
 	ZPinnedSearchSetQuery,
@@ -570,6 +822,11 @@ export const OP_SCHEMAS = [
 	ZUpstreamAck,
 	ZArtistAliasSet,
 	ZArtistAliasRemove,
+	ZFeedItemSetState,
+	ZFeedItemMarkPlayed,
+	ZFeedItemMarkListened,
+	ZFeedSuppressionSet,
+	ZAlbumSetMeta,
 ] as const;
 
 // zod 3 cannot nest a discriminated union on `kind` inside one on `entity`
@@ -650,6 +907,18 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 	['artist_alias/set', 2],
 	['artist_alias/remove', 2],
 	['library_track/set-meta', 3],
+	['library_track/set-attrs', 4],
+	['library_track/set-cues-edited', 4],
+	['library_track/set-curation', 4],
+	['cue/upsert2', 4],
+	['play_event/append2', 4],
+	['playlist/set-attrs', 4],
+	['playlist_folder/set-attrs', 4],
+	['feed_item/set-state', 4],
+	['feed_item/mark-played', 4],
+	['feed_item/mark-listened', 4],
+	['feed_suppression/set', 4],
+	['album/set-meta', 4],
 ]);
 
 // Account setting keys added after v1. A `setting.set` is a v1 kind, but an
@@ -658,9 +927,21 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 // the op carries the version that introduced its key.
 const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3]]);
 
-export function opSchemaVersion(op: { entity: string; kind: string; entity_id?: string }): number {
+// Enum values added to a v1 kind's payload, by the same reasoning: a
+// `recording_claim.add` of kind traxsource, or a `set-rb-analysis` of unit
+// bpm, fails an older client's enum, so the op carries the version that
+// introduced the value and that client holds it aside. Since v4.
+export const CLAIM_KIND_SINCE: ReadonlyMap<string, number> = new Map([['traxsource', 4], ['musicbrainz', 4], ['discogs', 4]]);
+export const RB_UNIT_SINCE: ReadonlyMap<string, number> = new Map([['bpm', 4], ['key_strength', 4]]);
+
+// Reads the payload only for the two kinds whose enum grew (the stamp must
+// be right for an op before it is parsed: emitOps stamps, then parses).
+export function opSchemaVersion(op: { entity: string; kind: string; entity_id?: string; payload?: unknown }): number {
 	const kind = KIND_SINCE.get(`${op.entity}/${op.kind}`) ?? 1;
 	if (op.entity === 'setting' && op.entity_id !== undefined) return Math.max(kind, SETTING_KEY_SINCE.get(op.entity_id) ?? 1);
+	const p = op.payload !== null && typeof op.payload === 'object' ? (op.payload as Record<string, unknown>) : null;
+	if (op.entity === 'recording_claim' && op.kind === 'add' && typeof p?.['kind'] === 'string') return Math.max(kind, CLAIM_KIND_SINCE.get(p['kind']) ?? 1);
+	if (op.entity === 'library_track' && op.kind === 'set-rb-analysis' && typeof p?.['unit'] === 'string') return Math.max(kind, RB_UNIT_SINCE.get(p['unit']) ?? 1);
 	return kind;
 }
 

@@ -87,6 +87,11 @@ import { claimLinkPendingCount, claimLinksSwept, drainClaimLinksAsync, sweepClai
 import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
 import { healPlayHistoryAsync, playHealPending } from './play-heal.js';
 import { reconcileProviderClaimsAsync } from './claim-reconcile.js';
+import { featuresReadV4, pushableSchemaVersion, recordServerV4 } from './features.js';
+import { drainTrackAttrsAsync, queueTrackAttrsBackfillAsync, trackAttrsBackfillPending, trackAttrsDirtyCount } from './track-attrs.js';
+import { drainPlaylistAttrsAsync, playlistAttrsBackfillPending, playlistAttrsDirtyCount, queuePlaylistAttrsBackfill } from './playlist-attrs.js';
+import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async, v4BackfillsPending } from './v4-backfill.js';
+import { albumMetaBackfillAsync, albumMetaBackfillPending } from './album-meta.js';
 import {
 	defaultMasterDevice, drainTrackMetaAsync, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
 } from './track-meta.js';
@@ -222,6 +227,18 @@ export type SyncClientOptions = {
 	// moves the cursor) after its apply, with the whole page — throwing here
 	// is a crash mid-page.
 	beforeCursorAdvance?: (page: StoredOp[]) => void;
+	// The Discover feed's decisions live in feed.db, another database
+	// (feed/sync.ts): the client drives their two v4 steps through these.
+	feed?: SyncFeedHooks;
+};
+
+export type SyncFeedHooks = {
+	// Decisions pulled for feed.db, queued by the projection.
+	pending(): number;
+	applyPending(): Promise<{ keys: number; changed: number }>;
+	// The one-time statement of feed.db's decisions once the server reads v4.
+	backfillPending(): boolean;
+	backfill(): Promise<{ emitted: number }>;
 };
 
 export type PushOutcome = { pushed: number; rejected: number; more: boolean; stopped: 'update_required' | 'device_revoked' | null };
@@ -451,6 +468,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		serverSkipsOwn = f?.includes('pull_skip_own') ?? false;
 		serverDeviceReads = f?.includes('device_reads') ?? false;
 		features = [...(f ?? [])];
+		// The inline writers' copy (features.ts): they decide v4 vs v3 shapes
+		// from it, outside this client.
+		if (recordServerV4(raw, featuresReadV4(features))) slog.info('server protocol v4 support changed', { readsV4: featuresReadV4(features) });
 	};
 	const forgetFeatures = (): void => {
 		serverSkipsOwn = false;
@@ -558,13 +578,17 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	// ── push ────────────────────────────────────────────────────────────
 
+	// Ops above what the server reads (features.ts pushableSchemaVersion) stay
+	// pending rather than fail the batch: a v3 server answers a v4 op
+	// `server_outdated` for the whole call. Order across versions does not
+	// matter to the reducer (every rule is a max over clocks).
 	const pendingStmt = raw.prepare(`SELECT op_id, device_id, client_ts, schema_version, entity, entity_id, kind, payload
-		FROM sync_outbox WHERE state = 'pending' ORDER BY seq_local LIMIT ?`);
+		FROM sync_outbox WHERE state = 'pending' AND schema_version <= ? ORDER BY seq_local LIMIT ?`);
 	const markAcked = raw.prepare(`UPDATE sync_outbox SET state = 'acked', reason = NULL WHERE op_id = ? AND state = 'pending'`);
 	const markRejected = raw.prepare(`UPDATE sync_outbox SET state = 'rejected', reason = ? WHERE op_id = ? AND state = 'pending'`);
 
 	const pushOnce = async (): Promise<PushOutcome> => {
-		const rows = pendingStmt.all(MAX_PUSH_OPS) as OutboxRow[];
+		const rows = pendingStmt.all(pushableSchemaVersion(features), MAX_PUSH_OPS) as OutboxRow[];
 		if (rows.length === 0) return { pushed: 0, rejected: 0, more: false, stopped: null };
 		// Fill to the byte cap; one op alone is always under it (16 KB max).
 		const ops: Op[] = [];
@@ -824,16 +848,19 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// `resetCursor`: replay from the snapshot's seq even when the cursor is
 	// past it (the clamp repair), instead of keeping the further cursor.
 	const fetchSnapshot = async (): ReturnType<CloudTransport['bootstrap']> => {
+		// 'snapshot_chunks': the body in pieces (the transport joins them); a
+		// v4 library's snapshot is tens of MB gzipped.
+		const chunked = features?.includes('snapshot_chunks') ? { chunked: true as const } : {};
 		if (serverDeviceReads) {
 			try {
-				return await transport.bootstrap({ deviceId });
+				return await transport.bootstrap({ deviceId, ...chunked });
 			} catch (err) {
 				if (!(err instanceof CloudTransportError && err.kind === 'bad_request')) throw err;
 				slog.warn('bootstrap: the server refused the device id; loading without it', { reason: err.message });
 				serverDeviceReads = false;
 			}
 		}
-		return transport.bootstrap();
+		return transport.bootstrap(chunked.chunked ? chunked : undefined);
 	};
 
 	const bootstrap = async (bopts: { resetCursor?: boolean } = {}): Promise<void> => {
@@ -1041,12 +1068,67 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// not claim stayed invisible to every other device. Only once the
 	// account's records are here (first pull): before it, every link of a
 	// device joining an existing library would look unclaimed.
-	let claimsReconciled = false;
+	// Run again, with the v4 kinds (traxsource), the first time this session
+	// learns the server reads v4.
+	let claimsReconciled: 'v3' | 'v4' | null = null;
 	const reconcileClaims = async (): Promise<void> => {
-		if (claimsReconciled || !initialPushDone() || claimsBackfillPending(raw) || !recordsComplete(raw) || !firstPullDone(raw)) return;
-		const r = await reconcileProviderClaimsAsync(raw);
-		claimsReconciled = true;
+		const v4 = featuresReadV4(features);
+		if (claimsReconciled === 'v4' || (claimsReconciled === 'v3' && !v4) || !initialPushDone() || claimsBackfillPending(raw) || !recordsComplete(raw) || !firstPullDone(raw)) return;
+		const r = await reconcileProviderClaimsAsync(raw, { v4 });
+		claimsReconciled = v4 ? 'v4' : 'v3';
 		if (r.emitted > 0) slog.info('provider claims: stated links no claim carried', { emitted: r.emitted, bySource: r.bySource, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+	};
+
+	// ── protocol v4: the zero-loss statements ───────────────────────────
+	// Once the server reads v4 (features.ts): the track attributes and the
+	// playlist details (one-time backfill, then the drains of what changed),
+	// the one-time backfills of cue origins, play references, rekordbox tempo /
+	// key strength, provider album metadata and the feed's decisions. Each is
+	// a no-op when it has nothing to do; each yields between chunks.
+	const syncV4 = async (): Promise<number> => {
+		// v4 implies v3 (a server reads every older kind).
+		if (!featuresReadV4(features) || !serverReadsTrackMeta(features) || !recordsComplete(raw) || !initialPushDone() || !firstPullDone(raw)) return 0;
+		let emitted = 0;
+		if (trackAttrsBackfillPending(raw)) {
+			const queued = await queueTrackAttrsBackfillAsync(raw);
+			slog.info('track attributes: queued every own row for the one-time backfill', { rows: queued });
+		}
+		if (trackAttrsDirtyCount(raw) > 0) {
+			const r = await drainTrackAttrsAsync(raw);
+			emitted += r.emitted;
+			if (r.emitted > 0) slog.info('track attributes: stated', { rows: r.rows, emitted: r.emitted, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+		}
+		if (playlistAttrsBackfillPending(raw)) queuePlaylistAttrsBackfill(raw);
+		if (playlistAttrsDirtyCount(raw) > 0) {
+			const r = await drainPlaylistAttrsAsync(raw);
+			emitted += r.emitted;
+			if (r.emitted > 0) slog.info('playlist details: stated', { rows: r.rows, emitted: r.emitted, maxSliceMs: Math.round(r.maxSliceMs) });
+		}
+		if (v4BackfillsPending(raw)) {
+			for (const [name, run] of [['cue origins', backfillCueOriginsAsync], ['play references', backfillPlayRefsAsync], ['rekordbox tempo / key strength', backfillRbUnitsV4Async]] as const) {
+				const r = await run(raw);
+				emitted += r.emitted;
+				if (r.rows > 0) slog.info(`v4 backfill: ${name}`, { rows: r.rows, emitted: r.emitted, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+			}
+		}
+		if (albumMetaBackfillPending(raw)) {
+			const r = await albumMetaBackfillAsync(raw);
+			emitted += r.emitted;
+			if (r.albums > 0) slog.info('v4 backfill: provider album metadata', { albums: r.albums, emitted: r.emitted, maxSliceMs: Math.round(r.maxSliceMs) });
+		}
+		if (opts.feed?.backfillPending()) {
+			const r = await opts.feed.backfill();
+			emitted += r.emitted;
+			slog.info('v4 backfill: feed decisions', { emitted: r.emitted });
+		}
+		return emitted;
+	};
+
+	// Feed decisions a pull brought, into feed.db.
+	const applyFeedDecisions = async (): Promise<void> => {
+		if (!opts.feed || opts.feed.pending() === 0) return;
+		const r = await opts.feed.applyPending();
+		if (r.changed > 0) slog.info('feed decisions applied', { keys: r.keys, changed: r.changed });
 	};
 
 	const stage = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
@@ -1145,6 +1227,8 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			const metaStage = async (): Promise<void> => {
 				await stage('master device', ensureMaster);
 				await stage('track meta', syncTrackMeta);
+				await stage('provider claims (v4)', reconcileClaims);
+				await stage('zero-loss v4', syncV4);
 				while (!pushRefused) {
 					const p = await pushOnce();
 					if (p.stopped === 'device_revoked') { outcome = 'device_revoked'; return; }
@@ -1152,6 +1236,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				}
 			};
 			const metaBeforePull = serverReadsTrackMeta(features) && !pushRefused;
+			const v4BeforePull = featuresReadV4(features);
 			if (metaBeforePull) await metaStage();
 			if (outcome === 'device_revoked') return;
 			await pullOnce();
@@ -1161,11 +1246,15 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			await sweepStreamingDuplicates();
 			await stage('remote rows', settleRemoteRows);
 			await stage('play history heal', healPlayHistory);
+			await stage('feed decisions', applyFeedDecisions);
 			// The pull was what told this session the server reads v3 (the
 			// push before it had nothing to send): the meta stage runs now,
 			// and one more pull brings the cursor back to the head past this
 			// device's own new ops (the server leaves them out).
-			if (!metaBeforePull && serverReadsTrackMeta(features) && !pushRefused) {
+			// Likewise when the pull was the first answer naming protocol v4 (a
+			// server upgraded since the last push): the v4 statements go now,
+			// not a poll later.
+			if (((!metaBeforePull && serverReadsTrackMeta(features)) || (!v4BeforePull && featuresReadV4(features))) && !pushRefused) {
 				await metaStage();
 				if (outcome === 'device_revoked') return;
 				await pullOnce();
@@ -1181,6 +1270,14 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			}
 			lastError = describe(err);
 			outcome = err instanceof CloudTransportError ? err.kind : 'error';
+			// The server no longer reads what this device last heard it read (a
+			// rolled-back server refusing a v4 op, whole call): stop sending v4
+			// until an answer names it again, so the rest of the outbox flows.
+			if (err instanceof CloudTransportError && err.kind === 'server' && /server_outdated/.test(err.message) && featuresReadV4(features)) {
+				features = (features ?? []).filter((f) => f !== 'zero_loss_v4');
+				recordServerV4(raw, false);
+				slog.warn('the server refused protocol v4 ops; holding them until it reads v4 again');
+			}
 			if (err instanceof CloudTransportError && err.kind === 'update_required') { pushRefused = true; return; }
 			if (err instanceof CloudTransportError && err.kind === 'device_revoked') { markRevoked(); return; }
 			// Re-register on the next attempt (the backoff's first step is short).

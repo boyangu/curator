@@ -49,7 +49,7 @@ const TRACKS = Array.from({ length: 8 }, (_, i) => `trk-${i}`);
 // two-desktops-catalogue.test.ts).
 function v2Cloud(): FakeCloud {
 	const cloud = new FakeCloud();
-	cloud.features = cloud.features.filter((f) => f !== 'track_meta');
+	cloud.features = cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
 	return cloud;
 }
 

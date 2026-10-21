@@ -97,7 +97,7 @@ function parseKeyInput(s: string): string | null {
 // + saving without any edit would re-pull Tidal/Beatport).
 let editingTrackId: string | null = null;
 let modalDirty = false;
-let initialUrls = { spotify: '', tidal: '', beatport: '' };
+let initialUrls = { spotify: '', tidal: '', beatport: '', traxsource: '' };
 // Genre/label autocomplete vocabulary. Cached across opens so reopening the
 // editor shows suggestions instantly; refreshed in the background on each open
 // so genres/labels added since (e.g. via a Beatport refetch) surface too.
@@ -120,7 +120,7 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 	// here so formRef is set by the time open() returns.
 	editingTrackId = trackId;
 	modalDirty = false;
-	initialUrls = { spotify: '', tidal: '', beatport: '' };
+	initialUrls = { spotify: '', tidal: '', beatport: '', traxsource: '' };
 	pendingResets.clear();
 	trackEditModal.open();
 	const form = trackEditModal.form();
@@ -154,6 +154,7 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 	set('spotifyUrl', '');
 	set('tidalUrl', '');
 	set('beatportUrl', '');
+	set('traxsourceUrl', '');
 	deps.getModal()?.setDerivedUrls([]);
 	deps.getModal()?.setOtherUrls({});
 	(form.elements.namedItem('title') as HTMLInputElement | null)?.focus();
@@ -171,6 +172,7 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 					case 'spotify':  return `https://open.spotify.com/track/${id}`;
 					case 'tidal':    return `https://tidal.com/browse/track/${id}`;
 					case 'beatport': return `https://www.beatport.com/track/-/${id}`;
+					case 'traxsource': return `https://www.traxsource.com/track/${id}`;
 					default:         return '';
 				}
 			};
@@ -189,10 +191,12 @@ export async function openTrackEditor(trackId: string): Promise<void> {
 				spotify:  byS.get('spotify')  ?? '',
 				tidal:    byS.get('tidal')    ?? '',
 				beatport: byS.get('beatport') ?? '',
+				traxsource: byS.get('traxsource') ?? '',
 			};
 			set('spotifyUrl',  initialUrls.spotify);
 			set('tidalUrl',    initialUrls.tidal);
 			set('beatportUrl', initialUrls.beatport);
+			set('traxsourceUrl', initialUrls.traxsource);
 			// Ids another device linked (core claim-links.ts) fill the field
 			// too, marked "from your account". They sit in initialUrls like an
 			// own link, so leaving one alone saves nothing; editing it sets this
@@ -261,6 +265,7 @@ export async function saveTrackEditor(): Promise<void> {
 	const spotifyUrl = read('spotifyUrl');
 	const tidalUrl = read('tidalUrl');
 	const beatportUrl = read('beatportUrl');
+	const traxsourceUrl = read('traxsourceUrl');
 
 	try {
 		if (Object.keys(setPatch).length > 0) {
@@ -279,10 +284,11 @@ export async function saveTrackEditor(): Promise<void> {
 	// without blocking the overrides write. We diff against the snapshot taken
 	// when the modal opened: changed-and-non-empty URLs upsert (and refetch);
 	// emptied URLs that previously had a link delete that link.
-	const urlDeletes: ('spotify' | 'tidal' | 'beatport')[] = [];
+	const urlDeletes: ('spotify' | 'tidal' | 'beatport' | 'traxsource')[] = [];
 	if (!spotifyUrl  && initialUrls.spotify)  urlDeletes.push('spotify');
 	if (!tidalUrl    && initialUrls.tidal)    urlDeletes.push('tidal');
 	if (!beatportUrl && initialUrls.beatport) urlDeletes.push('beatport');
+	if (!traxsourceUrl && initialUrls.traxsource) urlDeletes.push('traxsource');
 	for (const src of urlDeletes) {
 		try {
 			await tracksApi.deleteSourceLink(trackId, src);
@@ -290,10 +296,11 @@ export async function saveTrackEditor(): Promise<void> {
 			showToast(`${src}: link delete failed`, { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
 		}
 	}
-	const urlPayload: { spotify?: string | null; tidal?: string | null; beatport?: string | null } = {};
+	const urlPayload: { spotify?: string | null; tidal?: string | null; beatport?: string | null; traxsource?: string | null } = {};
 	if (spotifyUrl  && spotifyUrl  !== initialUrls.spotify)  urlPayload.spotify  = spotifyUrl;
 	if (tidalUrl    && tidalUrl    !== initialUrls.tidal)    urlPayload.tidal    = tidalUrl;
 	if (beatportUrl && beatportUrl !== initialUrls.beatport) urlPayload.beatport = beatportUrl;
+	if (traxsourceUrl && traxsourceUrl !== initialUrls.traxsource) urlPayload.traxsource = traxsourceUrl;
 	// Provider ids already owned by another live track — offered as merges
 	// after the modal closes (one dialog at a time).
 	const conflicts: SourceLinkError[] = [];
@@ -441,8 +448,8 @@ export function resetTrackEditorField(field: string): Promise<void> {
 	// and the resync is skipped.)
 	modalDirty = true;
 
-	const urlMap: Record<string, 'spotify' | 'tidal' | 'beatport'> = {
-		spotifyUrl: 'spotify', tidalUrl: 'tidal', beatportUrl: 'beatport',
+	const urlMap: Record<string, 'spotify' | 'tidal' | 'beatport' | 'traxsource'> = {
+		spotifyUrl: 'spotify', tidalUrl: 'tidal', beatportUrl: 'beatport', traxsourceUrl: 'traxsource',
 	};
 	const fieldMap: Record<string, ClearableTrackField[]> = {
 		title:   ['title'],

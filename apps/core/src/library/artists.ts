@@ -24,7 +24,7 @@ interface ArtistRow { id: string; name: string; merged_into: string | null; name
 interface Stmts {
 	byFold: Database.Statement<[string], ArtistRow>;
 	byId: Database.Statement<[string], ArtistRow>;
-	insArtist: Database.Statement<[string, string, string]>;
+	insArtist: Database.Statement<[string, string, string, string]>;
 	delLinks: Database.Statement<[string]>;
 	insLink: Database.Statement<[string, string, string | null, number]>;
 	setSort: Database.Statement<[string | null, string]>;
@@ -39,7 +39,10 @@ function stmts(raw: Raw): Stmts {
 		s = {
 			byFold: raw.prepare(`SELECT id, name, merged_into, name_curated_at FROM artist WHERE name_ascii = ?`),
 			byId: raw.prepare(`SELECT id, name, merged_into, name_curated_at FROM artist WHERE id = ?`),
-			insArtist: raw.prepare(`INSERT INTO artist (id, name, name_ascii) VALUES (?, ?, ?)`),
+			// A new artist takes the account master's spelling of it when the
+			// op log carried one (artist_spelling, sync-log/track-attrs.ts):
+			// "first seen" differs per device, the master's does not.
+			insArtist: raw.prepare(`INSERT INTO artist (id, name, name_ascii) VALUES (?, COALESCE((SELECT name FROM artist_spelling WHERE name_ascii = ?), ?), ?)`),
 			delLinks: raw.prepare(`DELETE FROM track_artist WHERE track_id = ?`),
 			insLink: raw.prepare(`INSERT OR IGNORE INTO track_artist (track_id, artist_id, role, position) VALUES (?, ?, ?, ?)`),
 			setSort: raw.prepare(`UPDATE track SET artist_sort = ? WHERE id = ?`),
@@ -80,7 +83,7 @@ export function upsertArtistRaw(raw: Raw, name: string): ArtistRow {
 	const hit = s.byFold.get(fold);
 	if (hit) return resolveAlias(s, hit);
 	const id = randomUUID();
-	s.insArtist.run(id, name.trim(), fold);
+	s.insArtist.run(id, fold, name.trim(), fold);
 	return { id, name: name.trim(), merged_into: null, name_curated_at: null };
 }
 

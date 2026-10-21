@@ -211,6 +211,15 @@ export const track = sqliteTable(
 		// library root, marked "not on this device" (service.ts
 		// sourceMembership).
 		remoteSource: text('remote_source'),
+		// Track attributes this row took from the account (protocol v4
+		// set-attrs; apps/core/src/sync-log/track-attrs.ts): { field: { v, from } }
+		// per adopted field, "from" = 'account' (another device's winning
+		// value, written into a field this row's own source left empty) or
+		// 'catalogue' (the hydrate's analyzer fill). The row states such a
+		// field as null, follows the winner while the column still holds the
+		// adopted value, and owns the field again once a local writer changes
+		// it. Device-local; never an op.
+		attrsAdopted: text('attrs_adopted'),
 		// Materialized library-membership tier — see MembershipTier above.
 		// NULL = none. Written by the MembershipClassifier on every event that
 		// can change local-file presence or playlist membership (sync, scan,
@@ -1538,6 +1547,90 @@ export const trackMetaSeen = sqliteTable('track_meta_seen', {
 	recordingId: text('recording_id').notNull(),
 	digest: text('digest').notNull(),
 	seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
+});
+
+// Track attributes on the op log (protocol v4 `library_track.set-attrs`,
+// apps/core/src/sync-log/track-attrs.ts): the same dirty set + digest
+// baseline pair as track meta above, filled by triggers on the attribute
+// columns (bpm, key, comment, colour, explicit, mbid, copyright, play
+// count, cue-edit stamp, credits) and on the provider links.
+export const trackAttrsDirty = sqliteTable('track_attrs_dirty', {
+	trackId: text('track_id').primaryKey(),
+});
+export const trackAttrsSeen = sqliteTable('track_attrs_seen', {
+	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
+	recordingId: text('recording_id').notNull(),
+	digest: text('digest').notNull(),
+	seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
+});
+
+// The provider listings (release + artist ids) the account's winning
+// attributes carry, for a row of this device with no Spotify/Tidal payload
+// of its own (a remote row, a local file). `payload` is a Spotify-shaped
+// track object, so the album seam and the artist links read it like a
+// source_link payload (library/albums.ts, sync-log/remote-rows.ts).
+export const trackProviderRef = sqliteTable(
+	'track_provider_ref',
+	{
+		trackId: text('track_id').notNull().references(() => track.id, { onDelete: 'cascade' }),
+		ord: integer('ord').notNull(),
+		source: text('source').notNull(),
+		payload: text('payload').notNull(),
+	},
+	(t) => ({ pk: primaryKey({ columns: [t.trackId, t.ord] }) }),
+);
+
+// Playlist / folder details on the op log (protocol v4 `set-attrs`,
+// apps/core/src/sync-log/playlist-attrs.ts). `entity` is 'playlist' or
+// 'playlist_folder'; `attrs` (JSON) the per-field baseline — what this
+// device last stated or projected — which both suppresses echoes and keeps
+// an unstated local change from being overwritten by an older pulled one.
+export const playlistAttrsDirty = sqliteTable(
+	'playlist_attrs_dirty',
+	{ entity: text('entity').notNull(), id: text('id').notNull() },
+	(t) => ({ pk: primaryKey({ columns: [t.entity, t.id] }) }),
+);
+export const playlistAttrsSeen = sqliteTable(
+	'playlist_attrs_seen',
+	{ entity: text('entity').notNull(), id: text('id').notNull(), attrs: text('attrs').notNull() },
+	(t) => ({ pk: primaryKey({ columns: [t.entity, t.id] }) }),
+);
+
+// Feed decisions pulled for feed.db (protocol v4 feed_item /
+// feed_suppression): feed.db is another database, so the projection queues
+// the record keys here in its own transaction and the feed side applies
+// them (apps/core/src/feed/sync.ts). `map` is the records map.
+export const feedSyncPending = sqliteTable(
+	'feed_sync_pending',
+	{ map: text('map').notNull(), key: text('key').notNull() },
+	(t) => ({ pk: primaryKey({ columns: [t.map, t.key] }) }),
+);
+
+// A track's curation (comment free text, colour) as this row last stated
+// it or took it from the account (protocol v4 set-curation,
+// apps/core/src/sync-log/track-curation.ts): JSON, field → value, a field
+// absent = never either. The baseline that makes a received value wait for
+// an unstated local change, and an unchanged re-import state nothing.
+export const trackCurationSeen = sqliteTable('track_curation_seen', {
+	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
+	seen: text('seen').notNull(),
+});
+
+// When this device's own row last had its comment / colour written (any
+// writer; triggers in migrate.ts): the time a curation op is stamped with,
+// so concurrent edits on two devices resolve by when they were made.
+export const trackCurationEdit = sqliteTable('track_curation_edit', {
+	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
+	commentAt: integer('comment_at'),
+	colorLabelAt: integer('color_label_at'),
+});
+
+// The account master's display spelling of an artist nobody renamed (from
+// its winning set-attrs `artist_names`): the artist seam mints a new
+// artist with it, so "first seen" cannot differ between devices.
+export const artistSpelling = sqliteTable('artist_spelling', {
+	nameAscii: text('name_ascii').primaryKey(),
+	name: text('name').notNull(),
 });
 
 // Remote rows (track.remoteOnly) whose derived tables — the artist junction,

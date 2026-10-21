@@ -40,6 +40,7 @@ import type { TrackArtist, TrackOverrides } from '@curator/shared/schema';
 import { syncTrackAlbumsRaw } from '../library/albums.js';
 import { loadArtistAliasMap, mapCredits } from '../library/artist-alias.js';
 import { artistsBaseCell, syncTrackArtistsByIdRaw } from '../library/artists.js';
+import { upsertArtistLinksRaw, type ProviderArtistRef } from '../library/artist-links.js';
 import { recomputePositions } from '../library/playlist-order.js';
 import { refsOfRecordings } from './claim-bind.js';
 import { remoteTrackId } from './stable-ids.js';
@@ -306,6 +307,12 @@ export function drainTrackDerivations(raw: Raw, opts: { max?: number } = {}): st
 		if (live.length > 0) {
 			syncTrackArtistsByIdRaw(raw, live);
 			syncTrackAlbumsRaw(raw, live);
+			// Provider artist ids the account's attributes carry for a row
+			// without listings of its own (track-attrs.ts), as a sync would
+			// have linked them from its payload.
+			for (const r of raw.prepare(`SELECT source, json_extract(payload, '$.artists') AS artists FROM track_provider_ref WHERE track_id IN (${live.map(() => '?').join(',')}) AND json_valid(payload)`).all(...live) as Array<{ source: string; artists: string | null }>) {
+				try { upsertArtistLinksRaw(raw, r.source, JSON.parse(r.artists ?? '[]') as ProviderArtistRef[]); } catch { /* a malformed ref links nothing */ }
+			}
 		}
 		raw.prepare(`DELETE FROM track_derive_pending WHERE track_id IN (${ids.map(() => '?').join(',')})`).run(...ids);
 		return live;

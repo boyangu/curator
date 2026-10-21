@@ -56,7 +56,7 @@ export class FakeCloud {
 	readonly rejectIds = new Map<string, RejectReason>();
 	// Failures thrown by the next calls, in order, per procedure.
 	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[] } = { push: [], pull: [] };
-	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0 };
+	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0, chunkedBootstraps: 0 };
 	readonly pushSizes: number[] = [];
 	// Every push call's device and outcome, for "a revoked device stops pushing".
 	readonly pushLog: Array<{ deviceId: string; sent: number; accepted: number }> = [];
@@ -98,6 +98,14 @@ export class FakeCloud {
 				batchMaxSeq: 0,
 				features: [...this.features],
 			};
+		}
+		// apps/cloud sync/push.ts: an op from a newer protocol than this server
+		// reads fails the whole call (`server_outdated`, a 'server' error on the
+		// desktop transport). A fake that does not advertise 'zero_loss_v4'
+		// stands for a v3 server.
+		const reads = this.features.includes('zero_loss_v4') ? 4 : 3;
+		if (input.ops.some((o) => typeof (o as { schema_version?: unknown }).schema_version === 'number' && (o as { schema_version: number }).schema_version > reads)) {
+			throw new CloudTransportError('server', 'server_outdated');
 		}
 		const rejected: PushResult['rejected'] = [];
 		const clamped: NonNullable<PushResult['clamped']> = [];
@@ -208,6 +216,9 @@ export class FakeCloud {
 				offline();
 				if (!cloud.legacy) gateRead(input?.deviceId);
 				cloud.calls.bootstrap++;
+				// The pieces are the HTTP transport's to join (desktop
+				// transport.ts); here only that the client asked for them.
+				if (input?.chunked) cloud.calls.chunkedBootstraps++;
 				if (!cloud.snapshot) return { snapshotSeq: 0, records: [] };
 				return { snapshotSeq: cloud.snapshot.seq, records: decodeLibraryStateSnapshot(cloud.snapshot.json) };
 			},

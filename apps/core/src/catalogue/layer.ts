@@ -102,6 +102,7 @@ import {
 	type MirrorCounts,
 } from './mirror.js';
 import { stmt as stmtCache } from './stmt.js';
+import { markCatalogueFill } from '../sync-log/track-attrs.js';
 import { coverage, jobNeeds, remainingWork, skipCovered } from './needs.js';
 import {
 	CatalogueBlobError,
@@ -714,10 +715,17 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	// rekordbox or Beatport link), the pulled analysis is the only tempo and
 	// key it can show (2026-10-21 audit: hydrate never wrote bpm). A fill
 	// only — a value the row has is the user's or its source's, and wins.
+	// A fill is marked adopted (sync-log/track-attrs.ts): the analyzer's tempo
+	// is not this row's own source's, so the row never states it as its own
+	// attribute, and the account's tempo (the master's rekordbox or Beatport
+	// one) replaces it when the op log carries one.
 	const fillTrackMirrors = (trackId: string, items: readonly StoredCatalogueItem[]): void => {
 		for (const it of items) {
-			if (it.unit === 'rhythm' && it.data.bpm > 0) stmtOf(`UPDATE track SET bpm = ? WHERE id = ? AND bpm IS NULL`).run(it.data.bpm, trackId);
-			else if (it.unit === 'key' && it.data.camelot) stmtOf(`UPDATE track SET key_camelot = ? WHERE id = ? AND key_camelot IS NULL`).run(it.data.camelot, trackId);
+			if (it.unit === 'rhythm' && it.data.bpm > 0) {
+				if (stmtOf(`UPDATE track SET bpm = ? WHERE id = ? AND bpm IS NULL`).run(it.data.bpm, trackId).changes > 0) markCatalogueFill(raw, trackId, 'bpm', it.data.bpm);
+			} else if (it.unit === 'key' && it.data.camelot) {
+				if (stmtOf(`UPDATE track SET key_camelot = ? WHERE id = ? AND key_camelot IS NULL`).run(it.data.camelot, trackId).changes > 0) markCatalogueFill(raw, trackId, 'key_camelot', it.data.camelot);
+			}
 		}
 	};
 	const stmtOf = (sql: string) => stmtCache(raw, sql);

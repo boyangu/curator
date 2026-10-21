@@ -58,7 +58,23 @@ export type PushInput = {
 //     and the `library.master_device` setting. A desktop emits neither
 //     before it sees this: an older server refuses both, and a refused op
 //     is never retried.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta'] as const;
+//   - 'zero_loss_v4': the server reads protocol v4 — every kind, claim kind,
+//     rekordbox unit and entity ops.ts stamps 4 (set-attrs, set-cues-edited,
+//     cue.upsert2, play_event.append2, playlist / folder set-attrs, the feed
+//     decisions, album set-meta, the traxsource / musicbrainz / discogs
+//     claims, rb bpm / key_strength). Before it a desktop emits and pushes
+//     none of them: a v3 server answers a v4 op `server_outdated` for the
+//     whole push.
+//   - 'snapshot_chunks': sync.bootstrap takes `chunked: true` and answers
+//     with the snapshot's seq and size instead of its body, which the client
+//     then reads with sync.snapshotChunk, at most MAX_SNAPSHOT_CHUNK_BYTES a
+//     call. The main library's snapshot is 36.7 MB gzipped (227 MB of JSON,
+//     2026-10-21, protocol v4): one inline response of ~49 MB base64 is one
+//     request that must not time out, held whole in the server's and the
+//     desktop's memory as a string; pieces keep every response small and
+//     resumable, still read from Postgres under the user's own RLS (the API
+//     holds no Storage service key; see apps/cloud README).
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'snapshot_chunks'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -107,8 +123,32 @@ export type PullInput = {
 };
 
 // sync.bootstrap's input ('device_reads'). An older client sends none.
+// `chunked` ('snapshot_chunks'): answer with the size, not the body.
 export type BootstrapInput = {
 	deviceId?: string;
+	chunked?: true;
+};
+
+// The most bytes of snapshot body one sync.snapshotChunk returns (before
+// base64).
+export const MAX_SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
+
+// sync.snapshotChunk ('snapshot_chunks'): bytes [offset, offset + length) of
+// the gzipped body of the snapshot at `snapshotSeq`. A snapshot pruned since
+// the bootstrap answered (`snapshot_gone`) means bootstrap again.
+export type SnapshotChunkInput = {
+	deviceId?: string;
+	snapshotSeq: number;
+	offset: number;
+	length: number;
+};
+
+export type SnapshotChunkResult = {
+	snapshotSeq: number;
+	offset: number;
+	// base64 of the bytes; shorter than `length` only at the end.
+	data: string;
+	totalBytes: number;
 };
 
 export type PullResult = {
@@ -133,9 +173,12 @@ export type BootstrapResult = {
 	// v1 keeps snapshots in Postgres, so there is no signed URL to fetch; an
 	// account with no snapshot yet gets the empty state at seq 0, so the
 	// client has one code path. Load it, then pull after `snapshotSeq`.
+	// Empty when `chunked` is set: read the body with sync.snapshotChunk.
 	snapshot: string;
 	snapshotSeq: number;
 	encoding: typeof SNAPSHOT_ENCODING;
+	// 'snapshot_chunks', answering `chunked: true`: the gzipped body's size.
+	chunked?: { totalBytes: number };
 };
 
 // Why the server refused a whole call (as opposed to one op, which rides in
@@ -171,6 +214,9 @@ export const CALL_ERROR_REASONS = [
 	// catalogue.put: the account has no catalogue entitlement (the owner
 	// adds it). Lookups still answer; do not upload.
 	'catalogue_not_entitled',
+	// sync.snapshotChunk: the snapshot named was pruned by a newer build
+	// since the bootstrap answered. Bootstrap again.
+	'snapshot_gone',
 ] as const;
 export type CallErrorReason = (typeof CALL_ERROR_REASONS)[number];
 
@@ -196,6 +242,7 @@ export interface CloudService {
 		push(input: PushInput): Promise<PushResult>;
 		pull(input: PullInput): Promise<PullResult>;
 		bootstrap(input?: BootstrapInput): Promise<BootstrapResult>;
+		snapshotChunk(input: SnapshotChunkInput): Promise<SnapshotChunkResult>;
 	};
 	account: {
 		registerDevice(input: RegisterDeviceInput): Promise<{ ok: true }>;

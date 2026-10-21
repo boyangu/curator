@@ -165,6 +165,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'feed:refresh': async () => svc.runFeedRefresh(),
 		'feed:refresh-producer': async (producerId) => svc.runFeedProducerRefresh(producerId),
 		'feed:load-more': async (days) => svc.loadMoreFeed(days),
+		'feed:role': async () => svc.getFeedRole(),
 		// Journeys + knowledge base — in-process like the feed (user-paced
 		// reads; the expansion queue already backgrounds provider crawls).
 		'journey:create': async (seed, opts) => svc.createJourney(seed, opts),

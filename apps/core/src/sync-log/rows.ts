@@ -62,7 +62,8 @@ type PlaylistRow = {
 type FolderRow = { name: string; source: string; source_id: string; parent_folder_id: string | null; created_at: number };
 type PinnedRow = { name: string; query: string; sort_column: string | null; sort_dir: string | null; created_at: number };
 export type TrackStateRow = { rating: number | null; state: string; overrides: string | null; deleted_at: number | null };
-export type CueRow = { slot: number; kind: 'hot' | 'memory'; position_sec: number; length_sec: number | null; color: string | null; name: string | null };
+// `origin` (cue.origin: 'rekordbox' | 'curator') rides only a v4 upsert2.
+export type CueRow = { slot: number; kind: 'hot' | 'memory'; position_sec: number; length_sec: number | null; color: string | null; name: string | null; origin?: string | null };
 
 const STMTS = new WeakMap<Raw, Stmts>();
 
@@ -78,7 +79,7 @@ function stmts(raw: Raw): Stmts {
 			pinned: raw.prepare(`SELECT name, query, sort_column, sort_dir, created_at FROM pinned_search WHERE id = ?`),
 			member: raw.prepare(`SELECT playlist_id, track_id, order_key, added_at FROM playlist_track WHERE id = ?`),
 			trackState: raw.prepare(`SELECT rating, state, overrides, deleted_at FROM track WHERE id = ?`),
-			cuesOf: raw.prepare(`SELECT slot, kind, position_sec, length_sec, color, name FROM cue WHERE track_id = ? ORDER BY kind, slot`),
+			cuesOf: raw.prepare(`SELECT slot, kind, position_sec, length_sec, color, name, origin FROM cue WHERE track_id = ? ORDER BY kind, slot`),
 			tagsOf: raw.prepare(`SELECT tag_id, added_at FROM track_tag WHERE track_id = ?`),
 		};
 		STMTS.set(raw, s);
@@ -324,15 +325,16 @@ export function readCues(raw: Raw, trackId: string): CueRow[] {
 	return stmts(raw).cuesOf.all(trackId);
 }
 
-export function cueUpsertOp(recordingId: string, c: CueRow): NewOp {
+// `v4`: the server reads protocol v4 (sync-log/features.ts emitV4) — the cue
+// then rides as an upsert2 with its origin, so another device's rekordbox
+// import knows a rekordbox cue for one.
+export function cueUpsertOp(recordingId: string, c: CueRow, v4 = false): NewOp {
 	const pos = Number.isFinite(c.position_sec) ? Math.max(0, c.position_sec) : 0;
 	const len = c.length_sec != null && Number.isFinite(c.length_sec) && c.length_sec >= 0 ? c.length_sec : null;
-	return {
-		entity: 'cue',
-		entity_id: cueEntityId(recordingId, c.slot, c.kind),
-		kind: 'upsert',
-		payload: { slot: c.slot, kind: c.kind, position_sec: pos, length_sec: len, color: c.color ?? null, name: c.name ?? null },
-	};
+	const body = { slot: c.slot, kind: c.kind, position_sec: pos, length_sec: len, color: c.color ?? null, name: c.name ?? null };
+	const entity_id = cueEntityId(recordingId, c.slot, c.kind);
+	if (v4) return { entity: 'cue', entity_id, kind: 'upsert2', payload: { ...body, origin: c.origin === 'rekordbox' ? 'rekordbox' : 'curator' } };
+	return { entity: 'cue', entity_id, kind: 'upsert', payload: body };
 }
 
 export function cueDeleteOp(recordingId: string, slot: number, kind: 'hot' | 'memory'): NewOp {
@@ -342,14 +344,17 @@ export function cueDeleteOp(recordingId: string, slot: number, kind: 'hot' | 'me
 const cueSlotKey = (c: { slot: number; kind: string }): string => `${c.kind}:${c.slot}`;
 
 // Whole-cue LWW: a changed cue is one upsert, a vanished one one delete.
-export function cueDiffOps(recordingId: string, before: readonly CueRow[], after: readonly CueRow[]): NewOp[] {
+// Under v4 a change of origin alone (an edit taking a rekordbox cue over) is
+// a change too.
+export function cueDiffOps(recordingId: string, before: readonly CueRow[], after: readonly CueRow[], v4 = false): NewOp[] {
 	const ops: NewOp[] = [];
 	const was = new Map(before.filter((c) => c.slot >= 0).map((c) => [cueSlotKey(c), c]));
 	const now = new Map(after.filter((c) => c.slot >= 0).map((c) => [cueSlotKey(c), c]));
 	for (const [k, c] of now) {
 		const p = was.get(k);
-		if (!p || p.position_sec !== c.position_sec || (p.length_sec ?? null) !== (c.length_sec ?? null) || (p.color ?? null) !== (c.color ?? null) || (p.name ?? null) !== (c.name ?? null)) {
-			ops.push(cueUpsertOp(recordingId, c));
+		if (!p || p.position_sec !== c.position_sec || (p.length_sec ?? null) !== (c.length_sec ?? null) || (p.color ?? null) !== (c.color ?? null) || (p.name ?? null) !== (c.name ?? null)
+			|| (v4 && (p.origin ?? null) !== (c.origin ?? null))) {
+			ops.push(cueUpsertOp(recordingId, c, v4));
 		}
 	}
 	for (const [k, c] of was) if (!now.has(k)) ops.push(cueDeleteOp(recordingId, c.slot, c.kind));
@@ -400,8 +405,17 @@ export function claimOp(recordingId: string, c: RecordingClaim): NewOp | null {
 // stays device-local: it cannot ride the log, and rekordbox data is kept out
 // of the catalogue by decision.
 
-export type RbUnit = 'grid' | 'key' | 'segments';
+export type RbUnit = 'grid' | 'key' | 'segments' | 'bpm' | 'key_strength';
+// The v3 units: what the importer diffs and every server reads.
 export const RB_UNITS: readonly RbUnit[] = ['grid', 'key', 'segments'];
+// Since protocol v4 (ops.ts RB_UNIT_SINCE): stated only once the server reads
+// v4 (features.ts) — by the v4 backfill and a merge's re-assert.
+export const RB_UNITS_V4: readonly RbUnit[] = ['bpm', 'key_strength'];
+export function rbUnitsFor(v4: boolean): readonly RbUnit[] {
+	return v4 ? [...RB_UNITS, ...RB_UNITS_V4] : RB_UNITS;
+}
+
+const rbScalar = (v: number | null | undefined): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 export function rbGridValue(row: RbSlotRow | null): number[] | null {
 	if (!row?.rb_beatgrid) return null;
@@ -426,6 +440,8 @@ export function rbUnitValue(row: RbSlotRow | null, unit: RbUnit): unknown {
 		case 'grid': return rbGridValue(row);
 		case 'key': return row?.rb_key_camelot || null;
 		case 'segments': return rbSegmentsValue(row);
+		case 'bpm': return rbScalar(row?.rb_bpm);
+		case 'key_strength': return rbScalar(row?.rb_key_strength);
 	}
 }
 
@@ -445,6 +461,8 @@ export function sameUnit(a: RbSlotRow | null, b: RbSlotRow | null, unit: RbUnit)
 		}
 		case 'key': return (a?.rb_key_camelot || null) === (b?.rb_key_camelot || null);
 		case 'segments': return (a?.rb_segments_json ?? null) === (b?.rb_segments_json ?? null) || JSON.stringify(rbSegmentsValue(a)) === JSON.stringify(rbSegmentsValue(b));
+		case 'bpm': return rbScalar(a?.rb_bpm) === rbScalar(b?.rb_bpm);
+		case 'key_strength': return rbScalar(a?.rb_key_strength) === rbScalar(b?.rb_key_strength);
 	}
 }
 
@@ -464,6 +482,10 @@ export function rbUnitDigest(row: RbSlotRow | null, unit: RbUnit): string {
 			return row?.rb_key_camelot || '';
 		case 'segments':
 			return h.update(JSON.stringify(rbSegmentsValue(row))).digest('hex');
+		case 'bpm':
+			return String(rbScalar(row?.rb_bpm));
+		case 'key_strength':
+			return String(rbScalar(row?.rb_key_strength));
 	}
 }
 
@@ -473,6 +495,8 @@ export function rbUnitPatch(row: RbSlotRow | null, unit: RbUnit): RbSlotPatch {
 		case 'grid': return { beatgrid: row?.rb_beatgrid ?? null, downbeats: row?.rb_downbeats ?? null };
 		case 'key': return { keyCamelot: row?.rb_key_camelot || null };
 		case 'segments': return { segmentsJson: row?.rb_segments_json ?? null };
+		case 'bpm': return { bpm: rbScalar(row?.rb_bpm) };
+		case 'key_strength': return { keyStrength: rbScalar(row?.rb_key_strength) };
 	}
 }
 
@@ -492,11 +516,13 @@ export function rbUnitMirrors(raw: Raw, trackId: string, row: RbSlotRow | null, 
 }
 
 // One op per unit the write changed. `skipped` counts units too large to
-// emit (the caller logs them).
-export function rbAnalysisDiffOps(recordingId: string, before: RbSlotRow | null, after: RbSlotRow | null): { ops: NewOp[]; skipped: number } {
+// emit (the caller logs them). `v4`: the server reads protocol v4, so the
+// tempo / key-strength units are diffed too (an importer that writes them
+// goes through the same baseline as the grid, key and phrases).
+export function rbAnalysisDiffOps(recordingId: string, before: RbSlotRow | null, after: RbSlotRow | null, v4 = false): { ops: NewOp[]; skipped: number } {
 	const ops: NewOp[] = [];
 	let skipped = 0;
-	for (const unit of RB_UNITS) {
+	for (const unit of rbUnitsFor(v4)) {
 		if (sameUnit(before, after, unit)) continue;
 		const op = rbUnitOp(recordingId, unit, rbUnitValue(after, unit));
 		if (op) ops.push(op); else skipped++;

@@ -22,8 +22,12 @@ import {
 	type OpOf,
 } from './ops.js';
 import {
+	attrsCellName,
 	clockOf,
 	compareClock,
+	CUES_EDITED_CELL,
+	CURATION_CELL_PREFIX,
+	FEED_LISTEN_PREFIX,
 	laterClock,
 	metaCellName,
 	resolveRecording,
@@ -55,6 +59,16 @@ function recordOf(map: Map<string, LwwRecord>, id: string): LwwRecord {
 function writeCell(fields: Record<string, Cell>, name: string, value: unknown, clock: Clock): boolean {
 	const cur = fields[name];
 	if (cur && compareClock(cur.clock, clock) >= 0) return false;
+	fields[name] = { value, clock };
+	return true;
+}
+
+// The larger value wins, the clock only between equal values: a stamp that
+// only ever moves forward (the cue-edit time), whatever order its writes
+// arrive in — max is as order-independent as LWW.
+function writeMaxCell(fields: Record<string, Cell>, name: string, value: number, clock: Clock): boolean {
+	const cur = fields[name];
+	if (cur && typeof cur.value === 'number' && (cur.value > value || (cur.value === value && compareClock(cur.clock, clock) >= 0))) return false;
 	fields[name] = { value, clock };
 	return true;
 }
@@ -211,6 +225,17 @@ function applyLibraryTrack(state: LibraryState, op: OpOf<'library_track'>, clock
 		case 'set-rb-analysis':
 			changed = writeCell(rec.fields, `rb.${op.payload.unit}`, op.payload.value, clock);
 			break;
+		// One cell per device, picked like the meta (state.ts resolveTrackAttrs).
+		case 'set-attrs':
+			changed = writeCell(rec.fields, attrsCellName(op.device_id), op.payload, clock);
+			break;
+		case 'set-cues-edited':
+			changed = writeMaxCell(rec.fields, CUES_EDITED_CELL, op.payload.at, clock);
+			break;
+		// Plain per-field LWW: the later edit wins, from any device.
+		case 'set-curation':
+			changed = writeCell(rec.fields, `${CURATION_CELL_PREFIX}${op.payload.field}`, op.payload.value, clock);
+			break;
 		// delete and undelete are LWW on one field, so the later of the two
 		// wins whatever order they arrive in.
 		case 'delete':
@@ -228,7 +253,9 @@ function applyCue(state: LibraryState, op: OpOf<'cue'>, clock: Clock): EntityRef
 	const recordingId = resolveRecording(state, parts.recordingId);
 	const key = `${recordingId}:${parts.slot}:${parts.kind}`;
 	let changed = false;
-	if (op.kind === 'upsert') {
+	// upsert and its v4 form upsert2 (which adds the origin) are one record:
+	// the later write of either is the cue.
+	if (op.kind === 'upsert' || op.kind === 'upsert2') {
 		const { slot: _s, kind: _k, ...body } = op.payload;
 		const rec = state.cues.get(key);
 		if (!rec) {
@@ -264,6 +291,33 @@ function applyPlayEvent(state: LibraryState, op: OpOf<'play_event'>, clock: Cloc
 	if (cur && compareClock(cur.clock, clock) >= 0) return [];
 	state.playEvents.set(op.entity_id, { value, clock });
 	return [ref('play_event', op.entity_id)];
+}
+
+// The feed's decision records (v4): per-field LWW like a container's edits,
+// with no create (a decision may arrive before, or without, the item).
+function applyFeedItem(state: LibraryState, op: OpOf<'feed_item'>, clock: Clock): EntityRef[] {
+	const rec = recordOf(state.feedItems, op.entity_id);
+	let changed: boolean;
+	switch (op.kind) {
+		case 'set-state':
+			changed = writeFields(rec, op.payload, clock);
+			break;
+		case 'mark-played':
+			changed = writeCell(rec.fields, 'played_at', op.payload.at, clock);
+			break;
+		case 'mark-listened':
+			changed = writeCell(rec.fields, `${FEED_LISTEN_PREFIX}${op.payload.source_track_id}`, true, clock);
+			break;
+	}
+	return changed ? [ref('feed_item', op.entity_id)] : [];
+}
+
+function applyFeedSuppression(state: LibraryState, op: OpOf<'feed_suppression'>, clock: Clock): EntityRef[] {
+	return writeFields(recordOf(state.feedSuppressions, op.entity_id), op.payload, clock) ? [ref('feed_suppression', op.entity_id)] : [];
+}
+
+function applyAlbum(state: LibraryState, op: OpOf<'album'>, clock: Clock): EntityRef[] {
+	return writeFields(recordOf(state.albums, op.entity_id), op.payload, clock) ? [ref('album', op.entity_id)] : [];
 }
 
 function applySetting(state: LibraryState, op: OpOf<'setting'>, clock: Clock): EntityRef[] {
@@ -617,6 +671,16 @@ export function isRestatement(state: LibraryState, op: NewOp): boolean {
 				}
 				case 'set-override': return cellHolds(rec, `override.${op.payload.field}`, op.payload.value);
 				case 'set-rb-analysis': return cellHolds(rec, `rb.${op.payload.unit}`, op.payload.value);
+				case 'set-attrs': {
+					const device = (op as { device_id?: string }).device_id;
+					return device !== undefined && cellHolds(rec, attrsCellName(device), op.payload);
+				}
+				// A stamp no later than the one held changes nothing visible.
+				case 'set-cues-edited': {
+					const c = rec?.fields[CUES_EDITED_CELL];
+					return c !== undefined && typeof c.value === 'number' && c.value >= op.payload.at;
+				}
+				case 'set-curation': return cellHolds(rec, `${CURATION_CELL_PREFIX}${op.payload.field}`, op.payload.value);
 				// The delete's value is its own client_ts; already deleted at any
 				// time is the same visible state.
 				case 'delete': { const c = rec?.fields['deleted_at']; return c !== undefined && c.value !== null; }
@@ -653,6 +717,19 @@ export function isRestatement(state: LibraryState, op: NewOp): boolean {
 			const cur = state.claims.get(`${resolveRecording(state, op.entity_id)}:${op.payload.kind}:${op.payload.value}`);
 			return cur !== undefined && sameValue(cur.cell.value, { confidence: op.payload.confidence, duration_sec: op.payload.duration_sec ?? null });
 		}
+		case 'feed_item': {
+			const rec = state.feedItems.get(op.entity_id);
+			switch (op.kind) {
+				case 'set-state': return fieldsHold(rec, op.payload);
+				case 'mark-played': return cellHolds(rec, 'played_at', op.payload.at);
+				case 'mark-listened': return rec?.fields[`${FEED_LISTEN_PREFIX}${op.payload.source_track_id}`] !== undefined;
+			}
+			return false;
+		}
+		case 'feed_suppression':
+			return fieldsHold(state.feedSuppressions.get(op.entity_id), op.payload);
+		case 'album':
+			return fieldsHold(state.albums.get(op.entity_id), op.payload);
 		case 'recording':
 		case 'artist_alias':
 		case 'upstream':
@@ -710,6 +787,15 @@ export function applyOp(state: LibraryState, op: Op): ApplyResult {
 			break;
 		case 'artist_alias':
 			changed = applyArtistAlias(state, op, clock);
+			break;
+		case 'feed_item':
+			changed = applyFeedItem(state, op, clock);
+			break;
+		case 'feed_suppression':
+			changed = applyFeedSuppression(state, op, clock);
+			break;
+		case 'album':
+			changed = applyAlbum(state, op, clock);
 			break;
 	}
 	return { state, changed };

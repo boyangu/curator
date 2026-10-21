@@ -1,6 +1,6 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, FeedRole, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
 import type { DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
@@ -89,10 +89,10 @@ export interface IpcChannels {
 		ret: Track | null;
 	};
 	'tracks:set-source-links': {
-		args: [trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null }];
+		args: [trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null; traxsource?: string | null }];
 		ret: SetSourceLinksResult;
 	};
-	'tracks:delete-source-link': { args: [trackId: string, source: 'spotify' | 'tidal' | 'beatport']; ret: void };
+	'tracks:delete-source-link': { args: [trackId: string, source: 'spotify' | 'tidal' | 'beatport' | 'traxsource']; ret: void };
 	'tracks:merge-preview': { args: [aId: string, bId: string]; ret: TrackMergePreview };
 	'tracks:merge': { args: [keepId: string, dropId: string]; ret: TrackMergeOutcome };
 	'tracks:clear-fields': { args: [trackId: string, fields: ClearableTrackField[]]; ret: Track | null };
@@ -342,6 +342,7 @@ export interface IpcChannels {
 	// Playlists buttons). Remove with those buttons.
 	'feed:refresh-producer': { args: [producerId: string]; ret: FeedRefreshResult };
 	'feed:load-more': { args: [days: number]; ret: FeedRefreshResult };
+	'feed:role':     { args: []; ret: FeedRole };
 
 	// ─── Discovery journeys + knowledge base ──────────────────────────────
 	// Journeys are persistent forkable navigation trees; the KB answers
@@ -841,6 +842,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'feed:refresh': { description: 'Run one manual poll pass over every registered feed producer. Returns per-producer inserted counts and errors.' },
 	'feed:refresh-producer': { description: 'Run one manual poll pass over a SINGLE feed producer by id. Powers the temporary Refresh Artists / Refresh Playlists buttons. Unknown id is a clean no-op.' },
 	'feed:load-more': { description: 'Extend every feed producer\'s history horizon back by N days (clamped 1..60) and ingest the newly-uncovered older items. Powers the "Load more" button at the end of the Discover feed.' },
+	'feed:role': { description: 'Whether this device collects the Discover feed (it is the account\'s master device, or no master is stated) or follows the master: a follower runs no feed producer — Refresh and Load more are refused — and shows the decisions made on the master (archived, dismissed, muted artists).' },
 	'journey:create': { description: 'Start a discovery journey from a seed (library track / KB entity / provider source ref): resolves the seed to a KB entity, creates the journey with that entity as root node + current position, and returns the full journey detail.' },
 	'journey:list': { description: 'List non-archived journeys, most-recently-active first, with node counts and the current node\'s entity name for the resume strip.' },
 	'journey:get': { description: 'Return one journey plus its full node tree as a flat array — the renderer reassembles the tree via parentNodeId.' },

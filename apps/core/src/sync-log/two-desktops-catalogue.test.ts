@@ -519,7 +519,7 @@ describe('scenario 17 — a fresh device with no sources shows the account\'s wh
 
 	it('the v2-snapshot upgrade: records loaded before any device stated meta show nothing, then everything once the server reads v3', async () => {
 		const v2 = rig.cloud.features;
-		rig.cloud.features = v2.filter((f) => f !== 'track_meta');
+		rig.cloud.features = v2.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
 		const a = await rig.desktop('a');
 		await curate(a);
 		await rig.settle();

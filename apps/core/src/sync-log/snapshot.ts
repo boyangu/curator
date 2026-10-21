@@ -60,6 +60,7 @@ const LOAD_ORDER: Array<StateMap | 'tombstones'> = [
 	'tombstones',
 	'tags', 'playlistFolders', 'playlists', 'pinnedSearches', 'settings', 'playSessions',
 	'libraryTracks', 'trackTags', 'playlistTracks', 'cues', 'playEvents', 'claims', 'upstreamAcks',
+	'feedItems', 'feedSuppressions', 'albums',
 ];
 
 const ENTITY_OF: Record<Exclude<StateMap, 'merges' | 'artistAliases'>, Entity> = {
@@ -76,6 +77,9 @@ const ENTITY_OF: Record<Exclude<StateMap, 'merges' | 'artistAliases'>, Entity> =
 	playEvents: 'play_event',
 	claims: 'recording_claim',
 	upstreamAcks: 'upstream',
+	feedItems: 'feed_item',
+	feedSuppressions: 'feed_suppression',
+	albums: 'album',
 };
 
 // The ref projection reads for a joined record. Recording-keyed maps may

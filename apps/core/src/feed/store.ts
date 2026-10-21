@@ -22,6 +22,9 @@ import type {
 	FeedPage,
 	FeedSignalInput,
 	FeedSuppressionScope,
+	FeedDecisionsDump,
+	SyncedFeedItem,
+	SyncedFeedSuppression,
 } from './types.js';
 import { recordingKeysFor } from './recording.js';
 
@@ -82,6 +85,16 @@ export interface FeedStore {
 	// play-failure probe). Global by source-track id — not per item — so the
 	// same recording surfacing via several items reflects everywhere.
 	markUnavailable(sourceTrackId: string): Promise<void>;
+	// ── account decisions (protocol v4; feed/sync.ts) ──
+	// This device's decisions, for the one-time statement to the op log.
+	decisionsDump(): FeedDecisionsDump;
+	// Decisions another device made, onto the items (by dedupe key) and the
+	// suppression table. Returns the items changed.
+	applySyncedDecisions(items: readonly SyncedFeedItem[], suppressions: readonly SyncedFeedSuppression[]): number;
+	// What the account decided about items a producer is about to insert:
+	// applied in the insert's own transaction, so a re-surfacing item never
+	// shows before its decision lands.
+	setDecisionSource(fn: ((dedupeKeys: readonly string[]) => SyncedFeedItem[]) | null): void;
 	getCursor(producerId: string): Promise<unknown>;
 	setCursor(producerId: string, cursor: unknown): Promise<void>;
 	// Drop un-acted items older than the cutoff. Dismissed/promoted rows are
@@ -257,6 +270,7 @@ const VISIBLE_WHERE = `
 
 interface ItemRow {
 	id: string;
+	dedupe_key: string;
 	type: string;
 	source: string;
 	source_id: string;
@@ -280,6 +294,7 @@ interface ItemRow {
 function rowToItem(r: ItemRow): FeedItem {
 	return {
 		id: r.id,
+		dedupeKey: r.dedupe_key,
 		type: r.type as FeedItem['type'],
 		source: r.source as FeedItem['source'],
 		sourceId: r.source_id,
@@ -445,6 +460,12 @@ export class SqliteFeedStore implements FeedStore {
 			.run(String(SCHEMA_VERSION));
 	}
 
+	private decisionSource: ((dedupeKeys: readonly string[]) => SyncedFeedItem[]) | null = null;
+
+	setDecisionSource(fn: ((dedupeKeys: readonly string[]) => SyncedFeedItem[]) | null): void {
+		this.decisionSource = fn;
+	}
+
 	async upsertItems(drafts: FeedItemDraft[]): Promise<{ inserted: number }> {
 		if (drafts.length === 0) return { inserted: 0 };
 		const now = Date.now();
@@ -461,6 +482,7 @@ export class SqliteFeedStore implements FeedStore {
 		let inserted = 0;
 		const recKeys = new Set<string>();
 		const touched: string[] = [];
+		const insertedKeys: string[] = [];
 		const txn = this.db.transaction(() => {
 			for (const d of drafts) {
 				const id = randomUUID();
@@ -489,6 +511,7 @@ export class SqliteFeedStore implements FeedStore {
 					itemId = existing.id;
 				} else {
 					inserted++;
+					insertedKeys.push(d.dedupeKey);
 					for (const k of recordingKeysFor(d.type, d.payload)) {
 						insertRecording.run(itemId, k);
 						recKeys.add(k);
@@ -497,6 +520,9 @@ export class SqliteFeedStore implements FeedStore {
 				this.accrueOnto(itemId, d, now);
 				touched.push(itemId);
 			}
+			// An item the account already decided about (archived on another
+			// device, say) lands with that decision, before reconcile.
+			if (insertedKeys.length > 0 && this.decisionSource) this.applyItemDecisions(this.decisionSource(insertedKeys));
 			// Collapse + re-rank everything this batch touched: new rows may absorb
 			// (or be absorbed by) existing ones via a shared recording, and dedupe
 			// hits gained a source.
@@ -919,6 +945,77 @@ export class SqliteFeedStore implements FeedStore {
 		this.db
 			.prepare(`INSERT OR IGNORE INTO feed_unavailable (source_track_id, at) VALUES (?, ?)`)
 			.run(sourceTrackId, Date.now());
+	}
+
+	// ── account decisions (protocol v4; feed/sync.ts) ────────────────────────
+
+	decisionsDump(): FeedDecisionsDump {
+		// The decision's time: when it was archived, else the latest signal
+		// that made it, else when the item arrived — a statement stamped with it
+		// loses to anything decided later anywhere.
+		const items = this.db.prepare(`
+			SELECT f.dedupe_key, f.state, f.promoted_track_id, f.played_at,
+				CASE WHEN f.state = 'archived' AND f.archived_at IS NOT NULL THEN f.archived_at
+					ELSE COALESCE((SELECT max(s.at) FROM feed_signal s WHERE s.item_id = f.id AND s.kind IN ('dismiss', 'promote', 'archive', 'expand', 'impression')), f.fetched_at) END AS at
+			FROM feed_item f WHERE f.state != 'fresh' OR f.played_at IS NOT NULL`).all() as Array<{ dedupe_key: string; state: FeedItemState; promoted_track_id: string | null; played_at: number | null; at: number }>;
+		const listens = this.db.prepare(`
+			SELECT f.dedupe_key, json_extract(s.value_json, '$.sourceTrackId') AS sid, min(s.at) AS at
+			FROM feed_signal s JOIN feed_item f ON f.id = s.item_id
+			WHERE s.kind = 'listen' AND s.value_json IS NOT NULL AND json_valid(s.value_json) AND json_extract(s.value_json, '$.sourceTrackId') IS NOT NULL
+			GROUP BY f.dedupe_key, sid`).all() as Array<{ dedupe_key: string; sid: string; at: number }>;
+		return {
+			items: items.map((i) => ({ dedupeKey: i.dedupe_key, state: i.state, at: i.at, promotedTrackId: i.promoted_track_id, playedAt: i.played_at })),
+			listens: listens.map((l) => ({ dedupeKey: l.dedupe_key, sourceTrackId: String(l.sid), at: l.at })),
+			suppressions: (this.db.prepare(`SELECT key, scope, at FROM feed_suppression`).all() as Array<{ key: string; scope: FeedSuppressionScope; at: number }>),
+			unavailable: (this.db.prepare(`SELECT source_track_id, at FROM feed_unavailable`).all() as Array<{ source_track_id: string; at: number }>).map((u) => ({ sourceTrackId: u.source_track_id, at: u.at })),
+		};
+	}
+
+	// Inside a transaction (the caller's). Writes only what differs.
+	private applyItemDecisions(items: readonly SyncedFeedItem[]): string[] {
+		const find = this.stmt(`SELECT id, state, promoted_track_id, played_at FROM feed_item WHERE dedupe_key = ?`);
+		const setState = this.stmt(`UPDATE feed_item SET state = ?, promoted_track_id = ?,
+			archived_at = CASE WHEN ? = 'archived' THEN COALESCE(?, archived_at, ?) ELSE archived_at END WHERE id = ?`);
+		const setPlayed = this.stmt(`UPDATE feed_item SET played_at = ? WHERE id = ? AND played_at IS NULL`);
+		const hasListen = this.stmt(`SELECT 1 FROM feed_signal WHERE item_id = ? AND kind = 'listen' AND json_extract(value_json, '$.sourceTrackId') = ? LIMIT 1`);
+		const addListen = this.stmt(`INSERT INTO feed_signal (id, item_id, kind, value_json, at) VALUES (?, ?, 'listen', ?, ?)`);
+		const changed: string[] = [];
+		for (const d of items) {
+			const row = find.get(d.dedupeKey) as { id: string; state: string; promoted_track_id: string | null; played_at: number | null } | undefined;
+			if (!row) continue;
+			let touched = false;
+			if (d.state && (d.state !== row.state || (d.state === 'promoted' && (d.promotedTrackId ?? null) !== row.promoted_track_id))) {
+				setState.run(d.state, d.state === 'promoted' ? d.promotedTrackId : null, d.state, d.stateAt, Date.now(), row.id);
+				touched = true;
+			}
+			if (d.playedAt != null && row.played_at == null && setPlayed.run(d.playedAt, row.id).changes > 0) touched = true;
+			for (const sid of d.listened) {
+				if (hasListen.get(row.id, sid)) continue;
+				addListen.run(randomUUID(), row.id, JSON.stringify({ sourceTrackId: sid, synced: true }), d.playedAt ?? Date.now());
+				touched = true;
+			}
+			if (touched) changed.push(row.id);
+		}
+		return changed;
+	}
+
+	applySyncedDecisions(items: readonly SyncedFeedItem[], suppressions: readonly SyncedFeedSuppression[]): number {
+		return this.db.transaction(() => {
+			const changed = this.applyItemDecisions(items);
+			for (const s of suppressions) {
+				if (s.scope === 'track') {
+					const id = s.key.startsWith('track:') ? s.key.slice('track:'.length) : s.key;
+					if (s.active) this.stmt(`INSERT OR IGNORE INTO feed_unavailable (source_track_id, at) VALUES (?, ?)`).run(id, s.at);
+					else this.stmt(`DELETE FROM feed_unavailable WHERE source_track_id = ?`).run(id);
+				} else if (s.active) {
+					this.stmt(`INSERT OR IGNORE INTO feed_suppression (id, scope, key, at) VALUES (?, ?, ?, ?)`).run(randomUUID(), s.scope, s.key, s.at);
+				} else {
+					this.stmt(`DELETE FROM feed_suppression WHERE key = ?`).run(s.key);
+				}
+			}
+			if (changed.length > 0) this.reconcile(this.recordingKeysOf(changed), changed);
+			return changed.length;
+		})();
 	}
 
 	async getCursor(producerId: string): Promise<unknown> {

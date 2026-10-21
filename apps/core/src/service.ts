@@ -160,8 +160,9 @@ export interface PlaylistUpstreamDrift {
 import { keyToCamelot } from './enrich/keys.js';
 import { SqliteFeedStore } from './feed/store.js';
 import { createFeedService } from './feed/service.js';
+import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedDecisionPort, feedBackfillPending, feedPendingCount, syncedItemsFor } from './feed/sync.js';
 import type { LibraryMembershipLookup } from './feed/pipeline.js';
-import type { FeedAction, FeedActionResult, FeedItem, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, EnrichmentResult } from './feed/types.js';
+import type { FeedAction, FeedActionResult, FeedItem, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRole, EnrichmentResult } from './feed/types.js';
 import { resolveFeedMembership } from './feed/types.js';
 import { LibrarySink } from './enrich/sinks/library-sink.js';
 import type { FeedFilter } from './feed/store.js';
@@ -674,8 +675,8 @@ export interface CoreService {
 	// reports per provider. `code: 'already-linked'` + `conflictTrackId`
 	// identify the identity-guard case — the provider id is bound to another
 	// live track — which the Edit modal turns into a merge offer.
-	setTrackSourceLinks(trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null }): Promise<SetSourceLinksResult>;
-	deleteTrackSourceLink(trackId: string, source: 'spotify' | 'tidal' | 'beatport'): Promise<void>;
+	setTrackSourceLinks(trackId: string, urls: { spotify?: string | null; tidal?: string | null; beatport?: string | null; traxsource?: string | null }): Promise<SetSourceLinksResult>;
+	deleteTrackSourceLink(trackId: string, source: 'spotify' | 'tidal' | 'beatport' | 'traxsource'): Promise<void>;
 	// Merge two library rows into one (library/merge-tracks.ts). Preview is a
 	// read-only dry run for BOTH directions plus the per-side summary the
 	// dialog shows; `suggestedKeepId` is the more-curated side (`aId` on a
@@ -1118,6 +1119,10 @@ export interface CoreService {
 	// Started by desktop main AFTER the renderer bootstrap lands — same
 	// constraint as startLibraryWatching().
 	startFeedPolling(): void;
+	// Whether this device collects the Discover feed or follows the account's
+	// master device (feed/sync.ts): a follower runs no producer and shows the
+	// collector's decisions.
+	getFeedRole(): Promise<FeedRole>;
 	// Background Spotify album fill (library/album-enrich.ts): fetches the
 	// full album object for every release with a Spotify id not yet fetched,
 	// paced through the shared rate gate. Called by the desktop main after
@@ -1752,6 +1757,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// Held separately so mergeTracks can re-point promoted_track_id without
 	// going through the feed engine.
 	const feedStore = new SqliteFeedStore(feedDbPath);
+	// The account's feed decisions (protocol v4, feed/sync.ts): a re-surfacing
+	// item lands with the decision another device made about it.
+	feedStore.setDecisionSource((keys) => syncedItemsFor(sqlite, keys));
 	const feedService = createFeedService({
 		store: feedStore,
 		auth, // AuthService satisfies FeedAuthPort structurally
@@ -1759,6 +1767,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		library: { membership: feedLibraryMembership, promote: feedPromote, libraryTrackIds: feedLibraryTrackIds, deletedKeys: feedLibraryDeletedKeys, unpromote: feedUnpromote },
 		// Feed unfollow (playlist/artist) mutates the live account — same gate.
 		remoteWriteGate,
+		decisions: createFeedDecisionPort(sqlite),
 	});
 
 	// ─── Knowledge service (discovery journeys) ────────────────────────
@@ -2173,6 +2182,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			onApplied: (a) => {
 				if (a.tracks.length > 5_000) membership.recomputeAll();
 				else if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks);
+			},
+			// The feed's decisions live in feed.db (feed/sync.ts).
+			feed: {
+				pending: () => feedPendingCount(sqlite),
+				applyPending: () => applyPendingFeedDecisionsAsync(sqlite, feedStore),
+				backfillPending: () => feedBackfillPending(sqlite),
+				backfill: () => backfillFeedDecisionsAsync(sqlite, feedStore),
 			},
 		})
 		: null;
@@ -2691,7 +2707,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const t = db.select().from(track).where(eq(track.id, trackId)).get();
 			if (!t) return { updated, refetched, errors: [{ source: 'track', message: 'Track not found' }] };
 
-			const upsert = (source: 'spotify' | 'tidal' | 'beatport', srcId: string, fullUrl: string): boolean => {
+			const upsert = (source: 'spotify' | 'tidal' | 'beatport' | 'traxsource', srcId: string, fullUrl: string): boolean => {
 				// Guard the UNIQUE(source, source_track_id) index: an external
 				// track maps to exactly one library track. If THIS id is already
 				// claimed by a *different* track, assigning it here would collide —
@@ -2868,6 +2884,15 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 						errors.push({ source: 'beatport', message: err instanceof Error ? err.message : String(err) });
 					}
 				}
+			}
+
+			// Traxsource URL: link-only, like Spotify (the enricher fills its
+			// metadata; a paste only names the track). Its claim kind is
+			// protocol v4 (addClaims holds it back from a v3 server).
+			if (urls.traxsource && urls.traxsource.trim()) {
+				const id = parseTraxsourceTrackId(urls.traxsource);
+				if (!id) errors.push({ source: 'traxsource', message: 'Could not parse Traxsource track id from URL' });
+				else upsert('traxsource', id, `https://www.traxsource.com/track/${id}`);
 			}
 
 			return { updated, refetched, errors };
@@ -4209,6 +4234,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 		startFeedPolling() {
 			feedService.startPolling();
+		},
+		async getFeedRole() {
+			return feedService.role();
 		},
 		startAlbumEnrichment() {
 			albumEnricher.start();
@@ -6362,6 +6390,14 @@ function parseSpotifyTrackId(s: string): string | null {
 function parseTidalTrackId(s: string): string | null {
 	const v = s.trim();
 	const m = v.match(/tidal\.com\/(?:browse\/)?track\/(\d+)/);
+	if (m && m[1]) return m[1];
+	if (/^\d+$/.test(v)) return v;
+	return null;
+}
+
+function parseTraxsourceTrackId(s: string): string | null {
+	const v = s.trim();
+	const m = v.match(/traxsource\.com\/track\/(\d+)/);
 	if (m && m[1]) return m[1];
 	if (/^\d+$/.test(v)) return v;
 	return null;

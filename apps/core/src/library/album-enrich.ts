@@ -17,6 +17,8 @@ import type { SpotifyClient, SpotifyFullAlbum } from '@curator/spotify';
 import { upsertArtistRaw } from './artists.js';
 import { setAlbumArtistsRaw } from './albums.js';
 import { log } from '../log.js';
+import { emitAlbumMeta } from '../sync-log/album-meta.js';
+import { emitV4 } from '../sync-log/features.js';
 
 const elog = log.for('album-enrich');
 
@@ -143,11 +145,24 @@ export function createAlbumEnricher(deps: {
 		let merged = 0;
 		deps.raw.transaction(() => {
 			const answered = new Set<string>();
+			const v4 = emitV4(deps.raw);
 			for (const f of albums) {
 				const albumId = byId.get(f.id);
 				if (!albumId) continue;
 				answered.add(f.id);
 				if (applySpotifyAlbumRaw(deps.raw, albumId, f, extra.get(f.id)) !== albumId) merged++;
+				// What the provider said, for every other device (protocol v4,
+				// sync-log/album-meta.ts); before the server reads v4 the
+				// backfill states it later.
+				if (v4) {
+					const names = (f.artists ?? []).map((a) => a?.name?.trim()).filter((n): n is string => !!n);
+					const various = names.length === 1 && /^various artists$/i.test(names[0]!);
+					emitAlbumMeta(deps.raw, 'spotify', {
+						providerId: f.id, albumType: f.album_type ?? null, totalTracks: Number.isFinite(f.total_tracks) ? f.total_tracks : null,
+						releaseDate: f.release_date || null, label: f.label?.trim() || null, upc: f.external_ids?.upc ?? null,
+						coverUrl: f.images?.[0]?.url ?? null, artists: various ? [] : names, various,
+					});
+				}
 			}
 			markGone(deps.raw, batch.filter((b) => !answered.has(b.spotifyId)).map((b) => b.albumId));
 		})();

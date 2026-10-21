@@ -21,6 +21,12 @@ export type RbSlotRow = {
 	rb_downbeats: Buffer | null;
 	rb_key_camelot: string | null;
 	rb_segments_json: string | null;
+	// rekordbox's tempo and key confidence (protocol v4 units bpm /
+	// key_strength). The importer does not write them today; the values on a
+	// library come from the dual-slot migration, and the op log carries them
+	// to other devices.
+	rb_bpm?: number | null;
+	rb_key_strength?: number | null;
 };
 
 const STMTS = new WeakMap<Raw, { read: Database.Statement<[string], RbSlotRow> }>();
@@ -28,7 +34,7 @@ const STMTS = new WeakMap<Raw, { read: Database.Statement<[string], RbSlotRow> }
 export function readRbSlot(raw: Raw, trackId: string): RbSlotRow | null {
 	let s = STMTS.get(raw);
 	if (!s) {
-		s = { read: raw.prepare(`SELECT rb_beatgrid, rb_downbeats, rb_key_camelot, rb_segments_json FROM track_analysis WHERE track_id = ?`) };
+		s = { read: raw.prepare(`SELECT rb_beatgrid, rb_downbeats, rb_key_camelot, rb_segments_json, rb_bpm, rb_key_strength FROM track_analysis WHERE track_id = ?`) };
 		STMTS.set(raw, s);
 	}
 	return s.read.get(trackId) ?? null;
@@ -71,6 +77,8 @@ export type RbSlotPatch = {
 	downbeats?: Buffer | null;
 	keyCamelot?: string | null;
 	segmentsJson?: string | null;
+	bpm?: number | null;
+	keyStrength?: number | null;
 };
 
 // Upsert only the given rb_* columns (placeholder row when there is none).
@@ -80,6 +88,8 @@ export function writeRbSlot(raw: Raw, trackId: string, patch: RbSlotPatch): void
 	if (patch.downbeats !== undefined) cols.push(['rb_downbeats', patch.downbeats]);
 	if (patch.keyCamelot !== undefined) cols.push(['rb_key_camelot', patch.keyCamelot]);
 	if (patch.segmentsJson !== undefined) cols.push(['rb_segments_json', patch.segmentsJson]);
+	if (patch.bpm !== undefined) cols.push(['rb_bpm', patch.bpm]);
+	if (patch.keyStrength !== undefined) cols.push(['rb_key_strength', patch.keyStrength]);
 	if (cols.length === 0) return;
 	raw.prepare(`INSERT INTO track_analysis (track_id, analyzer_version, analyzed_at, ${cols.map((c) => c[0]).join(', ')})
 		VALUES (?, 'rekordbox', ?, ${cols.map(() => '?').join(', ')})

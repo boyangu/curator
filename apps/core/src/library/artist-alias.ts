@@ -70,10 +70,19 @@ type Raw = Database.Database;
 // ── the shared credit transform ─────────────────────────────────────────────
 
 // Every credit whose artist key `target` maps is written with the mapped
-// name; credits that collapse onto one spelling are deduped by fold. A list
-// none of whose keys map is returned untouched (even if it already holds a
-// duplicate), so a whole-library scan changes exactly the tracks a local
-// rename's own selection would.
+// name; credits that collapse onto one spelling are deduped by fold AND
+// role. A list none of whose keys map is returned untouched (even if it
+// already holds a duplicate), so a whole-library scan changes exactly the
+// tracks a local rename's own selection would.
+//
+// Roles merge, none is lost (decided 2026-10-21): when an alias folds two
+// credits into one artist, the artist keeps every role the two carried — a
+// main credit and a remixer credit of "Samm" and "Samm (BE)" stay a main and
+// a remixer credit of "Samm (BE)", one each. Deduping by fold alone dropped
+// whichever came second, and a remote row derived through the rule then lost
+// the remixer the master showed (the 2026-10-21 replay: recording 0416fee4,
+// "Kama Yeah - Samm, MAXI MERAKI, Marlin Remix"). Two credits of one artist
+// with the same role still collapse to the first.
 export function mapCredits(list: readonly TrackArtist[] | null | undefined, target: (key: string) => string | undefined): { list: TrackArtist[]; changed: boolean } {
 	if (!list || list.length === 0) return { list: list ? [...list] : [], changed: false };
 	let hit = false;
@@ -90,7 +99,8 @@ export function mapCredits(list: readonly TrackArtist[] | null | undefined, targ
 	for (let i = 0; i < mapped.length; i++) {
 		const el = mapped[i]!;
 		if (el !== list[i]) changed = true;
-		const key = searchFold(el.name);
+		// A credit without a role and a 'main' one are the same role.
+		const key = `${searchFold(el.name)}\u0000${el.role && el.role !== 'main' ? el.role : 'main'}`;
 		if (seen.has(key)) { changed = true; continue; }
 		seen.add(key);
 		out.push(el);
@@ -329,6 +339,27 @@ export function queueArtistCreditRewrite(raw: Raw, keys: readonly string[]): voi
 	if (fresh) fresh.keys = [...new Set([...fresh.keys, ...keys])].sort();
 	else jobs.push({ keys: [...new Set(keys)].sort(), after: '' });
 	writeJobs(raw, jobs);
+}
+
+// Once (gate key below): every rule's credits re-derived under the role-
+// merging mapCredits. Rows a rule rewrote before it lost a role the rule
+// collapsed; rows ingested while a rule stood (normalize substitutes the
+// spelling, then reads remixers off the title) hold credits mapCredits
+// would not produce, so the device stating them and a device deriving them
+// disagreed. After this every row's credits are f(source credits, rules)
+// again, on every device.
+export const ROLE_MERGE_REDERIVE_KEY = 'artist.rederive_role_merge_v1_at';
+export function queueRoleMergeRederive(raw: Raw): number {
+	if (raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(ROLE_MERGE_REDERIVE_KEY)) return 0;
+	const keys = new Set<string>();
+	for (const r of raw.prepare(`SELECT key, value FROM sync_state WHERE map = 'artistAliases'`).all() as Array<{ key: string; value: string }>) {
+		keys.add(r.key);
+		const to = parseJson<{ value?: { to_key?: string } | null }>(r.value)?.value?.to_key;
+		if (to) keys.add(to);
+	}
+	queueArtistCreditRewrite(raw, [...keys]);
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`).run(ROLE_MERGE_REDERIVE_KEY, JSON.stringify(Date.now()), Date.now());
+	return keys.size;
 }
 
 export function artistCreditRewritePending(raw: Raw): boolean {

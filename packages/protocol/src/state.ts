@@ -10,7 +10,7 @@
 // the user sees is derived from them by `materialize`, which applies the
 // visibility rules (tombstones, container deletes, add-wins).
 
-import { MASTER_DEVICE_SETTING, type CueKind, type Entity, type Op, type PayloadOf, type SourceLink, type TrackMeta } from './ops.js';
+import { MASTER_DEVICE_SETTING, type CueKind, type Entity, type Op, type PayloadOf, type SourceLink, type TrackAttrs, type TrackMeta } from './ops.js';
 import { compareKeys } from './order-key.js';
 
 // ── clocks ──────────────────────────────────────────────────────────────────
@@ -64,7 +64,12 @@ export type PlaylistTrackRecord = {
 	orderKey: Cell<string> | null;
 };
 
-export type CueBody = Omit<PayloadOf<'cue', 'upsert'>, 'slot' | 'kind'>;
+// `origin` only from a v4 `upsert2`; absent means unknown.
+export type CueBody = Omit<PayloadOf<'cue', 'upsert'>, 'slot' | 'kind'> & { origin?: PayloadOf<'cue', 'upsert2'>['origin'] };
+
+// A play as the latest append stated it; the references only from a v4
+// `append2`.
+export type PlayEventBody = PayloadOf<'play_event', 'append'> & { rb_content_id?: string | null; source_track_id?: string | null };
 
 export type CueRecord = {
 	recordingId: string;
@@ -105,7 +110,7 @@ export type LibraryState = {
 	pinnedSearches: Map<string, LwwRecord>;
 	settings: Map<string, Cell>; // key
 	playSessions: Map<string, LwwRecord>;
-	playEvents: Map<string, Cell<PayloadOf<'play_event', 'append'>>>;
+	playEvents: Map<string, Cell<PlayEventBody>>;
 	claims: Map<string, ClaimRecord>; // `${recordingId}:${kind}:${value}`
 	upstreamAcks: Map<string, Cell<PayloadOf<'upstream', 'ack'>>>; // acked op id
 	merges: Map<string, MergeRecord>; // loser
@@ -117,6 +122,12 @@ export type LibraryState = {
 	// rebuilt by the reducer whenever a rule changes; see
 	// `rebuildArtistAlias` in reduce.ts.
 	artistAlias: Map<string, ArtistAliasTarget>;
+	// Since v4 (snapshot.ts ADDED_MAPS): the Discover feed's decisions, keyed
+	// by item dedupe key / suppression key, and the provider's releases keyed
+	// `${source}:${albumId}`. Per-field LWW records with no create.
+	feedItems: Map<string, LwwRecord>;
+	feedSuppressions: Map<string, LwwRecord>;
+	albums: Map<string, LwwRecord>;
 	// `${entity}:${entityId}` → the latest delete/remove seen. For containers
 	// (tag, playlist, playlist_folder, pinned_search) presence alone wins; for
 	// sets (track_tag, playlist_track) the ts decides against adds; for cues
@@ -143,6 +154,9 @@ export function createLibraryState(): LibraryState {
 		recordingAlias: new Map(),
 		artistAliases: new Map(),
 		artistAlias: new Map(),
+		feedItems: new Map(),
+		feedSuppressions: new Map(),
+		albums: new Map(),
 		tombstones: new Map(),
 	};
 }
@@ -184,6 +198,9 @@ export function cloneLibraryState(s: LibraryState): LibraryState {
 		recordingAlias: new Map(s.recordingAlias),
 		artistAliases: copyMap(s.artistAliases),
 		artistAlias: copyMap(s.artistAlias),
+		feedItems: copyMap(s.feedItems),
+		feedSuppressions: copyMap(s.feedSuppressions),
+		albums: copyMap(s.albums),
 		tombstones: copyMap(s.tombstones),
 	};
 }
@@ -216,20 +233,83 @@ const META_SOURCE_RANK: Record<string, number> = { local: 0, spotify: 1, tidal: 
 
 export type ResolvedTrackMeta = { device: string; meta: TrackMeta; clock: Clock };
 
-export function resolveTrackMeta(rec: Pick<LwwRecord, 'fields'> | undefined, master: string | null): ResolvedTrackMeta | null {
+// The rule over any family of per-device cells `<prefix><device>` whose
+// values carry a `source`: set-meta's and set-attrs' (v4), which must pick
+// the same device for a recording or a remote row would show one device's
+// title beside another's tempo.
+function resolveDeviceCell<T extends { source: string }>(rec: Pick<LwwRecord, 'fields'> | undefined, prefix: string, master: string | null): { device: string; value: T; clock: Clock } | null {
 	if (!rec) return null;
-	let best: ResolvedTrackMeta | null = null;
+	let best: { device: string; value: T; clock: Clock } | null = null;
 	for (const [name, cell] of Object.entries(rec.fields)) {
-		if (!name.startsWith(META_CELL_PREFIX) || cell.value === null || typeof cell.value !== 'object') continue;
-		const cand: ResolvedTrackMeta = { device: name.slice(META_CELL_PREFIX.length), meta: cell.value as TrackMeta, clock: cell.clock };
+		if (!name.startsWith(prefix) || cell.value === null || typeof cell.value !== 'object') continue;
+		const cand = { device: name.slice(prefix.length), value: cell.value as T, clock: cell.clock };
 		if (master !== null && cand.device === master) return cand;
 		if (!best) { best = cand; continue; }
-		const rb = META_SOURCE_RANK[best.meta.source] ?? 9;
-		const rc = META_SOURCE_RANK[cand.meta.source] ?? 9;
+		const rb = META_SOURCE_RANK[best.value.source] ?? 9;
+		const rc = META_SOURCE_RANK[cand.value.source] ?? 9;
 		if (rc < rb || (rc === rb && compareClock(cand.clock, best.clock) > 0)) best = cand;
 	}
 	return best;
 }
+
+export function resolveTrackMeta(rec: Pick<LwwRecord, 'fields'> | undefined, master: string | null): ResolvedTrackMeta | null {
+	const r = resolveDeviceCell<TrackMeta>(rec, META_CELL_PREFIX, master);
+	return r ? { device: r.device, meta: r.value, clock: r.clock } : null;
+}
+
+// ── track attributes (library_track.set-attrs, since v4) ────────────────────
+// Same cells-per-device shape and the same precedence as the meta above —
+// the master's cell, then the best source, then the later write — applied
+// PER FIELD: each field shows the first cell in that order that states a
+// value. A device states only its own values (a value it adopted from the
+// account rides as null), so a field the master has no value for shows
+// another device's own value instead of nothing: the master wins wherever it
+// knows, and nothing another device knows is lost. The key's source travels
+// with the key; the provider refs are the first non-empty list; the artist
+// spellings are the master's only (a spelling is a display choice, and two
+// non-master devices would flip it).
+
+export const ATTRS_CELL_PREFIX = 'attrs.';
+
+export function attrsCellName(deviceId: string): string {
+	return `${ATTRS_CELL_PREFIX}${deviceId}`;
+}
+
+// `device`: the cell that leads the precedence (the master's when it has
+// one); `attrs` merges every cell by it.
+export type ResolvedTrackAttrs = { device: string; attrs: TrackAttrs; clock: Clock };
+
+const ATTR_SCALARS = ['bpm', 'explicit', 'mbid', 'copyright', 'play_count'] as const;
+
+export function resolveTrackAttrs(rec: Pick<LwwRecord, 'fields'> | undefined, master: string | null): ResolvedTrackAttrs | null {
+	if (!rec) return null;
+	const cells: Array<{ device: string; value: TrackAttrs; clock: Clock }> = [];
+	for (const [name, cell] of Object.entries(rec.fields)) {
+		if (!name.startsWith(ATTRS_CELL_PREFIX) || cell.value === null || typeof cell.value !== 'object') continue;
+		cells.push({ device: name.slice(ATTRS_CELL_PREFIX.length), value: cell.value as TrackAttrs, clock: cell.clock });
+	}
+	if (cells.length === 0) return null;
+	const rank = (c: { device: string; value: TrackAttrs }): number => (master !== null && c.device === master ? -1 : META_SOURCE_RANK[c.value.source] ?? 9);
+	cells.sort((a, b) => rank(a) - rank(b) || -compareClock(a.clock, b.clock));
+	const lead = cells[0]!;
+	const out: TrackAttrs = { ...lead.value };
+	for (const f of ATTR_SCALARS) {
+		const hit = cells.find((c) => c.value[f] !== null && c.value[f] !== undefined);
+		(out as Record<string, unknown>)[f] = hit ? hit.value[f] : null;
+	}
+	const key = cells.find((c) => c.value.key_camelot !== null && c.value.key_camelot !== undefined);
+	out.key_camelot = key?.value.key_camelot ?? null;
+	out.key_source = key?.value.key_source ?? null;
+	out.provider_refs = cells.find((c) => (c.value.provider_refs?.length ?? 0) > 0)?.value.provider_refs ?? [];
+	out.artist_names = master !== null && lead.device !== master ? [] : lead.value.artist_names ?? [];
+	return { device: lead.device, attrs: out, clock: lead.clock };
+}
+
+// The account's cue-edit stamp (set-cues-edited), or null.
+export const CUES_EDITED_CELL = 'cues_edited_at';
+
+// The track's curation (set-curation, v4): one plain LWW cell per field.
+export const CURATION_CELL_PREFIX = 'curation.';
 
 // The master device id the settings hold, or null (no master stated yet:
 // the rest of the rule decides alone).
@@ -290,8 +370,9 @@ export function cueAlive(state: LibraryState, key: string): boolean {
 // rows, visibility applied, sorted so two views compare structurally.
 
 export type TagView = { id: string; name: string | null; kind: string | null; color: string | null };
-export type PlaylistView = { id: string; name: string | null; folderId: string | null; sourceLink: SourceLink | null; favourite: boolean };
-export type PlaylistFolderView = { id: string; name: string | null; parentFolderId: string | null; sourceLink: SourceLink | null };
+// `attrs`: the v4 set-attrs fields the records hold (only those).
+export type PlaylistView = { id: string; name: string | null; folderId: string | null; sourceLink: SourceLink | null; favourite: boolean; attrs: Record<string, unknown> };
+export type PlaylistFolderView = { id: string; name: string | null; parentFolderId: string | null; sourceLink: SourceLink | null; attrs: Record<string, unknown> };
 export type PlaylistTrackView = { id: string; playlistId: string; recordingId: string; orderKey: string; position: number; addedAt: number };
 export type LibraryTrackView = {
 	recordingId: string;
@@ -306,7 +387,16 @@ export type LibraryTrackView = {
 	// The winning base metadata (resolveTrackMeta) and the device it came
 	// from; null when no device has stated any.
 	meta: (TrackMeta & { device: string }) | null;
+	// Since v4: the winning attributes (resolveTrackAttrs) and the account's
+	// cue-edit stamp.
+	attrs: (TrackAttrs & { device: string }) | null;
+	cuesEditedAt: number | null;
+	// The curation fields stated (set-curation), a null one as null.
+	curation: Record<string, unknown>;
 };
+export type FeedItemView = { key: string; state: string | null; promotedRecordingId: string | null; playedAt: number | null; listened: string[] };
+export type FeedSuppressionView = { key: string; scope: string | null; active: boolean };
+export type AlbumView = { key: string } & Record<string, unknown>;
 export type CueView = { recordingId: string; slot: number; kind: CueKind } & CueBody;
 export type PinnedSearchView = { id: string; name: string | null; query: string | null; sortColumn: string | null; sortDir: string | null };
 export type PlaySessionView = { id: string } & Record<string, unknown>;
@@ -330,7 +420,22 @@ export type LibraryView = {
 	upstreamAcks: UpstreamAckView[];
 	recordingAlias: Record<string, string>;
 	artistAlias: Record<string, ArtistAliasTarget>;
+	feedItems: FeedItemView[];
+	feedSuppressions: FeedSuppressionView[];
+	albums: AlbumView[];
 };
+
+// The set-attrs field names a playlist / folder record may hold (ops.ts
+// PLAYLIST_ATTR_FIELDS), for the view and the desktop's projection.
+const PLAYLIST_ATTR_NAMES = ['hybrid_tidal', 'position', 'mark', 'description', 'owner_name', 'owner_id', 'cover_url', 'is_public', 'is_collaborative', 'is_hidden', 'followers'];
+function attrsOf(rec: LwwRecord, names: readonly string[]): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const n of names) if (rec.fields[n] !== undefined) out[n] = rec.fields[n]!.value;
+	return out;
+}
+
+// A feed item record's listened set (`listen.<source track id>` fields).
+export const FEED_LISTEN_PREFIX = 'listen.';
 
 function field<T>(rec: LwwRecord, name: string, fallback: T): T {
 	const c = rec.fields[name];
@@ -370,6 +475,7 @@ export function materialize(state: LibraryState): LibraryView {
 			folderId: field(r, 'folder_id', null),
 			sourceLink: field(r, 'source_link', null),
 			favourite: field(r, 'favourite', false),
+			attrs: attrsOf(r, PLAYLIST_ATTR_NAMES),
 		});
 	}
 
@@ -382,6 +488,7 @@ export function materialize(state: LibraryState): LibraryView {
 			name: field(r, 'name', null),
 			parentFolderId: field(r, 'parent_folder_id', null),
 			sourceLink: field(r, 'source_link', null),
+			attrs: attrsOf(r, ['position']),
 		});
 	}
 
@@ -410,9 +517,11 @@ export function materialize(state: LibraryState): LibraryView {
 		const r = state.libraryTracks.get(id)!;
 		const overrides: Record<string, unknown> = {};
 		const rb: Record<string, unknown> = {};
+		const curation: Record<string, unknown> = {};
 		for (const [name, cell] of Object.entries(r.fields)) {
 			if (name.startsWith('override.') && cell.value !== null) overrides[name.slice('override.'.length)] = cell.value;
 			else if (name.startsWith('rb.') && cell.value !== null) rb[name.slice('rb.'.length)] = cell.value;
+			else if (name.startsWith(CURATION_CELL_PREFIX)) curation[name.slice(CURATION_CELL_PREFIX.length)] = cell.value;
 		}
 		libraryTracks.push({
 			recordingId: id,
@@ -427,6 +536,12 @@ export function materialize(state: LibraryState): LibraryView {
 				const m = resolveTrackMeta(r, master);
 				return m ? { ...m.meta, device: m.device } : null;
 			})(),
+			attrs: (() => {
+				const a = resolveTrackAttrs(r, master);
+				return a ? { ...a.attrs, device: a.device } : null;
+			})(),
+			cuesEditedAt: field(r, CUES_EDITED_CELL, null),
+			curation,
 		});
 	}
 
@@ -480,6 +595,31 @@ export function materialize(state: LibraryState): LibraryView {
 	const artistAlias: Record<string, ArtistAliasTarget> = {};
 	for (const key of sortedKeys(state.artistAlias)) artistAlias[key] = { ...state.artistAlias.get(key)! };
 
+	const feedItems: FeedItemView[] = [];
+	for (const key of sortedKeys(state.feedItems)) {
+		const r = state.feedItems.get(key)!;
+		const promoted = field<string | null>(r, 'promoted_recording_id', null);
+		feedItems.push({
+			key,
+			state: field(r, 'state', null),
+			promotedRecordingId: promoted === null ? null : resolveRecording(state, promoted),
+			playedAt: field(r, 'played_at', null),
+			listened: Object.keys(r.fields).filter((n) => n.startsWith(FEED_LISTEN_PREFIX)).map((n) => n.slice(FEED_LISTEN_PREFIX.length)).sort(compareKeys),
+		});
+	}
+	const feedSuppressions: FeedSuppressionView[] = [];
+	for (const key of sortedKeys(state.feedSuppressions)) {
+		const r = state.feedSuppressions.get(key)!;
+		feedSuppressions.push({ key, scope: field(r, 'scope', null), active: field(r, 'active', false) });
+	}
+	const albums: AlbumView[] = [];
+	for (const key of sortedKeys(state.albums)) {
+		const r = state.albums.get(key)!;
+		const row: AlbumView = { key };
+		for (const name of Object.keys(r.fields).sort()) row[name] = r.fields[name]!.value;
+		albums.push(row);
+	}
+
 	return {
 		tags: tags.sort(byId),
 		trackTags,
@@ -496,5 +636,8 @@ export function materialize(state: LibraryState): LibraryView {
 		upstreamAcks,
 		recordingAlias,
 		artistAlias,
+		feedItems,
+		feedSuppressions,
+		albums,
 	};
 }

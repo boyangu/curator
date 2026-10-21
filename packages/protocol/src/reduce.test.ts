@@ -362,7 +362,7 @@ describe('merge rules', () => {
 			op('library_track', 'set-rating', A, { rating: 2 }, { ts: T(9, 0) }),
 		]);
 		expect(view.libraryTracks).toEqual([
-			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' }, meta: null },
+			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' }, meta: null, attrs: null, cuesEditedAt: null, curation: {} },
 		]);
 	});
 
@@ -966,5 +966,163 @@ describe('base metadata (v3, master device wins)', () => {
 		// Without a device (a NewOp) there is no cell to compare: a change.
 		const { op_id: _a, device_id: _b, client_ts: _c, schema_version: _d, ...bare } = again;
 		expect(isRestatement(s, bare as Parameters<typeof isRestatement>[1])).toBe(false);
+	});
+});
+
+describe('zero-loss additions (v4)', () => {
+	const attrs = (bpm: number | null, source: 'local' | 'spotify' | 'tidal' | 'other' = 'local', extra: Record<string, unknown> = {}) => ({
+		source, bpm, key_camelot: null, key_source: null, explicit: null, mbid: null, copyright: null, play_count: null, provider_refs: [], artist_names: [], ...extra,
+	});
+	const master = (device: string, ts: number) => op('setting', 'set', 'library.master_device', { value: device }, { ts, device });
+	const bpmOf = (view: LibraryView, rec: string) => view.libraryTracks.find((t) => t.recordingId === rec)?.attrs?.bpm ?? null;
+
+	it('set-attrs: one cell per device, the master\'s wins whoever wrote later, in every order', () => {
+		const { state, view } = converge([
+			op('library_track', 'set-attrs', A, attrs(122), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-attrs', A, attrs(120, 'local'), { ts: T(10, 0), device: 'laptop' }),
+			master('main', T(7, 0)),
+		]);
+		expect(Object.keys(state.libraryTracks.get(A)!.fields).sort()).toEqual(['attrs.laptop', 'attrs.main']);
+		expect(bpmOf(view, A)).toBe(122);
+		expect(view.libraryTracks[0]!.attrs!.device).toBe('main');
+	});
+
+	it('set-attrs picks the same device as set-meta, and a master switch re-picks both', () => {
+		const meta = (title: string) => ({ source: 'local' as const, title, artists: [], album_title: null, duration_sec: null, isrc: null, release_date: null, label: null, genre: null, cover_url: null });
+		const ops = [
+			op('library_track', 'set-meta', A, meta('Main'), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-attrs', A, attrs(122), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-meta', A, meta('Laptop'), { ts: T(9, 1), device: 'laptop' }),
+			op('library_track', 'set-attrs', A, attrs(120), { ts: T(9, 1), device: 'laptop' }),
+			master('main', T(7, 0)),
+		];
+		const before = materialize(reduceAll(ops)).libraryTracks[0]!;
+		expect([before.meta!.device, before.attrs!.device]).toEqual(['main', 'main']);
+		const { view } = converge([...ops, master('laptop', T(11, 0))]);
+		expect([view.libraryTracks[0]!.meta!.title, view.libraryTracks[0]!.attrs!.bpm]).toEqual(['Laptop', 120]);
+	});
+
+	it('set-attrs resolves per field: the master where it states a value, another device\'s own value where it does not', () => {
+		const { view } = converge([
+			op('library_track', 'set-attrs', A, attrs(122, 'local', { explicit: null, mbid: 'mb-main', artist_names: ['Main Spelling'] }), { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-attrs', A, attrs(120, 'local', { explicit: true, mbid: 'mb-laptop', key_camelot: '8A', key_source: 'beatport', artist_names: ['Laptop Spelling'] }), { ts: T(10, 0), device: 'laptop' }),
+			master('main', T(7, 0)),
+		]);
+		const a = view.libraryTracks[0]!.attrs!;
+		expect([a.device, a.bpm, a.mbid, a.explicit, a.key_camelot, a.key_source]).toEqual(['main', 122, 'mb-main', true, '8A', 'beatport']);
+		expect(a.artist_names).toEqual(['Main Spelling']);
+		// A master with no cell for the recording speaks no spelling.
+		const other = converge([
+			op('library_track', 'set-attrs', B, attrs(120, 'local', { artist_names: ['Laptop Spelling'] }), { ts: T(10, 0), device: 'laptop' }),
+			master('main', T(7, 0)),
+		]);
+		expect(other.view.libraryTracks[0]!.attrs!.artist_names).toEqual([]);
+	});
+
+	it('set-curation is plain LWW across devices: the later edit wins, master or not, in every order', () => {
+		const { view } = converge([
+			op('setting', 'set', 'library.master_device', { value: 'main' }, { ts: T(7, 0), device: 'main' }),
+			op('library_track', 'set-curation', A, { field: 'comment', value: 'from main' }, { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-curation', A, { field: 'comment', value: 'from phone' }, { ts: T(10, 0), device: 'phone' }),
+			op('library_track', 'set-curation', A, { field: 'color_label', value: 'red' }, { ts: T(11, 0), device: 'main' }),
+			op('library_track', 'set-curation', A, { field: 'color_label', value: null }, { ts: T(12, 0), device: 'phone' }),
+		]);
+		expect(view.libraryTracks[0]!.curation).toEqual({ comment: 'from phone', color_label: null });
+		const s = reduceAll([op('library_track', 'set-curation', A, { field: 'comment', value: 'x' }, { ts: T(9, 0), device: 'main' })]);
+		expect(isRestatement(s, op('library_track', 'set-curation', A, { field: 'comment', value: 'x' }, { ts: T(9, 5), device: 'phone' }))).toBe(true);
+		expect(isRestatement(s, op('library_track', 'set-curation', A, { field: 'comment', value: 'y' }, { ts: T(9, 5), device: 'phone' }))).toBe(false);
+	});
+
+	it('set-cues-edited keeps the latest stamp in every order, and an older restatement changes nothing', () => {
+		const { view } = converge([
+			op('library_track', 'set-cues-edited', A, { at: T(9, 0) }, { ts: T(9, 0), device: 'main' }),
+			op('library_track', 'set-cues-edited', A, { at: T(8, 0) }, { ts: T(12, 0), device: 'laptop' }),
+			op('library_track', 'set-cues-edited', A, { at: T(10, 0) }, { ts: T(10, 0), device: 'laptop' }),
+		]);
+		expect(view.libraryTracks[0]!.cuesEditedAt).toBe(T(10, 0));
+		const s = reduceAll([op('library_track', 'set-cues-edited', A, { at: T(10, 0) }, { ts: T(10, 0) })]);
+		expect(isRestatement(s, op('library_track', 'set-cues-edited', A, { at: T(9, 0) }, { ts: T(11, 0) }))).toBe(true);
+		expect(isRestatement(s, op('library_track', 'set-cues-edited', A, { at: T(11, 0) }, { ts: T(11, 0) }))).toBe(false);
+	});
+
+	it('rb bpm / key_strength are rb units like the rest', () => {
+		const { view } = converge([
+			op('library_track', 'set-rb-analysis', A, { unit: 'bpm', value: 120.0006 }, { ts: T(9, 0) }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'key_strength', value: 0.61 }, { ts: T(9, 0) }),
+			op('library_track', 'set-rb-analysis', A, { unit: 'bpm', value: 121 }, { ts: T(8, 0) }),
+		]);
+		expect(view.libraryTracks[0]!.rb).toEqual({ bpm: 120.0006, key_strength: 0.61 });
+	});
+
+	it('cue upsert2 and upsert share the slot: the later write of either wins, origin travels with upsert2', () => {
+		const body = { slot: 1, kind: 'hot' as const, position_sec: 10, length_sec: null, color: null, name: null };
+		const id = cueEntityId(A, 1, 'hot');
+		const { view } = converge([
+			op('cue', 'upsert2', id, { ...body, origin: 'rekordbox' }, { ts: T(9, 0) }),
+			op('cue', 'upsert', id, { ...body, position_sec: 9 }, { ts: T(8, 0) }),
+		]);
+		expect(view.cues).toEqual([{ recordingId: A, slot: 1, kind: 'hot', position_sec: 10, length_sec: null, color: null, name: null, origin: 'rekordbox' }]);
+		const later = converge([
+			op('cue', 'upsert2', id, { ...body, origin: 'rekordbox' }, { ts: T(9, 0) }),
+			op('cue', 'upsert', id, { ...body, position_sec: 11 }, { ts: T(10, 0) }),
+		]);
+		expect(later.view.cues[0]).toEqual({ recordingId: A, slot: 1, kind: 'hot', position_sec: 11, length_sec: null, color: null, name: null });
+	});
+
+	it('play_event append2 restates the event with its references; it folds under a merge like any play', () => {
+		const body = { session_id: 'S', recording_id: A, source: 'rekordbox' as const, played_at: T(9, 0), played_ms: null, duration_ms: null, max_position_ms: null, played75: null, ended_reason: null, context_type: null, context_id: null, track_no: 1, rb_song_history_id: '9' };
+		const E = uuid();
+		const { view } = converge([
+			op('play_event', 'append', E, body, { ts: T(9, 0) }),
+			op('play_event', 'append2', E, { ...body, rb_content_id: '123', source_track_id: null }, { ts: T(9, 5) }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 0) }),
+		]);
+		expect(view.playEvents).toEqual([{ id: E, ...body, recording_id: B, rb_content_id: '123', source_track_id: null }]);
+	});
+
+	it('playlist / folder set-attrs are per-field LWW fields of the container', () => {
+		const PL = uuid();
+		const F = uuid();
+		const { view } = converge([
+			op('playlist', 'create', PL, { name: 'Deep' }, { ts: T(8, 0) }),
+			op('playlist', 'set-attrs', PL, { hybrid_tidal: true, position: 3 }, { ts: T(9, 0), device: 'main' }),
+			op('playlist', 'set-attrs', PL, { position: 5, description: 'x' }, { ts: T(9, 5), device: 'laptop' }),
+			op('playlist', 'set-attrs', PL, { hybrid_tidal: false }, { ts: T(8, 30), device: 'laptop' }),
+			op('playlist_folder', 'create', F, { name: 'Gigs' }, { ts: T(8, 0) }),
+			op('playlist_folder', 'set-attrs', F, { position: 2 }, { ts: T(9, 0) }),
+		]);
+		expect(view.playlists[0]!.attrs).toEqual({ hybrid_tidal: true, position: 5, description: 'x' });
+		expect(view.playlistFolders[0]!.attrs).toEqual({ position: 2 });
+	});
+
+	it('feed decisions: per-field LWW by stable key, listened is a set, promoted ids follow merges', () => {
+		const K = 'spotify:album:4aaw';
+		const items = converge([
+			op('feed_item', 'set-state', K, { state: 'archived' }, { ts: T(9, 0), device: 'main' }),
+			op('feed_item', 'set-state', K, { state: 'seen' }, { ts: T(8, 0), device: 'laptop' }),
+			op('feed_item', 'mark-listened', K, { source_track_id: 't2' }, { ts: T(8, 0) }),
+			op('feed_item', 'mark-listened', K, { source_track_id: 't1' }, { ts: T(8, 1) }),
+		]);
+		expect(items.view.feedItems).toEqual([{ key: K, state: 'archived', promotedRecordingId: null, playedAt: null, listened: ['t1', 't2'] }]);
+		const promoted = converge([
+			op('feed_item', 'set-state', 'isrc:X', { state: 'promoted', promoted_recording_id: A }, { ts: T(9, 0) }),
+			op('feed_item', 'mark-played', 'isrc:X', { at: T(9, 1) }, { ts: T(9, 1) }),
+			op('feed_suppression', 'set', 'artist:1', { scope: 'artist', active: true }, { ts: T(9, 0) }),
+			op('feed_suppression', 'set', 'artist:1', { scope: 'artist', active: false }, { ts: T(9, 2), device: 'laptop' }),
+			op('recording', 'merge', A, { winner: B }, { ts: T(10, 0) }),
+		]);
+		expect(promoted.view.feedItems).toEqual([{ key: 'isrc:X', state: 'promoted', promotedRecordingId: B, playedAt: T(9, 1), listened: [] }]);
+		expect(promoted.view.feedSuppressions).toEqual([{ key: 'artist:1', scope: 'artist', active: false }]);
+		const s = reduceAll([op('feed_item', 'mark-listened', K, { source_track_id: 't1' }, { ts: T(8, 0) })]);
+		expect(isRestatement(s, op('feed_item', 'mark-listened', K, { source_track_id: 't1' }, { ts: T(9, 0) }))).toBe(true);
+	});
+
+	it('album set-meta is per-field LWW by provider album id', () => {
+		const m = { album_type: 'album', total_tracks: 12, release_date: '2022', label: 'Ninja Tune', upc: '1', cover_url: null, artists: ['Bonobo'], various: false };
+		const { view } = converge([
+			op('album', 'set-meta', 'spotify:4aaw', m, { ts: T(9, 0) }),
+			op('album', 'set-meta', 'spotify:4aaw', { ...m, label: 'Ninja' }, { ts: T(8, 0) }),
+		]);
+		expect(view.albums).toEqual([{ key: 'spotify:4aaw', ...m }]);
 	});
 });
