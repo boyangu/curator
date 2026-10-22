@@ -7,6 +7,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createTestApp, errorReason, sampleLibrary, type TestApp } from '../test/harness.js';
 import { deserializeLibraryState, serializeLibraryState } from '@curator/protocol';
 import { decodeSnapshotBase64 } from './codec.js';
+import type { Db } from '../db/db.js';
+import { bootstrap, snapshotChunk } from '../sync/bootstrap.js';
 import { buildSnapshot, DEFAULT_DUE_OPTIONS, runDueSnapshots } from './job.js';
 
 let app: TestApp;
@@ -158,6 +160,8 @@ describe('snapshot job and bootstrap', () => {
 		await old.api.sync.push.mutate({ deviceId: old.deviceId, ops: sampleLibrary(old.deviceId).slice(0, 3) });
 		await quiet.api.sync.push.mutate({ deviceId: quiet.deviceId, ops: sampleLibrary(quiet.deviceId).slice(0, 3) });
 		await app.pg.query(`update curator.library_op set received_at = now() - interval '2 days' where user_id = $1`, [old.userId]);
+		// Both logs went quiet a while ago (the quiet-period rule, tested below).
+		await app.pg.query(`update curator.library_op set received_at = now() - interval '10 minutes' where user_id = $1`, [busy.userId]);
 
 		const opts = { ...DEFAULT_DUE_OPTIONS, minOps: 20 };
 		const mine = (r: Awaited<ReturnType<typeof runDueSnapshots>>) =>
@@ -171,5 +175,74 @@ describe('snapshot job and bootstrap', () => {
 		);
 		// Nothing new since: not due again.
 		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts))).toEqual([]);
+	});
+
+	it('waits for a quiet log (5 min) unless the last snapshot is an hour old, and skips users with a live batch', async () => {
+		const opts = { ...DEFAULT_DUE_OPTIONS, minOps: 20 };
+		const mine = (r: Awaited<ReturnType<typeof runDueSnapshots>>, ids: string[]) => r.filter((x) => ids.includes(x.userId)).map((x) => x.status);
+
+		// A flood still arriving: worth a snapshot (past minOps), not due.
+		const flood = await app.signIn();
+		await flood.api.sync.push.mutate({ deviceId: flood.deviceId, ops: sampleLibrary(flood.deviceId, 2) });
+		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), [flood.userId])).toEqual([]);
+		// Quiet for 5 minutes: due.
+		await app.pg.query(`update curator.library_op set received_at = now() - interval '6 minutes' where user_id = $1`, [flood.userId]);
+		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), [flood.userId])).toEqual(['built']);
+
+		// Still flooding, but the last snapshot is over an hour old: due anyway,
+		// so a steady stream gets one an hour, not one per 15-minute sweep.
+		await flood.api.sync.push.mutate({ deviceId: flood.deviceId, ops: sampleLibrary(flood.deviceId, 2) });
+		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), [flood.userId])).toEqual([]);
+		await app.pg.query(`update curator.library_snapshot set created_at = now() - interval '61 minutes' where user_id = $1`, [flood.userId]);
+		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), [flood.userId])).toEqual(['built']);
+
+		// An open batch: skipped by the sweep, and by a direct build too (it
+		// is about to add to the log; the sweep after its commit builds one).
+		const batching = await app.signIn();
+		await batching.api.sync.push.mutate({ deviceId: batching.deviceId, ops: sampleLibrary(batching.deviceId, 2) });
+		await app.pg.query(`update curator.library_op set received_at = now() - interval '1 hour' where user_id = $1`, [batching.userId]);
+		await batching.api.sync.batchBegin.mutate({ deviceId: batching.deviceId, label: 'backfill' });
+		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), [batching.userId])).toEqual([]);
+		expect(await buildSnapshot(app.db, batching.userId)).toEqual({ userId: batching.userId, status: 'batch_pending' });
+	});
+
+	it('moves bodies as bytea: no base64 inside Postgres on build, bootstrap or chunk reads', async () => {
+		const seen: string[] = [];
+		const spy: Db = {
+			query: (text, params) => {
+				seen.push(text);
+				return app.db.query(text, params);
+			},
+			exec: (text) => app.db.exec(text),
+			begin: (fn) =>
+				app.db.begin((tx) =>
+					fn({
+						query: (text, params) => {
+							seen.push(text);
+							return tx.query(text, params);
+						},
+						exec: (text) => tx.exec(text),
+					}),
+				),
+			close: () => Promise.resolve(),
+		};
+		const { userId, deviceId, api } = await app.signIn();
+		const all = sampleLibrary(deviceId, 3);
+		await api.sync.push.mutate({ deviceId, ops: all });
+		const built = await buildSnapshot(spy, userId);
+		expect(built.status).toBe('built');
+		// A second, incremental build reads the first body back.
+		await api.sync.push.mutate({ deviceId, ops: sampleLibrary(deviceId, 1) });
+		expect((await buildSnapshot(spy, userId)).status).toBe('built');
+		const caller = { sessionId: null };
+		const inline = await bootstrap(spy, userId, caller, {});
+		const head = await bootstrap(spy, userId, caller, { chunked: true });
+		const piece = await snapshotChunk(spy, userId, caller, { snapshotSeq: head.snapshotSeq, offset: 0, length: head.chunked!.totalBytes });
+		expect(piece.data).toBe(inline.snapshot);
+		expect(seen.length).toBeGreaterThan(0);
+		expect(seen.filter((q) => /encode\s*\(|decode\s*\(|base64/i.test(q))).toEqual([]);
+		// And what came back is the snapshot of every op, byte for byte.
+		const stored = await app.pg.query<{ body: Uint8Array }>('select body from curator.library_snapshot where user_id = $1 order by snapshot_seq desc limit 1', [userId]);
+		expect(Buffer.from(stored.rows[0]!.body).toString('base64')).toBe(inline.snapshot);
 	});
 });

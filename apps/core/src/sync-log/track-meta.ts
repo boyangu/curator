@@ -31,9 +31,7 @@ import { createHash } from 'node:crypto';
 import {
 	MASTER_DEVICE_SETTING,
 	MAX_OP_PAYLOAD_BYTES,
-	masterDeviceOf,
 	opPayloadBytes,
-	type Cell,
 	type JsonValue,
 	type NewOp,
 	type SyncFeature,
@@ -44,7 +42,8 @@ import type { TrackArtist } from '@curator/shared/schema';
 import { artistsBaseOf } from '../library/artists.js';
 import { log } from '../log.js';
 import { INITIAL_PUSH_KEY } from './apply.js';
-import { emitOps } from './outbox.js';
+import { emitOps, type BatchLabel } from './outbox.js';
+import { leftToOthers, sourceRole, type SourceRole } from './role.js';
 
 type Raw = Database.Database;
 
@@ -147,9 +146,16 @@ export function trackMetaDirtyCount(raw: Raw): number {
 // One chunk of dirty rows, in one transaction: their set-meta ops (outbox +
 // records, emitOps), the baseline, and the marks cleared. Callers check the
 // server feature first.
-export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMetaDrain {
+// `batchLabel`: the client's verdict that this drain is a backlog (outbox.ts
+// BATCH_LABELS): a backfill's queue, not a few edited rows.
+// On a secondary (role.ts) a recording it did not bring, or the master
+// describes, is skipped with
+// no baseline written, so a later promotion to master states it.
+export function drainTrackMeta(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole } = {}): TrackMetaDrain {
 	const max = Math.max(1, opts.max ?? CHUNK);
 	return raw.transaction((): TrackMetaDrain => {
+		const role = opts.role ?? sourceRole(raw);
+		if (role.speaks === 'none') return { rows: 0, emitted: 0, done: true };
 		const ids = raw.prepare(`SELECT track_id FROM track_meta_dirty LIMIT ?`).pluck().all(max) as string[];
 		if (ids.length === 0) return { rows: 0, emitted: 0, done: true };
 		const marks = ids.map(() => '?').join(',');
@@ -157,6 +163,7 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 		// Everything below in a few IN (...) reads per chunk, not per row.
 		const recMarks = recs.map(() => '?').join(',');
 		const aliased = new Set(recs.length > 0 ? raw.prepare(`SELECT loser FROM recording_alias WHERE loser IN (${recMarks})`).pluck().all(...recs) as string[] : []);
+		const others = role.speaks === 'own' ? leftToOthers(raw, role, recs) : new Set<string>();
 		// The speaking row of each recording (live own first, then oldest).
 		// `+derived_from_track_id`: see remote-rows.ts (the IN-list plan).
 		const primary = new Map<string, MetaRow>();
@@ -198,7 +205,7 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 		const seen: Array<[string, string, string]> = [];
 		let tooLarge = 0;
 		for (const rec of recs) {
-			if (aliased.has(rec)) continue;
+			if (aliased.has(rec) || others.has(rec)) continue;
 			const row = primary.get(rec);
 			if (!row) continue;
 			const meta = trackMetaOf(row, sources.get(row.id) ?? new Set(), payloadCovers.get(row.id) ?? null);
@@ -208,7 +215,7 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number } = {}): TrackMeta
 			ops.push({ entity: 'library_track', entity_id: rec, kind: 'set-meta', payload: meta });
 			seen.push([row.id, rec, digest]);
 		}
-		if (ops.length > 0) emitOps(raw, ops);
+		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel });
 		for (const [id, rec, digest] of seen) putSeen.run(id, rec, digest, now);
 		raw.prepare(`DELETE FROM track_meta_dirty WHERE track_id IN (${marks})`).run(...ids);
 		if (tooLarge > 0) tlog.warn('rows whose meta is too large for an op stay device-local', { count: tooLarge });
@@ -224,17 +231,22 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 // measured 264 ms, 2026-10-21), so the next chunk aims at META_SLICE_MS from
 // the last one's cost. `chunk` pins a fixed size (tests).
 const META_SLICE_MS = 40;
-export async function drainTrackMetaAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean } } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
+// The floor: below ~20 rows a chunk's fixed cost (its transaction, the
+// records store emitOps builds) outweighs its rows, and a slow slice
+// collapsed the drain to 5-row chunks — thousands of transactions for a
+// backfill (2026-10-22 sync review).
+const MIN_CHUNK = 20;
+export async function drainTrackMetaAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	const fixed = opts.chunk !== undefined;
 	let size = Math.max(1, opts.chunk ?? 20);
 	for (;;) {
 		if (opts.signal?.aborted) break;
 		const t0 = performance.now();
-		const r = drainTrackMeta(raw, { max: size });
+		const r = drainTrackMeta(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role });
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
-		if (!fixed && r.rows > 0) size = Math.max(5, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * META_SLICE_MS / Math.max(ms, 1))));
+		if (!fixed && r.rows > 0) size = Math.max(MIN_CHUNK, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * META_SLICE_MS / Math.max(ms, 1))));
 		if (r.rows === 0) break;
 		out.chunks++;
 		out.rows += r.rows;
@@ -275,17 +287,7 @@ export async function queueTrackMetaBackfillAsync(raw: Raw, opts: { page?: numbe
 
 // ── the master device ───────────────────────────────────────────────────────
 
-// The master as the records hold it (the same cell every device's view and
-// the server's read), or null when none was ever stated.
-export function masterDevice(raw: Raw): string | null {
-	const json = raw.prepare(`SELECT value FROM sync_state WHERE map = 'settings' AND key = ?`).pluck().get(MASTER_DEVICE_SETTING) as string | undefined;
-	if (!json) return null;
-	try {
-		return masterDeviceOf(new Map([[MASTER_DEVICE_SETTING, JSON.parse(json) as Cell]]));
-	} catch {
-		return null;
-	}
-}
+export { masterDevice } from './role.js';
 
 // States `deviceId` as the master: an ordinary account setting op, so it
 // reaches every device and the server and wins by LWW like any setting.

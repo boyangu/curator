@@ -363,6 +363,32 @@ describe('devices and pushes', () => {
 		const fresh = (await api.account.devices.query())[0]!.lastSeenAt!;
 		expect(fresh - stale).toBeGreaterThan(23 * 3600_000);
 	});
+
+	it('moves last_seen_at at most every 5 minutes, push or batch call, and still refuses a revoked device in between', async () => {
+		const { userId, deviceId, api } = await app.signIn();
+		const seenAt = async (): Promise<number> =>
+			(await app.pg.query<{ at: number }>(`select floor(extract(epoch from last_seen_at) * 1000)::float8 as at from curator.device where device_id = $1`, [deviceId])).rows[0]!.at;
+		await app.pg.query(`update curator.device set last_seen_at = now() - interval '2 minutes' where device_id = $1`, [deviceId]);
+		const recent = await seenAt();
+		await api.sync.push.mutate({ deviceId, ops: [] });
+		const { batchId } = await api.sync.batchBegin.mutate({ deviceId, label: 'backfill' });
+		await api.sync.batchPush.mutate({ deviceId, batchId, ops: [] });
+		expect(await seenAt()).toBe(recent);
+		await app.pg.query(`update curator.device set last_seen_at = now() - interval '6 minutes' where device_id = $1`, [deviceId]);
+		const stale = await seenAt();
+		await api.sync.batchPush.mutate({ deviceId, batchId, ops: [] });
+		const moved = await seenAt();
+		expect(moved - stale).toBeGreaterThan(5 * 60_000);
+
+		// Revoked while freshly seen, judged by the device (a session not yet
+		// bound to it): the touch is skipped, the check is not.
+		await app.pg.query(`update curator.device set revoked_at = now() where device_id = $1`, [deviceId]);
+		const other = app.client(await app.sign(userId, { sessionId: `session-${randomUUID()}` }));
+		const op = opsFor(deviceId)('tag', 'create', randomUUID(), { name: 'late', kind: 'user' });
+		expect((await other.sync.push.mutate({ deviceId, ops: [op] })).rejected).toEqual([{ opId: op.op_id, reason: 'device_revoked' }]);
+		expect(await errorReason(other.sync.batchPush.mutate({ deviceId, batchId, ops: [op] }))).toMatchObject({ reason: 'device_revoked' });
+		expect(await seenAt()).toBe(moved);
+	});
 });
 
 describe('limits and clocks', () => {

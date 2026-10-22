@@ -52,6 +52,7 @@ import { log } from '../log.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot, type RbSlotPatch } from '../rekordbox/rb-slot.js';
 import { claimLinkPendingAtMost, drainClaimLinksRaw, INLINE_CLAIM_LINK_RECORDINGS, queueClaimLinks } from './claim-links.js';
 import { adoptRefs, derivePendingCount, drainTrackDerivations, dropRemoteRow, INLINE_CREATE_ROWS, INLINE_DERIVE_ROWS, materializeRemoteRows, requestRematerialize } from './remote-rows.js';
+import { requestRestatement } from './restate.js';
 import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, RB_UNITS_V4, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
 import { projectPlaylistAttrs } from './playlist-attrs.js';
@@ -211,7 +212,10 @@ export function project(
 		for (const t of [...m.created, ...m.updated]) tracksTouched.add(t);
 		if (m.adopt.length > 0 || m.dropped.length > 0) trackCache.clear();
 		for (const r of adoptRefs(raw, m.adopt)) add(r.entity, r.id);
-		if (by.get('setting')?.has(MASTER_DEVICE_SETTING)) requestRematerialize(raw);
+		if (by.get('setting')?.has(MASTER_DEVICE_SETTING)) {
+			requestRematerialize(raw);
+			requestRestatement(raw);
+		}
 	}
 
 	// ── 2. containers ────────────────────────────────────────────────────

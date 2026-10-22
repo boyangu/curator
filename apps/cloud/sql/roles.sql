@@ -51,6 +51,32 @@ grant usage on schema curator to curator_api;
 -- one function that reads across users.
 grant execute on function curator.users_due_for_snapshot(bigint, interval) to curator_api;
 
+-- Since 0007: the quiet-period snapshot rule (the sweep calls this one now; v1 stays for an older
+-- image during a rollback) and the batch upkeep list (expire idle batches, finish stalled commits).
+-- Cross-user ids only, like v1, so never `authenticated`. Conditional so this script still runs
+-- on a database that has not had 0007 yet (it is re-run after every migration, and the migration
+-- gate tests run it against older schemas).
+do $$
+begin
+	if to_regprocedure('curator.users_due_for_snapshot_v2(bigint, interval, interval, interval)') is not null then
+		grant execute on function curator.users_due_for_snapshot_v2(bigint, interval, interval, interval) to curator_api;
+	end if;
+	if to_regprocedure('curator.batches_to_tend(interval)') is not null then
+		grant execute on function curator.batches_to_tend(interval) to curator_api;
+	end if;
+end
+$$;
+
+-- Since 0008: the snapshot rule that leaves a freshly master-published account alone (the sweep
+-- calls this one now; v2 stays for an older image during a rollback). Conditional like the two above.
+do $$
+begin
+	if to_regprocedure('curator.users_due_for_snapshot_v3(bigint, interval, interval, interval, interval)') is not null then
+		grant execute on function curator.users_due_for_snapshot_v3(bigint, interval, interval, interval, interval) to curator_api;
+	end if;
+end
+$$;
+
 -- The access log and audit trail (sql/0002_audit.sql): write-only for the API through these
 -- definer functions. No table grant at all, so it can neither read rows back nor update or
 -- delete them; only the owner can.
@@ -62,7 +88,8 @@ grant execute on function curator.prune_request_log(interval) to curator_api;
 -- no other access to curator.schema_migration.
 grant execute on function curator.applied_migrations() to curator_api;
 
--- A runaway query should fail, not hold a pooled connection; the slowest legitimate statement is
--- a 5000-op page of the snapshot fold.
+-- A runaway query should fail, not hold a pooled connection; the slowest legitimate statements are
+-- a 5000-op page of the snapshot fold and one chunk of a batch commit's move (sized by time to a
+-- few seconds, src/sync/batch.ts).
 alter role curator_api set statement_timeout = '30s';
 alter role curator_api set idle_in_transaction_session_timeout = '60s';

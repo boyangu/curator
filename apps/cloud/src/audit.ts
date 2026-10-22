@@ -60,6 +60,29 @@ export const AUDIT_KINDS = [
 	// a whole call refused for a revoked device ({ procedure, reason, via })
 	// or a missing entitlement ({ procedure, reason }).
 	'catalogue_rejected',
+	// 'batches' (src/sync/batch.ts): a batch opened or resumed
+	// ({ batchId, label, resumed, stagedOps, expectedOps }), published
+	// ({ batchId, label, totalOps, insertedOps, rejected, fenceSeq,
+	// committedSeq, ms }), dropped by its device ({ batchId,
+	// label, stagedOps }) or expired idle by the sweep ({ ..., idleMs }).
+	// Raised by the commit runner and the sweep too, so not every one has a
+	// request id.
+	'batch_begun',
+	'batch_committed',
+	'batch_aborted',
+	'batch_expired',
+	// 'snapshot_storage' (src/sync/publish-snapshot.ts): the master indexed a
+	// Storage snapshot ({ snapshotSeq, bytes, parts, pruned, superseded }).
+	'snapshot_published',
+	// sync.push / batchPush accepted source ops (library_track set-meta /
+	// set-attrs, album set-meta) from a device that is not the account's
+	// master ({ procedure, master, byKind }). Audit only: the ops are kept.
+	'source_from_non_master',
+	// The verifier CLI (src/snapshot/verify.ts): a server fold of the log
+	// matched, or did not match, a published snapshot's state_sha256
+	// ({ snapshotSeq, baseSeq, opsFolded, stateSha256, foldSha256 }).
+	'snapshot_verified',
+	'snapshot_mismatch',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -93,6 +116,14 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	client_ts_clamped: 'warn',
 	bootstrap_served: 'info',
 	catalogue_rejected: 'info',
+	batch_begun: 'info',
+	batch_committed: 'info',
+	batch_aborted: 'info',
+	batch_expired: 'warn',
+	snapshot_published: 'info',
+	source_from_non_master: 'info',
+	snapshot_verified: 'info',
+	snapshot_mismatch: 'warn',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

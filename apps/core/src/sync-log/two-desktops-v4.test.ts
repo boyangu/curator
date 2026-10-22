@@ -170,8 +170,9 @@ describe('track attributes: master wins per field, adopted into empty fields', (
 		expect([row(b, 'trk-0')['bpm'], row(b, 'trk-0')['mbid'], row(b, 'trk-0')['play_count']]).toEqual([122, 'mb-main', 79]);
 		const rc = row(c, 'trk-0');
 		expect([rc['bpm'], rc['mbid'], rc['copyright'], rc['key_camelot'], rc['play_count']]).toEqual([120, 'mb-main', '(C) Main', '8A', 3]);
-		// C states only its own: bpm and its counter, nothing it adopted.
-		expect(await attrsOf(c, 'trk-0')).toMatchObject({ bpm: 120, mbid: null, copyright: null, key_camelot: null, play_count: 3 });
+		// C is not the master and A describes trk-0: C states none of it
+		// (role.ts) — its own tempo and counter stay on its row.
+		expect(await attrsOf(c, 'trk-0')).toBeUndefined();
 
 		// The master edits and clears: both follow.
 		a.raw.prepare(`UPDATE track SET mbid = 'mb-edited', copyright = NULL WHERE id = 'trk-0'`).run();
@@ -179,12 +180,12 @@ describe('track attributes: master wins per field, adopted into empty fields', (
 		expect([row(b, 'trk-0')['mbid'], row(b, 'trk-0')['copyright']]).toEqual(['mb-edited', null]);
 		expect([row(c, 'trk-0')['mbid'], row(c, 'trk-0')['copyright']]).toEqual(['mb-edited', null]);
 
-		// C's own writer puts its own value: the field is C's again, and C
-		// states it; the master's still wins on B (source data: master wins).
+		// C's own writer puts its own value: the field is C's again (still
+		// unsaid while A is the master); the master's wins on B.
 		c.raw.prepare(`UPDATE track SET mbid = 'mb-C' WHERE id = 'trk-0'`).run();
 		await rig.settle();
 		expect(row(c, 'trk-0')['mbid']).toBe('mb-C');
-		expect(await attrsOf(c, 'trk-0')).toMatchObject({ mbid: 'mb-C' });
+		expect(await attrsOf(c, 'trk-0')).toBeUndefined();
 		expect(row(b, 'trk-0')['mbid']).toBe('mb-edited');
 
 		// An override still wins on read over the account's tempo, everywhere.
@@ -197,8 +198,9 @@ describe('track attributes: master wins per field, adopted into empty fields', (
 		await a.svc.setTrackOverrides('trk-0', { bpm: null });
 		await rig.settle();
 
-		// Master switch to C: B's remote row re-picks per field — C's own tempo
-		// and mbid, the old master's key where C states none.
+		// Master switch to C: C states what it held back (role.ts
+		// requestRestatement), and B's remote row re-picks per field — C's own
+		// tempo and mbid, the old master's key where C states none.
 		await c.svc.setMasterDevice(await c.deviceId());
 		await rig.settle();
 		await rig.settle();

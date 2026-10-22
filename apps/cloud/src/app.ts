@@ -5,7 +5,8 @@
 //
 // It is also the access log's choke point: every request that reaches it,
 // whatever happens (404, 401, 429, a 500 thrown anywhere), leaves exactly one
-// request_log row and answers with an `x-request-id` header. The node bridge
+// request_log row and answers with an `x-request-id` header; the one
+// exception is a health check that succeeds (below). The node bridge
 // logs the few that never get here (413, a body that failed to arrive).
 
 import { performance } from 'node:perf_hooks';
@@ -134,11 +135,16 @@ export function createFetchHandler(deps: AppDeps): FetchHandler {
 			out = null;
 		}
 		headers.set(REQUEST_ID_HEADER, call.requestId);
-		try {
-			logRequest(deps, requestRow(req.headers, call, { status, startedAt, bytesIn: sizes.bytesIn, bytesOut: out?.byteLength ?? 0 }), { opsSkippedOwn: call.opsSkippedOwn });
-		} catch (e) {
-			// The log must never cost the caller their response.
-			deps.log.error('request_log_failed', { requestId: call.requestId, error: e });
+		// Fly's health check (fly.toml, every 30 s per machine) would be 2,880
+		// rows a day per machine that say nothing. A failing one is logged
+		// like any request, so it still shows in Fly's logs and the table.
+		if (call.procedure !== 'health' || status >= 400) {
+			try {
+				logRequest(deps, requestRow(req.headers, call, { status, startedAt, bytesIn: sizes.bytesIn, bytesOut: out?.byteLength ?? 0 }), { opsSkippedOwn: call.opsSkippedOwn });
+			} catch (e) {
+				// The log must never cost the caller their response.
+				deps.log.error('request_log_failed', { requestId: call.requestId, error: e });
+			}
 		}
 		return new Response(out && out.byteLength > 0 ? out : null, { status, headers });
 	};

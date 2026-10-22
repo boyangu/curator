@@ -41,6 +41,10 @@ export function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null, now 
 	if (s.needsUpdate) return { text: 'Update Curator to keep syncing. Your changes are kept and will sync after the update.', tone: 'error' };
 	if (s.initialPush) return { text: `Uploading your library… ${s.initialPush.done.toLocaleString()} of about ${s.initialPush.estimate.toLocaleString()} changes`, tone: 'ok' };
 	if (s.bootstrap) return { text: `Downloading your library… ${s.bootstrap.done.toLocaleString()} of ${s.bootstrap.total.toLocaleString()}`, tone: 'ok' };
+	// A backlog going up as one server batch: staged first, then published
+	// at once (other devices see none of it until the commit is done).
+	if (s.batch?.phase === 'uploading') return { text: `Uploading your library (batch)… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
+	if (s.batch?.phase === 'committing') return { text: `Publishing your library upload… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
 	if (s.lastError) return { text: `${s.lastError}${s.pending > 0 ? ` · ${s.pending.toLocaleString()} changes waiting` : ''}`, tone: 'error' };
 	// "Syncing…" only while changes actually move; a routine check (every
 	// minute or on focus) moves nothing and must not flip the label.

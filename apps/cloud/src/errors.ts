@@ -10,7 +10,7 @@
 
 import type { CallErrorReason } from '@curator/protocol';
 
-export type CloudErrorCode = 'UNAUTHORIZED' | 'FORBIDDEN' | 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'PAYLOAD_TOO_LARGE' | 'TOO_MANY_REQUESTS';
+export type CloudErrorCode = 'UNAUTHORIZED' | 'FORBIDDEN' | 'NOT_FOUND' | 'CONFLICT' | 'PRECONDITION_FAILED' | 'PAYLOAD_TOO_LARGE' | 'TOO_MANY_REQUESTS';
 
 // The reasons are the protocol's (`CALL_ERROR_REASONS`), so the desktop and
 // phone branch on the same list this server raises.

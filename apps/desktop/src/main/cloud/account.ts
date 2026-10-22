@@ -139,7 +139,7 @@ export class CloudAccount {
 	private channel: RealtimeChannel | null = null;
 	private channelUser: string | null = null;
 	private readonly changeListeners = new Set<(s: AccountState) => void>();
-	private readonly wakeListeners = new Set<(reason: WakeReason) => void>();
+	private readonly wakeListeners = new Set<(reason: WakeReason, seq?: number) => void>();
 	private ready: Promise<void>;
 	private signingOut = false;
 
@@ -274,7 +274,7 @@ export class CloudAccount {
 	}
 
 	// The sync client's wake source (CoreServiceOptions.cloud.subscribeWakeups).
-	subscribeWakeups(onWake: (reason?: WakeReason) => void): () => void {
+	subscribeWakeups(onWake: (reason?: WakeReason, seq?: number) => void): () => void {
 		this.wakeListeners.add(onWake);
 		const onFocus = (): void => this.wake('focus');
 		app.on('browser-window-focus', onFocus);
@@ -297,9 +297,9 @@ export class CloudAccount {
 		await this.supabase.auth.stopAutoRefresh().catch(() => { /* best-effort */ });
 	}
 
-	private wake(reason: WakeReason): void {
+	private wake(reason: WakeReason, seq?: number): void {
 		for (const cb of this.wakeListeners) {
-			try { cb(reason); } catch (err) { alog.warn('wake listener threw', undefined, err); }
+			try { cb(reason, seq); } catch (err) { alog.warn('wake listener threw', undefined, err); }
 		}
 	}
 
@@ -322,7 +322,7 @@ export class CloudAccount {
 			this.channelUser = s.user.id;
 			this.channel = this.supabase
 				.channel(`user:${s.user.id}`, { config: { private: true } })
-				.on('broadcast', { event: 'wake' }, () => this.wake('realtime'))
+				.on('broadcast', { event: 'wake' }, (msg: { payload?: unknown }) => this.wake('realtime', pingSeq(msg.payload)))
 				.subscribe((status, err) => {
 					const userId = s.user.id;
 					if (status === 'SUBSCRIBED') alog.info('realtime wake channel joined', { userId });
@@ -344,6 +344,15 @@ export class CloudAccount {
 			await this.supabase.removeChannel(ch).catch(() => { /* already closed */ });
 		}
 	}
+}
+
+// The head seq a wake broadcast names (`{ seq }`, the server's library_op
+// trigger). The sync client skips a ping it has already pulled — its own
+// push ringing back, mostly — and wakes on anything it cannot read.
+function pingSeq(payload: unknown): number | undefined {
+	const seq = (payload as { seq?: unknown } | null | undefined)?.seq;
+	const n = typeof seq === 'string' ? Number(seq) : seq;
+	return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
 }
 
 // Supabase's messages are developer-facing; the panel shows these.

@@ -27,7 +27,8 @@ import type { AuditEmit } from '../audit.js';
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
-import { assertSessionNotRevoked, bindSession, DeviceRevokedError, type Caller, type RevokedVia } from '../account/device-gate.js';
+import { assertSessionNotRevoked, bindSession, DeviceRevokedError, touchDevice, type Caller, type RevokedVia } from '../account/device-gate.js';
+import { sourceFromNonMaster } from './master.js';
 
 export type PushCall = { deviceId: string; ops: readonly unknown[] };
 
@@ -160,12 +161,7 @@ export async function push(db: Db, audit: AuditEmit, userId: string, caller: Cal
 		if (revoked === null) {
 			// `last_seen_at` moves for a revoked device too: "still trying" is
 			// what the account's device list should show for it.
-			const [device] = await tx.query<{ revoked: boolean }>(
-				`update curator.device set last_seen_at = now()
-				where user_id = (select auth.uid()) and device_id = $1
-				returning revoked_at is not null as revoked`,
-				[call.deviceId],
-			);
+			const device = await touchDevice(tx, call.deviceId);
 			if (!device) throw new CloudError('PRECONDITION_FAILED', 'device_not_registered');
 			if (device.revoked) revoked = 'device';
 			else await bindSession(tx, caller, call.deviceId);
@@ -263,6 +259,11 @@ export async function push(db: Db, audit: AuditEmit, userId: string, caller: Cal
 				[call.deviceId, JSON.stringify([...new Set(valid.map((op) => op.op_id.toLowerCase()))])],
 			);
 			priorOwnMaxSeq = prior ? num(prior.seq) : 0;
+
+			// After the INSERT, so a master setting op in this very call
+			// counts (master.ts). No probe unless the call carries a source kind.
+			const nonMaster = await sourceFromNonMaster(tx, call.deviceId, valid);
+			if (nonMaster) events.push(['source_from_non_master', { procedure: 'sync.push', master: nonMaster.master, byKind: nonMaster.byKind }]);
 		}
 
 		if (clamped.length > 0) {

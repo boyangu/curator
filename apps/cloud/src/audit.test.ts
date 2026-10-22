@@ -115,9 +115,17 @@ describe('request_log', () => {
 		// The input travels in the query string; its size counts, the text does not.
 		expect(r!.bytes_in).toBeGreaterThan(0);
 
-		const minted = await get(app, '/trpc/health', undefined);
-		const [h] = await requestRows(app, rid(minted));
-		expect(h).toMatchObject({ procedure: 'health', http_status: 200, user_id: null });
+		const minted = await get(app, '/trpc/sync.pull', { afterSeq: 0 }, { authorization: `Bearer ${token}` });
+		const [m] = await requestRows(app, rid(minted));
+		expect(m).toMatchObject({ procedure: 'sync.pull', http_status: 200 });
+	});
+
+	it('leaves a passing health check out of request_log and stdout, but still answers its request id', async () => {
+		const res = await get(app, '/trpc/health', undefined);
+		expect(res.status).toBe(200);
+		const id = rid(res);
+		expect(await requestRows(app, id)).toEqual([]);
+		expect(app.logs.some((l) => l.requestId === id)).toBe(false);
 	});
 
 	it('logs an unauthenticated call with no user, even when the token names one', async () => {
@@ -364,13 +372,13 @@ describe('AuditWriter', () => {
 		};
 		const app = await createTestApp({ auditDb: failing });
 		try {
-			const { api, userId } = await app.signIn();
+			const { api, userId, token } = await app.signIn();
 			await expect(api.sync.pull.query({ afterSeq: 0 })).resolves.toMatchObject({ ops: [] });
-			const res = await get(app, '/trpc/health', undefined);
+			const res = await get(app, '/trpc/sync.pull', { afterSeq: 0 }, { authorization: `Bearer ${token}` });
 			expect(res.status).toBe(200);
 			await app.audit.flush();
 			expect(app.logs.some((l) => l.msg === 'log_flush_failed' && l.level === 'error')).toBe(true);
-			expect(app.logs.some((l) => l.msg === 'request_log_unsaved' && l.request_id === rid(res) && l.procedure === 'health')).toBe(true);
+			expect(app.logs.some((l) => l.msg === 'request_log_unsaved' && l.request_id === rid(res) && l.procedure === 'sync.pull')).toBe(true);
 			expect(app.logs.some((l) => l.msg === 'audit_event_unsaved' && l.kind === 'device_registered' && l.user_id === userId)).toBe(true);
 			expect(app.audit.buffered).toEqual({ request: 0, audit: 0 });
 		} finally {

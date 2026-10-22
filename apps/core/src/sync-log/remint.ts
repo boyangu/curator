@@ -112,9 +112,14 @@ function swapIdentity(raw: Raw, oldDeviceId: string | null): RemintResult {
 
 	raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLOCK_KEY);
 
+	// Server batches ('batches') are per device: the old id's open ones expire
+	// on the server, and their ops, now stamped with the new id, are staged
+	// again under it.
+	raw.prepare(`UPDATE sync_outbox SET batch_id = NULL WHERE state = 'pending' AND batch_id IS NOT NULL`).run();
+
 	const client = readSetting(raw, CLIENT_STATE_KEY);
 	if (client && typeof client === 'object') {
-		writeSetting(raw, CLIENT_STATE_KEY, { ...(client as Record<string, unknown>), registeredFor: null, ownThroughSeq: 0 });
+		writeSetting(raw, CLIENT_STATE_KEY, { ...(client as Record<string, unknown>), registeredFor: null, ownThroughSeq: 0, batches: {} });
 	}
 	return { reminted: true, oldDeviceId, newDeviceId, restamped };
 }

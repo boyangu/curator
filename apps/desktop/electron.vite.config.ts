@@ -85,6 +85,11 @@ export default defineConfig(({ mode, command }) => ({
 					// snapshots, hashing, zstd and uploads stay off the main loop
 					// (src/main/backup/host.ts).
 					'backup-worker': resolve(__dirname, 'src/main/backup/worker.ts'),
+					// Utility-process script that builds the account snapshot this
+					// device publishes as its master — reading every sync record and
+					// gzipping ~227 MB of JSON stays off the main loop
+					// (src/main/cloud/snapshot-host.ts).
+					'snapshot-worker': resolve(__dirname, 'src/main/cloud/snapshot-worker.ts'),
 				},
 				output: { format: 'cjs', entryFileNames: '[name].cjs' },
 			},

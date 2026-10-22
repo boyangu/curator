@@ -34,7 +34,7 @@
 import type Database from 'better-sqlite3';
 import { cueEntityId, isAccountSettingKey, trackTagEntityId, type JsonValue } from '@curator/protocol';
 import { INITIAL_PUSH_KEY, markRecordsComplete } from './apply.js';
-import { emitOps, type EmitOp } from './outbox.js';
+import { emitOps, type BatchLabel, type EmitOp } from './outbox.js';
 import {
 	claimOp, cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
 	OVERRIDE_KEYS, OVERRIDE_FIELD_OF, RB_UNITS, type CueRow, type RecordingClaim,
@@ -349,8 +349,11 @@ export function estimateInitialPush(raw: Raw): number {
 		+ estimateRecordingOps(raw);
 }
 
-function emitChunk(raw: Raw, batch: EmitOp[], byEntity: Record<string, number>): void {
-	raw.transaction(() => { emitOps(raw, batch, { noPrerequisites: true }); })();
+// Every op here is a one-time backlog's, labelled for a server batch
+// (outbox.ts BATCH_LABELS): 'initial-push' for the library's first upload,
+// 'backfill' for the sections stated again later.
+function emitChunk(raw: Raw, batch: EmitOp[], byEntity: Record<string, number>, batchLabel: BatchLabel): void {
+	raw.transaction(() => { emitOps(raw, batch, { noPrerequisites: true, batchLabel }); })();
 	for (const op of batch) byEntity[op.entity] = (byEntity[op.entity] ?? 0) + 1;
 }
 
@@ -363,9 +366,9 @@ export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPus
 	for (const op of initialPushOps(raw)) {
 		pending.push(op);
 		total++;
-		if (pending.length >= chunk) { emitChunk(raw, pending, byEntity); pending = []; }
+		if (pending.length >= chunk) { emitChunk(raw, pending, byEntity, 'initial-push'); pending = []; }
 	}
-	if (pending.length > 0) emitChunk(raw, pending, byEntity);
+	if (pending.length > 0) emitChunk(raw, pending, byEntity, 'initial-push');
 	markRecordsComplete(raw);
 	markRbBackfilled(raw);
 	markClaimsBackfilled(raw);
@@ -384,7 +387,7 @@ export async function initialPushAsync(
 	raw: Raw,
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
 ): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); markClaimsBackfilled(raw); }, opts);
+	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); markClaimsBackfilled(raw); }, 'initial-push', opts);
 }
 
 async function driveAsync(
@@ -392,6 +395,7 @@ async function driveAsync(
 	gen: Generator<EmitOp>,
 	estimate: number,
 	onDone: () => void,
+	batchLabel: BatchLabel,
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } },
 ): Promise<InitialPushAsyncResult> {
 	const started = Date.now();
@@ -414,7 +418,7 @@ async function driveAsync(
 			batch.push(next.value);
 		}
 		if (batch.length > 0) {
-			emitChunk(raw, batch, byEntity);
+			emitChunk(raw, batch, byEntity, batchLabel);
 			total += batch.length;
 			chunks++;
 		}
@@ -453,7 +457,7 @@ export function rbBackfillAsync(
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
 ): Promise<InitialPushAsyncResult> {
 	const estimate = (raw.prepare(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`).get() as { n: number }).n;
-	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), opts);
+	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), 'backfill', opts);
 }
 
 // ── backfill: recordings (creates + claims) ────────────────────────────────
@@ -481,5 +485,5 @@ export function claimsBackfillAsync(
 	raw: Raw,
 	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
 ): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, recordingOps(raw), estimateRecordingOps(raw), () => markClaimsBackfilled(raw), opts);
+	return driveAsync(raw, recordingOps(raw), estimateRecordingOps(raw), () => markClaimsBackfilled(raw), 'backfill', opts);
 }

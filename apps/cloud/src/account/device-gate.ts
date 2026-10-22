@@ -71,6 +71,34 @@ export async function bindSession(tx: Queryable, caller: Caller, deviceId: strin
 	);
 }
 
+// How stale `last_seen_at` may get before a write moves it. The device list
+// shows it as "last seen 3 min ago"; minutes are all it needs, and writing
+// it on every push and batch call was a new row version of curator.device
+// each time (with ~240 batchPush calls in one backlog).
+const LAST_SEEN_EVERY = `interval '5 minutes'`;
+
+// A push or batch call's device: whether it is registered (undefined if
+// not) and revoked, from the same statement that touches its `last_seen_at`
+// when that is stale. The read is a plain one, as every read gate's is; the
+// touch, when it runs, waits on a concurrent revoke like any update.
+export async function touchDevice(tx: Queryable, deviceId: string): Promise<{ revoked: boolean } | undefined> {
+	// A data-modifying CTE runs whether or not the outer select reads it.
+	const [row] = await tx.query<{ revoked: boolean }>(
+		`with d as (
+			select revoked_at is not null as revoked from curator.device
+			where user_id = (select auth.uid()) and device_id = $1
+		), touched as (
+			update curator.device set last_seen_at = now()
+			where user_id = (select auth.uid()) and device_id = $1
+				and (last_seen_at is null or last_seen_at < now() - ${LAST_SEEN_EVERY})
+			returning 1
+		)
+		select revoked from d`,
+		[deviceId],
+	);
+	return row;
+}
+
 // A read or a catalogue call that names its device: the session first (so
 // a revoked session cannot probe which device ids exist), then the device,
 // then the binding.

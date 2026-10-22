@@ -25,10 +25,18 @@ import { gunzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { app, net } from 'electron';
 import { createTRPCUntypedClient, httpLink, TRPCClientError } from '@trpc/client';
-import { CloudTransportError, decodeLibraryStateSnapshot, type CloudTransport } from '@curator/core';
+import { CatalogueBlobError, CloudTransportError, decodeLibraryStateSnapshot, readStorageSnapshotBody, type CloudTransport } from '@curator/core';
 import {
 	CALL_ERROR_REASONS,
 	SNAPSHOT_ENCODING,
+	type BatchAbortInput,
+	type BatchAbortResult,
+	type BatchBeginInput,
+	type BatchBeginResult,
+	type BatchCommitInput,
+	type BatchCommitResult,
+	type BatchPushInput,
+	type BatchPushResult,
 	type BootstrapInput,
 	type BootstrapResult,
 	type CallErrorReason,
@@ -39,6 +47,8 @@ import {
 	type CataloguePutInput,
 	type CataloguePutResult,
 	type DeviceInfo,
+	type PublishSnapshotInput,
+	type PublishSnapshotResult,
 	type PullInput,
 	type PullResult,
 	type PushInput,
@@ -48,6 +58,7 @@ import {
 } from '@curator/protocol';
 import { mainLog } from '../log.js';
 import { readSnapshotBody } from './snapshot-chunks.js';
+import { createSnapshotBlobStore } from './blobs.js';
 import type { CloudAccount } from './account.js';
 
 const gunzipAsync = promisify(gunzip);
@@ -61,6 +72,14 @@ const PROCS = {
 	pull: { path: 'sync.pull', type: 'query' },
 	bootstrap: { path: 'sync.bootstrap', type: 'query' },
 	snapshotChunk: { path: 'sync.snapshotChunk', type: 'query' },
+	// 'batches': the sync client calls these only after the server named the
+	// feature.
+	batchBegin: { path: 'sync.batchBegin', type: 'mutation' },
+	batchPush: { path: 'sync.batchPush', type: 'mutation' },
+	batchCommit: { path: 'sync.batchCommit', type: 'mutation' },
+	batchAbort: { path: 'sync.batchAbort', type: 'mutation' },
+	// 'snapshot_storage': the master names the parts it uploaded.
+	publishSnapshot: { path: 'sync.publishSnapshot', type: 'mutation' },
 	registerDevice: { path: 'account.registerDevice', type: 'mutation' },
 	devices: { path: 'account.devices', type: 'query' },
 	revokeDevice: { path: 'account.revokeDevice', type: 'mutation' },
@@ -126,6 +145,9 @@ function mapError(err: unknown): CloudTransportError {
 		// retry later, the ops stay pending.
 		if (reason === 'server_outdated') return new CloudTransportError('server', reason, retryMs);
 		if (reason === 'snapshot_gone') return new CloudTransportError('server', reason);
+		if (reason === 'batch_gone') return new CloudTransportError('batch_gone', reason);
+		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
+		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
 		if (status >= 500) return new CloudTransportError('server', `HTTP ${status}`);
 		if (status >= 400) return new CloudTransportError('bad_request', reason ?? `HTTP ${status}`);
@@ -161,6 +183,8 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 	// that misbehaves from one that does not.
 	const clientHeader = `desktop/${app.getVersion()} ${process.platform}`;
 	const wire = new Map<string, Wire>();
+	// The `snapshots` bucket ('snapshot_storage'), as the signed-in user.
+	const snapshots = createSnapshotBlobStore(account);
 
 	const client = createTRPCUntypedClient({
 		links: [
@@ -200,6 +224,7 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 	// inventory entries.
 	const opsSent = (proc: Proc, input: unknown): number | null => {
 		if (proc === PROCS.push) return (input as PushInput).ops?.length ?? 0;
+		if (proc === PROCS.batchPush) return (input as BatchPushInput).ops?.length ?? 0;
 		if (proc === PROCS.catalogueLookup) return (input as CatalogueLookupInput).audioHashes?.length ?? 0;
 		if (proc === PROCS.cataloguePut) return (input as CataloguePutInput).items?.length ?? 0;
 		return null;
@@ -263,7 +288,13 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 		sync: {
 			push: (input: PushInput) => call<PushResult>(PROCS.push, input),
 			pull: (input: PullInput) => call<PullResult>(PROCS.pull, input),
+			batchBegin: (input: BatchBeginInput) => call<BatchBeginResult>(PROCS.batchBegin, input),
+			batchPush: (input: BatchPushInput) => call<BatchPushResult>(PROCS.batchPush, input),
+			batchCommit: (input: BatchCommitInput) => call<BatchCommitResult>(PROCS.batchCommit, input),
+			batchAbort: (input: BatchAbortInput) => call<BatchAbortResult>(PROCS.batchAbort, input),
+			publishSnapshot: (input: PublishSnapshotInput) => call<PublishSnapshotResult>(PROCS.publishSnapshot, input),
 		},
+		snapshots,
 		// The snapshot arrives inline (base64 gzip of the serialised state).
 		// gunzip runs on libuv's pool; the JSON parse and flatten are the one
 		// synchronous step (~100–300 ms for a 40k-track library, once).
@@ -273,18 +304,34 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 		// the body's size and it is read in MAX_SNAPSHOT_CHUNK_BYTES pieces,
 		// each a small request. A newer snapshot pruning this one mid-read
 		// (`snapshot_gone`) starts over from the new one, a few times at most.
+		// `storage` ('snapshot_storage', the sync client asks): an answer with
+		// a manifest is a master-published snapshot, downloaded from Storage
+		// with this user's session, every part and the joined body checked
+		// against the manifest before anything inflates (core
+		// snapshot-storage.ts). A part pruned meanwhile (not_found) also
+		// starts over from the newer snapshot.
 		async bootstrap(input?: BootstrapInput) {
 			for (let attempt = 0; ; attempt++) {
 				const res = await call<BootstrapResult>(PROCS.bootstrap, input);
-				if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
 				let body: Buffer;
 				try {
-					body = await readSnapshotBody(res, (offset, length) => call<SnapshotChunkResult>(PROCS.snapshotChunk, {
-						...(input?.deviceId !== undefined ? { deviceId: input.deviceId } : {}),
-						snapshotSeq: res.snapshotSeq, offset, length,
-					}), MAX_INFLATED_BYTES);
+					if (res.storage) {
+						const t0 = performance.now();
+						body = await readStorageSnapshotBody(res.storage, (path) => snapshots.download(path), { maxBytes: MAX_INFLATED_BYTES });
+						clog.info('bootstrap: snapshot read from storage', { snapshotSeq: res.snapshotSeq, parts: res.storage.parts.length, bytes: body.length, ms: Math.round(performance.now() - t0) });
+					} else {
+						if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
+						body = await readSnapshotBody(res, (offset, length) => call<SnapshotChunkResult>(PROCS.snapshotChunk, {
+							...(input?.deviceId !== undefined ? { deviceId: input.deviceId } : {}),
+							snapshotSeq: res.snapshotSeq, offset, length,
+						}), MAX_INFLATED_BYTES);
+					}
 				} catch (err) {
 					if (err instanceof CloudTransportError && err.message === 'snapshot_gone' && attempt < 3) continue;
+					if (err instanceof CatalogueBlobError) {
+						if (err.kind === 'not_found' && attempt < 3) continue;
+						throw new CloudTransportError(err.kind === 'transient' ? 'network' : err.kind === 'denied' ? 'auth' : 'server', `snapshot part: ${err.kind}`);
+					}
 					throw err;
 				}
 				const json = await gunzipAsync(body, { maxOutputLength: MAX_INFLATED_BYTES });

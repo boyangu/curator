@@ -64,9 +64,11 @@ import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
 import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
+import { inlineSnapshotBuilder, type SnapshotBuilder } from './sync-log/snapshot-build.js';
 import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
 import { remoteRowCount, requestRematerialize } from './sync-log/remote-rows.js';
+import { requestRestatement } from './sync-log/restate.js';
 import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
 import type { DevicePlatform } from '@curator/protocol';
@@ -410,7 +412,8 @@ export interface CoreServiceOptions {
 	// Never wire this from scripts or tests against a real account.
 	cloud?: {
 		transport: CloudTransport;
-		subscribeWakeups?: (onWake: (reason?: WakeReason) => void) => () => void;
+		// `seq`: the head a Realtime ping names, when the server sent one.
+		subscribeWakeups?: (onWake: (reason?: WakeReason, seq?: number) => void) => () => void;
 		// Whether the user is using the app, decided by the host (desktop
 		// main: window focus + OS idle time). Started with startCloudSync;
 		// `idleAfterMs` is pushed whenever the poll setting changes. Omitted ⇒
@@ -423,6 +426,15 @@ export interface CoreServiceOptions {
 		// builds the catalogue layer (apps/core/src/catalogue/); without
 		// either, there is none and analysis behaves exactly as before.
 		blobs?: CatalogueBlobStore;
+		// The master's snapshot publish ('snapshot_storage', sync-log/
+		// snapshot-build.ts). The desktop main injects a builder that runs in
+		// a utility process (reading the DB read-only, writing parts under
+		// userData); omitted ⇒ the build runs inline into the OS temp dir
+		// (tests, CLI) — same injection pattern as parseAudio. It only ever
+		// runs on the account's master, against a server that offers the
+		// feature, with a transport that has `snapshots`. The cadence knobs
+		// default to sync-log/client.ts SNAPSHOT_EVERY_*.
+		snapshot?: { builder?: SnapshotBuilder; everyOps?: number; everyMs?: number; retryMs?: number };
 	};
 }
 
@@ -2183,6 +2195,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				if (a.tracks.length > 5_000) membership.recomputeAll();
 				else if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks);
 			},
+			snapshot: { ...opts.cloud.snapshot, builder: opts.cloud.snapshot?.builder ?? inlineSnapshotBuilder(dbPath) },
 			// The feed's decisions live in feed.db (feed/sync.ts).
 			feed: {
 				pending: () => feedPendingCount(sqlite),
@@ -2255,7 +2268,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		: {
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
 			lastPushAt: null, lastPullAt: null, lastCheckedAt: null, lastChangedAt: null, transferring: false, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
-			initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
+			initialPush: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null }, nextRetryAt: null,
 			poll: { policy: readPollPolicy(sqlite), active: true, nextPollAt: null },
 		};
 
@@ -5567,8 +5580,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (!serverReadsTrackMeta(cloudClient.serverFeatures())) throw new Error('The sync server does not support a master device yet — sync once more, or update the server.');
 			if (typeof deviceId !== 'string' || deviceId.length === 0 || deviceId.length > 128) throw new Error('Not a device id.');
 			setMasterDevice(sqlite, deviceId);
-			// The next cycle pushes it and re-picks this device's remote rows.
+			// The next cycle pushes it, re-picks this device's remote rows and
+			// states what this device's new role lets it (sync-log/role.ts).
 			requestRematerialize(sqlite);
+			requestRestatement(sqlite);
 			cloudClient.wake('local');
 			return accountLibraryInfo();
 		},
@@ -5583,9 +5598,14 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (!cloudClient || cloudWakeUnsub) return;
 			cloudClient.start();
 			catalogue?.start();
-			cloudWakeUnsub = opts.cloud?.subscribeWakeups?.((reason) => {
-				cloudClient.wake(reason);
-				if (reason) catalogue?.wake(reason);
+			cloudWakeUnsub = opts.cloud?.subscribeWakeups?.((reason, seq) => {
+				cloudClient.wake(reason, seq);
+				// A sign-in or a regained network only: each catalogue pass is a
+				// full inventory (~3.5 s on the live library), and a Realtime
+				// ping or a focus says nothing new about the catalogue. Its own
+				// interval, ingests, the server's feature answer and the user's
+				// actions wake it otherwise (start, settings, backfill).
+				if (reason === 'session' || reason === 'network') catalogue?.wake(reason);
 			}) ?? (() => { /* no wake source */ });
 			cloudActivity = opts.cloud?.watchActivity?.((active) => cloudClient.setActive(active)) ?? null;
 			cloudActivity?.setIdleAfterMs(readPollPolicy(sqlite).idleAfterSec * 1000);

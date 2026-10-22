@@ -84,6 +84,52 @@ export function serializeLibraryState(state: LibraryState): string {
 	return JSON.stringify({ format: SNAPSHOT_FORMAT, version: SNAPSHOT_FORMAT_VERSION, maps });
 }
 
+// ── streaming form ──────────────────────────────────────────────────────────
+// The same JSON as `serializeLibraryState`, byte for byte, written from one
+// sorted entry source per map instead of a whole `LibraryState`: the master
+// device publishes the account's snapshot from its persisted records
+// ('snapshot_storage', cloud-service.ts), and the main library's is 227 MB of
+// JSON — one string of it, or the whole state in memory at once, is what the
+// streaming form exists to avoid. The server's verifier compares sha256 of
+// the JSON with its own fold at the same seq, so this must never drift from
+// `serializeLibraryState`: same map order, same key order, same `canonical`
+// values, same per-entry `JSON.stringify([key, value])` (protocol tests pin
+// it on random states).
+
+export type LibraryStateMapName = StateKey;
+// Every map, in the order the snapshot writes them.
+export const LIBRARY_STATE_MAPS: readonly LibraryStateMapName[] = KEYS;
+
+// The entry order inside a map: plain UTF-16 code-unit order. Not SQLite's
+// BINARY collation, which is UTF-8 byte (code point) order: the two differ
+// where a surrogate pair meets a character in U+E000..U+FFFF.
+export function compareSnapshotKeys(a: string, b: string): number {
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// `source(map)` is called once per map, in LIBRARY_STATE_MAPS order, and
+// must yield that map's entries in compareSnapshotKeys order: a key out of
+// order or repeated throws rather than write a snapshot that differs from
+// the fold. Yields the JSON in pieces (one entry each, plus the frame); their
+// concatenation is the document.
+export function* serializeLibraryStateChunks(source: (map: LibraryStateMapName) => Iterable<readonly [string, unknown]>): Generator<string, void, undefined> {
+	// `{"format":…,"version":1` exactly as JSON.stringify writes the object's
+	// head, then the maps.
+	yield `${JSON.stringify({ format: SNAPSHOT_FORMAT, version: SNAPSHOT_FORMAT_VERSION }).slice(0, -1)},"maps":{`;
+	for (let i = 0; i < KEYS.length; i++) {
+		const k = KEYS[i]!;
+		yield `${i === 0 ? '' : ','}${JSON.stringify(k)}:[`;
+		let prev: string | null = null;
+		for (const [key, value] of source(k)) {
+			if (prev !== null && !(prev < key)) throw new TypeError(`snapshot entries of ${k} out of order or repeated at ${JSON.stringify(key)}`);
+			yield `${prev === null ? '' : ','}${JSON.stringify([key, canonical(value)])}`;
+			prev = key;
+		}
+		yield ']';
+	}
+	yield '}}';
+}
+
 export class SnapshotFormatError extends Error {
 	override readonly name = 'SnapshotFormatError';
 }

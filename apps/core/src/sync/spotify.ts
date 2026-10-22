@@ -40,6 +40,7 @@ import { normalizeIncomingCredits, syncTrackArtists } from '../library/artists.j
 import { syncTrackAlbumsById } from '../library/albums.js';
 import { upsertArtistLinks } from '../library/artist-links.js';
 import { findExistingByContent } from './match-existing.js';
+import { canonicalSpotifyCover } from './spotify-cover.js';
 import { normalizeIsrc } from '@curator/library-logic';
 import { log } from '../log.js';
 
@@ -458,7 +459,7 @@ export class SpotifySync {
 						description: pl.description,
 						ownerName: pl.owner.display_name,
 						ownerId: pl.owner.id,
-						coverUrl: pl.images?.[0]?.url ?? null,
+						coverUrl: canonicalSpotifyCover(pl.images?.[0]?.url ?? null),
 						trackCount: pl.tracks.total,
 						isCollaborative: pl.collaborative,
 						isPublic: pl.public,
@@ -486,7 +487,7 @@ export class SpotifySync {
 			description: pl.description,
 			ownerName: pl.owner.display_name,
 			ownerId: pl.owner.id,
-			coverUrl: pl.images?.[0]?.url ?? null,
+			coverUrl: canonicalSpotifyCover(pl.images?.[0]?.url ?? null),
 			trackCount: pl.tracks.total,
 			followers: null,
 			isCollaborative: pl.collaborative,

@@ -14,13 +14,17 @@
 // Logging (area `catalogue-blobs`): failures at warn with status and code,
 // successes at debug with size and duration. Never a path's contents, never
 // a token.
+//
+// The account snapshot's parts ('snapshot_storage': the master uploads them,
+// a bootstrapping device downloads them) go to the private `snapshots`
+// bucket the same way, under the same kind of policies (own prefix, insert
+// and delete, no update), with the same error mapping; area
+// `snapshot-blobs`.
 
-import { CATALOGUE_BUCKET } from '@curator/protocol';
-import { CatalogueBlobError, type CatalogueBlobStore } from '@curator/core';
+import { CATALOGUE_BUCKET, SNAPSHOT_BUCKET } from '@curator/protocol';
+import { CatalogueBlobError, type CatalogueBlobStore, type SnapshotBlobStore } from '@curator/core';
 import { mainLog } from '../log.js';
 import type { CloudAccount } from './account.js';
-
-const blog = mainLog.for('catalogue-blobs');
 
 type StorageErrorLike = { status?: unknown; statusCode?: unknown; code?: unknown; message?: unknown; name?: unknown };
 
@@ -55,7 +59,15 @@ function mapError(err: unknown): CatalogueBlobError {
 }
 
 export function createCatalogueBlobStore(account: CloudAccount): CatalogueBlobStore {
-	const bucket = () => account.storage().from(CATALOGUE_BUCKET);
+	return bucketStore(account, CATALOGUE_BUCKET, mainLog.for('catalogue-blobs'));
+}
+
+export function createSnapshotBlobStore(account: CloudAccount): SnapshotBlobStore {
+	return bucketStore(account, SNAPSHOT_BUCKET, mainLog.for('snapshot-blobs'));
+}
+
+function bucketStore(account: CloudAccount, name: string, blog: ReturnType<typeof mainLog.for>): CatalogueBlobStore & SnapshotBlobStore {
+	const bucket = () => account.storage().from(name);
 	return {
 		async upload(path, bytes) {
 			const t0 = performance.now();

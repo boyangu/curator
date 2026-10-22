@@ -1353,6 +1353,13 @@ export const playEvent = sqliteTable(
 // `state` (SYNC_OUTBOX_STATES): pending until the server accepts or refuses
 // it (with `reason`). The push loop reads pending rows in seq_local order,
 // hence the (state, seq_local) index.
+//
+// `batch_label` marks a one-time backlog's op (the initial push, a backfill:
+// sync-log/outbox.ts BATCH_LABELS), which the client uploads as a server
+// batch ('batches') instead of plain pushes; null for every edit.
+// `batch_id` is the server batch it is staged in (still pending: staged ops
+// are not in the log until the batch commits). The partial index serves the
+// staging loop's "next unstaged rows of this label".
 
 export const syncOutbox = sqliteTable(
 	'sync_outbox',
@@ -1369,9 +1376,12 @@ export const syncOutbox = sqliteTable(
 		state: text('state', { enum: SYNC_OUTBOX_STATES }).notNull().default('pending'),
 		reason: text('reason'),
 		createdAt: integer('created_at').notNull(),
+		batchLabel: text('batch_label'),
+		batchId: text('batch_id'),
 	},
 	(t) => ({
 		stateSeqIdx: index('sync_outbox_state_seq_idx').on(t.state, t.seqLocal),
+		batchIdx: index('sync_outbox_batch_idx').on(t.batchLabel, t.batchId, t.seqLocal).where(sql`state = 'pending' AND batch_label IS NOT NULL`),
 	})
 );
 

@@ -29,6 +29,7 @@ import { heldCount, replayHeldOps } from './held.js';
 import { planIdentityMerges } from './identity.js';
 import { planStreamingDedupe } from './playlist-dedupe.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { FIRST_PULL_KEY } from './role.js';
 import { remoteTrackId, streamingPlaylistId } from './stable-ids.js';
 import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import {
@@ -53,6 +54,12 @@ afterEach(() => {
 });
 
 const R = recordingIdForTrack;
+// The real profile ran a build from before role.ts, which stated its base
+// metadata before its first pull. Its first-pull key set, a device that
+// names no master yet does the same (role.ts sourceRole: 'all').
+const asPreRoleBuild = (raw: Database.Database): void => {
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1)`).run(FIRST_PULL_KEY);
+};
 const ORDERS = [['A syncs first', 'ab'], ['B syncs first', 'ba']] as const;
 
 // ── the Spotify read-sync, offline ─────────────────────────────────────────
@@ -318,6 +325,7 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 			seed: (raw) => {
 				seedSpotify(raw, ids.b, B_LIST, 1_750_000_000_000, lastKey);
 				markPreOpLog(raw);
+				asPreRoleBuild(raw);
 			},
 		});
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
@@ -606,7 +614,7 @@ describe('a streaming playlist holding two releases of one song that another dev
 		const a = await rig.desktop('a', { catalogue: [], seed: (raw) => seed(raw, [['a-sa', ['spA']], ['a-sb', ['spB']]], ['a-sa', 'a-sb'], 1_700_000_000_000) });
 		await a.sync();
 		// B pushes and goes away before pulling.
-		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => seed(raw, [['b-p', ['spA', 'spB']]], ['b-p', 'b-p'], 1_750_000_000_000) });
+		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => { seed(raw, [['b-p', ['spA', 'spB']]], ['b-p', 'b-p'], 1_750_000_000_000); asPreRoleBuild(raw); } });
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
 		await b.sync();
 		b.transport.online = false;

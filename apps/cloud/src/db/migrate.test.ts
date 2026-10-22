@@ -32,7 +32,11 @@ describe('migrations', () => {
 			'device',
 			'device_session',
 			'library_op',
+			'library_op_batch',
+			'library_op_fence',
+			'library_op_staged',
 			'library_snapshot',
+			'library_snapshot_lease',
 			'request_log',
 			'schema_migration',
 		]);
@@ -57,7 +61,11 @@ describe('migrations', () => {
 			{ relname: 'device', relrowsecurity: true },
 			{ relname: 'device_session', relrowsecurity: true },
 			{ relname: 'library_op', relrowsecurity: true },
+			{ relname: 'library_op_batch', relrowsecurity: true },
+			{ relname: 'library_op_fence', relrowsecurity: true },
+			{ relname: 'library_op_staged', relrowsecurity: true },
 			{ relname: 'library_snapshot', relrowsecurity: true },
+			{ relname: 'library_snapshot_lease', relrowsecurity: true },
 			{ relname: 'request_log', relrowsecurity: true },
 		]);
 	});
@@ -128,6 +136,26 @@ describe('sql/roles.sql', () => {
 		await expect(asRole('curator_api', due)).resolves.toEqual([]);
 		await expect(asRole('authenticated', due)).rejects.toThrow(/permission denied/);
 		await expect(asRole('anon', due)).rejects.toThrow(/permission denied/);
+	});
+
+	it('keeps the 0007 / 0008 cross-user lists (snapshot rules, batch upkeep) for the login role alone', async () => {
+		for (const sql of [
+			`select * from curator.users_due_for_snapshot_v2(1, interval '1 hour', interval '5 minutes', interval '1 hour')`,
+			`select * from curator.batches_to_tend(interval '1 day')`,
+			// 0008's snapshot rule, which leaves a freshly master-published account alone.
+			`select * from curator.users_due_for_snapshot_v3(1, interval '1 hour', interval '5 minutes', interval '1 hour', interval '7 days')`,
+		]) {
+			await expect(asRole('curator_api', sql)).resolves.toEqual([]);
+			await expect(asRole('authenticated', sql)).rejects.toThrow(/permission denied/);
+			await expect(asRole('anon', sql)).rejects.toThrow(/permission denied/);
+		}
+		// The batch tables are the user's own, through RLS; never the login role's.
+		for (const table of ['library_op_batch', 'library_op_staged', 'library_op_fence', 'library_snapshot_lease']) {
+			await expect(asRole('curator_api', `select * from curator.${table}`)).rejects.toThrow(/permission denied/);
+			await expect(asRole('anon', `select * from curator.${table}`)).rejects.toThrow(/permission denied/);
+		}
+		// wake_self rings the caller's own channel only, so authenticated may call it; anon may not.
+		await expect(asRole('anon', 'select curator.wake_self(1)')).rejects.toThrow(/permission denied/);
 	});
 
 	it('gives anon nothing in the curator schema', async () => {

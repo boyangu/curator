@@ -42,4 +42,7 @@ kill_timeout = "15s"
 [[vm]]
   size = "shared-cpu-1x"
   # A snapshot build holds one user's whole library state in memory.
+  # The image caps the V8 heap at 384 MB to match (Dockerfile NODE_OPTIONS);
+  # raising this, raise that too in [env], e.g. for 1gb:
+  #   NODE_OPTIONS = "--max-old-space-size=768"
   memory = "512mb"

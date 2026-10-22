@@ -13,7 +13,7 @@ function status(patch: Partial<CloudSyncStatusReport> = {}): CloudSyncStatusRepo
 	return {
 		enabled: true, signedIn: true, userId: 'u1', email: 'dj@example.test', deviceId: 'this', pending: 0, rejected: 0,
 		lastPushAt: NOW - 30_000, lastPullAt: NOW - 30_000, lastCheckedAt: NOW - 12_000, lastChangedAt: NOW - 360_000, transferring: false, lastSeq: 10, lastError: null, needsUpdate: false, revoked: false, boundUserId: 'u1',
-		initialPushDone: true, initialPush: null, bootstrap: null, running: false, nextRetryAt: null,
+		initialPushDone: true, initialPush: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null }, nextRetryAt: null,
 		poll: { policy: { activeSec: 60, idleSec: 600, idleAfterSec: 600 }, active: true, nextPollAt: null },
 		...patch,
 	};
@@ -114,6 +114,12 @@ describe('account panel: the library status line', () => {
 	});
 	it('says syncing only while changes actually move', () => {
 		expect(syncLine(account, status({ running: true, transferring: true }), NOW)).toEqual({ text: 'Syncing…', tone: 'ok' });
+	});
+	it('shows a batch upload as staged, then publishing', () => {
+		const up = status({ running: true, transferring: true, pending: 116_000, batch: { label: 'backfill', phase: 'uploading', done: 42_500, total: 116_000 } });
+		expect(syncLine(account, up, NOW)).toEqual({ text: `Uploading your library (batch)… ${(42_500).toLocaleString()} of ${(116_000).toLocaleString()} changes`, tone: 'ok' });
+		const pub = status({ running: true, batch: { label: 'backfill', phase: 'committing', done: 8_000, total: 116_000 } });
+		expect(syncLine(account, pub, NOW)).toEqual({ text: `Publishing your library upload… ${(8_000).toLocaleString()} of ${(116_000).toLocaleString()} changes`, tone: 'ok' });
 	});
 	it('formats the compact relative time', () => {
 		expect(fmtAgo(null, NOW)).toBe('never');

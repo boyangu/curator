@@ -47,7 +47,9 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 export type BackfillRun = { rows: number; emitted: number; chunks: number; maxSliceMs: number };
 
 // Pages of `page` source rows by rowid, one transaction each (reads + the
-// ops), a yield between; the key is set by a run that finished.
+// ops), a yield between; the key is set by a run that finished. Every op is
+// labelled 'backfill': the sync client uploads the lot as one server batch
+// (outbox.ts BATCH_LABELS).
 async function paged<R extends { rid: number }>(raw: Raw, key: string, select: Database.Statement, page: number, build: (rows: R[]) => EmitOp[]): Promise<BackfillRun> {
 	const out: BackfillRun = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	if (!pending(raw, key)) return out;
@@ -58,7 +60,7 @@ async function paged<R extends { rid: number }>(raw: Raw, key: string, select: D
 		after = rows[rows.length - 1]!.rid;
 		raw.transaction(() => {
 			const ops = build(rows);
-			if (ops.length > 0) out.emitted += emitOps(raw, ops).length;
+			if (ops.length > 0) out.emitted += emitOps(raw, ops, { batchLabel: 'backfill' }).length;
 		})();
 		out.rows += rows.length;
 		out.chunks++;

@@ -16,6 +16,7 @@ import type { Db } from './db/db.js';
 import { CloudError } from './errors.js';
 import type { Logger } from './log.js';
 import type { RateLimits, TokenBucketLimiter } from './rate-limit.js';
+import type { BatchOptions } from './sync/batch.js';
 import type { PullOptions } from './sync/pull.js';
 
 export type AppDeps = {
@@ -31,6 +32,8 @@ export type AppDeps = {
 	catalogue: CataloguePolicy | null;
 	// Refuse reads that name no device (config.ts `requireDeviceId`).
 	requireDeviceId: boolean;
+	// 'batches' (src/sync/batch.ts): commit chunking, leases, expiry.
+	batch: BatchOptions;
 };
 
 export type AppContext = {

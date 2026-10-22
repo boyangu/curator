@@ -69,9 +69,10 @@ import {
 import { artistKey } from '@curator/shared';
 import { log } from '../log.js';
 import { INITIAL_PUSH_KEY } from './apply.js';
-import { emitOps, type EmitOp } from './outbox.js';
+import { emitOps, type BatchLabel, type EmitOp } from './outbox.js';
 import { metaSourceOf } from './track-meta.js';
 import { curationCells, curationOps } from './track-curation.js';
+import { leftToOthers, sourceRole, type SourceRole } from './role.js';
 
 type Raw = Database.Database;
 
@@ -302,9 +303,15 @@ export type TrackAttrsDrain = { rows: number; emitted: number; done: boolean };
 // set-cues-edited where this device holds a later cue edit than the
 // account), the baseline, the marks cleared. Callers check the server
 // feature first (features.ts).
-export function drainTrackAttrs(raw: Raw, opts: { max?: number } = {}): TrackAttrsDrain {
+// `batchLabel`: as drainTrackMeta's (track-meta.ts).
+// On a secondary (role.ts) only the set-attrs of a recording it did not
+// bring, or the master describes, is skipped (no baseline, so a promotion states it); its
+// curation and cue-edit stamp are the user's and go as everywhere.
+export function drainTrackAttrs(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole } = {}): TrackAttrsDrain {
 	const max = Math.max(1, opts.max ?? CHUNK);
 	return raw.transaction((): TrackAttrsDrain => {
+		const role = opts.role ?? sourceRole(raw);
+		if (role.speaks === 'none') return { rows: 0, emitted: 0, done: true };
 		const ids = raw.prepare(`SELECT track_id FROM track_attrs_dirty LIMIT ?`).pluck().all(max) as string[];
 		if (ids.length === 0) return { rows: 0, emitted: 0, done: true };
 		const recs = [...new Set(raw.prepare(`SELECT recording_id FROM track WHERE id IN (${marks(ids.length)}) AND recording_id IS NOT NULL`).pluck().all(...ids) as string[])];
@@ -313,6 +320,7 @@ export function drainTrackAttrs(raw: Raw, opts: { max?: number } = {}): TrackAtt
 		let tooLarge = 0;
 		if (recs.length > 0) {
 			const aliased = new Set(raw.prepare(`SELECT loser FROM recording_alias WHERE loser IN (${marks(recs.length)})`).pluck().all(...recs) as string[]);
+			const others = role.speaks === 'own' ? leftToOthers(raw, role, recs) : new Set<string>();
 			const rowsOf = new Map<string, AttrsRow[]>();
 			for (const r of raw.prepare(`SELECT ${ATTRS_COLUMNS} FROM track WHERE recording_id IN (${marks(recs.length)}) AND remote_only = 0 AND +derived_from_track_id IS NULL
 				ORDER BY recording_id, deleted_at IS NOT NULL, created_at, id`).all(...recs) as AttrsRow[]) {
@@ -366,13 +374,15 @@ export function drainTrackAttrs(raw: Raw, opts: { max?: number } = {}): TrackAtt
 				const rows = rowsOf.get(rec);
 				if (!rows) continue;
 				const row = rows[0]!;
-				const attrs = trackAttrsOf(row, { sources: sources.get(row.id) ?? new Set(), links: links.get(row.id) ?? [], rbKey: rbKey.get(row.id) ?? null, artistName });
-				if (!attrs) tooLarge++;
-				else {
-					const digest = digestOf(rec, attrs);
-					if (seenDigest.get(`${row.id}\u0000${rec}`) !== digest) {
-						ops.push({ entity: 'library_track', entity_id: rec, kind: 'set-attrs', payload: attrs });
-						seen.push([row.id, rec, digest]);
+				if (!others.has(rec)) {
+					const attrs = trackAttrsOf(row, { sources: sources.get(row.id) ?? new Set(), links: links.get(row.id) ?? [], rbKey: rbKey.get(row.id) ?? null, artistName });
+					if (!attrs) tooLarge++;
+					else {
+						const digest = digestOf(rec, attrs);
+						if (seenDigest.get(`${row.id}\u0000${rec}`) !== digest) {
+							ops.push({ entity: 'library_track', entity_id: rec, kind: 'set-attrs', payload: attrs });
+							seen.push([row.id, rec, digest]);
+						}
 					}
 				}
 				// The row's curation (comment free text, colour): LWW, fresh
@@ -386,7 +396,7 @@ export function drainTrackAttrs(raw: Raw, opts: { max?: number } = {}): TrackAtt
 				}
 			}
 		}
-		if (ops.length > 0) emitOps(raw, ops);
+		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel });
 		const putSeen = raw.prepare(`INSERT INTO track_attrs_seen (track_id, recording_id, digest, seen_at) VALUES (?, ?, ?, ?)
 			ON CONFLICT(track_id) DO UPDATE SET recording_id = excluded.recording_id, digest = excluded.digest, seen_at = excluded.seen_at`);
 		const now = Date.now();
@@ -400,17 +410,19 @@ export function drainTrackAttrs(raw: Raw, opts: { max?: number } = {}): TrackAtt
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 const SLICE_MS = 40;
-export async function drainTrackAttrsAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean } } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
+// As track-meta.ts's floor.
+const MIN_CHUNK = 20;
+export async function drainTrackAttrsAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	const fixed = opts.chunk !== undefined;
 	let size = Math.max(1, opts.chunk ?? 20);
 	for (;;) {
 		if (opts.signal?.aborted) break;
 		const t0 = performance.now();
-		const r = drainTrackAttrs(raw, { max: size });
+		const r = drainTrackAttrs(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role });
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
-		if (!fixed && r.rows > 0) size = Math.max(5, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * SLICE_MS / Math.max(ms, 1))));
+		if (!fixed && r.rows > 0) size = Math.max(MIN_CHUNK, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * SLICE_MS / Math.max(ms, 1))));
 		if (r.rows === 0) break;
 		out.chunks++;
 		out.rows += r.rows;

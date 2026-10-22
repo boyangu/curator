@@ -158,6 +158,76 @@ describe('migration gate before 0004', () => {
 	});
 });
 
+// 0007 adds the batch tables and the two functions roles.sql grants; the
+// script must still run on a database without them (it is re-run after
+// every migration), and the gate must name the file.
+describe('migration gate before 0007', () => {
+	let t: TestDb;
+	beforeAll(async () => {
+		t = await createTestDb({ migrate: false });
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0007_')));
+		await t.db.exec(rolesSql);
+	});
+	afterAll(() => t.db.close());
+
+	it('refuses an image that ships 0007_library_op_batch.sql, naming it', async () => {
+		expect(shipped).toContain('0007_library_op_batch.sql');
+		const { log, lines } = capture();
+		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0007_') })]);
+	});
+
+	it('starts once the owner runs it and re-runs roles.sql, which then grants the new functions', async () => {
+		await migrate(t.db, sqlDir);
+		await t.db.exec(rolesSql);
+		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
+		await expect(asApi(t, (q) => q.query(`select * from curator.batches_to_tend(interval '1 day')`))).resolves.toEqual([]);
+	});
+});
+
+// 0008 makes library_snapshot.body nullable and adds the v3 snapshot rule
+// roles.sql grants; a database with bodied snapshots from before it keeps
+// them as they are.
+describe('migration gate before 0008', () => {
+	let t: TestDb;
+	let user: string;
+	beforeAll(async () => {
+		t = await createTestDb({ migrate: false });
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0008_')));
+		await t.db.exec(rolesSql);
+		user = await t.createUser();
+		await t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, body) values ($1, 7, 'body'::bytea)`, [user]);
+	});
+	afterAll(() => t.db.close());
+
+	it('refuses an image that ships 0008_snapshot_storage.sql, naming it', async () => {
+		expect(shipped).toContain('0008_snapshot_storage.sql');
+		const { log, lines } = capture();
+		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0008_') })]);
+	});
+
+	it('keeps older snapshots, and grants v3 once the owner re-runs roles.sql', async () => {
+		await migrate(t.db, sqlDir);
+		await t.db.exec(rolesSql);
+		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
+		await expect(
+			asApi(t, (q) => q.query(`select * from curator.users_due_for_snapshot_v3(1, interval '1 day', interval '5 minutes', interval '1 hour', interval '7 days')`)),
+		).resolves.toEqual([]);
+		const rows = await t.db.query<{ seq: number; bodied: boolean; storage: unknown }>(
+			`select snapshot_seq::int as seq, body is not null as bodied, storage from curator.library_snapshot where user_id = $1`,
+			[user],
+		);
+		expect(rows).toEqual([{ seq: 7, bodied: true, storage: null }]);
+		// Exactly one of body / storage, and a Storage row is stamped.
+		await expect(t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq) values ($1, 8)`, [user])).rejects.toThrow(/library_snapshot_body_or_storage/);
+		await expect(
+			t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, body, storage, state_sha256, published_by) values ($1, 9, 'body'::bytea, '{}', repeat('a', 64), 'd')`, [user]),
+		).rejects.toThrow(/library_snapshot_body_or_storage/);
+		await expect(t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, storage) values ($1, 10, '{}')`, [user])).rejects.toThrow(/library_snapshot_storage_stamped/);
+	});
+});
+
 // 0005 is index-only, but it ships like any other file: a database without it
 // is behind, and the gate says so by name.
 describe('migration gate before 0005', () => {

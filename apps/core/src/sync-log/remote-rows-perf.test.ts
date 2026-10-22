@@ -49,7 +49,7 @@ describe('protocol v3 drains on a generated 10,000-track library', () => {
 				}
 			})();
 			await queueTrackMetaBackfillAsync(a);
-			const meta = await drainTrackMetaAsync(a);
+			const meta = await drainTrackMetaAsync(a, { role: { speaks: 'all' } });
 			expect(meta.emitted).toBe(N);
 			const metaOps = readOutbox(a).filter((o) => o.kind === 'set-meta');
 			a.close();

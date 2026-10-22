@@ -23,6 +23,7 @@ import { planIdentityMerges } from './identity.js';
 import { initialPush } from './initial-push.js';
 import { readOutbox } from './outbox.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { FIRST_PULL_KEY } from './role.js';
 import { INLINE_CREATE_ROWS, MATERIALIZE_KEY, materializeSwept, remotePendingCount, remoteRowCount } from './remote-rows.js';
 import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
 import { loadSnapshot, recordsFromState } from './snapshot.js';
@@ -69,6 +70,8 @@ function meta(title: string, extra: Partial<TrackMeta> = {}): TrackMeta {
 const created = (device: string, rec: string): Record<string, unknown> => op(device, 'library_track', rec, 'create', { added_at: 1_755_000_000_000 });
 const setMeta = (device: string, rec: string, m: TrackMeta): Record<string, unknown> => op(device, 'library_track', rec, 'set-meta', m);
 const master = (device: string, value: string): Record<string, unknown> => op(device, 'setting', MASTER_DEVICE_SETTING, 'set', { value });
+// A device that has seen the account and names no master: it states its own.
+const markFirstPull = (raw: Database.Database): void => { raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1)`).run(FIRST_PULL_KEY); };
 const remoteRec = (i: number): string => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`;
 const rowsOf = (raw: Database.Database, rec: string): Array<{ id: string; remote_only: number; title: string }> =>
 	raw.prepare(`SELECT id, remote_only, title FROM track WHERE recording_id = ? ORDER BY remote_only, id`).all(rec) as never;
@@ -137,6 +140,11 @@ describe('track meta: triggers, drain, baseline', () => {
 		raw.prepare(`UPDATE track SET created_at = created_at + 1 WHERE id = 'b2'`).run();
 		insertTrack(raw, 'gone', { title: 'Merged away' });
 		raw.prepare(`INSERT INTO recording_alias (loser, winner) VALUES (?, ?)`).run(R('gone'), R('a'));
+		// Before the device's first pull nothing is said (role.ts) and the
+		// marks wait for it.
+		expect(drainTrackMeta(raw)).toMatchObject({ rows: 0, emitted: 0 });
+		expect(trackMetaDirtyCount(raw)).toBe(4);
+		markFirstPull(raw);
 		const r = drainTrackMeta(raw);
 		expect(r).toMatchObject({ rows: 4, emitted: 2, done: true });
 		const ops = readOutbox(raw).filter((o) => o.kind === 'set-meta');
@@ -160,6 +168,7 @@ describe('track meta: triggers, drain, baseline', () => {
 		expect(await queueTrackMetaBackfillAsync(raw, { page: 3 })).toBe(7);
 		expect(trackMetaBackfillPending(raw)).toBe(false);
 		expect(raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(TRACK_META_BACKFILL_KEY)).toBeDefined();
+		markFirstPull(raw);
 		expect(drainTrackMeta(raw).emitted).toBe(7);
 	});
 });

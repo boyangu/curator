@@ -30,6 +30,7 @@ import { createLogger, type Logger } from '../log.js';
 import { TokenBucketLimiter, type RateLimits } from '../rate-limit.js';
 import type { AppRouter } from '../router.js';
 import { CATALOGUE_POLICY_D_A, parseCataloguePolicy } from '../catalogue/policy.js';
+import { DEFAULT_BATCH_OPTIONS, type BatchOptions } from '../sync/batch.js';
 import { DEFAULT_PULL_OPTIONS, type PullOptions } from '../sync/pull.js';
 import type { AppDeps } from '../trpc.js';
 import { SUPABASE_SHIM_SQL } from './supabase-shim.js';
@@ -114,12 +115,13 @@ export async function entitle(pg: PGlite, userId: string, opts: { quotaBytes?: n
 // A device's upload, as the storage service records it: an insert into
 // storage.objects as the user, judged by sql/storage.sql's insert policy,
 // with the size in `metadata` (the column the API's blob check reads).
-export async function uploadBlob(pg: PGlite, userId: string, path: string, size: number): Promise<void> {
+export async function uploadBlob(pg: PGlite, userId: string, path: string, size: number, bucket: 'catalogue' | 'snapshots' = 'catalogue'): Promise<void> {
 	await asUser(pg, userId, (tx) =>
-		tx.query(`insert into storage.objects (bucket_id, name, owner_id, metadata) values ('catalogue', $1, $2, jsonb_build_object('size', $3::bigint))`, [
+		tx.query(`insert into storage.objects (bucket_id, name, owner_id, metadata) values ($4, $1, $2, jsonb_build_object('size', $3::bigint))`, [
 			path,
 			userId,
 			String(size),
+			bucket,
 		]),
 	);
 }
@@ -187,6 +189,9 @@ export async function createTestApp(
 		catalogue?: CataloguePolicy | null;
 		// Default false, as production runs during the 'device_reads' transition.
 		requireDeviceId?: boolean;
+		// Default: production's, except that batchCommit waits for its commit
+		// to finish (a minute), so a test reads `committed` from one call.
+		batch?: Partial<BatchOptions>;
 	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
@@ -205,6 +210,7 @@ export async function createTestApp(
 		audit,
 		catalogue: opts.catalogue === undefined ? parseCataloguePolicy(CATALOGUE_POLICY_D_A) : opts.catalogue,
 		requireDeviceId: opts.requireDeviceId ?? false,
+		batch: { ...DEFAULT_BATCH_OPTIONS, commitWaitMs: 60_000, ...opts.batch },
 	};
 	const handler = createFetchHandler(deps);
 	const client = (token?: string) =>

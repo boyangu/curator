@@ -48,7 +48,22 @@ export type EmitOptions = {
 	sameClock?: boolean;
 	// Skip the prerequisite creates (initial push emits every row itself).
 	noPrerequisites?: boolean;
+	// The ops are a one-time backlog's (the initial push, a backfill), not a
+	// user's edit: recorded on their outbox rows so the sync client can
+	// upload them as a server batch ('batches', client.ts) while edits keep
+	// flowing as plain pushes. Only ever passed by the backfill drivers
+	// themselves, per call: a scope spanning their yields would also catch
+	// a user's edit made in between.
+	batchLabel?: BatchLabel;
 };
+
+// The batch labels the client uploads under (protocol BATCH_LABEL_PATTERN):
+// one live server batch per device and label. 'initial-push': a library's
+// first upload. 'backfill': everything stated once later (rekordbox units,
+// recordings and claims, track meta / attributes, the v4 statements, album
+// metadata, feed decisions, and a backlog found pending at upgrade).
+export const BATCH_LABELS = ['initial-push', 'backfill'] as const;
+export type BatchLabel = (typeof BATCH_LABELS)[number];
 
 // ── clock state ─────────────────────────────────────────────────────────────
 // Device-local, in app_setting (never an account key, so it can never ride
@@ -171,14 +186,14 @@ function withPrerequisites(raw: Raw, store: SyncStateStore, ops: readonly EmitOp
 
 // ── emit ────────────────────────────────────────────────────────────────────
 
-type Stmts = { insert: Database.Statement<[string, number, string, number, number, string, string, string, string, number]> };
+type Stmts = { insert: Database.Statement<[string, number, string, number, number, string, string, string, string, number, string | null]> };
 const STMTS = new WeakMap<Raw, Stmts>();
 function stmts(raw: Raw): Stmts {
 	let s = STMTS.get(raw);
 	if (!s) {
 		s = {
-			insert: raw.prepare(`INSERT INTO sync_outbox (op_id, seq_local, device_id, client_ts, schema_version, entity, entity_id, kind, payload, state, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`),
+			insert: raw.prepare(`INSERT INTO sync_outbox (op_id, seq_local, device_id, client_ts, schema_version, entity, entity_id, kind, payload, state, created_at, batch_label)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`),
 		};
 		STMTS.set(raw, s);
 	}
@@ -259,7 +274,7 @@ export function emitOps(raw: Raw, ops: readonly EmitOp[], opts: EmitOptions = {}
 		if (suppress && op.client_ts === undefined && isRestatement(store.state, full)) continue;
 		if (op.client_ts === undefined && !opts.sameClock) clock.lastIssuedTs = ts;
 		clock.lastSeqLocal++;
-		s.insert.run(full.op_id, clock.lastSeqLocal, device, ts, full.schema_version, full.entity, full.entity_id, full.kind, JSON.stringify(full.payload), now);
+		s.insert.run(full.op_id, clock.lastSeqLocal, device, ts, full.schema_version, full.entity, full.entity_id, full.kind, JSON.stringify(full.payload), now, opts.batchLabel ?? null);
 		stamped.push(full);
 		applyOp(store.state, full);
 	}

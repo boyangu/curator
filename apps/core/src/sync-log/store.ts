@@ -167,8 +167,9 @@ function stmts(raw: Raw): Stmts {
 }
 
 // A tombstone row from before B4 (or written by hand) carries no device/op;
-// the empty strings sort it below any real clock at the same ms.
-function tombClock(r: { client_ts: number; device_id: string | null; op_id: string | null }): Clock {
+// the empty strings sort it below any real clock at the same ms. Also the
+// snapshot builder's reading of a row (snapshot-build.ts).
+export function tombClock(r: { client_ts: number; device_id: string | null; op_id: string | null }): Clock {
 	return { ts: r.client_ts, device: r.device_id ?? '', op: r.op_id ?? '' };
 }
 
@@ -205,14 +206,34 @@ export class SyncStateStore {
 	// diffs against it to find the rules whose effect changed.
 	readonly artistAliasBefore: ReadonlyMap<string, ArtistAliasTarget>;
 
+	// Whether `state.merges` holds the persisted merge records yet.
+	private mergesLoaded = false;
+
 	constructor(private readonly raw: Raw) {
 		this.s = stmts(raw);
-		// Merges are few (one per user merge or catalogue alias) and the alias
-		// rebuild reads all of them, so they load whole.
-		for (const r of this.s.allOfMap.all('merges')) {
-			this.state.merges.set(r.key, JSON.parse(r.value));
-			this.snap.get('merges')!.set(r.key, r.value);
-		}
+		// Merge records load whole (the alias rebuild reads all of them), but
+		// only on first read of `state.merges`: the identity resolver writes
+		// one per shared file (~3,500 on the live library), and only the
+		// reducer's recording rule reads them (reduce.ts applyRecording), while
+		// a store is built for every emit and every pulled slice. A getter
+		// rather than a load in touch(), so nothing that reads the map can see
+		// it short — a rebuild over a partial map would drop aliases. The
+		// alias map they derive is persisted itself and loads here as before.
+		const merges = this.state.merges;
+		Object.defineProperty(this.state, 'merges', {
+			enumerable: true,
+			get: () => {
+				if (!this.mergesLoaded) {
+					this.mergesLoaded = true;
+					const snap = this.snap.get('merges')!;
+					for (const r of this.s.allOfMap.all('merges')) {
+						merges.set(r.key, JSON.parse(r.value));
+						snap.set(r.key, r.value);
+					}
+				}
+				return merges;
+			},
+		});
 		for (const r of this.s.aliasAll.all()) this.state.recordingAlias.set(r.loser, r.winner);
 		this.aliasSnap = new Map(this.state.recordingAlias);
 		// Artist alias rules are few and chain resolution reads all of them.
@@ -467,6 +488,8 @@ export class SyncStateStore {
 	// server's `ts`: the server clamped this device's far-future stamp, and
 	// every other device holds the op under the clamped clock. Callers touch
 	// the op first so its records are loaded; flush persists the change.
+	// The loop reads `merges` too, which loads them: a recording op's clock
+	// lives in its merge record, which touch() does not load.
 	restampClock(opId: string, deviceId: string, ts: number): void {
 		const fix = (v: unknown): void => {
 			if (Array.isArray(v)) { for (const x of v) fix(x); return; }
@@ -629,6 +652,8 @@ export class SyncStateStore {
 	flush(): FlushResult {
 		const removed: RemovedRecord[] = [];
 		for (const name of STATE_MAPS) {
+			// Never read, so never changed; reading would load them.
+			if (name === 'merges' && !this.mergesLoaded) continue;
 			const m = this.map(name);
 			const snap = this.snap.get(name)!;
 			for (const [key, v] of m) {

@@ -1,6 +1,7 @@
 // Production entry: config from env, Postgres pool, JWKS-backed verifier,
-// HTTP server, the access-log writer, and the snapshot sweep on a timer
-// (which also prunes the access log once a day). Nothing starts until the
+// HTTP server, the access-log writer, and the maintenance sweep on a timer:
+// batch upkeep (expire idle batches, finish stalled commits), snapshots, and
+// the access log's daily prune. Nothing starts until the
 // migration gate has confirmed the database holds every migration this
 // image ships (src/db/migration-gate.ts).
 
@@ -15,10 +16,12 @@ import { toNodeListener } from './http.js';
 import { createLogger } from './log.js';
 import { defaultRateLimits } from './rate-limit.js';
 import { runDueSnapshots } from './snapshot/job.js';
+import { DEFAULT_BATCH_OPTIONS, tendBatches } from './sync/batch.js';
 import { DEFAULT_PULL_OPTIONS } from './sync/pull.js';
 
-// Often enough that "24 h" is met within the hour; cheap when nothing is
-// due (one query over the device table).
+// Often enough that "24 h" is met within the hour and an idle batch expires
+// within 15 min of its day; cheap when nothing is due (one query over the
+// device table, one over the live batches).
 const SNAPSHOT_SWEEP_MS = 15 * 60 * 1000;
 
 const log = createLogger();
@@ -49,6 +52,7 @@ const handler = createFetchHandler({
 	pull: DEFAULT_PULL_OPTIONS,
 	catalogue: config.catalogue,
 	requireDeviceId: config.requireDeviceId,
+	batch: DEFAULT_BATCH_OPTIONS,
 });
 log.info('device_reads', { requireDeviceId: config.requireDeviceId });
 log.info('catalogue_policy', { allow: config.catalogue?.allow.map((a) => (a.variants ? `${a.unit}:${a.variants.join('|')}` : a.unit)) ?? 'off' });
@@ -65,6 +69,9 @@ server.requestTimeout = 60_000;
 let lastPruneAt = 0;
 
 async function maintenance(): Promise<void> {
+	// Batches first: a commit finished here builds its own snapshot, and a
+	// user with an open batch is skipped by the snapshot rule below.
+	await tendBatches({ db, log, audit, options: DEFAULT_BATCH_OPTIONS }).catch((e: unknown) => log.error('batch_tend_sweep_failed', { error: e }));
 	await runDueSnapshots(db, log).catch((e: unknown) => log.error('snapshot_sweep_failed', { error: e }));
 	if (Date.now() - lastPruneAt >= PRUNE_EVERY_MS) {
 		lastPruneAt = Date.now();

@@ -74,7 +74,28 @@ export type PushInput = {
 //     desktop's memory as a string; pieces keep every response small and
 //     resumable, still read from Postgres under the user's own RLS (the API
 //     holds no Storage service key; see apps/cloud README).
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'snapshot_chunks'] as const;
+//   - 'batches': a device may upload a large one-time backlog (the initial
+//     push, a backfill) as a per-user virtual transaction instead of plain
+//     pushes: sync.batchBegin opens (or resumes) a batch per device and
+//     label, sync.batchPush stages ops into it with push's own validation,
+//     caps and per-op rejections, and sync.batchCommit moves them into the
+//     log under fresh seqs and only then makes them visible, all at once
+//     with one wake-up (the snapshot sweep folds them later, once the log is
+//     quiet). Staged ops are never seen by a pull, a bootstrap or a
+//     snapshot. Normal edits never ride a batch. Without the feature a
+//     client pushes everything plainly.
+//   - 'snapshot_storage': the account's master device publishes the
+//     snapshot itself (section below): it uploads the gzipped state in
+//     content-addressed parts to the private `snapshots` bucket with its own
+//     session and names them in sync.publishSnapshot, which the server only
+//     verifies and indexes. sync.bootstrap takes `storage: true` and, when
+//     the newest snapshot is such a one, answers its manifest; the client
+//     downloads and joins the parts. A client without the feature (or that
+//     does not ask) still gets the newest snapshot the server folded into
+//     Postgres, and the far-behind hint only ever names one of those. The
+//     server's own fold remains the fallback, for an account whose master
+//     never published or has gone quiet (a week).
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'snapshot_chunks', 'batches', 'snapshot_storage'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -105,6 +126,145 @@ export type PushResult = {
 	features?: SyncFeature[];
 };
 
+// ── 'batches' ───────────────────────────────────────────────────────────────
+
+// What a batch is for, chosen by the client ('initial-push', 'backfill'):
+// one open batch per device and label, so a restart resumes the batch
+// instead of opening another. Lower-case ASCII, at most 64 characters.
+export const BATCH_LABEL_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
+
+// open: staging. committing: the commit runs (moving the staged ops into the
+// log); still invisible to every reader. committed:
+// published. aborted: by its device. expired: idle past the server's limit
+// (24 h), its staged ops deleted.
+export type BatchStatus = 'open' | 'committing' | 'committed' | 'aborted' | 'expired';
+
+// sync.batchBegin: the device's open (or committing) batch for `label`, or a
+// new one. `expectedOps` is the client's estimate, for the server's log only.
+export type BatchBeginInput = { deviceId: string; label: string; expectedOps?: number };
+
+export type BatchBeginResult = {
+	batchId: string;
+	status: 'open' | 'committing';
+	// True when the batch existed already (a restart resuming it).
+	resumed: boolean;
+	// Distinct ops staged in it so far.
+	stagedOps: number;
+	features?: SyncFeature[];
+};
+
+// sync.batchPush: like sync.push (same caps, validation and per-op
+// rejections), but the ops are staged, not stored in the log: no seq, no
+// wake-up, invisible to every read. Staging the same op id twice is a no-op.
+export type BatchPushInput = { deviceId: string; batchId: string; ops: Op[] };
+
+export type BatchPushResult = {
+	// Ops now staged (re-staged duplicates included). Everything not in
+	// `rejected` is staged.
+	accepted: number;
+	rejected: { opId: string; reason: RejectReason }[];
+	// As PushResult.clamped: staged ops whose stored `client_ts` differs from
+	// the one sent (the clamp runs at staging).
+	clamped?: { opId: string; clientTs: number }[];
+	stagedOps: number;
+	features?: SyncFeature[];
+};
+
+// sync.batchCommit: starts the commit (idempotent) and reports how far it
+// got. The server works on it in the background; the client calls again
+// until `committed` (the server's wake-up on publish is the other cue).
+// Called on a committed batch it answers the same result again, so a client
+// that crashed before recording the answer learns it.
+export type BatchCommitInput = { deviceId: string; batchId: string };
+
+export type BatchCommitResult = {
+	status: 'committing' | 'committed';
+	// Ops moved into the log so far, of the batch's staged total.
+	movedOps: number;
+	totalOps: number;
+	// `committed` only (0 while committing): the highest seq the log holds
+	// for any of the batch's ops.
+	committedSeq: number;
+	// `committed` only: as PushResult.priorOwnMaxSeq, the highest seq of
+	// this device's ops outside the batch when the commit began.
+	priorOwnMaxSeq?: number;
+	// Ops the commit could not store: their op id belongs to another
+	// account (`not_owner`). Never retried.
+	rejected: { opId: string; reason: RejectReason }[];
+	features?: SyncFeature[];
+};
+
+// sync.batchAbort: drops an open batch and its staged ops. A committing
+// batch cannot be aborted (`batch_committing`); a closed one answers its
+// status.
+export type BatchAbortInput = { deviceId: string; batchId: string };
+export type BatchAbortResult = { status: BatchStatus };
+
+// ── 'snapshot_storage' ──────────────────────────────────────────────────────
+// The account's master device publishes the snapshot; the server indexes it
+// (2026-10-22 sync review). The master already holds the fold of the log in
+// its records (desktop sync_state), so it serialises that, gzips it, and
+// uploads it in parts to the private `snapshots` Storage bucket under its
+// own `<uid>/` prefix, with its own session, as catalogue blobs go
+// (apps/cloud sql/storage.sql). sync.publishSnapshot then names the parts;
+// the server checks they exist with the stated sizes under the caller's RLS,
+// that the caller is the account's master and that the seq is at or below
+// the visible head, and records the manifest. A device that bootstraps with
+// `storage: true` gets the manifest and downloads the parts straight from
+// Storage. The server's own fold (one 227 MB state in a 512 MB API process)
+// remains only as the fallback for an account whose master never published.
+// A snapshot is still only a cache of the log.
+
+export const SNAPSHOT_BUCKET = 'snapshots';
+// One part's most bytes: well under the bucket's per-object limit, and one
+// short request each way.
+export const SNAPSHOT_PART_MAX_BYTES = 8 * 1024 * 1024;
+export const MAX_SNAPSHOT_PARTS = 64;
+// A Storage snapshot is the serialised JSON (snapshot.ts), gzipped, cut into
+// parts: their concatenation is the gzip body. No base64 anywhere.
+export const SNAPSHOT_STORAGE_ENCODING = 'curator.library-state.v1+json+gzip';
+
+// Parts are content-addressed (sha256 of the part's bytes), so the same
+// bytes always land on the same path and an object is never overwritten
+// (the bucket has no update policy).
+export function snapshotPartPath(userId: string, sha256: string): string {
+	return `${userId.toLowerCase()}/snap/${sha256}.cgz`;
+}
+
+export type SnapshotPart = { path: string; bytes: number; sha256: string };
+
+export type SnapshotManifest = {
+	encoding: typeof SNAPSHOT_STORAGE_ENCODING;
+	parts: SnapshotPart[];
+	// The gzip body: the sum of the parts' sizes, and the sha256 of their
+	// concatenation (a reader checks both before it inflates).
+	totalBytes: number;
+	sha256: string;
+	// sha256 of the serialised JSON itself. gzip output is not canonical
+	// across zlib builds; the JSON is (snapshot.ts), so this is what a
+	// verifier compares with a server fold at the same seq.
+	stateSha256: string;
+};
+
+// sync.publishSnapshot: the state after every op up to `snapshotSeq`.
+// Whole-call errors: `not_master`, `snapshot_ahead`, `snapshot_part_missing`,
+// `snapshot_part_invalid`.
+export type PublishSnapshotInput = { deviceId: string; snapshotSeq: number; manifest: SnapshotManifest };
+
+export type PublishSnapshotResult = {
+	// stored: indexed. exists: a snapshot at this seq was stored already.
+	// stale: a newer snapshot is stored already; nothing was done.
+	status: 'stored' | 'exists' | 'stale';
+	// The newest snapshot's seq after this call.
+	latestSeq: number;
+	// Part paths no kept snapshot references any more: the parts of older
+	// snapshots this call pruned or, on 'exists' / 'stale', this call's own
+	// parts (its manifest was not stored). The publisher deletes them from
+	// Storage. A path a kept manifest still lists is never named.
+	superseded: string[];
+	features?: SyncFeature[];
+};
+
 export type PullInput = {
 	afterSeq: number;
 	// At most MAX_PULL_OPS; the server caps it.
@@ -124,9 +284,12 @@ export type PullInput = {
 
 // sync.bootstrap's input ('device_reads'). An older client sends none.
 // `chunked` ('snapshot_chunks'): answer with the size, not the body.
+// `storage` ('snapshot_storage'): the client can read a Storage snapshot;
+// when the newest one is, the answer carries its manifest.
 export type BootstrapInput = {
 	deviceId?: string;
 	chunked?: true;
+	storage?: true;
 };
 
 // The most bytes of snapshot body one sync.snapshotChunk returns (before
@@ -179,6 +342,10 @@ export type BootstrapResult = {
 	encoding: typeof SNAPSHOT_ENCODING;
 	// 'snapshot_chunks', answering `chunked: true`: the gzipped body's size.
 	chunked?: { totalBytes: number };
+	// 'snapshot_storage', answering `storage: true` when the newest snapshot
+	// is in Storage: download and join its parts (`snapshot` is empty and
+	// `chunked` absent). A Postgres snapshot answers as before.
+	storage?: SnapshotManifest;
 };
 
 // Why the server refused a whole call (as opposed to one op, which rides in
@@ -217,6 +384,23 @@ export const CALL_ERROR_REASONS = [
 	// sync.snapshotChunk: the snapshot named was pruned by a newer build
 	// since the bootstrap answered. Bootstrap again.
 	'snapshot_gone',
+	// sync.batchPush / batchCommit: no such open batch for this device (never
+	// begun, aborted, or expired after a day idle). Its staged ops are gone:
+	// stage them again in a new batch.
+	'batch_gone',
+	// sync.batchPush / batchAbort: the batch is committing; poll batchCommit.
+	'batch_committing',
+	// sync.publishSnapshot ('snapshot_storage'): the caller is not the
+	// account's master device; only the master publishes.
+	'not_master',
+	// sync.publishSnapshot: `snapshotSeq` is above the visible head.
+	'snapshot_ahead',
+	// sync.publishSnapshot: a part is not in the caller's Storage prefix yet
+	// (upload it, then publish again), or its size differs from the stated.
+	'snapshot_part_missing',
+	// sync.publishSnapshot: a part's path is not snapshotPartPath(caller,
+	// sha256), or the manifest's sizes do not add up.
+	'snapshot_part_invalid',
 ] as const;
 export type CallErrorReason = (typeof CALL_ERROR_REASONS)[number];
 
@@ -243,6 +427,13 @@ export interface CloudService {
 		pull(input: PullInput): Promise<PullResult>;
 		bootstrap(input?: BootstrapInput): Promise<BootstrapResult>;
 		snapshotChunk(input: SnapshotChunkInput): Promise<SnapshotChunkResult>;
+		// 'batches'.
+		batchBegin(input: BatchBeginInput): Promise<BatchBeginResult>;
+		batchPush(input: BatchPushInput): Promise<BatchPushResult>;
+		batchCommit(input: BatchCommitInput): Promise<BatchCommitResult>;
+		batchAbort(input: BatchAbortInput): Promise<BatchAbortResult>;
+		// 'snapshot_storage'.
+		publishSnapshot(input: PublishSnapshotInput): Promise<PublishSnapshotResult>;
 	};
 	account: {
 		registerDevice(input: RegisterDeviceInput): Promise<{ ok: true }>;

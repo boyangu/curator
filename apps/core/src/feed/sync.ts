@@ -148,7 +148,8 @@ export async function backfillFeedDecisionsAsync(raw: Raw, store: Pick<FeedStore
 	let emitted = 0;
 	for (let i = 0; i < ops.length; i += 500) {
 		const chunk = ops.slice(i, i + 500);
-		raw.transaction(() => { emitted += emitOps(raw, chunk).length; })();
+		// A one-time backlog: uploaded as a server batch ('batches', outbox.ts).
+		raw.transaction(() => { emitted += emitOps(raw, chunk, { batchLabel: 'backfill' }).length; })();
 		await yieldToLoop();
 	}
 	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)

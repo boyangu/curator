@@ -7,17 +7,27 @@ import {
 	MIN_SUPPORTED_SCHEMA_VERSION,
 	SCHEMA_VERSION,
 	SYNC_FEATURES,
+	ZBatchAbortInput,
+	ZBatchBeginInput,
+	ZBatchCommitInput,
+	ZBatchPushInput,
 	ZBootstrapInput,
 	ZSnapshotChunkInput,
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
+	ZPublishSnapshotInput,
 	ZPullInput,
+	type BatchAbortResult,
+	type BatchBeginResult,
+	type BatchCommitResult,
+	type BatchPushResult,
 	type CatalogueInventoryResult,
 	type CatalogueLookupResult,
 	type CataloguePolicy,
 	type CataloguePutResult,
 	type DeviceInfo,
+	type PublishSnapshotResult,
 	type PullResult,
 	type PushResult,
 	type SnapshotChunkResult,
@@ -28,7 +38,9 @@ import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
+import { batchAbort, batchBegin, batchCommit, batchPush, type BatchDeps } from './sync/batch.js';
 import { bootstrap, snapshotChunk } from './sync/bootstrap.js';
+import { publishSnapshot } from './sync/publish-snapshot.js';
 import { pull } from './sync/pull.js';
 import { push } from './sync/push.js';
 import { authedProcedure, publicProcedure, rateLimit, router, type AppContext } from './trpc.js';
@@ -88,6 +100,19 @@ async function auditedRead<T>(ctx: AppContext, procedure: 'sync.pull' | 'sync.bo
 	}
 }
 
+// A batch call refused for a revoked device is audited like a push from one
+// (it is one: the batch's ops would be its pushes); the error goes on.
+async function auditedWrite<T>(ctx: AppContext, ops: number, fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (e) {
+		if (e instanceof DeviceRevokedError) ctx.call.audit('push_from_revoked_device', { ops, via: e.via });
+		throw e;
+	}
+}
+
+const batchDeps = (ctx: AppContext): BatchDeps => ({ db: ctx.deps.db, log: ctx.deps.log, audit: ctx.deps.audit, options: ctx.deps.batch });
+
 const ZRegisterDeviceInput = z
 	.object({
 		deviceId: ZDeviceId,
@@ -140,8 +165,44 @@ export const appRouter = router({
 			readDevice(ctx, input?.deviceId);
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
 			const r = await auditedRead(ctx, 'sync.bootstrap', () => bootstrap(ctx.deps.db, ctx.user.id, callerOf(ctx), input ?? {}));
-			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes: r.chunked ? r.chunked.totalBytes : Buffer.byteLength(r.snapshot, 'base64'), chunked: !!r.chunked });
+			const bytes = r.storage ? r.storage.totalBytes : r.chunked ? r.chunked.totalBytes : Buffer.byteLength(r.snapshot, 'base64');
+			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes, chunked: !!r.chunked, storage: !!r.storage });
 			return r;
+		}),
+		// 'batches' (src/sync/batch.ts). All four share the push bucket: they
+		// are the push path, staged. request_log: batchPush has ops_in = ops
+		// sent, batchCommit ops_out = ops moved into the log so far.
+		batchBegin: authedProcedure.input(ZBatchBeginInput).mutation(async ({ ctx, input }): Promise<BatchBeginResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			return withFeatures(ctx, await auditedWrite(ctx, 0, () => batchBegin(batchDeps(ctx), ctx.user.id, callerOf(ctx), input)));
+		}),
+		batchPush: authedProcedure.input(ZBatchPushInput).mutation(async ({ ctx, input }): Promise<BatchPushResult> => {
+			ctx.call.deviceId = input.deviceId;
+			ctx.call.opsIn = input.ops.length;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			return withFeatures(ctx, await auditedWrite(ctx, input.ops.length, () => batchPush(batchDeps(ctx), ctx.call.audit, ctx.user.id, callerOf(ctx), input)));
+		}),
+		batchCommit: authedProcedure.input(ZBatchCommitInput).mutation(async ({ ctx, input }): Promise<BatchCommitResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			const r = await auditedWrite(ctx, 0, () => batchCommit(batchDeps(ctx), ctx.user.id, callerOf(ctx), input));
+			ctx.call.opsOut = r.movedOps;
+			return withFeatures(ctx, r);
+		}),
+		batchAbort: authedProcedure.input(ZBatchAbortInput).mutation(async ({ ctx, input }): Promise<BatchAbortResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			return auditedWrite(ctx, 0, () => batchAbort(batchDeps(ctx), ctx.user.id, callerOf(ctx), input));
+		}),
+		// 'snapshot_storage' (src/sync/publish-snapshot.ts): the master indexes
+		// the snapshot it uploaded. The push bucket: it is a write, a few a day.
+		// A revoked device is audited as a push from one (it would replace
+		// what every new device loads).
+		publishSnapshot: authedProcedure.input(ZPublishSnapshotInput).mutation(async ({ ctx, input }): Promise<PublishSnapshotResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			return withFeatures(ctx, await auditedWrite(ctx, 0, () => publishSnapshot(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input)));
 		}),
 		// 'snapshot_chunks': the body of a chunked bootstrap, a piece a call.
 		// The pull bucket, like the bootstrap it belongs to (a 40 MB body is

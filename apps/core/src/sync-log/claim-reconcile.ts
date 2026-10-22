@@ -67,7 +67,9 @@ export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: numb
 				ops.push(l.fetched_at != null ? { ...op, client_ts: Math.max(0, Math.round(l.fetched_at)) } : op);
 				out.bySource[l.source] = (out.bySource[l.source] ?? 0) + 1;
 			}
-			if (ops.length > 0) emitOps(raw, ops);
+			// Labelled like the backfill it completes; a handful (the usual
+			// launch) is below the client's batch threshold and goes plainly.
+			if (ops.length > 0) emitOps(raw, ops, { batchLabel: 'backfill' });
 			out.emitted += ops.length;
 		})();
 		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);

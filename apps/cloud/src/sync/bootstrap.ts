@@ -1,16 +1,28 @@
 // sync.bootstrap: the latest snapshot plus the seq it covers; the client
-// loads it, then pulls after `snapshotSeq`. Inline base64 because v1 keeps
-// snapshots in Postgres; the shape is the protocol's `BootstrapResult`.
-// Behind the same revoke gate as a pull (account/device-gate.ts).
+// loads it, then pulls after `snapshotSeq`. The shape is the protocol's
+// `BootstrapResult`. Behind the same revoke gate as a pull
+// (account/device-gate.ts).
 //
-// 'snapshot_chunks': a client that asks `chunked: true` gets the size, not
-// the body, and reads the body in pieces through sync.snapshotChunk. Still
-// from Postgres, under the user's RLS like every read here: the API holds no
-// Storage service key, so a bucket would have to be written as the user,
-// and the snapshot job runs on a timer with no user session to write with.
-// A bytea gzip body is stored uncompressed out of line (pglz finds nothing
-// to gain on gzip), so `substring(body from … for …)` reads just the slice's
-// TOAST chunks, not the whole value per piece.
+// Two kinds of snapshot (sql/0008_snapshot_storage.sql): bodied ones the
+// server's fold wrote into Postgres, and Storage ones the account's master
+// published ('snapshot_storage', src/sync/publish-snapshot.ts), which this
+// server cannot read: it holds no Storage key. A client that asks
+// `storage: true` gets the newest of either; when that is a Storage one, the
+// answer is its manifest and the client downloads the parts itself with its
+// own session. Any other client gets the newest bodied snapshot (an older
+// seq is fine: it pulls the rest), or the empty state at 0.
+//
+// 'snapshot_chunks': a client that asks `chunked: true` gets a bodied
+// snapshot's size, not its body, and reads the body in pieces through
+// sync.snapshotChunk, under the user's RLS like every read here. A bytea
+// gzip body is stored uncompressed out of line (pglz finds nothing to gain
+// on gzip), so `substring(body from … for …)` reads just the slice's TOAST
+// chunks, not the whole value per piece. Bodies leave Postgres as bytea and
+// are base64'd here, never by SQL's encode() (db.ts).
+//
+// The newest snapshot is offered as it is, a committing batch's fence or
+// not: none is ever stored above a fence (visibility.ts; publishSnapshot
+// refuses a seq above the visible head).
 
 import {
 	createLibraryState,
@@ -19,13 +31,13 @@ import {
 	type BootstrapResult,
 	type SnapshotChunkInput,
 	type SnapshotChunkResult,
+	type SnapshotManifest,
 } from '@curator/protocol';
 import { assertSessionNotRevoked, gateDevice, type Caller } from '../account/device-gate.js';
-import { num, type Db } from '../db/db.js';
+import { bytes, num, type Db } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
 import { encodeSnapshot } from '../snapshot/codec.js';
-import { BODY_BASE64 } from '../snapshot/job.js';
 
 let emptyBody: Promise<string> | null = null;
 
@@ -40,22 +52,22 @@ export async function bootstrap(db: Db, userId: string, caller: Caller, input: B
 	const latest = await withUserTx(db, userId, async (tx) => {
 		if (input.deviceId !== undefined) await gateDevice(tx, caller, input.deviceId);
 		else await assertSessionNotRevoked(tx, caller);
-		if (input.chunked) {
-			const [row] = await tx.query<{ seq: unknown; bytes: unknown }>(
-				`select snapshot_seq::float8 as seq, octet_length(body)::float8 as bytes from curator.library_snapshot
-				where user_id = (select auth.uid())
-				order by snapshot_seq desc
-				limit 1`,
-			);
-			return row ? { snapshot: '', snapshotSeq: num(row.seq), chunked: { totalBytes: num(row.bytes) } } : null;
-		}
-		const [row] = await tx.query<{ seq: unknown; body: string }>(
-			`select snapshot_seq::float8 as seq, ${BODY_BASE64} as body from curator.library_snapshot
-			where user_id = (select auth.uid())
+		// A client that cannot read Storage gets the newest bodied snapshot,
+		// however much newer a published one is: it pulls the difference.
+		// The body is read only for an inline answer; `body is null` is the
+		// null bitmap, not a detoast.
+		const [row] = await tx.query<{ seq: unknown; bytes: unknown; storage: string | null; body?: unknown }>(
+			`select snapshot_seq::float8 as seq, octet_length(body)::float8 as bytes, storage::text as storage${input.chunked ? '' : ', body'}
+			from curator.library_snapshot
+			where user_id = (select auth.uid())${input.storage ? '' : ' and body is not null'}
 			order by snapshot_seq desc
 			limit 1`,
 		);
-		return row ? { snapshot: row.body, snapshotSeq: num(row.seq) } : null;
+		if (!row) return null;
+		const snapshotSeq = num(row.seq);
+		if (row.storage !== null) return { snapshot: '', snapshotSeq, storage: JSON.parse(row.storage) as SnapshotManifest };
+		if (input.chunked) return { snapshot: '', snapshotSeq, chunked: { totalBytes: num(row.bytes) } };
+		return { snapshot: bytes(row.body).toString('base64'), snapshotSeq };
 	});
 	if (latest) return { ...latest, encoding: SNAPSHOT_ENCODING };
 	// The empty state is a few hundred bytes: inline even when chunked.
@@ -67,13 +79,13 @@ export async function snapshotChunk(db: Db, userId: string, caller: Caller, inpu
 	return withUserTx(db, userId, async (tx) => {
 		if (input.deviceId !== undefined) await gateDevice(tx, caller, input.deviceId);
 		else await assertSessionNotRevoked(tx, caller);
-		const [row] = await tx.query<{ data: string; bytes: unknown }>(
-			`select translate(encode(substring(body from $2::int + 1 for $3::int), 'base64'), chr(10), '') as data, octet_length(body)::float8 as bytes
+		const [row] = await tx.query<{ data: unknown; bytes: unknown }>(
+			`select substring(body from $2::int + 1 for $3::int) as data, octet_length(body)::float8 as bytes
 			from curator.library_snapshot
-			where user_id = (select auth.uid()) and snapshot_seq = $1::bigint`,
+			where user_id = (select auth.uid()) and snapshot_seq = $1::bigint and body is not null`,
 			[String(input.snapshotSeq), String(input.offset), String(input.length)],
 		);
 		if (!row) throw new CloudError('NOT_FOUND', 'snapshot_gone');
-		return { snapshotSeq: input.snapshotSeq, offset: input.offset, data: row.data, totalBytes: num(row.bytes) };
+		return { snapshotSeq: input.snapshotSeq, offset: input.offset, data: bytes(row.data).toString('base64'), totalBytes: num(row.bytes) };
 	});
 }

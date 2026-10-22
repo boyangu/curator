@@ -37,6 +37,19 @@ RUN pnpm deploy --filter @curator/cloud --prod /out
 FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
 ENV NODE_ENV=production
 ENV PORT=8080
+# The V8 heap cap, set for the 512 MB Fly machine (fly.toml [[vm]]) rather
+# than left to V8's guess from the memory it detects. A snapshot build holds
+# one user's whole folded library on the heap, plus Buffers outside it (the
+# gunzipped JSON, the gzip output). A build too big for the machine should
+# end as V8's "JavaScript heap out of memory", its stack on stderr in Fly's
+# logs, not as a SIGKILL from the kernel's OOM killer with nothing from the
+# process to say what it was doing. Fatal either way (Fly restarts the
+# machine); the difference is knowing why. 384 MB of heap leaves ~128 MB for
+# what lives outside it: code, the young generation, those Buffers. Through
+# NODE_OPTIONS so it reaches every node process in the image, the CLIs run
+# over `fly ssh console` included, and so a bigger machine is a fly.toml
+# change: set NODE_OPTIONS there in [env], about 3/4 of the new memory.
+ENV NODE_OPTIONS=--max-old-space-size=384
 WORKDIR /app
 COPY --from=build --chown=node:node /out .
 # Build provenance, served by the health procedure. Declared after the

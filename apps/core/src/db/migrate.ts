@@ -1047,16 +1047,31 @@ const ALTER_MIGRATIONS: string[] = [
 	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_insert AFTER INSERT ON track
 		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
 		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.id); END`,
-	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_update AFTER UPDATE OF recording_id, title, artists, artists_base, album_title, duration, isrc,
+	// The update triggers fire on a real change only (OLD IS NOT NEW per
+	// column the drain states): the streaming read-syncs, the rekordbox
+	// importer and the enrichers re-write rows with the values they already
+	// hold, and each such write queued a drain pass that found nothing to
+	// state. IS NOT, not !=, so NULL ↔ value counts. Renamed when gated
+	// (2026-10-22): CREATE TRIGGER IF NOT EXISTS never replaces, so the
+	// ungated trigger an older build left is dropped first, by its old name.
+	`DROP TRIGGER IF EXISTS track_meta_dirty_update`,
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_change AFTER UPDATE OF recording_id, title, artists, artists_base, album_title, duration, isrc,
 		release_date, label, genre, cover_url, track_number, disc_number, remote_only ON track
 		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+			AND (OLD.recording_id IS NOT NEW.recording_id OR OLD.title IS NOT NEW.title OR OLD.artists IS NOT NEW.artists
+				OR OLD.artists_base IS NOT NEW.artists_base OR OLD.album_title IS NOT NEW.album_title OR OLD.duration IS NOT NEW.duration
+				OR OLD.isrc IS NOT NEW.isrc OR OLD.release_date IS NOT NEW.release_date OR OLD.label IS NOT NEW.label
+				OR OLD.genre IS NOT NEW.genre OR OLD.cover_url IS NOT NEW.cover_url OR OLD.track_number IS NOT NEW.track_number
+				OR OLD.disc_number IS NOT NEW.disc_number OR OLD.remote_only IS NOT NEW.remote_only)
 		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.id); END`,
 	// A row's source (local file vs streaming link) is part of its meta.
 	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_insert AFTER INSERT ON source_link
 		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (NEW.track_id); END`,
 	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_delete AFTER DELETE ON source_link
 		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (OLD.track_id); END`,
-	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_move AFTER UPDATE OF track_id ON source_link
+	`DROP TRIGGER IF EXISTS track_meta_dirty_link_move`,
+	`CREATE TRIGGER IF NOT EXISTS track_meta_dirty_link_moved AFTER UPDATE OF track_id ON source_link
+		WHEN OLD.track_id IS NOT NEW.track_id
 		BEGIN INSERT OR IGNORE INTO track_meta_dirty (track_id) VALUES (OLD.track_id), (NEW.track_id); END`,
 	// A source arriving on a remote row makes it this device's own: an
 	// import or a scan bound to the recording (claim-bind.ts) attaches its
@@ -1186,15 +1201,30 @@ const ALTER_MIGRATIONS: string[] = [
 	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_insert AFTER INSERT ON track
 		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
 		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.id) ON CONFLICT DO NOTHING; END`,
-	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_update AFTER UPDATE OF recording_id, bpm, key_camelot, comment, color_label, explicit, mbid, copyright,
-		play_count, cues_edited_at, artists, artists_base, remote_only, attrs_adopted ON track
+	// Gated on a real change, as track_meta_dirty_change (old name dropped).
+	// The credits the drain states are `artists` plus the overrides' artists
+	// (track-attrs.ts creditNames); artists_base is base metadata, not an
+	// attribute, so it is not in this list. A provider payload is read for
+	// Spotify / Tidal only (their release and artist ids); a Beatport or
+	// Traxsource link counts by being there (key source), so a refetch of
+	// its payload states nothing.
+	`DROP TRIGGER IF EXISTS track_attrs_dirty_update`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_change AFTER UPDATE OF recording_id, bpm, key_camelot, comment, color_label, explicit, mbid, copyright,
+		play_count, cues_edited_at, artists, overrides, remote_only, attrs_adopted ON track
 		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+			AND (OLD.recording_id IS NOT NEW.recording_id OR OLD.bpm IS NOT NEW.bpm OR OLD.key_camelot IS NOT NEW.key_camelot
+				OR OLD.comment IS NOT NEW.comment OR OLD.color_label IS NOT NEW.color_label OR OLD.explicit IS NOT NEW.explicit
+				OR OLD.mbid IS NOT NEW.mbid OR OLD.copyright IS NOT NEW.copyright OR OLD.play_count IS NOT NEW.play_count
+				OR OLD.cues_edited_at IS NOT NEW.cues_edited_at OR OLD.artists IS NOT NEW.artists OR OLD.overrides IS NOT NEW.overrides
+				OR OLD.remote_only IS NOT NEW.remote_only OR OLD.attrs_adopted IS NOT NEW.attrs_adopted)
 		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.id) ON CONFLICT DO NOTHING; END`,
 	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_insert AFTER INSERT ON source_link
 		WHEN NEW.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
 		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (NEW.track_id) ON CONFLICT DO NOTHING; END`,
-	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_update AFTER UPDATE OF track_id, payload ON source_link
+	`DROP TRIGGER IF EXISTS track_attrs_dirty_link_update`,
+	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_change AFTER UPDATE OF track_id, payload ON source_link
 		WHEN NEW.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
+			AND (OLD.track_id IS NOT NEW.track_id OR (NEW.source IN ('spotify', 'tidal') AND OLD.payload IS NOT NEW.payload))
 		BEGIN INSERT INTO track_attrs_dirty (track_id) VALUES (OLD.track_id), (NEW.track_id) ON CONFLICT DO NOTHING; END`,
 	`CREATE TRIGGER IF NOT EXISTS track_attrs_dirty_link_delete AFTER DELETE ON source_link
 		WHEN OLD.source IN ('spotify', 'tidal', 'beatport', 'traxsource')
@@ -1210,15 +1240,24 @@ const ALTER_MIGRATIONS: string[] = [
 	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_dirty_insert AFTER INSERT ON playlist
 		WHEN NEW.is_smart = 0 AND NEW.derived_from_playlist_id IS NULL
 		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist', NEW.id) ON CONFLICT DO NOTHING; END`,
-	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_dirty_update AFTER UPDATE OF hybrid_tidal, position, mark, description, owner_name, owner_id, cover_url,
+	// Gated on a real change, as track_meta_dirty_change (old names dropped):
+	// every streaming read-sync re-writes each playlist's provider details.
+	`DROP TRIGGER IF EXISTS playlist_attrs_dirty_update`,
+	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_dirty_change AFTER UPDATE OF hybrid_tidal, position, mark, description, owner_name, owner_id, cover_url,
 		is_public, is_collaborative, is_hidden, followers ON playlist
 		WHEN NEW.is_smart = 0 AND NEW.derived_from_playlist_id IS NULL
+			AND (OLD.hybrid_tidal IS NOT NEW.hybrid_tidal OR OLD.position IS NOT NEW.position OR OLD.mark IS NOT NEW.mark
+				OR OLD.description IS NOT NEW.description OR OLD.owner_name IS NOT NEW.owner_name OR OLD.owner_id IS NOT NEW.owner_id
+				OR OLD.cover_url IS NOT NEW.cover_url OR OLD.is_public IS NOT NEW.is_public OR OLD.is_collaborative IS NOT NEW.is_collaborative
+				OR OLD.is_hidden IS NOT NEW.is_hidden OR OLD.followers IS NOT NEW.followers)
 		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist', NEW.id) ON CONFLICT DO NOTHING; END`,
 	`CREATE TRIGGER IF NOT EXISTS playlist_attrs_seen_delete AFTER DELETE ON playlist
 		BEGIN DELETE FROM playlist_attrs_seen WHERE entity = 'playlist' AND id = OLD.id; END`,
 	`CREATE TRIGGER IF NOT EXISTS folder_attrs_dirty_insert AFTER INSERT ON playlist_folder
 		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist_folder', NEW.id) ON CONFLICT DO NOTHING; END`,
-	`CREATE TRIGGER IF NOT EXISTS folder_attrs_dirty_update AFTER UPDATE OF position ON playlist_folder
+	`DROP TRIGGER IF EXISTS folder_attrs_dirty_update`,
+	`CREATE TRIGGER IF NOT EXISTS folder_attrs_dirty_change AFTER UPDATE OF position ON playlist_folder
+		WHEN OLD.position IS NOT NEW.position
 		BEGIN INSERT INTO playlist_attrs_dirty (entity, id) VALUES ('playlist_folder', NEW.id) ON CONFLICT DO NOTHING; END`,
 	`CREATE TRIGGER IF NOT EXISTS folder_attrs_seen_delete AFTER DELETE ON playlist_folder
 		BEGIN DELETE FROM playlist_attrs_seen WHERE entity = 'playlist_folder' AND id = OLD.id; END`,
@@ -2422,6 +2461,9 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// Collapse play-history restatements a pre-fix rekordbox sync left in a
 	// never-synced outbox. One-shot, gated, backs up first.
 	dedupeOutboxRestatements(sqlite, dbPath);
+	// Batch labels on the outbox ('batches'); a backlog already pending at
+	// upgrade is classified with the column's add, never again.
+	addOutboxBatchColumns(sqlite);
 	// Stamp existing analysis rows with the audio they describe, so the
 	// catalogue can share them. One-shot, gated; touches only the new column.
 	backfillAnalysisAudioHash(sqlite);
@@ -2429,6 +2471,41 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// artist-alias.ts mapCredits): queued here, drained by the sync client.
 	queueRoleMergeRederive(sqlite);
 	sqlite.close();
+}
+
+// One-shot: sync_outbox.batch_label / batch_id ('batches', sync-log/client.ts)
+// and the classification of what is already pending. Riding the column's
+// add, like addLinkPushedAt: a re-run must never relabel live edits.
+//
+// A desktop upgraded mid-backfill (the main library, 2026-10-21: ~116k v4
+// ops emitted, part of them already pushed plainly) holds the rest of that
+// backfill as unlabelled pending rows, which would otherwise keep going out
+// as plain pushes. At upgrade a pending backlog of OUTBOX_BACKLOG_MIN rows or
+// more is by construction a backlog: edits drain within seconds of being
+// made. So all of it is labelled 'backfill' and goes up in one batch. The
+// rows keep their op ids, so nothing is lost or doubled: the acked ones are
+// untouched, and any of these the server already holds (a push whose answer
+// was lost) is skipped by op id when the batch commits. A live edit caught in
+// it reaches the other devices with the batch's commit instead of on its own
+// — later, never wrong: the reducer does not care about order. Below the
+// threshold nothing is labelled and the few pending rows push as before.
+const OUTBOX_BACKLOG_MIN = 1000;
+
+function addOutboxBatchColumns(sqlite: Database.Database): void {
+	try {
+		sqlite.exec(`ALTER TABLE sync_outbox ADD COLUMN batch_label TEXT`);
+	} catch (err) {
+		const message = (err as Error).message ?? '';
+		if (!/duplicate column/i.test(message)) throw err;
+		return; // already added: the backlog was classified then
+	}
+	sqlite.exec(`ALTER TABLE sync_outbox ADD COLUMN batch_id TEXT`);
+	sqlite.exec(`CREATE INDEX IF NOT EXISTS sync_outbox_batch_idx ON sync_outbox(batch_label, batch_id, seq_local) WHERE state = 'pending' AND batch_label IS NOT NULL`);
+	const pending = (sqlite.prepare(`SELECT count(*) AS n FROM sync_outbox WHERE state = 'pending'`).get() as { n: number }).n;
+	if (pending >= OUTBOX_BACKLOG_MIN) {
+		sqlite.prepare(`UPDATE sync_outbox SET batch_label = 'backfill' WHERE state = 'pending'`).run();
+		mlog.info('outbox backlog labelled for a batch upload', { rows: pending });
+	}
 }
 
 // One-shot: add rekordbox_link.pushed_at ("last verified push") and treat

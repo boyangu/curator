@@ -12,6 +12,7 @@ import { MAX_PULL_OPS, SYNC_FEATURES, type PullInput, type PullResult, type Stor
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx, type UserTx } from '../db/user-tx.js';
 import { assertSessionNotRevoked, gateDevice, type Caller } from '../account/device-gate.js';
+import { VISIBLE_THROUGH } from './visibility.js';
 
 export type PullCall = PullInput;
 
@@ -69,10 +70,11 @@ export function toStoredOp(r: OpRow): StoredOp {
 	} as StoredOp;
 }
 
+// Never past a committing batch's fence (visibility.ts).
 export async function selectOpsAfter(tx: Queryable, afterSeq: number, limit: number): Promise<StoredOp[]> {
 	const rows = await tx.query<OpRow>(
 		`select ${OP_COLUMNS} from curator.library_op
-		where user_id = (select auth.uid()) and seq > $1::bigint
+		where user_id = (select auth.uid()) and seq > $1::bigint and seq <= ${VISIBLE_THROUGH}
 		order by seq
 		limit $2::int`,
 		[String(afterSeq), String(limit)],
@@ -80,10 +82,18 @@ export async function selectOpsAfter(tx: Queryable, afterSeq: number, limit: num
 	return rows.map(toStoredOp);
 }
 
+// The snapshot the far-behind hint names: the newest BODIED one, fence or
+// not (none is ever stored above a fence, so it never covers an op the
+// reader may not see yet; visibility.ts). Not a newer master-published one
+// ('snapshot_storage'): a pull does not say whether its client can read
+// Storage, and a client that cannot would bootstrap to the older bodied
+// snapshot, pull, be told again, and download the library every cycle. Every
+// client can load a bodied snapshot, and one that reads Storage bootstraps
+// to the newest of either, at or past the hint.
 export async function latestSnapshotSeq(tx: Queryable): Promise<number | null> {
 	const [row] = await tx.query<{ seq: unknown }>(
 		`select snapshot_seq::float8 as seq from curator.library_snapshot
-		where user_id = (select auth.uid())
+		where user_id = (select auth.uid()) and body is not null
 		order by snapshot_seq desc
 		limit 1`,
 	);
@@ -150,19 +160,26 @@ type SkipPageRow = { [K in keyof OpRow]: OpRow[K] | null } & { next_seq: unknown
 //     this page never saw. Hence one statement.
 //   - Never the sequence's position or a push's `maxSeq` / `batchMaxSeq`:
 //     those can name seqs that are not committed, or not yet visible here.
+//   - "The head" is the visible head: while a batch commits, the page and
+//     the head both stop at its fence, in this one statement
+//     (visibility.ts), so the cursor never passes ops it will be shown
+//     later.
 // `in_range` counts the rows the cursor moves over (the index answers it);
 // minus the ops returned, that is the own ops skipped, for the access log.
 async function selectPageSkippingOwn(tx: Queryable, afterSeq: number, limit: number, skip: SkipOwn): Promise<{ ops: StoredOp[]; nextSeq: number; skippedOwn: number }> {
 	const rows = await tx.query<SkipPageRow>(
-		`with page as (
+		`with fence as (
+			select ${VISIBLE_THROUGH} as v
+		), page as (
 			select ${OP_COLUMNS} from curator.library_op
-			where user_id = (select auth.uid()) and seq > $1::bigint ${skipPredicate(skip, 3, 4)}
+			where user_id = (select auth.uid()) and seq > $1::bigint and seq <= (select v from fence) ${skipPredicate(skip, 3, 4)}
 			order by seq
 			limit $2::int
 		), bound as (
 			select case
 				when (select count(*) from page) >= $2::int then (select max(seq) from page)::bigint
-				else greatest($1::bigint, (select coalesce(max(seq), 0) from curator.library_op where user_id = (select auth.uid())))
+				else greatest($1::bigint, (select coalesce(max(seq), 0) from curator.library_op
+					where user_id = (select auth.uid()) and seq <= (select v from fence)))
 			end as next_seq
 		), moved as (
 			select count(*)::float8 as n from curator.library_op

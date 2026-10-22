@@ -33,6 +33,7 @@ import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport } from './cloud/transport.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
+import { createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
 import { cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import { PROFILE_NAME_RE, decideRails, parseProfileEnv, profileAppUserModelId, profileDeviceName, profileRailsSummary, profileTitleSuffix, profileUserDataDir } from './profile.js';
 import type { CloudTransport } from '@curator/core';
@@ -1202,6 +1203,10 @@ app.whenReady().then(async () => {
 				// Shared analysis: waveform blobs move directly between this
 				// device and Supabase Storage under the user's own session.
 				blobs: createCatalogueBlobStore(accountForCore),
+				// The account snapshot this device publishes when it is the
+				// master: built in a utility process (DB read-only, parts under
+				// userData), uploaded by core with the user's session.
+				snapshot: { builder: createUtilitySnapshotBuilder({ workerPath: join(__dirname, 'snapshot-worker.cjs'), dbPath, tmpRoot: join(app.getPath('userData'), 'snapshot-build') }) },
 			}
 			: undefined,
 		peaksDir,

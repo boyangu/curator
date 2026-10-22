@@ -26,7 +26,7 @@ import { audioHash } from '../ingest/audio-hash.js';
 import type { ParseFn, ParseResult } from '../ingest/types.js';
 import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import type { ScanProgress } from '../local/scanner.js';
-import { createCoreService, type CoreService } from '../service.js';
+import { createCoreService, type CoreService, type CoreServiceOptions } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import { INITIAL_PUSH_KEY } from '../sync-log/apply.js';
 import { readCursor } from '../sync-log/client.js';
@@ -125,6 +125,9 @@ export type DesktopOpts = {
 	// library from before the op log; markPreOpLog makes it push them).
 	seed?: (raw: Raw, d: { dir: string; musicDir: string }) => void | Promise<void>;
 	parseAudio?: ParseFn;
+	// The master's snapshot publish: cadence knobs, or a builder of its own
+	// (default: the inline builder, as tests and the CLI run it).
+	snapshot?: NonNullable<CoreServiceOptions['cloud']>['snapshot'];
 };
 
 export class Desktop {
@@ -144,6 +147,7 @@ export class Desktop {
 		readonly musicDir: string,
 		readonly transport: FakeTransport,
 		private readonly parseAudio: ParseFn | undefined,
+		private readonly snapshot?: DesktopOpts['snapshot'],
 	) {
 		const { db, sqlite } = createDb(path);
 		this.db = db;
@@ -159,7 +163,7 @@ export class Desktop {
 			writeAudit: (e) => { this.audit.push(e); },
 			// Never the OS trash: record the path (always under the rig dir).
 			trashFile: async (p) => { this.trashed.push(p); },
-			cloud: { transport: this.transport, device: { name: this.name, platform: 'win32' } },
+			cloud: { transport: this.transport, device: { name: this.name, platform: 'win32' }, ...(this.snapshot ? { snapshot: this.snapshot } : {}) },
 			...(this.parseAudio ? { parseAudio: this.parseAudio } : {}),
 		});
 		this.svcs.push(this.svc);
@@ -176,6 +180,16 @@ export class Desktop {
 	async sync(): Promise<void> { await this.svc.cloudSyncNow(); }
 
 	async deviceId(): Promise<string> { return (await this.svc.getCloudSyncStatus()).deviceId!; }
+
+	// The master's snapshot publish runs beside the sync cycles (client.ts),
+	// started at the end of one: waits until none runs.
+	async publishIdle(ms = 10_000): Promise<void> {
+		const end = Date.now() + ms;
+		while ((await this.svc.getCloudSyncStatus()).snapshot.publishing) {
+			if (Date.now() > end) throw new Error(`${this.name}: snapshot publish still running after ${ms} ms`);
+			await tick(10);
+		}
+	}
 
 	trackId(recordingId: string): string | undefined {
 		return this.raw.prepare(`SELECT id FROM track WHERE recording_id = ? ORDER BY deleted_at IS NOT NULL, created_at, id LIMIT 1`).pluck().get(recordingId) as string | undefined;
@@ -214,7 +228,7 @@ export class TwoDesktopRig {
 		} finally {
 			sqlite.close();
 		}
-		const d = new Desktop(this, name, path, dir, musicDir, this.cloud.transport(USER), opts.parseAudio);
+		const d = new Desktop(this, name, path, dir, musicDir, this.cloud.transport(USER), opts.parseAudio, opts.snapshot);
 		this.desktops.push(d);
 		return d;
 	}
@@ -246,9 +260,18 @@ export class TwoDesktopRig {
 		return this.desktops.flatMap((d) => [...d.upstream.map((c) => `${d.name}: ${c}`), ...d.audit.map((e) => `${d.name}: audit ${JSON.stringify(e)}`)]);
 	}
 
+	// Every snapshot a master published in the scenario was the fake server's
+	// fold at its seq, byte for byte ('snapshot_storage'): the verifier the
+	// real server runs, held over every scenario rather than one suite.
+	snapshotMismatches(): Array<{ deviceId: string; seq: number }> {
+		return this.cloud.publishes.filter((p) => !p.stateMatches).map(({ deviceId, seq }) => ({ deviceId, seq }));
+	}
+
 	close(): void {
+		const mismatches = this.snapshotMismatches();
 		for (const d of this.desktops.splice(0)) d.close();
 		try { rmSync(this.dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+		if (mismatches.length > 0) throw new Error(`published snapshots differ from the server fold: ${JSON.stringify(mismatches)}`);
 	}
 }
 
