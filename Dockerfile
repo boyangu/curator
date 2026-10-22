@@ -21,7 +21,7 @@
 # the same commit gets the same Node and Debian; Dependabot (docker) bumps
 # it. Tag: node:22-slim, Node 22.23.3 on bookworm, resolved 2026-10-19.
 
-FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+FROM node:25-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS build
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 # pnpm comes from the root package.json's `packageManager` field.
 RUN corepack enable
@@ -34,7 +34,7 @@ RUN pnpm --filter @curator/cloud build
 RUN pnpm deploy --filter @curator/cloud --prod /out
 
 # node:22-slim, the same digest as above.
-FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+FROM node:25-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370
 ENV NODE_ENV=production
 ENV PORT=8080
 # The V8 heap cap, set for the 512 MB Fly machine (fly.toml [[vm]]) rather
