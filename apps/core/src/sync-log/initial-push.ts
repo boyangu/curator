@@ -4,22 +4,41 @@
 // so anything the user does afterwards — recorded with a current clock —
 // wins over them on every device.
 //
-// Rows that already have a record (a mutator emitted for them, or a previous
-// run of this got that far) are skipped, so it is resumable and safe to run
-// again. Device-local rows yield nothing (see rows.ts). Ops go into the
-// outbox in chunks of `chunk` per transaction, so the writer lock is never
-// held for the whole library; when every chunk is in, the initial-push
-// marker lets applyOps run (apply.ts INITIAL_PUSH_KEY).
+// One op generator (`initialPushOps`), two ways to state it (the 2026-10-22
+// sync review):
+//   - `foldLibraryAsync`, the FOUNDER: the first device of an account folds
+//     its library into its own records and sends nothing — the records are
+//     the account's base, which it publishes whole as a snapshot once it is
+//     the master (client.ts; snapshot-build.ts). The main library is ~127k
+//     ops that the log, and every later device, no longer carries. The fold
+//     covers everything the one-time backfills would have restated (the
+//     rekordbox units, recordings and claims, track meta / attributes,
+//     playlist details, cue origins, play references, album metadata, feed
+//     decisions): each runs here in its local form and marks its own key,
+//     and the drains' baselines (track_meta_seen, track_attrs_seen,
+//     playlist_attrs_seen) are seeded by the drains themselves, so nothing
+//     is re-queued afterwards.
+//   - `joinPushAsync`, a JOINER: a device that bootstrapped from the
+//     account's snapshot and bound its rows to the account's recordings
+//     (join-bind.ts) emits what only it holds, as real ops under the
+//     'initial-push' batch label ('batches', client.ts). The generator's
+//     "already recorded?" probes are what keep it to that: a bound row's
+//     create, claims and tags are in the records already. Its meta and
+//     attributes are the drains' (client.ts), gated by role.ts to the
+//     recordings it created.
+//   - `initialPush`, the synchronous joiner form (tests, replay-check, the
+//     headless CLI).
 //
-// Two drivers over one op generator: `initialPush` runs it to completion
-// synchronously (tests, replay-check, the headless CLI), and
-// `initialPushAsync` yields to the event loop between chunks — the desktop
-// runs core in Electron's main process, and B measured 18 s for the 127k ops
-// of the real library, which would freeze every window if run in one go.
-// The generator is lazy, so each chunk's "already recorded?" probes see the
-// chunks emitted before it (and any mutator write made in between: a user
-// edit during the push records its container's create first, and the push
-// then skips it).
+// Rows that already have a record (a mutator emitted for them, a previous
+// run got that far, the snapshot carried them) are skipped, so every form
+// is resumable and safe to run again. Device-local rows yield nothing (see
+// rows.ts). Ops go in chunks of `chunk` per transaction, so the writer lock
+// is never held for the whole library; the async drivers yield to the event
+// loop between chunks — the desktop runs core in Electron's main process,
+// and B measured 18 s for the 127k ops of the real library in one go. The
+// generator is lazy, so each chunk's probes see the chunks before it (and
+// any mutator write made in between). The marker (apply.ts
+// INITIAL_PUSH_KEY) is written only by a run that finished.
 //
 // Past artist renames/merges ARE reconstructed, from the artist table's
 // alias rows and curated spellings (artist_alias rules), and so are the
@@ -33,8 +52,14 @@
 
 import type Database from 'better-sqlite3';
 import { cueEntityId, isAccountSettingKey, trackTagEntityId, type JsonValue } from '@curator/protocol';
-import { INITIAL_PUSH_KEY, markRecordsComplete } from './apply.js';
+import { INITIAL_PUSH_KEY, markInitialPushDone, markRecordsComplete } from './apply.js';
+import { albumMetaBackfillAsync } from './album-meta.js';
+import { reconcileProviderClaimsAsync } from './claim-reconcile.js';
 import { emitOps, type BatchLabel, type EmitOp } from './outbox.js';
+import { drainPlaylistAttrsAsync, queuePlaylistAttrsBackfill } from './playlist-attrs.js';
+import { drainTrackAttrsAsync, queueTrackAttrsBackfillAsync } from './track-attrs.js';
+import { drainTrackMetaAsync, queueTrackMetaBackfillAsync } from './track-meta.js';
+import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async } from './v4-backfill.js';
 import {
 	claimOp, cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
 	OVERRIDE_KEYS, OVERRIDE_FIELD_OF, RB_UNITS, type CueRow, type RecordingClaim,
@@ -351,12 +376,15 @@ export function estimateInitialPush(raw: Raw): number {
 
 // Every op here is a one-time backlog's, labelled for a server batch
 // (outbox.ts BATCH_LABELS): 'initial-push' for the library's first upload,
-// 'backfill' for the sections stated again later.
-function emitChunk(raw: Raw, batch: EmitOp[], byEntity: Record<string, number>, batchLabel: BatchLabel): void {
-	raw.transaction(() => { emitOps(raw, batch, { noPrerequisites: true, batchLabel }); })();
+// 'backfill' for the sections stated again later. `local`: the founder
+// fold, which sends nothing (EmitOptions.local).
+function emitChunk(raw: Raw, batch: EmitOp[], byEntity: Record<string, number>, batchLabel: BatchLabel, local = false): void {
+	raw.transaction(() => { emitOps(raw, batch, { noPrerequisites: true, batchLabel, local }); })();
 	for (const op of batch) byEntity[op.entity] = (byEntity[op.entity] ?? 0) + 1;
 }
 
+// The synchronous joiner form: the library's unrecorded rows as real ops,
+// to completion (tests, replay-check, the headless CLI).
 export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPushResult {
 	const started = Date.now();
 	const chunk = opts.chunk ?? 500;
@@ -369,25 +397,93 @@ export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPus
 		if (pending.length >= chunk) { emitChunk(raw, pending, byEntity, 'initial-push'); pending = []; }
 	}
 	if (pending.length > 0) emitChunk(raw, pending, byEntity, 'initial-push');
-	markRecordsComplete(raw);
-	markRbBackfilled(raw);
-	markClaimsBackfilled(raw);
+	markStated(raw);
 	return { ops: total, byEntity, ms: Date.now() - started };
+}
+
+// A finished statement of the library: stated, its records complete (a
+// joiner's were already, from the snapshot), and the two backfills the
+// generator covers done with it.
+function markStated(raw: Raw): void {
+	raw.transaction(() => {
+		markInitialPushDone(raw);
+		markRecordsComplete(raw);
+		markRbBackfilled(raw);
+		markClaimsBackfilled(raw);
+	})();
 }
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-// The chunked, event-loop-friendly driver. Chunks are capped at 2,000 ops
-// (the plan's ceiling); the default 500 keeps each slice to tens of ms on the
-// real library. A slice is generation (row probes) plus one chunk's emit
-// transaction; `setImmediate` between slices lets queued IPC, timers and
-// paints run. `signal` stops between chunks — what is in stays in (the push
-// is resumable), and the marker is only written by a run that finished.
-export async function initialPushAsync(
+export type DriveOptions = { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } };
+
+// The joiner (header): after the bootstrap and the bind sweep, what this
+// library alone holds goes up as the 'initial-push' batch.
+export async function joinPushAsync(raw: Raw, opts: DriveOptions = {}): Promise<InitialPushAsyncResult> {
+	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => markStated(raw), 'initial-push', false, opts);
+}
+
+export type FoldLibraryResult = InitialPushAsyncResult & {
+	// Cells the drains folded beside the generator's ops.
+	meta: number;
+	attrs: number;
+	playlistAttrs: number;
+	v4: number;
+	claims: number;
+	albums: number;
+	feed: number;
+};
+
+// The founder (header). `feed`: the Discover feed's decisions live in
+// feed.db (feed/sync.ts), driven through the same hook the client uses.
+// Runs with the role gate open (role.ts: the account names no master yet
+// and this device has seen the — empty — account, which the client marks
+// before calling), so every drain speaks for every own row. `signal` stops
+// between chunks; the fold is resumable, and the marks are written only by
+// a run that finished.
+export async function foldLibraryAsync(
 	raw: Raw,
-	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
-): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { markRecordsComplete(raw); markRbBackfilled(raw); markClaimsBackfilled(raw); }, 'initial-push', opts);
+	opts: DriveOptions & { feed?: { backfill(o: { local: true }): Promise<{ emitted: number }> } } = {},
+): Promise<FoldLibraryResult> {
+	const started = Date.now();
+	const r = await driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { /* marked below, after the drains */ }, 'initial-push', true, opts);
+	const out: FoldLibraryResult = { ...r, meta: 0, attrs: 0, playlistAttrs: 0, v4: 0, claims: 0, albums: 0, feed: 0 };
+	if (opts.signal?.aborted) return out;
+	const slice = (ms: number): void => { out.maxSliceMs = Math.max(out.maxSliceMs, ms); };
+	// The drains' one-time queues, drained here in their local form: the
+	// cells land in the records and the baselines, the queues end empty.
+	await queueTrackMetaBackfillAsync(raw);
+	const meta = await drainTrackMetaAsync(raw, { local: true, signal: opts.signal });
+	out.meta = meta.emitted;
+	slice(meta.maxSliceMs);
+	await queueTrackAttrsBackfillAsync(raw);
+	const attrs = await drainTrackAttrsAsync(raw, { local: true, signal: opts.signal });
+	out.attrs = attrs.emitted;
+	slice(attrs.maxSliceMs);
+	queuePlaylistAttrsBackfill(raw);
+	const pl = await drainPlaylistAttrsAsync(raw, { local: true });
+	out.playlistAttrs = pl.emitted;
+	slice(pl.maxSliceMs);
+	for (const run of [backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async]) {
+		const v4 = await run(raw, { local: true });
+		out.v4 += v4.emitted;
+		slice(v4.maxSliceMs);
+	}
+	// Provider links the generator does not claim (Traxsource, v4): the
+	// claim reconcile, every source, folded too. A v3 server never reads
+	// the v4 kinds — but records carry no protocol version, and a v3 build
+	// that loads the base simply keeps what it does not read.
+	const claims = await reconcileProviderClaimsAsync(raw, { v4: true, local: true });
+	out.claims = claims.emitted;
+	slice(claims.maxSliceMs);
+	const albums = await albumMetaBackfillAsync(raw, { local: true });
+	out.albums = albums.emitted;
+	slice(albums.maxSliceMs);
+	if (opts.feed) out.feed = (await opts.feed.backfill({ local: true })).emitted;
+	if (opts.signal?.aborted) return out;
+	markStated(raw);
+	out.ms = Date.now() - started;
+	return out;
 }
 
 async function driveAsync(
@@ -396,8 +492,13 @@ async function driveAsync(
 	estimate: number,
 	onDone: () => void,
 	batchLabel: BatchLabel,
-	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } },
+	local: boolean,
+	opts: DriveOptions,
 ): Promise<InitialPushAsyncResult> {
+	// Chunks are capped at 2,000 ops (the plan's ceiling); the default 500
+	// keeps each slice to tens of ms on the real library. A slice is
+	// generation (row probes) plus one chunk's emit transaction;
+	// `setImmediate` between slices lets queued IPC, timers and paints run.
 	const started = Date.now();
 	const chunk = Math.max(1, Math.min(2_000, opts.chunk ?? 500));
 	const byEntity: Record<string, number> = {};
@@ -418,7 +519,7 @@ async function driveAsync(
 			batch.push(next.value);
 		}
 		if (batch.length > 0) {
-			emitChunk(raw, batch, byEntity, batchLabel);
+			emitChunk(raw, batch, byEntity, batchLabel, local);
 			total += batch.length;
 			chunks++;
 		}
@@ -452,12 +553,9 @@ export function rbBackfillPending(raw: Raw): boolean {
 		&& raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(RB_BACKFILL_KEY) === undefined;
 }
 
-export function rbBackfillAsync(
-	raw: Raw,
-	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
-): Promise<InitialPushAsyncResult> {
+export function rbBackfillAsync(raw: Raw, opts: DriveOptions = {}): Promise<InitialPushAsyncResult> {
 	const estimate = (raw.prepare(`SELECT COALESCE(sum((rb_beatgrid IS NOT NULL) + (rb_key_camelot IS NOT NULL) + (rb_segments_json IS NOT NULL)), 0) AS n FROM track_analysis`).get() as { n: number }).n;
-	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), 'backfill', opts);
+	return driveAsync(raw, rbAnalysisOps(raw), estimate, () => markRbBackfilled(raw), 'backfill', false, opts);
 }
 
 // ── backfill: recordings (creates + claims) ────────────────────────────────
@@ -481,9 +579,6 @@ export function claimsBackfillPending(raw: Raw): boolean {
 		&& raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(CLAIMS_BACKFILL_KEY) === undefined;
 }
 
-export function claimsBackfillAsync(
-	raw: Raw,
-	opts: { chunk?: number; onProgress?: (p: InitialPushProgress) => void; signal?: { aborted: boolean } } = {},
-): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, recordingOps(raw), estimateRecordingOps(raw), () => markClaimsBackfilled(raw), 'backfill', opts);
+export function claimsBackfillAsync(raw: Raw, opts: DriveOptions = {}): Promise<InitialPushAsyncResult> {
+	return driveAsync(raw, recordingOps(raw), estimateRecordingOps(raw), () => markClaimsBackfilled(raw), 'backfill', false, opts);
 }

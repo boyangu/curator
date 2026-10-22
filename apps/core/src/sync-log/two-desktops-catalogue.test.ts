@@ -29,6 +29,8 @@ import { heldCount, replayHeldOps } from './held.js';
 import { planIdentityMerges } from './identity.js';
 import { planStreamingDedupe } from './playlist-dedupe.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { INITIAL_PUSH_KEY } from './apply.js';
+import { initialPush } from './initial-push.js';
 import { FIRST_PULL_KEY } from './role.js';
 import { remoteTrackId, streamingPlaylistId } from './stable-ids.js';
 import { syncTrackArtistsByIdRaw } from '../library/artists.js';
@@ -54,11 +56,18 @@ afterEach(() => {
 });
 
 const R = recordingIdForTrack;
-// The real profile ran a build from before role.ts, which stated its base
-// metadata before its first pull. Its first-pull key set, a device that
-// names no master yet does the same (role.ts sourceRole: 'all').
+// The real profile ran a build from before the account had a base: it
+// stated its whole library as ops (never a bootstrap, never a bind sweep;
+// client.ts now sees it as stated and pushes), and, being from before
+// role.ts, its base metadata before its first pull — its first-pull key
+// set, a device that names no master yet does the same (role.ts
+// sourceRole: 'all'). `asOldBuild` leaves a seeded library exactly so.
 const asPreRoleBuild = (raw: Database.Database): void => {
-	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1)`).run(FIRST_PULL_KEY);
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1) ON CONFLICT(key) DO NOTHING`).run(FIRST_PULL_KEY);
+};
+const asOldBuild = (raw: Database.Database): void => {
+	initialPush(raw);
+	asPreRoleBuild(raw);
 };
 const ORDERS = [['A syncs first', 'ab'], ['B syncs first', 'ba']] as const;
 
@@ -225,7 +234,10 @@ describe('scenario 19 — the same Spotify playlist imported on both desktops', 
 		importPlaylist(a, 'spP', [1]);
 		importPlaylist(c, 'spP', [1]);
 		await a.sync();
-		// C pushes but cannot pull (so it cannot resolve the pair yet).
+		// C, an old build (above), pushes its own recording of sp1 but cannot
+		// pull (so it cannot resolve the pair yet).
+		c.raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1) ON CONFLICT(key) DO NOTHING`).run(INITIAL_PUSH_KEY);
+		asPreRoleBuild(c.raw);
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
 		await c.sync();
 		c.transport.online = false;
@@ -318,14 +330,14 @@ describe('scenario 20 — a second desktop that minted its own recordings for A\
 		const lastKey = a.one<string>(`SELECT max(order_key) FROM playlist_track WHERE playlist_id = ?`, PL);
 
 		// B: the profile. Its own recording ids for the same Spotify tracks and
-		// random-id rows in A's playlist, from before the fix; its initial push
-		// states all of it. It pushes and goes away before pulling (so it
-		// cannot heal anything itself).
+		// random-id rows in A's playlist, from before the fix; its old build
+		// stated all of it as ops. It pushes and goes away before pulling (so
+		// it cannot heal anything itself).
 		const b = await rig.desktop('b', {
 			seed: (raw) => {
 				seedSpotify(raw, ids.b, B_LIST, 1_750_000_000_000, lastKey);
 				markPreOpLog(raw);
-				asPreRoleBuild(raw);
+				asOldBuild(raw);
 			},
 		});
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
@@ -521,13 +533,15 @@ describe('scenario 17 — a fresh device with no sources shows the account\'s wh
 		rig.cloud.hintBelow = snapSeq;
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(1);
+		expect(rig.cloud.calls.storageBootstraps).toBe(1);
 		expectWholeLibrary(a, c);
 	});
 
 	it('the v2-snapshot upgrade: records loaded before any device stated meta show nothing, then everything once the server reads v3', async () => {
 		const v2 = rig.cloud.features;
-		rig.cloud.features = v2.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
+		// A v2 server: no v3, so no master and no base — A's library went up
+		// as ops, and the snapshot is the fold of that log (takeSnapshot).
+		rig.cloud.features = v2.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4' && f !== 'snapshot_storage');
 		const a = await rig.desktop('a');
 		await curate(a);
 		await rig.settle();
@@ -535,7 +549,7 @@ describe('scenario 17 — a fresh device with no sources shows the account\'s wh
 		rig.cloud.hintBelow = snapSeq;
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(1);
+		expect(rig.cloud.calls.storageBootstraps).toBe(1);
 		// The 2026-10-20 incident's second desktop: the records, no rows.
 		expect(c.one(`SELECT count(*) FROM sync_state WHERE map = 'libraryTracks'`)).toBeGreaterThan(0);
 		expect(c.one(`SELECT count(*) FROM track`)).toBe(0);
@@ -614,7 +628,7 @@ describe('a streaming playlist holding two releases of one song that another dev
 		const a = await rig.desktop('a', { catalogue: [], seed: (raw) => seed(raw, [['a-sa', ['spA']], ['a-sb', ['spB']]], ['a-sa', 'a-sb'], 1_700_000_000_000) });
 		await a.sync();
 		// B pushes and goes away before pulling.
-		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => { seed(raw, [['b-p', ['spA', 'spB']]], ['b-p', 'b-p'], 1_750_000_000_000); asPreRoleBuild(raw); } });
+		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => { seed(raw, [['b-p', ['spA', 'spB']]], ['b-p', 'b-p'], 1_750_000_000_000); asOldBuild(raw); } });
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
 		await b.sync();
 		b.transport.online = false;
@@ -641,7 +655,7 @@ describe('a streaming playlist holding two releases of one song that another dev
 		const a = await rig.desktop('a', { catalogue: [], seed: (raw) => seed(raw, [['a-sa', ['spA']], ['a-sb', ['spB']]], ['a-sa', 'a-sb'], 1_700_000_000_000) });
 		await a.sync();
 		// B first holds only the first release, once.
-		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => seed(raw, [['b-p', ['spA']]], ['b-p'], 1_750_000_000_000) });
+		const b = await rig.desktop('b', { catalogue: [], seed: (raw) => { seed(raw, [['b-p', ['spA']]], ['b-p'], 1_750_000_000_000); asOldBuild(raw); } });
 		rig.cloud.fail.pull.push(new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'));
 		await b.sync();
 		b.transport.online = false;

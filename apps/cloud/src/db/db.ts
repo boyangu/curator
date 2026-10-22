@@ -7,14 +7,9 @@
 // Parameters are strings (or null), cast in SQL (`$1::bigint`,
 // `$2::text::jsonb`). The two drivers infer types for JS numbers and arrays
 // differently; a string with an explicit cast means the same thing to both,
-// so a test on PGlite exercises the production query. The one exception is
-// a bytea body (a snapshot): a Uint8Array with `$n::bytea`, which both
-// drivers send as bytea (postgres.js hex-encodes it in the driver, PGlite
-// binds it natively), and bytea columns come back as bytes from both (`bytes()`
-// below). Bodies never pass through SQL's encode()/decode(): base64 of a
-// 37 MB snapshot (plus stripping its line breaks) inside Postgres was a
-// measurable share of the load on a saturated free-tier database
-// (2026-10-21).
+// so a test on PGlite exercises the production query. No bytea crosses this
+// seam any more: snapshot bodies left Postgres with sql/0009 (the master
+// publishes them to Storage), and the API never touches object bytes.
 //
 // jsonb is the exception that needs two casts, `$1::text::jsonb`: postgres.js
 // learns the parameter's type from the server and runs its json serializer
@@ -28,7 +23,7 @@
 
 import postgres from 'postgres';
 
-export type Param = string | null | Uint8Array;
+export type Param = string | null;
 export type Row = Record<string, unknown>;
 
 export interface Queryable {
@@ -112,12 +107,4 @@ export function num(v: unknown): number {
 
 export function numOrNull(v: unknown): number | null {
 	return v === null || v === undefined ? null : num(v);
-}
-
-// A bytea column: a Buffer from postgres.js, a Uint8Array from PGlite. A view
-// over the same memory, never a copy (a snapshot body is tens of MB).
-export function bytes(v: unknown): Buffer {
-	if (Buffer.isBuffer(v)) return v;
-	if (v instanceof Uint8Array) return Buffer.from(v.buffer, v.byteOffset, v.byteLength);
-	throw new TypeError('expected a bytea value from the database');
 }

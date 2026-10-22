@@ -335,7 +335,8 @@ describe('a far-behind third device', () => {
 
 		const c = await rig.desktop('c');
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(1);
+		// B joined from A's base; C from the newer snapshot.
+		expect(rig.cloud.calls.storageBootstraps).toBe(2);
 		expect(readCursor(c.raw)).toMatchObject({ snapshotSeq: snapSeq, lastSeq: rig.cloud.maxSeq });
 		expect(replicaDiff(a, c)).toEqual([]);
 		expect(replicaDiff(b, c)).toEqual([]);

@@ -13,7 +13,7 @@ import { gunzipSync } from 'node:zlib';
 import Database from 'better-sqlite3';
 import { createLibraryState, rebuildArtistAlias, serializeLibraryState, snapshotPartPath, type LibraryState } from '@curator/protocol';
 import { migrate } from '../db/migrate.js';
-import { INITIAL_PUSH_KEY } from './apply.js';
+import { RECORDS_COMPLETE_KEY } from './apply.js';
 import { buildSnapshotParts, type SnapshotBuildOk } from './snapshot-build.js';
 import { readStorageSnapshotBody } from './snapshot-storage.js';
 
@@ -26,7 +26,7 @@ beforeEach(() => {
 	migrate(dbPath);
 	db = new Database(dbPath);
 	db.pragma('journal_mode = WAL');
-	db.prepare(`INSERT OR REPLACE INTO app_setting (key, value, updated_at) VALUES (?, '1', 0)`).run(INITIAL_PUSH_KEY);
+	db.prepare(`INSERT OR REPLACE INTO app_setting (key, value, updated_at) VALUES (?, '1', 0)`).run(RECORDS_COMPLETE_KEY);
 	db.prepare(`INSERT OR REPLACE INTO sync_cursor (key, last_seq) VALUES ('library', 42)`).run();
 });
 afterEach(() => {
@@ -124,7 +124,7 @@ describe('buildSnapshotParts', () => {
 		expect(await skip()).toEqual({ ok: false, skipped: 'own_ops_ahead', count: 8 });
 		db.prepare(`UPDATE app_setting SET value = ? WHERE key = 'sync.client'`).run(JSON.stringify({ needsRepair: true }));
 		expect(await skip()).toEqual({ ok: false, skipped: 'needs_repair' });
-		db.prepare(`DELETE FROM app_setting WHERE key = ?`).run(INITIAL_PUSH_KEY);
+		db.prepare(`DELETE FROM app_setting WHERE key = ?`).run(RECORDS_COMPLETE_KEY);
 		expect(await skip()).toEqual({ ok: false, skipped: 'records_incomplete' });
 	});
 });

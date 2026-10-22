@@ -47,32 +47,28 @@ grant authenticated to curator_api;
 
 grant usage on schema curator to curator_api;
 
--- The snapshot sweep's user list (sql/0001_init.sql). Not granted to `authenticated`: it is the
--- one function that reads across users.
-grant execute on function curator.users_due_for_snapshot(bigint, interval) to curator_api;
-
--- Since 0007: the quiet-period snapshot rule (the sweep calls this one now; v1 stays for an older
--- image during a rollback) and the batch upkeep list (expire idle batches, finish stalled commits).
--- Cross-user ids only, like v1, so never `authenticated`. Conditional so this script still runs
--- on a database that has not had 0007 yet (it is re-run after every migration, and the migration
--- gate tests run it against older schemas).
+-- The sweeps' cross-user reads and the compaction writers, ids and counts only, so never
+-- `authenticated`. Conditional so this script still runs on a database that has not had the
+-- migration yet (it is re-run after every migration, and the migration gate tests run it against
+-- older schemas).
+--   0007: the batch upkeep list (expire idle batches, finish stalled commits).
+--   0009: the base model. users_due_for_compaction lists accounts whose oldest kept snapshot has
+--   aged past the base; set_base_seq and compact_ops are what the sweep (and the operator's
+--   `compact` CLI) then run, outside any user transaction. The snapshot-fold rules of 0001 / 0007 /
+--   0008 are dropped by 0009 and no longer granted.
 do $$
 begin
-	if to_regprocedure('curator.users_due_for_snapshot_v2(bigint, interval, interval, interval)') is not null then
-		grant execute on function curator.users_due_for_snapshot_v2(bigint, interval, interval, interval) to curator_api;
-	end if;
 	if to_regprocedure('curator.batches_to_tend(interval)') is not null then
 		grant execute on function curator.batches_to_tend(interval) to curator_api;
 	end if;
-end
-$$;
-
--- Since 0008: the snapshot rule that leaves a freshly master-published account alone (the sweep
--- calls this one now; v2 stays for an older image during a rollback). Conditional like the two above.
-do $$
-begin
-	if to_regprocedure('curator.users_due_for_snapshot_v3(bigint, interval, interval, interval, interval)') is not null then
-		grant execute on function curator.users_due_for_snapshot_v3(bigint, interval, interval, interval, interval) to curator_api;
+	if to_regprocedure('curator.users_due_for_compaction(interval)') is not null then
+		grant execute on function curator.users_due_for_compaction(interval) to curator_api;
+	end if;
+	if to_regprocedure('curator.set_base_seq(uuid, bigint)') is not null then
+		grant execute on function curator.set_base_seq(uuid, bigint) to curator_api;
+	end if;
+	if to_regprocedure('curator.compact_ops(uuid, int)') is not null then
+		grant execute on function curator.compact_ops(uuid, int) to curator_api;
 	end if;
 end
 $$;
@@ -89,7 +85,7 @@ grant execute on function curator.prune_request_log(interval) to curator_api;
 grant execute on function curator.applied_migrations() to curator_api;
 
 -- A runaway query should fail, not hold a pooled connection; the slowest legitimate statements are
--- a 5000-op page of the snapshot fold and one chunk of a batch commit's move (sized by time to a
--- few seconds, src/sync/batch.ts).
+-- one chunk of a batch commit's move (sized by time to a few seconds, src/sync/batch.ts) and one
+-- compact_ops call (5,000 rows, src/sync/compact.ts).
 alter role curator_api set statement_timeout = '30s';
 alter role curator_api set idle_in_transaction_session_timeout = '60s';

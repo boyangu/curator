@@ -23,7 +23,7 @@ kill_timeout = "15s"
   force_https = true
   auto_start_machines = true
   auto_stop_machines = "stop"
-  # One machine stays up: the snapshot sweep runs on a timer inside it, and
+  # One machine stays up: the batch and compaction sweeps run on timers inside it, and
   # a cold start would add seconds to the first push after idle.
   min_machines_running = 1
 
@@ -41,8 +41,9 @@ kill_timeout = "15s"
 
 [[vm]]
   size = "shared-cpu-1x"
-  # A snapshot build holds one user's whole library state in memory.
-  # The image caps the V8 heap at 384 MB to match (Dockerfile NODE_OPTIONS);
-  # raising this, raise that too in [env], e.g. for 1gb:
+  # Nothing here holds a library in memory any more (the master publishes
+  # the snapshot; the server never folds). The image caps the V8 heap at
+  # 384 MB (Dockerfile NODE_OPTIONS); raising this, raise that too in [env],
+  # e.g. for 1gb:
   #   NODE_OPTIONS = "--max-old-space-size=768"
   memory = "512mb"

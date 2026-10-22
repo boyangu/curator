@@ -15,8 +15,8 @@
 //      per-chunk wake-up;
 //   3. publishes: drops the fence, marks the batch committed, rings once.
 // No snapshot is built inside the commit: the fence alone keeps the moved
-// ops unseen, and the regular sweep (snapshot/job.ts) snapshots them once
-// the log has been quiet for its 5 minutes. Until then a new device
+// ops unseen, and the account's master publishes the next snapshot once it
+// has folded them (src/sync/publish-snapshot.ts). Until then a new device
 // bootstraps from the older snapshot and pulls the batch's ops after it.
 // Seqs are handed out at commit, in an order unrelated to when the ops were
 // made, and other devices' pushes interleave with the chunks. That is safe
@@ -41,6 +41,7 @@ import { num, numOrNull, type Db, type Queryable } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
 import type { Logger } from '../log.js';
+import { headSeq } from './base.js';
 import { sourceFromNonMaster } from './master.js';
 import { assertBatchSize, validatePush, type PushCall } from './push.js';
 
@@ -405,9 +406,11 @@ async function runCommit(deps: BatchDeps, userId: string, batchId: string): Prom
 
 // Step 1. Under the push lock, so the fence is the head exactly: every op
 // at or below it is committed, every seq taken from here on is above it.
-// Also fixes the batch's priorOwnMaxSeq: this device's newest op the batch
-// does not carry (the walk stops at the first; staged ops the log already
-// holds are skipped, as a re-push's are).
+// The head is never below the base (base.ts): a fence under the base would
+// hide the snapshot every new device loads. Also fixes the batch's
+// priorOwnMaxSeq: this device's newest op the batch does not carry (the
+// walk stops at the first; staged ops the log already holds are skipped, as
+// a re-push's are).
 async function raiseFence(db: Db, userId: string, batchId: string): Promise<boolean> {
 	return withUserTx(db, userId, async (tx) => {
 		await tx.query(PUSH_LOCK);
@@ -415,7 +418,7 @@ async function raiseFence(db: Db, userId: string, batchId: string): Promise<bool
 		if (other && other.batch_id !== batchId) return false;
 		if (!other) {
 			const [b] = await tx.query<{ device_id: string }>(`select device_id from curator.library_op_batch where id = $1::uuid`, [batchId]);
-			const [head] = await tx.query<{ head: unknown }>(`select coalesce(max(seq), 0)::float8 as head from curator.library_op where user_id = (select auth.uid())`);
+			const fence = String(await headSeq(tx, 'all'));
 			const [prior] = await tx.query<{ seq: unknown }>(
 				`select o.seq::float8 as seq from curator.library_op o
 				where o.user_id = (select auth.uid()) and o.device_id = $2
@@ -424,7 +427,6 @@ async function raiseFence(db: Db, userId: string, batchId: string): Promise<bool
 				limit 1`,
 				[batchId, b!.device_id],
 			);
-			const fence = String(num(head!.head));
 			await tx.query(`insert into curator.library_op_fence (batch_id, visible_through) values ($1::uuid, $2::bigint)`, [batchId, fence]);
 			await tx.query(`update curator.library_op_batch set fence_seq = $2::bigint, prior_own_max_seq = $3::bigint where id = $1::uuid`, [
 				batchId,
@@ -555,8 +557,7 @@ export type TendResult = { expired: number; driven: number; purged: number };
 
 // The sweep's half of 'batches' (server.ts maintenance, the snapshot CLI):
 // expire open batches idle past `idleExpiryMs`, finish commits nobody is
-// driving, purge staged rows a closed batch left behind. Before the snapshot
-// sweep, so a finished commit's user is not rebuilt twice.
+// driving, purge staged rows a closed batch left behind.
 export async function tendBatches(deps: BatchDeps): Promise<TendResult> {
 	const out: TendResult = { expired: 0, driven: 0, purged: 0 };
 	const rows = await deps.db.query<{ user_id: string; batch_id: string; device_id: string; status: string }>(

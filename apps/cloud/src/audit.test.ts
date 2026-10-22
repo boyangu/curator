@@ -273,7 +273,7 @@ describe('audit_event', () => {
 		const future = op('library_track', 'set-rating', randomUUID(), { rating: 2 }, Date.now() + 3600_000);
 		const foreign = opsFor('someone-else')('tag', 'create', randomUUID(), { name: 'x', kind: 'user' });
 		await api.sync.push.mutate({ deviceId, ops: [good, future, foreign, { op_id: 'junk' }] });
-		await api.sync.bootstrap.query();
+		await api.sync.bootstrap.query({ storage: true });
 
 		await api.account.revokeDevice.mutate({ deviceId: 'phone' });
 		expect(await errorReason(api.account.registerDevice.mutate({ deviceId: 'phone', name: 'Phone', platform: 'ios' }))).toMatchObject({ reason: 'device_revoked' });
@@ -291,8 +291,8 @@ describe('audit_event', () => {
 		expect(byKind('ops_rejected')).toMatchObject([{ device_id: deviceId, detail: { byReason: { not_owner: 1 } } }]);
 		const byReason = byKind('ops_rejected')[0]!.detail.byReason as Record<string, number>;
 		expect(Object.values(byReason).reduce((a, b) => a + b, 0)).toBe(2);
-		expect(byKind('bootstrap_served')).toMatchObject([{ device_id: null, detail: { snapshotSeq: 0 } }]);
-		expect(byKind('bootstrap_served')[0]!.detail.bytes).toBeGreaterThan(0);
+		// An account with no snapshot: the empty state, no manifest, no bytes.
+		expect(byKind('bootstrap_served')).toMatchObject([{ device_id: null, detail: { snapshotSeq: 0, baseSeq: 0, bytes: 0, storage: false } }]);
 		expect(byKind('device_revoked')).toMatchObject([{ device_id: 'phone', detail: {} }]);
 		expect(byKind('device_reregister_refused')).toMatchObject([{ device_id: 'phone' }]);
 		expect(byKind('push_from_revoked_device')).toMatchObject([{ device_id: 'phone', detail: { ops: 1 } }]);

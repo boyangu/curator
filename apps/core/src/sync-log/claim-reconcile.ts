@@ -36,7 +36,8 @@ export type ClaimReconcileResult = { tracks: number; emitted: number; bySource: 
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: number; v4?: boolean } = {}): Promise<ClaimReconcileResult> {
+// `local`: the founder fold's form (outbox.ts EmitOptions.local).
+export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: number; v4?: boolean; local?: boolean } = {}): Promise<ClaimReconcileResult> {
 	const page = Math.max(1, opts.page ?? 400);
 	const out: ClaimReconcileResult = { tracks: 0, emitted: 0, bySource: {}, chunks: 0, maxSliceMs: 0 };
 	const tracks = raw.prepare(`SELECT rowid, id, recording_id FROM track
@@ -69,7 +70,7 @@ export async function reconcileProviderClaimsAsync(raw: Raw, opts: { page?: numb
 			}
 			// Labelled like the backfill it completes; a handful (the usual
 			// launch) is below the client's batch threshold and goes plainly.
-			if (ops.length > 0) emitOps(raw, ops, { batchLabel: 'backfill' });
+			if (ops.length > 0) emitOps(raw, ops, { batchLabel: 'backfill', local: opts.local });
 			out.emitted += ops.length;
 		})();
 		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);

@@ -22,8 +22,8 @@
 //     different from the page boundaries the server draws anywhere in the
 //     log. The page is validated whole before its first sub-batch, so an
 //     unreadable op applies none of it.
-//     A `snapshotSeq` hint means "too far behind": bootstrap from the
-//     snapshot instead.
+//     A `snapshotSeq` hint means "too far behind" or "below the account's
+//     base": bootstrap from the master's snapshot instead.
 //   - Own ops: a server with 'pull_skip_own' leaves out this device's ops up
 //     to `ownThroughSeq`, the seq through which this database provably holds
 //     every op stamped with its device id (see ClientState). Anything else of
@@ -38,6 +38,26 @@
 //     device that has not seen the account's claims yet would mint a fresh
 //     recording for every track another desktop already holds (the
 //     2026-10-20 incident).
+//   - The account's BASE is a snapshot the master publishes, not a fold of
+//     the log (the 2026-10-22 sync review; 'snapshot_storage'). A device
+//     that has not stated its library yet (apply.ts INITIAL_PUSH_KEY) first
+//     asks for the base (establishBase): with a snapshot it is a JOINER — it
+//     loads the snapshot, binds its rows to the account's recordings
+//     (join-bind.ts) and sends only what it alone holds (initial-push.ts
+//     joinPushAsync); on an account with no snapshot and no ops it is the
+//     FOUNDER — it folds its library into its own records without sending
+//     an op (foldLibraryAsync), states itself master, and the publish stage
+//     puts the base up; on an account with ops but no snapshot (a founder
+//     still publishing, a legacy account whose master has not published
+//     yet) it WAITS, asking again each cycle (status `phase`). A server
+//     without 'snapshot_storage' has no base to give: the library goes up
+//     as ops, as it did before.
+//   - A secondary whose cursor sits exactly at the master's newest published
+//     snapshot checks its records' digest against the manifest's
+//     (snapshot-build.ts digest mode) and reloads the snapshot on a
+//     mismatch — the cross-device check that replaced the server's fold.
+//   - Acked outbox rows are deleted after a week (outbox.ts retention),
+//     after a cycle that left nothing pending.
 //   - A library is bound to the first account that syncs it. Signing in as
 //     someone else does not merge two people's libraries; it reports an error.
 //   - A one-time backlog (the initial push, a backfill: outbox rows with a
@@ -87,12 +107,13 @@ import {
 import type { AreaLogger } from '@curator/shared/log';
 import { log } from '../log.js';
 import { artistCreditRewritePending, drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
-import { applyOps, INITIAL_PUSH_KEY, recordsComplete, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
+import { applyOps, initialPushDone as libraryStated, recordsComplete, SyncRecordsIncompleteError, type ApplyOutcome } from './apply.js';
 import { getDeviceId } from './device.js';
 import { heldCount, heldNewerCount, holdOps, replayHeldOps } from './held.js';
-import { claimsBackfillAsync, claimsBackfillPending, initialPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushAsyncResult, type InitialPushProgress } from './initial-push.js';
+import { claimsBackfillAsync, claimsBackfillPending, foldLibraryAsync, joinPushAsync, rbBackfillAsync, rbBackfillPending, type InitialPushAsyncResult, type InitialPushProgress } from './initial-push.js';
+import { joinBindAsync, joinBindDone } from './join-bind.js';
 import { resolveRecordingIdentitiesAsync } from './identity.js';
-import { BATCH_LABELS, CLOCK_KEY, observeServerTs, onOutboxAppend, type BatchLabel } from './outbox.js';
+import { BATCH_LABELS, CLOCK_KEY, observeServerTs, onOutboxAppend, OUTBOX_RETENTION_MS, pruneAckedOutbox, type BatchLabel } from './outbox.js';
 import { healAfterApply, streamingDedupeSwept, type DedupeResult, sweepStreamingDuplicatesAsync } from './playlist-dedupe.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { remintDeviceForDetach } from './remint.js';
@@ -122,16 +143,17 @@ export type CloudSession = { userId: string; email: string | null };
 
 // The protocol's `sync` + `account` procedures and who is signed in (the
 // session lives with the transport, in desktop main). `sync.bootstrap` is
-// lifted out and returned decoded: the wire carries base64 gzip of the
-// serialised state, and inflating it (node:zlib, off the JS thread) is the
-// transport's job — the client only needs the records and their seq.
+// lifted out and returned decoded: the transport reads the master-published
+// snapshot out of Storage and inflates it (node:zlib, off the JS thread) —
+// the client only needs the records, their seq and the account's base.
 export interface CloudTransport {
 	// The batch procedures ('batches') are optional: a transport without them
 	// pushes everything plainly, whatever the server offers. Likewise
 	// publishSnapshot ('snapshot_storage'), which also needs `snapshots`.
 	sync: Pick<CloudService['sync'], 'push' | 'pull'> & Partial<Pick<CloudService['sync'], 'batchBegin' | 'batchPush' | 'batchCommit' | 'batchAbort' | 'publishSnapshot'>>;
 	account: CloudService['account'];
-	bootstrap(input?: BootstrapInput): Promise<{ snapshotSeq: number; records: readonly SnapshotRecord[] }>;
+	// `records` null: the account holds no snapshot yet (`snapshotSeq` 0).
+	bootstrap(input?: BootstrapInput): Promise<{ snapshotSeq: number; baseSeq: number; records: readonly SnapshotRecord[] | null }>;
 	session(): CloudSession | null;
 	// Ends this install's session (Supabase scope 'local'; other devices stay
 	// signed in). `unlink` calls it so the detached library cannot re-bind on
@@ -207,8 +229,13 @@ export type CloudSyncStatus = {
 	// first sign-in syncs it). Unlink keeps it: see `unlink`.
 	boundUserId: string | null;
 	initialPushDone: boolean;
-	// Set while the first-sign-in push of the existing library runs.
+	// Set while the first sign-in states the library: the founder's fold or
+	// a joiner's bind sweep and push (initial-push.ts).
 	initialPush: InitialPushProgress | null;
+	// 'waiting_for_snapshot': this library has not stated itself and the
+	// account has ops but no published snapshot to join from (the header);
+	// the client asks again each cycle.
+	phase: 'waiting_for_snapshot' | null;
 	// Set while a snapshot is being loaded.
 	bootstrap: { done: number; total: number } | null;
 	// Set while a backlog goes up as a server batch ('batches'): staging
@@ -218,8 +245,16 @@ export type CloudSyncStatus = {
 	running: boolean;
 	// The account snapshot this device published as its master
 	// ('snapshot_storage'): whether a build or upload runs now, and the seq
-	// and time of the last one the server took.
-	snapshot: { publishing: boolean; lastSeq: number | null; lastAt: number | null };
+	// and time of the last one the server took. `verifying` / `digest`: a
+	// secondary's check of its records against the master's newest snapshot
+	// (the header), running now, and the last one's result.
+	snapshot: {
+		publishing: boolean;
+		lastSeq: number | null;
+		lastAt: number | null;
+		verifying: boolean;
+		digest: { seq: number; at: number; matched: boolean } | null;
+	};
 	// When the next retry fires after a transient failure.
 	nextRetryAt: number | null;
 	// The fallback poll: the cadence in force, whether the host reports the
@@ -273,6 +308,9 @@ export type SyncClientOptions = {
 	batchCommitPolls?: number;
 	// Ops per apply transaction within a pulled page, fixed (PULL_SLICE_MS).
 	pullApplyChunk?: number;
+	// How long an acked outbox row is kept (outbox.ts OUTBOX_RETENTION_MS;
+	// tests shrink it).
+	outboxRetentionMs?: number;
 	random?: () => number;
 	// Test seam: runs inside a pull page's last transaction (the one that
 	// moves the cursor) after its apply, with the whole page — throwing here
@@ -303,9 +341,10 @@ export type SyncFeedHooks = {
 	// Decisions pulled for feed.db, queued by the projection.
 	pending(): number;
 	applyPending(): Promise<{ keys: number; changed: number }>;
-	// The one-time statement of feed.db's decisions once the server reads v4.
+	// The one-time statement of feed.db's decisions once the server reads v4
+	// — or, for the founder fold, into the records alone (`local`).
 	backfillPending(): boolean;
-	backfill(): Promise<{ emitted: number }>;
+	backfill(opts?: { local?: boolean }): Promise<{ emitted: number }>;
 };
 
 export type PushOutcome = { pushed: number; rejected: number; more: boolean; stopped: 'update_required' | 'device_revoked' | null };
@@ -326,10 +365,14 @@ type CycleTally = { pushed: number; rejected: number; held: number; pulled: numb
 export interface SyncClient {
 	pushOnce(): Promise<PushOutcome>;
 	pullOnce(): Promise<PullOutcome>;
-	bootstrap(opts?: { resetCursor?: boolean }): Promise<void>;
+	// Loads the master's newest snapshot; false when the account holds none.
+	bootstrap(opts?: { resetCursor?: boolean }): Promise<boolean>;
+	// States this library to the account (the header: found, join, or go up
+	// as ops to a server without a base) when it has not been, then the
+	// one-time backfills still owed. The cycle runs it first.
 	runInitialPush(): Promise<void>;
-	// One full cycle now: register, initial push, push until drained, pull
-	// until drained. Resets any backoff. Resolves when the cycle is done.
+	// One full cycle now: register, state the library, push until drained,
+	// pull until drained. Resets any backoff. Resolves when the cycle is done.
 	syncNow(): Promise<void>;
 	// Debounced cycle trigger for wake-ups (Realtime, focus, network, local
 	// writes, the fallback poll). `seq`: the head a Realtime ping names
@@ -412,6 +455,9 @@ type ClientState = {
 	// restart resumes it. `committing` once batchCommit was asked: from then
 	// on the batch is only ever polled, never staged into.
 	batches?: Partial<Record<BatchLabel, { batchId: string; committing: boolean }>>;
+	// The account's base as the last bootstrap answered it: ops at or below
+	// it are gone from the log, so a cursor below it bootstraps, never pulls.
+	baseSeq?: number;
 };
 
 function readClientState(raw: Raw): ClientState {
@@ -509,6 +555,23 @@ function writePublishRecord(raw: Raw, rec: PublishRecord): void {
 		.run(SNAPSHOT_PUBLISH_KEY, JSON.stringify(rec), Date.now());
 }
 
+// Device-local: the last digest check a secondary ran against the master's
+// snapshot (the header), so one seq is checked once.
+export const SNAPSHOT_DIGEST_KEY = 'sync.digest_checked';
+type DigestRecord = { seq: number; at: number; matched: boolean };
+
+function readDigestRecord(raw: Raw): DigestRecord | null {
+	const json = raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).pluck().get(SNAPSHOT_DIGEST_KEY) as string | undefined;
+	if (!json) return null;
+	try { return JSON.parse(json) as DigestRecord; } catch { return null; }
+}
+
+function writeDigestRecord(raw: Raw, rec: DigestRecord): void {
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+		.run(SNAPSHOT_DIGEST_KEY, JSON.stringify(rec), Date.now());
+}
+
 // ── client ──────────────────────────────────────────────────────────────────
 
 export function createSyncClient(opts: SyncClientOptions): SyncClient {
@@ -530,6 +593,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	let pushRefused = false;
 	let initialPushProgress: InitialPushProgress | null = null;
 	let bootstrapProgress: { done: number; total: number } | null = null;
+	// The header's waiting state, and whether it was logged this session.
+	let waitingForSnapshot = false;
+	let waitingLogged = false;
 	let batchProgress: CloudSyncStatus['batch'] = null;
 	let running = false;
 	// True only while changes are actually moving in this cycle (a push with
@@ -617,14 +683,21 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			needsUpdate: pushRefused || heldNewerCount(raw) > 0,
 			revoked: isRevoked(st),
 			boundUserId: st.userId,
-			initialPushDone: raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined,
+			initialPushDone: libraryStated(raw),
 			initialPush: initialPushProgress,
+			phase: waitingForSnapshot ? 'waiting_for_snapshot' : null,
 			bootstrap: bootstrapProgress,
 			batch: batchProgress,
 			running,
 			snapshot: (() => {
 				const rec = readPublishRecord(raw);
-				return { publishing: publishing !== null, lastSeq: rec && rec.seq > 0 ? rec.seq : null, lastAt: rec && rec.at > 0 ? rec.at : null };
+				return {
+					publishing: publishing !== null,
+					lastSeq: rec && rec.seq > 0 ? rec.seq : null,
+					lastAt: rec && rec.at > 0 ? rec.at : null,
+					verifying: verifying !== null,
+					digest: readDigestRecord(raw),
+				};
 			})(),
 			nextRetryAt,
 			poll: { policy: { ...pollPolicy }, active, nextPollAt },
@@ -1049,6 +1122,14 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			}
 			for (;;) {
 				const cursor = readCursor(raw);
+				// Below the account's base (learnt from the last bootstrap): the
+				// log no longer holds the ops after this cursor.
+				if (!out.bootstrapped && cursor.lastSeq < (readClientState(raw).baseSeq ?? 0)) {
+					slog.info('pull: the cursor is below the account base; bootstrapping', { cursor: cursor.lastSeq, baseSeq: readClientState(raw).baseSeq });
+					await bootstrap();
+					out.bootstrapped = true;
+					continue;
+				}
 				const res = await pullPage(cursor.lastSeq);
 				out.received += res.ops.length;
 				if (tally) tally.pulled += res.ops.length;
@@ -1060,24 +1141,41 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 					out.bootstrapped = true;
 					continue;
 				}
+				// A device that never loaded the account's base (snapshot_seq
+				// null: it stated its library as ops under an older build, or to
+				// a server without one) lacks what the founder folded — that is
+				// in the snapshot and nowhere in the log. Once, unless it is the
+				// master that publishes the base (its records are it).
+				if (!out.bootstrapped && res.published && cursor.snapshotSeq === null && features?.includes('snapshot_storage') && masterDevice(raw) !== deviceId) {
+					slog.info('pull: this device never loaded the account base; bootstrapping once', { cursor: cursor.lastSeq, published: res.published.seq });
+					out.bootstrapped = true;
+					await bootstrap();
+					continue;
+				}
 				if (res.ops.length === 0) {
 					if (readClientState(raw).needsRepair && !out.bootstrapped) {
-						slog.warn('own ops were re-stamped by the server (clock skew) — reloading the snapshot to repair');
-						await bootstrap({ resetCursor: true });
-						patchClientState({ needsRepair: false });
+						slog.warn('this device\'s records need the master\'s snapshot (a clock-skew re-stamp, or a digest mismatch) — reloading it to repair');
 						out.bootstrapped = true;
-						continue;
+						if (await bootstrap({ resetCursor: true })) {
+							patchClientState({ needsRepair: false });
+							continue;
+						}
+						slog.warn('repair: the account has no published snapshot yet; trying again next cycle');
 					}
 					// Drained. An empty page can still move the cursor (a run of
 					// own ops the server left out), and everything up to the
 					// cursor is now held here, so ownThroughSeq follows it.
+					let at = 0;
 					raw.transaction(() => {
-						const at = Math.max(res.nextSeq, cursor.lastSeq);
+						at = Math.max(res.nextSeq, cursor.lastSeq);
 						if (at > cursor.lastSeq) writeCursor(raw, at);
 						const st = readClientState(raw);
 						if (at > (st.ownThroughSeq ?? 0)) writeClientState(raw, { ...st, ownThroughSeq: at });
 						markFirstPull(raw);
 					})();
+					// At the master's newest snapshot exactly: the records here
+					// should be that snapshot (the digest check, after the cycle).
+					if (res.published && res.published.seq === at) digestDue = res.published;
 					pullReachedHead = true;
 					break;
 				}
@@ -1178,34 +1276,33 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	// ── bootstrap ───────────────────────────────────────────────────────
 
-	// `resetCursor`: replay from the snapshot's seq even when the cursor is
-	// past it (the clamp repair), instead of keeping the further cursor.
+	// The master's newest snapshot out of Storage (the transport reads and
+	// checks the parts), naming this device when the server offers
+	// 'device_reads'. A server that advertised it and then refuses the field
+	// (rolled back mid-session) gets the same call without it.
 	const fetchSnapshot = async (): ReturnType<CloudTransport['bootstrap']> => {
-		// 'snapshot_chunks': the body in pieces (the transport joins them); a
-		// v4 library's snapshot is tens of MB gzipped.
-		const chunked = features?.includes('snapshot_chunks') ? { chunked: true as const } : {};
-		// 'snapshot_storage': a master-published snapshot, read from Storage by
-		// the transport. Only with a transport that can (`snapshots`), and only
-		// to a server that names it (its input is strict). A server without a
-		// published snapshot answers from Postgres as before.
-		const storage = features?.includes('snapshot_storage') && transport.snapshots ? { storage: true as const } : {};
 		if (serverDeviceReads) {
 			try {
-				return await transport.bootstrap({ deviceId, ...chunked, ...storage });
+				return await transport.bootstrap({ deviceId });
 			} catch (err) {
 				if (!(err instanceof CloudTransportError && err.kind === 'bad_request')) throw err;
 				slog.warn('bootstrap: the server refused the device id; loading without it', { reason: err.message });
 				serverDeviceReads = false;
 			}
 		}
-		return transport.bootstrap(chunked.chunked || storage.storage ? { ...chunked, ...storage } : undefined);
+		return transport.bootstrap();
 	};
 
-	const bootstrap = async (bopts: { resetCursor?: boolean } = {}): Promise<void> => {
-		const b = await fetchSnapshot();
-		const records = b.records;
+	const rememberBase = (baseSeq: number): void => {
+		if (baseSeq !== (readClientState(raw).baseSeq ?? 0)) patchClientState({ baseSeq });
+	};
+
+	// Loads `records` (the snapshot at `snapshotSeq`) onto this device.
+	// `resetCursor`: replay from the snapshot's seq even when the cursor is
+	// past it (a repair), instead of keeping the further cursor.
+	const loadRecords = async (records: readonly SnapshotRecord[], snapshotSeq: number, bopts: { resetCursor?: boolean } = {}): Promise<void> => {
 		if (tally) { tally.bootstrapped = true; tally.snapshotRecords += records.length; }
-		slog.info('bootstrap: loading snapshot', { records: records.length, snapshotSeq: b.snapshotSeq });
+		slog.info('bootstrap: loading snapshot', { records: records.length, snapshotSeq });
 		bootstrapProgress = { done: 0, total: records.length };
 		emitStatus();
 		try {
@@ -1214,7 +1311,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			});
 			const cursor = readCursor(raw);
 			raw.transaction(() => {
-				writeCursor(raw, bopts.resetCursor ? b.snapshotSeq : Math.max(cursor.lastSeq, b.snapshotSeq), b.snapshotSeq);
+				writeCursor(raw, bopts.resetCursor ? snapshotSeq : Math.max(cursor.lastSeq, snapshotSeq), snapshotSeq);
 				markFirstPull(raw);
 			})();
 			slog.info('bootstrap: done', { changed: res.changed, chunks: res.chunks, maxSliceMs: Math.round(res.maxSliceMs) });
@@ -1225,42 +1322,128 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 	};
 
-	// ── initial push ────────────────────────────────────────────────────
-
-	const initialPushDone = (): boolean => raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined;
-	let initialPushRun: Promise<void> | null = null;
-	type Driver = (r: Raw, o: { chunk?: number; onProgress?: (p: InitialPushProgress) => void }) => Promise<InitialPushAsyncResult>;
-	const runInitialPush = (): Promise<void> => {
-		// A library pushed before rekordbox units, or before recordings and
-		// their claims, were emitted states them once, through the same
-		// chunked driver (initial-push.ts).
-		const runs: Array<[string, Driver]> = initialPushDone()
-			? [
-				...(rbBackfillPending(raw) ? [['rekordbox analysis backfill: done', rbBackfillAsync] as [string, Driver]] : []),
-				...(claimsBackfillPending(raw) ? [['recording claims backfill: done', claimsBackfillAsync] as [string, Driver]] : []),
-			]
-			: [['initial push: done', initialPushAsync]];
-		if (runs.length === 0) return Promise.resolve();
-		if (!initialPushRun) {
-			initialPushRun = (async () => {
-				initialPushProgress = { done: 0, estimate: 0 };
-				emitStatus();
-				try {
-					for (const [done, drive] of runs) {
-						const r = await drive(raw, {
-							chunk: opts.initialPushChunk,
-							onProgress: (p) => { initialPushProgress = p; emitStatus({ progress: true }); },
-						});
-						slog.info(done, { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
-					}
-				} finally {
-					initialPushProgress = null;
-					initialPushRun = null;
-					emitStatus();
-				}
-			})();
+	// False when nothing could be loaded: the account holds no snapshot but
+	// has a base (its log no longer starts at 0). No snapshot at base 0 is
+	// the empty state (protocol BootstrapResult): "replay the log from 0",
+	// which a repair (`resetCursor`) does by rewinding the cursor.
+	const bootstrap = async (bopts: { resetCursor?: boolean } = {}): Promise<boolean> => {
+		const b = await fetchSnapshot();
+		rememberBase(b.baseSeq);
+		if (b.records === null) {
+			if (b.baseSeq > 0) {
+				slog.warn('bootstrap: the account has no published snapshot', { baseSeq: b.baseSeq });
+				return false;
+			}
+			if (bopts.resetCursor) raw.transaction(() => { writeCursor(raw, 0); markFirstPull(raw); })();
+			return true;
 		}
-		return initialPushRun;
+		await loadRecords(b.records, b.snapshotSeq, bopts);
+		return true;
+	};
+
+	// ── stating the library (the header) ────────────────────────────────
+
+	const initialPushDone = (): boolean => libraryStated(raw);
+
+	// One pull of the head, for what the bootstrap does not say: whether the
+	// account has any op at all, and the server's features when this session
+	// has not heard them yet.
+	const probeHead = async (): Promise<{ empty: boolean }> => {
+		const res = await transport.sync.pull({ afterSeq: 0, limit: 1, ...(serverDeviceReads ? { deviceId } : {}) });
+		learnFeatures(res.features);
+		return { empty: res.ops.length === 0 && res.snapshotSeq === undefined };
+	};
+
+	type BaseOutcome = 'stated' | 'founded' | 'joined' | 'waiting' | 'pushed';
+	let baseRun: Promise<BaseOutcome> | null = null;
+	type Driver = (r: Raw, o: { chunk?: number; onProgress?: (p: InitialPushProgress) => void }) => Promise<InitialPushAsyncResult>;
+	const progress = (p: InitialPushProgress): void => { initialPushProgress = p; emitStatus({ progress: true }); };
+
+	// A joiner's statement: the bind sweep (once), then the join push as the
+	// 'initial-push' batch.
+	const joinAccount = async (): Promise<void> => {
+		if (!joinBindDone(raw)) {
+			const b = await joinBindAsync(raw);
+			slog.info('join: own rows bound to the account\'s recordings', { rows: b.rows, bound: b.bound, boundDeleted: b.boundDeleted, known: b.known, unbound: b.unbound, held: b.held, chunks: b.chunks, maxSliceMs: Math.round(b.maxSliceMs) });
+			emitApplied(b.tracksTouched, b.playlistsTouched, []);
+		}
+		const r = await joinPushAsync(raw, { chunk: opts.initialPushChunk, onProgress: progress });
+		slog.info('join push: done', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+	};
+
+	const establishBase = async (): Promise<BaseOutcome> => {
+		if (initialPushDone()) return 'stated';
+		// The features this session has not heard yet come with the probe the
+		// founder check needs anyway: one call, not two.
+		const probed = features === null ? await probeHead() : null;
+		// No base to be had: the library goes up as ops (the path before the
+		// account had a base at all; a server without 'snapshot_storage').
+		if (!features?.includes('snapshot_storage')) {
+			const r = await joinPushAsync(raw, { chunk: opts.initialPushChunk, onProgress: progress });
+			slog.info('initial push: done (the server holds no base)', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+			return 'pushed';
+		}
+		// A device that has seen the account already (a bootstrap that landed,
+		// then a crash before the join push) carries on from there.
+		if (!firstPullDone(raw)) {
+			const b = await fetchSnapshot();
+			rememberBase(b.baseSeq);
+			if (b.records !== null) {
+				await loadRecords(b.records, b.snapshotSeq);
+			} else if (b.baseSeq === 0 && (probed ?? await probeHead()).empty) {
+				// The founder. The account is empty, so this device has seen all
+				// of it (FIRST_PULL_KEY: the drains' role gate opens on it), and
+				// the fold states everything into the records alone.
+				// snapshot_seq 0: this device holds the base itself (the pull's
+				// never-loaded-a-base rule below does not apply to it).
+				raw.transaction(() => { markFirstPull(raw); writeCursor(raw, readCursor(raw).lastSeq, 0); })();
+				const r = await foldLibraryAsync(raw, {
+					chunk: opts.initialPushChunk,
+					onProgress: progress,
+					...(opts.feed ? { feed: { backfill: (o: { local: true }) => opts.feed!.backfill(o) } } : {}),
+				});
+				slog.info('founder: library folded into the records as the account base; nothing sent', { ops: r.ops, meta: r.meta, attrs: r.attrs, playlistAttrs: r.playlistAttrs, v4: r.v4, claims: r.claims, albums: r.albums, feed: r.feed, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+				return 'founded';
+			} else if (masterDevice(raw) === deviceId) {
+				// The records already name this device the master (nothing to
+				// join from): it publishes the base itself.
+				markFirstPull(raw);
+			} else {
+				return 'waiting';
+			}
+		}
+		await joinAccount();
+		return 'joined';
+	};
+
+	// Single flight over the statement and the backfills a stated library
+	// still owes (a library pushed before rekordbox units, or before
+	// recordings and their claims, were emitted states them once, through
+	// the same chunked driver).
+	const runInitialPush = (): Promise<BaseOutcome> => {
+		if (baseRun) return baseRun;
+		baseRun = (async (): Promise<BaseOutcome> => {
+			initialPushProgress = { done: 0, estimate: 0 };
+			emitStatus();
+			try {
+				const outcome = await establishBase();
+				if (outcome === 'waiting') return outcome;
+				const runs: Array<[string, Driver]> = [
+					...(rbBackfillPending(raw) ? [['rekordbox analysis backfill: done', rbBackfillAsync] as [string, Driver]] : []),
+					...(claimsBackfillPending(raw) ? [['recording claims backfill: done', claimsBackfillAsync] as [string, Driver]] : []),
+				];
+				for (const [done, drive] of runs) {
+					const r = await drive(raw, { chunk: opts.initialPushChunk, onProgress: progress });
+					slog.info(done, { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+				}
+				return outcome;
+			} finally {
+				initialPushProgress = null;
+				baseRun = null;
+				emitStatus();
+			}
+		})();
+		return baseRun;
 	};
 
 	// ── recording identity ──────────────────────────────────────────────
@@ -1544,6 +1727,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			slog.debug('snapshot: not now', { skipped: built.skipped, count: built.count });
 			return;
 		}
+		if (built.digestOnly) return;
 		try {
 			await uploadAndPublish(built, asDevice, store, publish, t0);
 		} finally {
@@ -1609,6 +1793,54 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		// this new: recorded, and the next is due from there.
 		writePublishRecord(raw, { seq: Math.max(built.snapshotSeq, res.latestSeq), at: Date.now(), refusedMaster: null, orphans });
 		slog.info('snapshot: published', { ...facts, status: res.status, latestSeq: res.latestSeq, superseded: res.superseded.length, uploadMs, ms: Math.round(performance.now() - t0) });
+	};
+
+	// ── a secondary's digest check (the header) ─────────────────────────
+	// Set by a drained pull that ended exactly at the master's newest
+	// published snapshot; run after the cycle, beside it like the publish
+	// (the build is the same utility process). A mismatch sets needsRepair:
+	// the next cycle's pull reloads the snapshot from its seq.
+	let digestDue: { seq: number; stateSha256: string } | null = null;
+	let verifying: Promise<void> | null = null;
+	const startDigestCheck = (): void => {
+		const target = digestDue;
+		digestDue = null;
+		if (!target || verifying || publishing || detaching || publishHalted || !publishOpts) return;
+		if (masterDevice(raw) === deviceId) return;
+		if (readDigestRecord(raw)?.seq === target.seq) return;
+		const c = { pending: 0, rejected: 0 };
+		for (const r of counts.all() as Array<{ state: 'pending' | 'rejected'; n: number }>) c[r.state] = r.n;
+		if (c.pending > 0 || c.rejected > 0 || heldCount(raw) > 0 || readClientState(raw).needsRepair) return;
+		const session = transport.session();
+		if (!session) return;
+		verifying = (async () => {
+			const r = await publishOpts.builder({ userId: session.userId, digestOnly: true });
+			if (!r.ok) { slog.debug('digest check: not now', { skipped: r.skipped, count: r.count }); return; }
+			if (!r.digestOnly) return;
+			// The cursor moved on while the build ran: not the same state.
+			if (r.snapshotSeq !== target.seq) { slog.debug('digest check: the cursor moved; skipped', { built: r.snapshotSeq, published: target.seq }); return; }
+			const matched = r.stateSha256 === target.stateSha256;
+			writeDigestRecord(raw, { seq: target.seq, at: Date.now(), matched });
+			if (matched) {
+				slog.info('digest check: this device\'s records match the master\'s snapshot', { seq: target.seq, records: r.records, buildMs: r.buildMs });
+				return;
+			}
+			patchClientState({ needsRepair: true });
+			slog.warn('digest check: this device\'s records differ from the master\'s snapshot — reloading it next cycle', { seq: target.seq, ours: r.stateSha256, master: target.stateSha256, records: r.records });
+			wake('local');
+		})()
+			.catch((err: unknown) => { slog.warn('digest check failed; trying again at the next snapshot', { seq: target.seq }, err); })
+			.finally(() => { verifying = null; emitStatus(); });
+		emitStatus();
+	};
+
+	// ── outbox retention (outbox.ts) ────────────────────────────────────
+	const retentionMs = opts.outboxRetentionMs ?? OUTBOX_RETENTION_MS;
+	const pruneOutbox = (): void => {
+		const pending = (raw.prepare(`SELECT count(*) FROM sync_outbox WHERE state = 'pending'`).pluck().get() as number);
+		if (pending > 0) return;
+		const n = pruneAckedOutbox(raw, { olderThanMs: retentionMs });
+		if (n > 0) slog.info('outbox: deleted acked rows past retention', { deleted: n, retentionDays: Math.round(retentionMs / 86_400_000) });
 	};
 
 	// A cycle that ends while a publish runs asks again once it is done: the
@@ -1738,7 +1970,16 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		let outcome = 'ok';
 		try {
 			await ensureRegistered(session);
-			await runInitialPush();
+			if ((await runInitialPush()) === 'waiting') {
+				waitingForSnapshot = true;
+				if (!waitingLogged) {
+					waitingLogged = true;
+					slog.info('waiting for the account\'s snapshot: the account has ops but no published base yet; asking again each cycle');
+				}
+				outcome = 'waiting';
+				return;
+			}
+			waitingForSnapshot = false;
 			await stage('provider claims', reconcileClaims);
 			// Claims made here since the last cycle (and by the backfills just
 			// above) resolve before the push carries them.
@@ -1785,12 +2026,13 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			lastError = null;
 			attempt = 0;
 			clearRetry();
-			if (pullReachedHead) startPublish();
+			pruneOutbox();
+			if (pullReachedHead) { startPublish(); startDigestCheck(); }
 		} catch (err) {
 			if (err instanceof SyncRecordsIncompleteError) {
-				// The initial-push marker vanished under us (a restore?): the
-				// next cycle runs the push again.
-				slog.warn('pull refused: records incomplete — re-running the initial push next cycle');
+				// The records-complete marker vanished under us (a restore?):
+				// the next cycle states the library again.
+				slog.warn('pull refused: records incomplete — stating the library again next cycle');
 			}
 			lastError = describe(err);
 			outcome = err instanceof CloudTransportError ? err.kind : 'error';
@@ -1882,8 +2124,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// A cycle already past the `detaching` check finishes first; one
 			// woken meanwhile returns at it.
 			while (inflight) await inflight.catch(() => { /* reported by the cycle */ });
-			// A snapshot publish stops at its next step (`detaching`).
+			// A snapshot publish stops at its next step (`detaching`); a digest
+			// check is a read and finishes.
 			while (publishing) await publishing;
+			while (verifying) await verifying;
 			const session = transport.session();
 			const st = readClientState(raw);
 			let revokedOnServer = false;
@@ -1987,7 +2231,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		pushOnce,
 		pullOnce,
 		bootstrap,
-		runInitialPush,
+		runInitialPush: async () => { await runInitialPush(); },
 		syncNow,
 		wake,
 		setPollPolicy,

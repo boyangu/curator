@@ -65,6 +65,9 @@ async function pair(cloud: FakeCloud) {
 	const b = client(bRaw, bT);
 	makeTags(aRaw, 'a', 2);
 	await a.syncNow();
+	// A founded the account (client.ts); these bare clients publish no
+	// snapshot, so the base B joins from is the fake's own fold.
+	cloud.takeSnapshot();
 	await b.syncNow();
 	expect(tagCount(bRaw)).toBe(2);
 	return { a, b, aRaw, bRaw, aT, bT };

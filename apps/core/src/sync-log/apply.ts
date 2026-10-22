@@ -25,22 +25,34 @@ import { SyncStateStore } from './store.js';
 
 type Raw = Database.Database;
 
-// Set by the initial push (initial-push.ts) once every pre-existing row has a
-// record. Before that the records are partial: a container the op log never
-// saw a create for counts as invisible to the reducer, so applying a remote
-// edit to it would hide the user's own playlist. applyOps refuses until then
-// unless the library holds nothing the records could be missing.
+// Two device-local marks, once one (the 2026-10-22 sync review split them):
+//
+// RECORDS_COMPLETE_KEY: every visible row of this library has a record. Set
+// by the founder fold (initial-push.ts foldLibraryAsync), by loading a
+// snapshot (snapshot.ts), by the first applied batch, and by migrate for a
+// library born empty. Before it the records are partial: a container the op
+// log never saw a create for counts as invisible to the reducer, so applying
+// a remote edit to it would hide the user's own playlist. applyOps refuses
+// until then unless the library holds nothing the records could be missing.
+//
+// INITIAL_PUSH_KEY: this device's library has been STATED to the account —
+// folded as the account's base (the founder) or sent as ops after a
+// bootstrap and the bind sweep (a joiner). The one-time backfills and the
+// drains key on it: nothing of a library is restated before the library
+// itself was. A bootstrapped device holds complete records before it has
+// stated anything, which is why the two are no longer one key.
+export const RECORDS_COMPLETE_KEY = 'sync.records_complete_at';
 export const INITIAL_PUSH_KEY = 'sync.initial_push_at';
 
 export class SyncRecordsIncompleteError extends Error {
 	override readonly name = 'SyncRecordsIncompleteError';
 	constructor() {
-		super('this library has rows the op log has not recorded yet; run the initial push before applying remote ops');
+		super('this library has rows the op log has not recorded yet; bootstrap or fold the library before applying remote ops');
 	}
 }
 
 export function recordsComplete(raw: Raw): boolean {
-	if (raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY)) return true;
+	if (raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(RECORDS_COMPLETE_KEY)) return true;
 	const any = (sql: string): boolean => raw.prepare(sql).get() !== undefined;
 	return !any(`SELECT 1 FROM playlist LIMIT 1`)
 		&& !any(`SELECT 1 FROM playlist_folder LIMIT 1`)
@@ -50,9 +62,27 @@ export function recordsComplete(raw: Raw): boolean {
 		&& !any(`SELECT 1 FROM tag WHERE kind != 'system' LIMIT 1`);
 }
 
-export function markRecordsComplete(raw: Raw): void {
+function markOnce(raw: Raw, key: string): void {
 	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)
-		.run(INITIAL_PUSH_KEY, JSON.stringify(Date.now()), Date.now());
+		.run(key, JSON.stringify(Date.now()), Date.now());
+}
+
+export function markRecordsComplete(raw: Raw): void {
+	markOnce(raw, RECORDS_COMPLETE_KEY);
+}
+
+export function initialPushDone(raw: Raw): boolean {
+	return raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) !== undefined;
+}
+
+export function markInitialPushDone(raw: Raw): void {
+	markOnce(raw, INITIAL_PUSH_KEY);
+}
+
+// The one-shot for libraries from before the split (migrate.ts): a library
+// that had stated itself under the single key had complete records too.
+export function migrateRecordsCompleteKey(raw: Raw): void {
+	if (initialPushDone(raw)) markRecordsComplete(raw);
 }
 
 // Up to this many track rows, an artist alias rule's credit rewrite runs

@@ -7,7 +7,9 @@
 // The parts land in a directory under `tmpRoot` (userData/snapshot-build);
 // the sync client removes it after the upload. A build a crash or the
 // watchdog cut short leaves its directory behind: the next build clears
-// whatever is there first (nothing else writes under it).
+// whatever is there first (nothing else writes under it). A digest-only
+// build (a secondary's check against the master's snapshot) runs the same
+// way and writes nothing.
 
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -22,7 +24,7 @@ const slog = mainLog.for('snapshot-host');
 const BUILD_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function createUtilitySnapshotBuilder(opts: { workerPath: string; dbPath: string; tmpRoot: string }): SnapshotBuilder {
-	return async ({ userId }) => {
+	return async ({ userId, digestOnly }) => {
 		await mkdir(opts.tmpRoot, { recursive: true });
 		for (const name of await readdir(opts.tmpRoot)) await rm(join(opts.tmpRoot, name), { recursive: true, force: true }).catch(() => { /* in use: next time */ });
 		const outDir = await mkdtemp(join(opts.tmpRoot, 'build-'));
@@ -45,9 +47,9 @@ export function createUtilitySnapshotBuilder(opts: { workerPath: string; dbPath:
 				// After an answer this is the kill below: the promise is settled.
 				proc.on('exit', (code: number) => { clearTimeout(timer); reject(new Error(`snapshot worker exited (code ${code})`)); });
 				proc.on('error', (type: string, location: string) => slog.error('worker fatal', undefined, { type, location }));
-				proc.postMessage({ id: 1, op: 'build', dbPath: opts.dbPath, outDir, userId });
+				proc.postMessage({ id: 1, op: 'build', dbPath: opts.dbPath, outDir, userId, digestOnly: !!digestOnly });
 			});
-			if (!result.ok) await rm(outDir, { recursive: true, force: true });
+			if (!result.ok || result.digestOnly) await rm(outDir, { recursive: true, force: true });
 			return result;
 		} catch (err) {
 			await rm(outDir, { recursive: true, force: true }).catch(() => { /* next build clears it */ });

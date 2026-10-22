@@ -185,46 +185,61 @@ describe('migration gate before 0007', () => {
 	});
 });
 
-// 0008 makes library_snapshot.body nullable and adds the v3 snapshot rule
-// roles.sql grants; a database with bodied snapshots from before it keeps
-// them as they are.
-describe('migration gate before 0008', () => {
+// 0009 is the destructive one: the server-folded (bodied) snapshots and the
+// fold's lease and rules go, the published rows stay, and the base table and
+// the compaction functions roles.sql grants arrive. A database from before
+// it (0008: bodied rows beside published ones) must come through with
+// exactly its published snapshots.
+describe('migration gate before 0009', () => {
 	let t: TestDb;
 	let user: string;
 	beforeAll(async () => {
 		t = await createTestDb({ migrate: false });
-		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0008_')));
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0009_')));
 		await t.db.exec(rolesSql);
 		user = await t.createUser();
-		await t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, body) values ($1, 7, 'body'::bytea)`, [user]);
+		await t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, body) values ($1, 7, 'body'::bytea), ($1, 9, 'body'::bytea)`, [user]);
+		await t.db.query(
+			`insert into curator.library_snapshot (user_id, snapshot_seq, storage, state_sha256, published_by) values ($1, 8, '{"parts": []}', repeat('a', 64), 'master')`,
+			[user],
+		);
+		await t.db.query(`insert into curator.library_snapshot_lease (user_id, holder, until) values ($1, 'job', now())`, [user]);
 	});
 	afterAll(() => t.db.close());
 
-	it('refuses an image that ships 0008_snapshot_storage.sql, naming it', async () => {
-		expect(shipped).toContain('0008_snapshot_storage.sql');
+	it('refuses an image that ships 0009_library_base.sql, naming it', async () => {
+		expect(shipped).toContain('0009_library_base.sql');
 		const { log, lines } = capture();
 		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
-		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0008_') })]);
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0009_') })]);
 	});
 
-	it('keeps older snapshots, and grants v3 once the owner re-runs roles.sql', async () => {
+	it('deletes the bodied snapshots and the lease, keeps the published ones, and grants the compaction functions once roles.sql is re-run', async () => {
 		await migrate(t.db, sqlDir);
 		await t.db.exec(rolesSql);
 		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
-		await expect(
-			asApi(t, (q) => q.query(`select * from curator.users_due_for_snapshot_v3(1, interval '1 day', interval '5 minutes', interval '1 hour', interval '7 days')`)),
-		).resolves.toEqual([]);
-		const rows = await t.db.query<{ seq: number; bodied: boolean; storage: unknown }>(
-			`select snapshot_seq::int as seq, body is not null as bodied, storage from curator.library_snapshot where user_id = $1`,
-			[user],
+		const rows = await t.db.query<{ seq: number; published_by: string }>(`select snapshot_seq::int as seq, published_by from curator.library_snapshot where user_id = $1`, [user]);
+		expect(rows).toEqual([{ seq: 8, published_by: 'master' }]);
+		const columns = await t.db.query<{ column_name: string; is_nullable: string }>(
+			`select column_name, is_nullable from information_schema.columns where table_schema = 'curator' and table_name = 'library_snapshot' order by column_name`,
 		);
-		expect(rows).toEqual([{ seq: 7, bodied: true, storage: null }]);
-		// Exactly one of body / storage, and a Storage row is stamped.
-		await expect(t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq) values ($1, 8)`, [user])).rejects.toThrow(/library_snapshot_body_or_storage/);
-		await expect(
-			t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, body, storage, state_sha256, published_by) values ($1, 9, 'body'::bytea, '{}', repeat('a', 64), 'd')`, [user]),
-		).rejects.toThrow(/library_snapshot_body_or_storage/);
-		await expect(t.db.query(`insert into curator.library_snapshot (user_id, snapshot_seq, storage) values ($1, 10, '{}')`, [user])).rejects.toThrow(/library_snapshot_storage_stamped/);
+		expect(columns).toEqual([
+			{ column_name: 'created_at', is_nullable: 'NO' },
+			{ column_name: 'published_by', is_nullable: 'NO' },
+			{ column_name: 'snapshot_seq', is_nullable: 'NO' },
+			{ column_name: 'state_sha256', is_nullable: 'NO' },
+			{ column_name: 'storage', is_nullable: 'NO' },
+			{ column_name: 'user_id', is_nullable: 'NO' },
+		]);
+		await expect(t.db.query(`select * from curator.library_snapshot_lease`)).rejects.toThrow(/does not exist/);
+		await expect(t.db.query(`select * from curator.users_due_for_snapshot_v3(1, interval '1 day', interval '5 minutes', interval '1 hour', interval '7 days')`)).rejects.toThrow(/does not exist/);
+		// The new functions, as the API role: no account is due, the base of
+		// this account can be set at its one snapshot, and compaction of a
+		// log that holds nothing deletes nothing.
+		await expect(asApi(t, (q) => q.query(`select * from curator.users_due_for_compaction(interval '7 days')`))).resolves.toEqual([]);
+		await expect(asApi(t, (q) => q.query(`select curator.set_base_seq($1::uuid, 8)::int as base`, [user]))).resolves.toEqual([{ base: 8 }]);
+		await expect(asApi(t, (q) => q.query(`select curator.compact_ops($1::uuid, 5000)::int as n`, [user]))).resolves.toEqual([{ n: 0 }]);
+		expect(await t.db.query(`select base_seq::int as base, compacted_at is not null as done from curator.library_base where user_id = $1`, [user])).toEqual([{ base: 8, done: true }]);
 	});
 });
 

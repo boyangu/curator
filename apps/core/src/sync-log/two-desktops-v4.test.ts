@@ -3,8 +3,9 @@
 // the other two-desktop suites: generated databases only, no
 // remoteWritePolicy, streaming adapters that record and throw, no network.
 //
-//   - a v3 server: nothing v4 is emitted or pushed, sync carries on; once the
-//     server reads v4 the backfills state everything the master holds;
+//   - a v3 server: nothing v4 is emitted or pushed, sync carries on; the
+//     founder's base carries every v4 cell regardless (records, not ops),
+//     and once the server reads v4 nothing is left to restate;
 //   - track attributes: master wins per field, adoption onto empty own
 //     fields, follow / clear, a local value taking a field back, a master
 //     switch, play counts of a rekordbox-linked row kept;
@@ -54,7 +55,7 @@ const attrsOf = async (d: Desktop, t: string): Promise<Record<string, unknown> |
 // ── the v3 server, then the upgrade ─────────────────────────────────────────
 
 describe('v4 against a v3 server, then after the server upgrade', () => {
-	it('emits nothing v4 to a v3 server and keeps syncing; the upgrade states the master\'s whole library once', async () => {
+	it('emits nothing v4 to a v3 server and keeps syncing; the base carries the v4 cells, so the upgrade restates nothing', async () => {
 		v3Server();
 		const a = await rig.desktop('a', {
 			catalogue: ['trk-0', 'trk-1', 'trk-2', 'trk-3', 'trk-4'],
@@ -80,20 +81,18 @@ describe('v4 against a v3 server, then after the server upgrade', () => {
 		});
 		const b = await rig.desktop('b', { catalogue: [] });
 		await rig.settle();
-		// Nothing v4 reached the v3 server, and no push failed.
+		// Nothing v4 reached the v3 server, and no push failed: the library is
+		// in the base A folded (records carry no protocol version), which B
+		// loaded whole — v4 cells included.
 		expect(v4Ops()).toEqual([]);
 		expect((await a.svc.getCloudSyncStatus()).lastError).toBeNull();
 		expect(a.one(`SELECT count(*) FROM sync_outbox WHERE schema_version >= 4`)).toBe(0);
-		expect(row(b, 'trk-0')['bpm']).toBeNull();
+		for (const map of ['cues', 'playEvents', 'albums']) expect(a.one(`SELECT count(*) FROM sync_state WHERE map = ?`, map), map).toBeGreaterThan(0);
 
 		v4Server();
 		await rig.settle();
-		const kinds = [...new Set(v4Ops().map((o) => `${o.entity}.${o.kind}`))].sort();
-		expect(kinds).toEqual([
-			'album.set-meta', 'cue.upsert2', 'library_track.set-attrs', 'library_track.set-curation', 'library_track.set-rb-analysis', 'play_event.append2', 'playlist.set-attrs', 'recording_claim.add',
-		]);
-		// Every v4 op is stamped 4: a v3 client holds it.
-		expect(v4Ops().every((o) => o.schema_version === 4 && schemaVersionStatus(o.schema_version, 3) === 'ahead')).toBe(true);
+		// The upgrade states nothing more: every v4 statement was folded.
+		expect(v4Ops()).toEqual([]);
 
 		const r0 = row(b, 'trk-0');
 		expect([r0['remote_only'], r0['bpm'], r0['key_camelot'], r0['comment'], r0['color_label'], r0['explicit'], r0['play_count']]).toEqual([1, 122.5, '8A', 'note', 'red', 0, 79]);
@@ -109,11 +108,10 @@ describe('v4 against a v3 server, then after the server upgrade', () => {
 		expect(b.one(`SELECT source_id FROM album_link al JOIN track t ON t.album_id = al.album_id WHERE t.id = ?`, remoteTrackId(R('trk-4')))).toBe('al1');
 		expect(b.one(`SELECT al.source_id FROM artist_link al JOIN artist ar ON ar.id = al.artist_id WHERE ar.name = 'Artist'`)).toBe('ar1');
 
-		// Once: a second settle (and a restart) states nothing more.
-		const n = v4Ops().length;
+		// A restart states nothing more either.
 		await a.restart();
 		await rig.settle();
-		expect(v4Ops().length).toBe(n);
+		expect(v4Ops()).toEqual([]);
 		// The remote rows never state anything of their own.
 		const bId = await b.deviceId();
 		expect(rig.cloud.log.filter((o) => o.device_id === bId && o.schema_version >= 4)).toEqual([]);
@@ -320,8 +318,10 @@ describe('curation: comment and colour are last-write-wins on every device', () 
 		const a = await rig.desktop('a', { catalogue: ['trk-0'], seed: rbLinked('keep /* deep / dub */', ['deep', 'dub']) });
 		await rig.desktop('b', { catalogue: [] });
 		await rig.settle();
+		// The comment's text and the colour went up in the founder's base, not
+		// as ops.
 		const n = (await curationOps(a)).length;
-		expect(n).toBe(2); // the comment's text and the colour, once
+		expect(n).toBe(0);
 		a.raw.prepare(`UPDATE track SET comment = 'keep /* deep / dub */', color_label = 'red' WHERE id = 'trk-0'`).run();
 		await rig.settle();
 		a.raw.prepare(`UPDATE track SET comment = 'keep /* dub / deep / new */' WHERE id = 'trk-0'`).run();
@@ -519,23 +519,16 @@ describe('Discover feed decisions', () => {
 	});
 });
 
-// ── the snapshot in pieces ──────────────────────────────────────────────────
+// ── the base out of Storage ─────────────────────────────────────────────────
 
-describe('bootstrap with snapshot_chunks', () => {
-	it('asks for the snapshot in pieces only from a server that offers them', async () => {
+describe('bootstrap from Storage', () => {
+	it('a joining device reads the master-published snapshot, never a server body', async () => {
 		const a = await rig.desktop('a', { catalogue: ['trk-0'], seed: (raw) => { raw.prepare(`UPDATE track SET bpm = 124 WHERE id = 'trk-0'`).run(); } });
 		await rig.settle();
-		rig.cloud.hintBelow = rig.cloud.takeSnapshot();
 		const b = await rig.desktop('b', { catalogue: [] });
 		await rig.settle();
-		expect([rig.cloud.calls.bootstrap, rig.cloud.calls.chunkedBootstraps]).toEqual([1, 1]);
+		expect([rig.cloud.calls.bootstrap, rig.cloud.calls.storageBootstraps]).toEqual([2, 1]);
 		expect(row(b, 'trk-0')['bpm']).toBe(124);
-		// A server without the feature gets the old inline request.
-		rig.cloud.features = rig.cloud.features.filter((f) => f !== 'snapshot_chunks');
-		const c = await rig.desktop('c', { catalogue: [] });
-		await rig.settle();
-		expect([rig.cloud.calls.bootstrap, rig.cloud.calls.chunkedBootstraps]).toEqual([2, 1]);
-		expect(row(c, 'trk-0')['bpm']).toBe(124);
 		void a;
 	});
 });
@@ -544,10 +537,12 @@ describe('bootstrap with snapshot_chunks', () => {
 
 describe('a v3 client holds v4 ops aside', () => {
 	it('every v4 op is "ahead" for a v3 reader; held, it replays once the build reads v4', async () => {
-		const a = await rig.desktop('a', { catalogue: ['trk-0'], seed: (raw) => { raw.prepare(`UPDATE track SET bpm = 124 WHERE id = 'trk-0'`).run(); } });
+		const a = await rig.desktop('a', { catalogue: ['trk-0'] });
 		const b = await rig.desktop('b', { catalogue: ['trk-0'] });
 		await rig.settle();
-		void a;
+		// A tempo learnt after the join: a v4 set-attrs op on the log.
+		a.raw.prepare(`UPDATE track SET bpm = 124 WHERE id = 'trk-0'`).run();
+		await rig.settle();
 		const v4 = v4Ops();
 		expect(v4.length).toBeGreaterThan(0);
 		expect(SCHEMA_VERSION).toBe(4);

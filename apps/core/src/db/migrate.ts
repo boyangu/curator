@@ -18,7 +18,7 @@ import { rebalance } from '@curator/protocol';
 import { randomUUID } from 'node:crypto';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { mergeRecordingRaw } from '../library/mutators.js';
-import { markRecordsComplete, recordsComplete } from '../sync-log/apply.js';
+import { markRecordsComplete, migrateRecordsCompleteKey, recordsComplete } from '../sync-log/apply.js';
 import { claimParentId } from '../sync-log/store.js';
 import { CLAIMS_BACKFILL_KEY } from '../sync-log/initial-push.js';
 import { CLAIM_LINKS_SWEEP_KEY } from '../sync-log/claim-links.js';
@@ -2401,10 +2401,16 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// is the library as the previous version left it.
 	migrateSyncSchema(sqlite, dbPath);
 	indexClaimRecords(sqlite);
-	// A library born empty is born complete: every row from here on is
-	// recorded by the mutators, so no initial push is owed (apply.ts). Nor
-	// the recordings backfill: the scanner and the streaming upserts record
-	// each new row's create and claims (initial-push.ts CLAIMS_BACKFILL_KEY).
+	// A library that stated itself under the old single key (apply.ts) had
+	// complete records too: the split's one-shot, before the empty-library
+	// rule below reads the new key.
+	migrateRecordsCompleteKey(sqlite);
+	// A library born empty is born with complete records: every row from
+	// here on is recorded by the mutators (apply.ts). Not stated yet, though
+	// (INITIAL_PUSH_KEY): its first sync still founds the account's base or
+	// joins an existing one (sync-log/client.ts). Nor the recordings
+	// backfill: the scanner and the streaming upserts record each new row's
+	// create and claims (initial-push.ts CLAIMS_BACKFILL_KEY).
 	if (recordsComplete(sqlite)) markRecordsComplete(sqlite);
 	if (sqlite.prepare(`SELECT 1 FROM track LIMIT 1`).get() === undefined) {
 		sqlite.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`)

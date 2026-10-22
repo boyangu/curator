@@ -28,7 +28,7 @@ import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import type { ScanProgress } from '../local/scanner.js';
 import { createCoreService, type CoreService, type CoreServiceOptions } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
-import { INITIAL_PUSH_KEY } from '../sync-log/apply.js';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from '../sync-log/apply.js';
 import { readCursor } from '../sync-log/client.js';
 import { canonicalOverrides, compareDumps, dumpLibrary, type LibraryDump, type TableReport } from '../sync-log/dump.js';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
@@ -87,9 +87,11 @@ export function seedCatalogue(raw: Raw, ids: readonly string[], artists: (id: st
 }
 
 // A library from before the op log (its rows were never emitted): the next
-// sign-in runs the initial push for them.
+// sign-in states them — folded as the account's base when this is the first
+// device, sent as ops after a bootstrap and the bind sweep otherwise
+// (sync-log/client.ts).
 export function markPreOpLog(raw: Raw): void {
-	raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(INITIAL_PUSH_KEY);
+	raw.prepare(`DELETE FROM app_setting WHERE key IN (?, ?)`).run(INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY);
 }
 
 // ── generated audio ─────────────────────────────────────────────────────────
@@ -177,16 +179,25 @@ export class Desktop {
 		return this.open();
 	}
 
-	async sync(): Promise<void> { await this.svc.cloudSyncNow(); }
+	// One cycle, and the publish or digest check it started (client.ts runs
+	// them beside the cycle): a scenario's next step sees the base this one
+	// put up.
+	async sync(): Promise<void> {
+		await this.svc.cloudSyncNow();
+		if (this.transport.online) await this.publishIdle();
+	}
 
 	async deviceId(): Promise<string> { return (await this.svc.getCloudSyncStatus()).deviceId!; }
 
-	// The master's snapshot publish runs beside the sync cycles (client.ts),
-	// started at the end of one: waits until none runs.
+	// The master's snapshot publish and a secondary's digest check run beside
+	// the sync cycles (client.ts), started at the end of one: waits until
+	// neither runs.
 	async publishIdle(ms = 10_000): Promise<void> {
 		const end = Date.now() + ms;
-		while ((await this.svc.getCloudSyncStatus()).snapshot.publishing) {
-			if (Date.now() > end) throw new Error(`${this.name}: snapshot publish still running after ${ms} ms`);
+		for (;;) {
+			const s = (await this.svc.getCloudSyncStatus()).snapshot;
+			if (!s.publishing && !s.verifying) return;
+			if (Date.now() > end) throw new Error(`${this.name}: snapshot publish or digest check still running after ${ms} ms`);
 			await tick(10);
 		}
 	}
@@ -234,20 +245,24 @@ export class TwoDesktopRig {
 	}
 
 	// Sync every device (in the given order) round after round until a round
-	// moves nothing: no new op reached the cloud and every device's cursor is
-	// at the head with nothing pending. Revoked or offline devices are
-	// synced but not waited on. Returns the rounds it took.
+	// moves nothing: no new op reached the cloud, no snapshot was published,
+	// and every device's cursor is at the head with nothing pending and
+	// nothing it waits for. Each device's publish or digest check is waited
+	// out after its cycle, so the next device's cycle sees the base the
+	// founder put up. Revoked or offline devices are synced but not waited
+	// on. Returns the rounds it took.
 	async settle(devices: readonly Desktop[] = this.desktops, maxRounds = 8): Promise<number> {
 		for (let round = 1; round <= maxRounds; round++) {
 			const before = this.cloud.log.length;
+			const published = this.cloud.publishes.length;
 			for (const d of devices) await d.sync();
-			let quiet = this.cloud.log.length === before;
+			let quiet = this.cloud.log.length === before && this.cloud.publishes.length === published;
 			for (const d of devices) {
 				if (!d.transport.online) continue;
 				const id = await d.deviceId();
 				if (this.cloud.isRevoked(id)) continue;
 				const s = await d.svc.getCloudSyncStatus();
-				if (s.pending > 0 || s.lastError !== null || readCursor(d.raw).lastSeq < this.cloud.maxSeq) quiet = false;
+				if (s.pending > 0 || s.lastError !== null || s.phase !== null || readCursor(d.raw).lastSeq < this.cloud.maxSeq) quiet = false;
 			}
 			if (quiet) return round;
 		}
@@ -261,10 +276,12 @@ export class TwoDesktopRig {
 	}
 
 	// Every snapshot a master published in the scenario was the fake server's
-	// fold at its seq, byte for byte ('snapshot_storage'): the verifier the
-	// real server runs, held over every scenario rather than one suite.
+	// fold at its seq, byte for byte ('snapshot_storage'): the base before it
+	// plus the log between, the check a verifier can run (fake-cloud.ts
+	// foldAt). Held over every scenario rather than one suite. An account's
+	// first snapshot has nothing to be checked against (null).
 	snapshotMismatches(): Array<{ deviceId: string; seq: number }> {
-		return this.cloud.publishes.filter((p) => !p.stateMatches).map(({ deviceId, seq }) => ({ deviceId, seq }));
+		return this.cloud.publishes.filter((p) => p.stateMatches === false).map(({ deviceId, seq }) => ({ deviceId, seq }));
 	}
 
 	close(): void {

@@ -8,7 +8,6 @@
 import { z } from 'zod';
 import {
 	BATCH_LABEL_PATTERN,
-	MAX_SNAPSHOT_CHUNK_BYTES,
 	MAX_SNAPSHOT_PARTS,
 	SNAPSHOT_PART_MAX_BYTES,
 	SNAPSHOT_STORAGE_ENCODING,
@@ -18,7 +17,6 @@ import {
 	type BootstrapInput,
 	type PublishSnapshotInput,
 	type PullInput,
-	type SnapshotChunkInput,
 } from './cloud-service.js';
 
 export const ZDeviceId = z.string().min(1).max(128);
@@ -45,18 +43,9 @@ export const ZPullInput = z
 	});
 
 // `.optional()`: a client from before 'device_reads' sends no input at all.
-// `chunked` only to a server with 'snapshot_chunks'.
-// `storage` only to a server with 'snapshot_storage'.
-export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional(), chunked: z.literal(true).optional(), storage: z.literal(true).optional() }).strict().optional();
-
-export const ZSnapshotChunkInput = z
-	.object({
-		deviceId: ZDeviceId.optional(),
-		snapshotSeq: ZSeq,
-		offset: ZSeq,
-		length: z.number().int().positive().max(MAX_SNAPSHOT_CHUNK_BYTES),
-	})
-	.strict();
+// `storage` only to a server with 'snapshot_storage' (every server now; a
+// call without it is answered `update_required`).
+export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional(), storage: z.literal(true).optional() }).strict().optional();
 
 // 'batches'. A batch id is the server's UUID; anything else cannot name a
 // batch and is refused before a query runs.
@@ -99,7 +88,6 @@ export const ZPublishSnapshotInput = z
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const _pullInputMatches: Same<z.infer<typeof ZPullInput>, PullInput> = true;
 const _bootstrapInputMatches: Same<z.infer<typeof ZBootstrapInput>, BootstrapInput | undefined> = true;
-const _chunkInputMatches: Same<z.infer<typeof ZSnapshotChunkInput>, SnapshotChunkInput> = true;
 const _batchBeginMatches: Same<z.infer<typeof ZBatchBeginInput>, BatchBeginInput> = true;
 const _batchCommitMatches: Same<z.infer<typeof ZBatchCommitInput>, BatchCommitInput> = true;
 const _batchAbortMatches: Same<z.infer<typeof ZBatchAbortInput>, BatchAbortInput> = true;
@@ -110,4 +98,3 @@ const _publishSnapshotMatches: Same<z.infer<typeof ZPublishSnapshotInput>, Publi
 void _publishSnapshotMatches;
 void _pullInputMatches;
 void _bootstrapInputMatches;
-void _chunkInputMatches;

@@ -55,6 +55,15 @@ export type EmitOptions = {
 	// themselves, per call: a scope spanning their yields would also catch
 	// a user's edit made in between.
 	batchLabel?: BatchLabel;
+	// The founder fold (initial-push.ts foldLibraryAsync): the op is stamped
+	// and folded into the records exactly as an emitted one, but it is never
+	// sent — no outbox row, no seq_local, no wake-up. The first device of an
+	// account states its library as the account's BASE, which the master
+	// publishes whole as a snapshot (snapshot-build.ts); the log carries only
+	// what changes after it. The records still need the op's clock (op_id,
+	// device_id, client_ts): every later write anywhere is compared against
+	// it, and the snapshot carries it to every other device.
+	local?: boolean;
 };
 
 // The batch labels the client uploads under (protocol BATCH_LABEL_PATTERN):
@@ -273,17 +282,67 @@ export function emitOps(raw: Raw, ops: readonly EmitOp[], opts: EmitOptions = {}
 		store.touch(full, { forRestatement: suppress });
 		if (suppress && op.client_ts === undefined && isRestatement(store.state, full)) continue;
 		if (op.client_ts === undefined && !opts.sameClock) clock.lastIssuedTs = ts;
-		clock.lastSeqLocal++;
-		s.insert.run(full.op_id, clock.lastSeqLocal, device, ts, full.schema_version, full.entity, full.entity_id, full.kind, JSON.stringify(full.payload), now, opts.batchLabel ?? null);
+		if (!opts.local) {
+			clock.lastSeqLocal++;
+			s.insert.run(full.op_id, clock.lastSeqLocal, device, ts, full.schema_version, full.entity, full.entity_id, full.kind, JSON.stringify(full.payload), now, opts.batchLabel ?? null);
+		}
 		stamped.push(full);
 		applyOp(store.state, full);
 	}
 	if (stamped.length === 0) return stamped;
+	// A local fold still advances the issued clock: its stamps are in the
+	// records, and the next real op must sort after them.
 	writeClock(raw, clock);
 	store.flush();
+	if (opts.local) return stamped;
 	for (const sink of CAPTURES.get(raw) ?? []) sink.push(...stamped);
 	notifyAppend(raw);
 	return stamped;
+}
+
+// ── retention ───────────────────────────────────────────────────────────────
+// Acked rows are kept for a week, then deleted (the sync client, after a
+// cycle that left nothing pending): a row's work is done once the server has
+// it — the own-op skip (apply.ts) needs it only until this device's pull
+// cursor has passed the op, which a drained pull guarantees, and the
+// restore-safe bound (client.ts ownThroughSeq) is a seq, not a row. The
+// main library's outbox was ~230k acked rows that nothing read.
+//
+// Before anything is deleted the clock row is pinned to what the outbox
+// holds: readClock derives lastIssuedTs / lastSeqLocal from the outbox's
+// maxima only while the row is missing (a DB from before the row, or a
+// restore that lost it), and once rows are gone those maxima can only
+// shrink — a clock that regressed would re-issue a seq_local and stamp an
+// op below one already in the log.
+
+export const OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function pinClock(raw: Raw): void {
+	raw.transaction(() => {
+		const c = readClock(raw);
+		const max = raw.prepare(`SELECT COALESCE(MAX(seq_local), 0) AS s, COALESCE(MAX(client_ts), 0) AS t FROM sync_outbox`).get() as { s: number; t: number };
+		writeClock(raw, { ...c, lastIssuedTs: Math.max(c.lastIssuedTs, max.t), lastSeqLocal: Math.max(c.lastSeqLocal, max.s) });
+	})();
+}
+
+// Deletes at most `max` acked rows created before `olderThanMs` ago, oldest
+// first, in chunks of 2,000 per transaction (the writer lock is never held
+// for the whole sweep). Returns how many went.
+export function pruneAckedOutbox(raw: Raw, opts: { olderThanMs?: number; max?: number; now?: number } = {}): number {
+	const cutoff = (opts.now ?? Date.now()) - (opts.olderThanMs ?? OUTBOX_RETENTION_MS);
+	let left = Math.max(0, opts.max ?? 20_000);
+	let deleted = 0;
+	if (left === 0) return 0;
+	pinClock(raw);
+	const del = raw.prepare(`DELETE FROM sync_outbox WHERE op_id IN (SELECT op_id FROM sync_outbox WHERE state = 'acked' AND created_at < ? ORDER BY seq_local LIMIT ?)`);
+	while (left > 0) {
+		const chunk = Math.min(2_000, left);
+		const n = del.run(cutoff, chunk).changes;
+		deleted += n;
+		left -= n;
+		if (n < chunk) break;
+	}
+	return deleted;
 }
 
 // The ops a write emits, for a caller that must refer to them afterwards by

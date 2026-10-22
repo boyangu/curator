@@ -1,15 +1,14 @@
 // 'batches': staged ops stay invisible to every reader until the commit
 // publishes; normal pushes and pulls keep flowing around a batch; the commit
 // moves, dedupes and orders, and rings once, building no snapshot (the
-// sweep does, after it); no cursor skips an op that becomes visible later. Expiry, abort, resume, isolation,
-// revocation and the audit trail. Against the real API over PGlite.
+// master publishes one after it); no cursor skips an op that becomes
+// visible later. Expiry, abort, resume, isolation, revocation and the audit
+// trail. Against the real API over PGlite.
 
 import { randomUUID } from 'node:crypto';
 import { applyOps, createLibraryState, serializeLibraryState, type LibraryState, type Op, type StoredOp } from '@curator/protocol';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { decodeSnapshotBase64 } from '../snapshot/codec.js';
-import { buildSnapshot } from '../snapshot/job.js';
-import { asUser, createTestApp, errorReason, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
+import { asUser, createTestApp, errorReason, insertSnapshot, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
 import { DEFAULT_BATCH_OPTIONS, tendBatches, type CommitStep } from './batch.js';
 
 let app: TestApp;
@@ -74,7 +73,7 @@ function holdAt(step: CommitStep, nth = 1): { reached: Promise<void>; release: (
 }
 
 describe('a batch while it is open', () => {
-	it('stages ops no reader can see: not a pull, a bootstrap, the far-behind hint or the snapshot job', async () => {
+	it('stages ops no reader can see: not a pull, a bootstrap or the far-behind hint', async () => {
 		const a = await app.signIn();
 		const b = await secondDevice(a.userId);
 		const before = sampleLibrary(a.deviceId, 1);
@@ -87,9 +86,8 @@ describe('a batch while it is open', () => {
 		expect(pulled.ops.map((o) => o.op_id)).toEqual(before.map((o) => o.op_id));
 		// The stager's own pull, own-op skip and all, sees no more.
 		expect((await drain(a.api, a.deviceId, 0)).ops).toHaveLength(before.length);
-		const boot = await b.api.sync.bootstrap.query({ deviceId: b.deviceId });
+		const boot = await b.api.sync.bootstrap.query({ deviceId: b.deviceId, storage: true });
 		expect(boot.snapshotSeq).toBe(0);
-		expect(await buildSnapshot(app.db, a.userId)).toEqual({ userId: a.userId, status: 'batch_pending' });
 		const staged = await app.pg.query<{ n: number }>('select count(*)::int as n from curator.library_op_staged where batch_id = $1', [batchId]);
 		expect(staged.rows[0]!.n).toBe(hidden.length);
 		// Staging rings no doorbell.
@@ -201,15 +199,10 @@ describe('committing a batch', () => {
 		// B's cursor from mid-batch picks up everything it had not seen, once.
 		const after = await drain(b.api, b.deviceId, bCursor);
 		expect(after.ops.map((o) => o.op_id).sort()).toEqual([...batch.slice(10), ...bOps.slice(15)].map((o) => o.op_id).sort());
-		// The sweep's snapshot after the commit holds the batch.
-		const built = await buildSnapshot(app.db, a.userId);
-		expect(built.status).toBe('built');
-		const boot = await b.api.sync.bootstrap.query({ deviceId: b.deviceId });
-		expect(boot.snapshotSeq).toBe(built.status === 'built' ? built.snapshotSeq : -1);
-		expect(boot.snapshotSeq).toBeGreaterThanOrEqual(res.committedSeq);
+		// A replay from nothing lands on the fold of every op, the batch's in
+		// the order the commit gave them.
 		const all = [...base, ...batch, ...bOps];
-		const viaSnapshot = fold(strip((await drain(b.api, b.deviceId, boot.snapshotSeq)).ops), await decodeSnapshotBase64(boot.snapshot));
-		expect(serializeLibraryState(viaSnapshot)).toBe(serializeLibraryState(fold(all)));
+		expect(serializeLibraryState(fold(strip((await drain(b.api, b.deviceId, 0)).ops)))).toBe(serializeLibraryState(fold(all)));
 		// One wake-up for the whole commit (plus the two plain pushes').
 		const wakes = await wakeups(app.pg, a.userId);
 		expect(wakes.length - wakesBefore).toBe(3 + 1);
@@ -248,23 +241,18 @@ describe('committing a batch', () => {
 			// The cursor does not move past the fence, not even with the skip.
 			expect(p.cursor).toBe(first.cursor);
 		}
-		expect((await b.api.sync.bootstrap.query({ deviceId: b.deviceId })).snapshotSeq).toBe(0);
+		expect((await b.api.sync.bootstrap.query({ deviceId: b.deviceId, storage: true })).snapshotSeq).toBe(0);
 		const progress = await a.api.sync.batchCommit.mutate({ deviceId: a.deviceId, batchId });
 		expect(progress).toMatchObject({ status: 'committing', totalOps: batch.length, committedSeq: 0 });
 		expect(progress.movedOps).toBeGreaterThan(0);
 		expect(progress.movedOps).toBeLessThan(batch.length);
 
-		// Held just before publishing: every op moved, still nothing visible,
-		// and nothing snapshots the fenced ops (the sweep skips the user, a
-		// direct build refuses).
+		// Held just before publishing: every op moved, still nothing visible.
 		const atPublish = holdAt('publish');
 		midMove.release();
 		await atPublish.reached;
 		expect((await drain(b.api, b.deviceId, first.cursor)).ops).toEqual([]);
-		expect((await b.api.sync.bootstrap.query({ deviceId: b.deviceId })).snapshotSeq).toBe(0);
-		expect(await buildSnapshot(app.db, a.userId)).toEqual({ userId: a.userId, status: 'batch_pending' });
-		const snaps = await app.pg.query(`select 1 from curator.library_snapshot where user_id = $1`, [a.userId]);
-		expect(snaps.rows).toEqual([]);
+		expect((await b.api.sync.bootstrap.query({ deviceId: b.deviceId, storage: true })).snapshotSeq).toBe(0);
 		atPublish.release();
 
 		for (let i = 0; i < 100; i++) {
@@ -273,14 +261,12 @@ describe('committing a batch', () => {
 		}
 		const after = await drain(b.api, b.deviceId, first.cursor);
 		expect(after.ops.map((o) => o.op_id).sort()).toEqual([...batch, live].map((o) => o.op_id).sort());
-		// Published: the next build takes everything, the push made during
-		// the commit included.
-		const built = await buildSnapshot(app.db, a.userId);
-		expect(built).toMatchObject({ status: 'built', opsFolded: base.length + batch.length + 1 });
-		expect((await b.api.sync.bootstrap.query({ deviceId: b.deviceId })).snapshotSeq).toBe(built.status === 'built' ? built.snapshotSeq : -1);
+		// Published: a replay takes everything, the push made during the
+		// commit included.
+		expect((await drain(b.api, b.deviceId, 0)).ops).toHaveLength(base.length + batch.length + 1);
 	});
 
-	it('offers a far-behind device the snapshot the sweep builds after the commit, which bootstraps and converges', async () => {
+	it('offers a far-behind device the snapshot the master publishes after the commit', async () => {
 		const small = await createTestApp({ pull: { farBehindOps: 20, farBehindMs: 90 * 24 * 3600 * 1000 } });
 		try {
 			const a = await small.signIn();
@@ -296,13 +282,11 @@ describe('committing a batch', () => {
 			const early = await bApi.sync.pull.query({ afterSeq: 0, deviceId: bId });
 			expect(early.snapshotSeq).toBeUndefined();
 			expect(early.ops.length).toBeGreaterThan(0);
-			const built = await buildSnapshot(small.db, a.userId);
-			expect(built.status).toBe('built');
+			// The master folds the batch and publishes at the commit's seq.
+			const manifest = await insertSnapshot(small.pg, a.userId, res.committedSeq);
 			const page = await bApi.sync.pull.query({ afterSeq: 0, deviceId: bId });
-			expect(page.snapshotSeq).toBe(built.status === 'built' ? built.snapshotSeq : -1);
-			const boot = await bApi.sync.bootstrap.query({ deviceId: bId });
-			const state = await decodeSnapshotBase64(boot.snapshot);
-			expect(serializeLibraryState(state)).toBe(serializeLibraryState(fold(batch)));
+			expect(page.snapshotSeq).toBe(res.committedSeq);
+			expect(await bApi.sync.bootstrap.query({ deviceId: bId, storage: true })).toEqual({ storage: manifest, snapshotSeq: res.committedSeq, baseSeq: 0 });
 			// The pushing device itself skips its own batch: its own-op bound
 			// moves to the commit's seq (priorOwnMaxSeq 0), so nothing comes back.
 			const own = await a.api.sync.pull.query({ afterSeq: 0, deviceId: a.deviceId, ownThroughSeq: res.committedSeq });
@@ -438,7 +422,7 @@ describe('abort, expiry and access', () => {
 		expect(await errorReason(other.api.sync.batchCommit.mutate({ deviceId: other.deviceId, batchId }))).toMatchObject({ reason: 'batch_gone' });
 		expect(await errorReason(other.api.sync.batchAbort.mutate({ deviceId: other.deviceId, batchId }))).toMatchObject({ reason: 'batch_gone' });
 		// Underneath it.
-		for (const table of ['library_op_batch', 'library_op_staged', 'library_op_fence', 'library_snapshot_lease']) {
+		for (const table of ['library_op_batch', 'library_op_staged', 'library_op_fence']) {
 			const seen = await asUser(app.pg, other.userId, (tx) => tx.query(`select * from curator.${table}`));
 			expect(seen.rows).toEqual([]);
 		}

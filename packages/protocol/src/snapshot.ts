@@ -7,17 +7,15 @@
 // same string (maps as key-sorted entry lists, object keys sorted), so two
 // builds can be compared byte for byte.
 //
-// Only the JSON half lives here. Compression and base64 are the transport's
-// (`SNAPSHOT_ENCODING`) and each runtime does them with its own primitives
-// (node:zlib on the server and desktop, a JS or native inflater on the
-// phone), which keeps this package free of node:* imports.
+// Only the JSON half lives here. Compression is the transport's
+// (`SNAPSHOT_STORAGE_ENCODING`, cloud-service.ts) and each runtime does it
+// with its own primitives (node:zlib on the desktop, a JS or native inflater
+// on the phone), which keeps this package free of node:* imports.
 
 import { createLibraryState, type LibraryState } from './state.js';
 
 export const SNAPSHOT_FORMAT = 'curator.library-state';
 export const SNAPSHOT_FORMAT_VERSION = 1;
-// What `sync.bootstrap`'s `snapshot` string is: this JSON, gzipped, base64.
-export const SNAPSHOT_ENCODING = 'curator.library-state.v1+json+gzip+base64';
 
 // Every map in `LibraryState`, named once. `satisfies` makes a field added to
 // the state a compile error here until it is listed, instead of a snapshot

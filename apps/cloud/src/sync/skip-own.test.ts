@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 import { SYNC_FEATURES, type Op } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestApp, errorReason, opsFor, sampleLibrary, type TestApp } from '../test/harness.js';
+import { createTestApp, errorReason, insertSnapshot, opsFor, sampleLibrary, type TestApp } from '../test/harness.js';
 
 let app: TestApp;
 beforeAll(async () => {
@@ -156,8 +156,7 @@ describe('sync.pull skipping the caller’s own ops', () => {
 		try {
 			const { userId, deviceId, api } = await small.signIn();
 			const pushed = await api.sync.push.mutate({ deviceId, ops: sampleLibrary(deviceId) });
-			const { buildSnapshot } = await import('../snapshot/job.js');
-			expect((await buildSnapshot(small.db, userId)).status).toBe('built');
+			await insertSnapshot(small.pg, userId, pushed.maxSeq);
 			// Everyone else would replay all of them: bootstrap.
 			expect((await api.sync.pull.query({ afterSeq: 0 })).snapshotSeq).toBeDefined();
 			await api.account.registerDevice.mutate({ deviceId: 'other', name: 'Other', platform: 'win32' });

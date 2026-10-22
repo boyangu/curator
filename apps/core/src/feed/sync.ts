@@ -118,7 +118,8 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 // records already hold is skipped (a decision that came from another device
 // and was applied here): a historical stamp bypasses emitOps' restatement
 // check, so an echo would otherwise go out.
-export async function backfillFeedDecisionsAsync(raw: Raw, store: Pick<FeedStore, 'decisionsDump'>): Promise<{ emitted: number }> {
+// `local`: the founder fold's form (sync-log/outbox.ts EmitOptions.local).
+export async function backfillFeedDecisionsAsync(raw: Raw, store: Pick<FeedStore, 'decisionsDump'>, opts: { local?: boolean } = {}): Promise<{ emitted: number }> {
 	const dump = store.decisionsDump();
 	const ops: EmitOp[] = [];
 	const at = (op: EmitOp | null, ts: number): void => { if (op && !held(op)) ops.push({ ...op, client_ts: Math.max(0, Math.round(ts)) }); };
@@ -149,7 +150,7 @@ export async function backfillFeedDecisionsAsync(raw: Raw, store: Pick<FeedStore
 	for (let i = 0; i < ops.length; i += 500) {
 		const chunk = ops.slice(i, i + 500);
 		// A one-time backlog: uploaded as a server batch ('batches', outbox.ts).
-		raw.transaction(() => { emitted += emitOps(raw, chunk, { batchLabel: 'backfill' }).length; })();
+		raw.transaction(() => { emitted += emitOps(raw, chunk, { batchLabel: 'backfill', local: opts.local }).length; })();
 		await yieldToLoop();
 	}
 	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)

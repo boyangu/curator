@@ -4,6 +4,10 @@
 // file's audio hash; the identity resolver (identity.ts) on the desktop that
 // holds the larger id merges it into the smaller, and every replica folds
 // both copies' tags, ratings, cues and playlist rows onto one recording.
+// A library that JOINS an account (the 2026-10-22 sync review) never gets
+// that far: the bind sweep (join-bind.ts) puts its rows on the account's
+// recordings before it states anything, so no second recording, no claim
+// and no merge exist for a file the account already holds.
 //
 // Same rig and rails as the other two-desktop suites: generated DBs and
 // files only, no remoteWritePolicy, streaming adapters that record and
@@ -129,8 +133,9 @@ describe('the same FLAC scanned on both desktops before syncing', () => {
 // ── libraries from before the op log ───────────────────────────────────────
 
 describe('a library from before the op log joins with a copy of the same file', () => {
-	// Which desktop holds the survivor decides which one emits the merge.
-	it.each([['A holds the smaller id', true], ['B holds the smaller id', false]] as const)('%s: its initial push carries the claim, and the copies merge', async (_label, aSmaller) => {
+	// Whichever side holds the smaller id: A founded the account, so B's row
+	// binds to A's recording on join (join-bind.ts) — no claim, no merge.
+	it.each([['A holds the smaller id', true], ['B holds the smaller id', false]] as const)('%s: B binds its copy to A\'s recording; nothing merges', async (_label, aSmaller) => {
 		const [lo, hi] = idsInOrder(['old-a', 'old-b']);
 		const [ida, idb] = aSmaller ? [lo!, hi!] : [hi!, lo!];
 		const a = await rig.desktop('a', {
@@ -155,42 +160,38 @@ describe('a library from before the op log joins with a copy of the same file', 
 		});
 		await rig.settle();
 
-		// Each initial push stated its row as a recording with its claims.
+		// A's claims are in the base it founded, not on the log; B stated no
+		// recording, no claim and no merge: its row took A's recording, and
+		// only its tag went up, against that recording.
+		expect(rig.cloud.log.filter((o) => o.entity === 'recording_claim' || (o.entity === 'library_track' && o.kind === 'create') || o.entity === 'recording')).toEqual([]);
+		expect(mergeOps()).toEqual([]);
+		const bId = await b.deviceId();
+		expect(rig.cloud.log.filter((o) => o.device_id === bId && o.entity === 'track_tag').map((o) => o.entity_id)).toEqual([`${R(ida)}:b-old`]);
 		for (const [d, id] of [[a, ida], [b, idb]] as const) {
-			const mine = await d.deviceId();
-			const claims = rig.cloud.log.filter((o) => o.entity === 'recording_claim' && o.device_id === mine && o.entity_id === R(id));
-			expect(claims.map((o) => (o.payload as { kind: string }).kind).sort(), d.name).toEqual(d === a ? ['audio_hash', 'isrc'] : ['audio_hash']);
-			expect(rig.cloud.log.some((o) => o.entity === 'library_track' && o.kind === 'create' && o.entity_id === R(id) && o.device_id === mine), d.name).toBe(true);
-		}
-		// The holder of the larger id moved; its row now carries the smaller.
-		expect(mergeOps().map((m) => [m.loser, m.winner])).toEqual([[R(hi!), R(lo!)]]);
-		expect(mergeOps()[0]!.device).toBe(await (aSmaller ? b : a).deviceId());
-		for (const [d, id] of [[a, ida], [b, idb]] as const) {
-			expect(recOf(d, id), d.name).toBe(R(lo!));
+			expect(recOf(d, id), d.name).toBe(R(ida));
 			expect(tagsOn(d, id), d.name).toEqual(['a-old', 'b-old']);
 			expect(d.one(`SELECT rating FROM track WHERE id = ?`, id), d.name).toBe(4);
 		}
 		expect(replicaDiff(a, b, { sharedOnly: true })).toEqual([]);
+		for (const d of [a, b]) expect(planIdentityMerges(d.raw), d.name).toMatchObject({ groups: 0, merges: [], held: [] });
 	});
 
-	// A library whose initial push ran before recordings were part of it:
-	// the one-time backfill states them, and then the resolver can match.
-	it('a library pushed before claims existed states them once (backfill), then merges', async () => {
+	// A row whose file was linked after the join, under a build that did not
+	// claim it: the one-time backfill states the claim, and then the resolver
+	// can match — this is the only way a joined library's copy still reaches
+	// a merge.
+	it('a row claimed only by the backfill, after the join, merges through the resolver', async () => {
 		const [lo, hi] = idsInOrder(['scan-a', 'early-b']);
 		const a = await rig.desktop('a', { catalogue: [...TRACKS, lo!], seed: (raw) => holdFile(raw, lo!) });
-		const b = await rig.desktop('b', {
-			catalogue: [...TRACKS, hi!],
-			seed: (raw) => {
-				holdFile(raw, hi!);
-				raw.prepare(`UPDATE track SET rating = 2 WHERE id = ?`).run(hi!);
-				// Its initial push ran (records complete) under a build that
-				// did not state recordings: rows from then carry no create.
-				raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', 1) ON CONFLICT(key) DO NOTHING`).run(INITIAL_PUSH_KEY);
-				raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLAIMS_BACKFILL_KEY);
-			},
-		});
-		expect(b.one(`SELECT count(*) FROM app_setting WHERE key = ?`, CLAIMS_BACKFILL_KEY)).toBe(0);
+		const b = await rig.desktop('b', { catalogue: [...TRACKS, hi!], seed: (raw) => { raw.prepare(`UPDATE track SET rating = 2 WHERE id = ?`).run(hi!); } });
 		await a.svc.addTrackTag(lo!, 'interested');
+		await rig.settle();
+		// B joined with its row unclaimed (no file): its own recording.
+		expect(recOf(b, hi!)).toBe(R(hi!));
+		// The file appears under a build that did not claim it; the library is
+		// marked as owing the claims backfill (holdFile).
+		holdFile(b.raw, hi!);
+		expect(b.one(`SELECT count(*) FROM app_setting WHERE key = ?`, CLAIMS_BACKFILL_KEY)).toBe(0);
 		await rig.settle();
 
 		expect(b.one(`SELECT count(*) FROM app_setting WHERE key = ?`, CLAIMS_BACKFILL_KEY)).toBe(1);
@@ -209,8 +210,8 @@ describe('a library from before the op log joins with a copy of the same file', 
 
 // ── three devices ──────────────────────────────────────────────────────────
 
-describe('three devices notice the same pair', () => {
-	it('every holder of the moved copy emits the same merge; the duplicates are idempotent', async () => {
+describe('three devices hold the same file', () => {
+	it('every joiner binds its copy to the founder\'s recording; a fourth folds what arrives; no merge anywhere', async () => {
 		const [lo, hi] = idsInOrder(['first', 'second']);
 		const a = await rig.desktop('a', { catalogue: [...TRACKS, lo!], seed: (raw) => holdFile(raw, lo!) });
 		// B and C hold one recording (same catalogue id) with the same file.
@@ -221,15 +222,12 @@ describe('three devices notice the same pair', () => {
 		await a.svc.setRating([lo!], 5);
 		await b.svc.addTrackTag(hi!, 'interested');
 		await c.svc.upsertCue({ trackId: hi!, slot: 1, kind: 'hot', positionSec: 64, lengthSec: null, color: null, name: 'C' });
-		// Every device syncs once before any merge reaches the others, so
-		// B and C each see the pair on their own.
 		for (const x of [a, b, c, d]) await x.sync();
 		for (const x of [a, b, c, d]) await x.sync();
 		await rig.settle();
 
-		const merges = mergeOps();
-		expect(merges.map((m) => [m.loser, m.winner])).toEqual([[R(hi!), R(lo!)], [R(hi!), R(lo!)]]);
-		expect(new Set(merges.map((m) => m.device))).toEqual(new Set([await b.deviceId(), await c.deviceId()]));
+		expect(mergeOps()).toEqual([]);
+		expect(rig.cloud.log.filter((o) => o.entity === 'recording_claim' || (o.entity === 'library_track' && o.kind === 'create'))).toEqual([]);
 		for (const [x, id] of [[a, lo!], [b, hi!], [c, hi!]] as const) {
 			expect(recOf(x, id), x.name).toBe(R(lo!));
 			expect(x.one(`SELECT rating FROM track WHERE id = ?`, id), x.name).toBe(5);
@@ -239,7 +237,7 @@ describe('three devices notice the same pair', () => {
 		expect(replicaDiff(a, b)).toEqual([]);
 		expect(replicaDiff(a, c)).toEqual([]);
 		expect(replicaDiff(a, d, { sharedOnly: true })).toEqual([]);
-		for (const x of [a, b, c, d]) expect(x.one(`SELECT winner FROM recording_alias WHERE loser = ?`, R(hi!)), x.name).toBe(R(lo!));
+		for (const x of [a, b, c, d]) expect(x.one(`SELECT count(*) FROM recording_alias`), x.name).toBe(0);
 	});
 });
 
@@ -249,8 +247,10 @@ describe('a desktop that holds two copies of the file as separate rows', () => {
 	// A keeps two byte-identical files as two rows on purpose (scanner.ts: a
 	// track holds one rekordbox content; the user resolves the pair from the
 	// duplicate groups), and here both are rekordbox entries, which
-	// merge-tracks refuses outright. B has a third copy.
-	it.each([['B holds the smallest id', 'b-first'], ['one of A\'s rows holds the smallest id', 'a-first']] as const)('%s: A\'s rows are never merged; the hold is reported', async (_label, shape) => {
+	// merge-tracks refuses outright. B joins with a third copy: it binds to
+	// the smaller of A's two (the resolver's survivor, claim-bind.ts step 2),
+	// whichever id its own row carried, and A's pair stays held.
+	it.each([['B holds the smallest id', 'b-first'], ['one of A\'s rows holds the smallest id', 'a-first']] as const)('%s: A\'s rows are never merged; the hold is reported; B binds to the survivor', async (_label, shape) => {
 		const ids = idsInOrder(['dup-x', 'dup-y', 'dup-z']);
 		const bId = shape === 'b-first' ? ids[0]! : ids[2]!;
 		const [d1, d2] = shape === 'b-first' ? [ids[1]!, ids[2]!] : [ids[0]!, ids[1]!];
@@ -277,18 +277,11 @@ describe('a desktop that holds two copies of the file as separate rows', () => {
 		expect(plan.held).toHaveLength(1);
 		expect(plan.held[0]).toMatchObject({ reason: 'local-duplicate', trackIds: expect.arrayContaining([d1, d2]) });
 		expect(plan.held[0]!.blockers.join(' ')).toMatch(/rekordbox/);
-		if (shape === 'b-first') {
-			// B holds the survivor, A holds two losers it keeps apart: nobody
-			// emits, and B's copy stays its own recording.
-			expect(mergeOps()).toEqual([]);
-			expect(recOf(b, bId)).toBe(R(bId));
-		} else {
-			// B's copy alone moves, onto the smaller of A's rows.
-			expect(mergeOps().map((m) => [m.loser, m.winner, m.device])).toEqual([[R(bId), R(d1), await b.deviceId()]]);
-			expect(recOf(b, bId)).toBe(R(d1));
-			expect(tagsOn(b, bId)).toEqual(['interested']);
-			expect(planIdentityMerges(b.raw)).toMatchObject({ merges: [], held: [] });
-		}
+		// B's copy took the smaller of A's recordings on join; nobody emits.
+		expect(mergeOps()).toEqual([]);
+		expect(recOf(b, bId)).toBe(R(d1));
+		expect(tagsOn(b, bId)).toEqual(['interested']);
+		expect(planIdentityMerges(b.raw)).toMatchObject({ merges: [] });
 		expect(replicaDiff(a, b, { sharedOnly: true })).toEqual([]);
 	});
 });

@@ -12,7 +12,6 @@ import {
 	ZBatchCommitInput,
 	ZBatchPushInput,
 	ZBootstrapInput,
-	ZSnapshotChunkInput,
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
@@ -30,7 +29,6 @@ import {
 	type PublishSnapshotResult,
 	type PullResult,
 	type PushResult,
-	type SnapshotChunkResult,
 	type SyncFeature,
 } from '@curator/protocol';
 import { z } from 'zod';
@@ -38,8 +36,9 @@ import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
+import { BaseInvariantError } from './sync/base.js';
 import { batchAbort, batchBegin, batchCommit, batchPush, type BatchDeps } from './sync/batch.js';
-import { bootstrap, snapshotChunk } from './sync/bootstrap.js';
+import { bootstrap } from './sync/bootstrap.js';
 import { publishSnapshot } from './sync/publish-snapshot.js';
 import { pull } from './sync/pull.js';
 import { push } from './sync/push.js';
@@ -91,11 +90,15 @@ function readDevice(ctx: AppContext, deviceId: string | undefined): void {
 }
 
 // A refused read is audited with which fact refused it; the error goes on.
+// So is a read that found the account's base without a snapshot (base.ts):
+// that one stays an internal error, since the server, not the client, is
+// what is wrong.
 async function auditedRead<T>(ctx: AppContext, procedure: 'sync.pull' | 'sync.bootstrap', fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
 		if (e instanceof DeviceRevokedError) ctx.call.audit('read_from_revoked_device', { procedure, via: e.via });
+		if (e instanceof BaseInvariantError) ctx.call.audit('base_without_snapshot', { procedure, baseSeq: e.baseSeq });
 		throw e;
 	}
 }
@@ -159,14 +162,13 @@ export const appRouter = router({
 			if (input.ownThroughSeq !== undefined) ctx.call.opsSkippedOwn = skippedOwn;
 			return withFeatures(ctx, result);
 		}),
-		// Shares the pull bucket: it is the heaviest read there is. Audited
-		// because it hands out the whole library in one response.
+		// Shares the pull bucket. Audited because it hands out the whole
+		// library (the manifest of it: the parts come from Storage).
 		bootstrap: authedProcedure.input(ZBootstrapInput).query(async ({ ctx, input }): Promise<BootstrapResult> => {
 			readDevice(ctx, input?.deviceId);
 			rateLimit(ctx, 'pull', pullKey(ctx.user));
 			const r = await auditedRead(ctx, 'sync.bootstrap', () => bootstrap(ctx.deps.db, ctx.user.id, callerOf(ctx), input ?? {}));
-			const bytes = r.storage ? r.storage.totalBytes : r.chunked ? r.chunked.totalBytes : Buffer.byteLength(r.snapshot, 'base64');
-			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, bytes, chunked: !!r.chunked, storage: !!r.storage });
+			ctx.call.audit('bootstrap_served', { snapshotSeq: r.snapshotSeq, baseSeq: r.baseSeq, bytes: r.storage?.totalBytes ?? 0, storage: !!r.storage });
 			return r;
 		}),
 		// 'batches' (src/sync/batch.ts). All four share the push bucket: they
@@ -203,14 +205,6 @@ export const appRouter = router({
 			ctx.call.deviceId = input.deviceId;
 			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
 			return withFeatures(ctx, await auditedWrite(ctx, 0, () => publishSnapshot(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input)));
-		}),
-		// 'snapshot_chunks': the body of a chunked bootstrap, a piece a call.
-		// The pull bucket, like the bootstrap it belongs to (a 40 MB body is
-		// ~10 pieces); not audited per piece — the bootstrap was.
-		snapshotChunk: authedProcedure.input(ZSnapshotChunkInput).query(async ({ ctx, input }): Promise<SnapshotChunkResult> => {
-			readDevice(ctx, input.deviceId);
-			rateLimit(ctx, 'pull', pullKey(ctx.user));
-			return auditedRead(ctx, 'sync.bootstrap', () => snapshotChunk(ctx.deps.db, ctx.user.id, callerOf(ctx), input));
 		}),
 	}),
 

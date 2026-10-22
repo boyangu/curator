@@ -26,9 +26,10 @@ import { createCoreService, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import { CloudTransportError, createSyncClient, readCursor, type CloudSyncEvent, type CloudTransport, type SyncClient } from './client.js';
 import { compareDumps, dumpLibrary } from './dump.js';
-import { INITIAL_PUSH_KEY } from './apply.js';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from './apply.js';
 import { heldCount, replayHeldOps } from './held.js';
-import { initialPushAsync } from './initial-push.js';
+import { foldLibraryAsync, joinPushAsync } from './initial-push.js';
+import { inlineSnapshotBuilder } from './snapshot-build.js';
 import { recordingIdForTrack } from './recording-id.js';
 import { remintDeviceIdentity } from './remint.js';
 import { FakeCloud } from '../test-support/fake-cloud.js';
@@ -45,11 +46,14 @@ const TRACKS = Array.from({ length: 8 }, (_, i) => `trk-${i}`);
 // These suites pin the push/pull mechanics as they were before protocol v3:
 // against a server that does not advertise 'track_meta', nothing of v3 (base
 // metadata, the default master) joins an outbox — which is itself the rule
-// (track-meta.ts). The v3 stage has its own suites (track-meta.test.ts,
-// two-desktops-catalogue.test.ts).
+// (track-meta.ts). Without v3 no device can state itself master, so such a
+// server holds no base either ('snapshot_storage' off): a library goes up
+// as ops and a device joins by pulling the log, the pre-base mechanics. The
+// v3 stage and the base have their own suites (track-meta.test.ts,
+// two-desktops-catalogue.test.ts, two-desktops-base.test.ts).
 function v2Cloud(): FakeCloud {
 	const cloud = new FakeCloud();
-	cloud.features = cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
+	cloud.features = cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4' && f !== 'snapshot_storage');
 	return cloud;
 }
 
@@ -192,7 +196,9 @@ describe('push', () => {
 		expect(c.status().pending).toBeGreaterThan(0);
 		expect(c.status().lastError).toMatch(/Offline/);
 		expect(c.status().nextRetryAt).not.toBeNull();
-		await until(() => c.status().pending === 0);
+		// Pending reaches 0 at the push's answer; the cycle clears its error and
+		// retry only when it ends (after its pull), so wait for that too.
+		await until(() => c.status().pending === 0 && c.status().lastError === null);
 		expect(cloud.calls.push).toBeGreaterThanOrEqual(3);
 		expect(c.status()).toMatchObject({ lastError: null, nextRetryAt: null });
 		// Duplicates on the server: none (every op landed exactly once).
@@ -596,7 +602,12 @@ describe('own ops on pull', () => {
 		const rec = restored.prepare(`SELECT value FROM sync_state WHERE map = 'tags' AND key = 'pending-0'`).pluck().get() as string;
 		expect(rec).toContain(r.newDeviceId);
 		expect(rec).not.toContain(oldId);
-		expect(restored.prepare(`SELECT 1 FROM app_setting WHERE key = 'sync.clock'`).get()).toBeUndefined();
+		// The clock keeps its issued stamp and seq_local (pinned to the
+		// restored outbox: outbox.ts pinClock) and forgets the server floor.
+		const clock = JSON.parse(restored.prepare(`SELECT value FROM app_setting WHERE key = 'sync.clock'`).pluck().get() as string) as { lastIssuedTs: number; lastServerTs: number; lastSeqLocal: number };
+		expect(clock.lastServerTs).toBe(0);
+		expect(clock.lastSeqLocal).toBe(restored.prepare(`SELECT max(seq_local) FROM sync_outbox`).pluck().get());
+		expect(clock.lastIssuedTs).toBeGreaterThanOrEqual(restored.prepare(`SELECT max(client_ts) FROM sync_outbox`).pluck().get() as number);
 		expect(clientState(restored).ownThroughSeq).toBe(0);
 		// Once per restore; the next restore re-mints again.
 		expect(remintDeviceIdentity(restored, 'snap-1@1')).toMatchObject({ reminted: false, newDeviceId: r.newDeviceId });
@@ -806,7 +817,7 @@ describe('bootstrap', () => {
 	});
 });
 
-// ── initial push ────────────────────────────────────────────────────────────
+// ── stating the library ─────────────────────────────────────────────────────
 
 // A library from before the op log: rows written straight into the tables.
 function legacyLibrary(raw: Database.Database, nTracks: number): number {
@@ -830,14 +841,19 @@ function legacyLibrary(raw: Database.Database, nTracks: number): number {
 		ids.forEach((id, i) => { if (i % 2 === 0) rate.run((i % 5) + 1, id); });
 		// migrate() marked the DB complete while it was still empty; a real
 		// pre-op-log library was migrated with these rows already in it.
-		raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(INITIAL_PUSH_KEY);
+		raw.prepare(`DELETE FROM app_setting WHERE key IN (?, ?)`).run(INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY);
 	})();
 	return nTracks;
 }
 
-describe('initial push', () => {
-	it('runs in chunks off the critical path and reports progress through the client status', async () => {
-		const cloud = v2Cloud();
+// 20 tags + 20 playlists + 4,000 tag rows + 2,000 members + 1,000 ratings +
+// 2 system tags + 2,000 recording creates (the rows carry no claims: no
+// links, no ISRC) for a 2,000-track legacy library.
+const LEGACY_2000_OPS = 20 + 20 + 4_000 + 2_000 + 1_000 + 2 + 2_000;
+
+describe('stating the library', () => {
+	it('the founder folds a legacy library into its records: no outbox row, progress through the client status', async () => {
+		const cloud = new FakeCloud();
 		const { raw } = freshDb('a', false);
 		legacyLibrary(raw, 2_000);
 		const c = client(raw, cloud.transport('u'), { initialPushChunk: 500 });
@@ -854,43 +870,74 @@ describe('initial push', () => {
 		expect(c.status().initialPush).toBeNull();
 		expect(new Set(seen).size).toBeGreaterThan(3);
 		expect(seen.every((n, i) => i === 0 || n >= seen[i - 1]!)).toBe(true);
-		// Status events are coalesced (≤ 4/s) but the run is announced.
 		expect(events.length).toBeGreaterThan(0);
-		expect(raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY)).toBeDefined();
-		// 20 tags + 20 playlists + 4,000 tag rows + 2,000 members + 1,000 ratings + 2 system tags
-		// + 2,000 recording creates (the rows carry no claims: no links, no ISRC).
-		expect(c.status().pending).toBe(20 + 20 + 4_000 + 2_000 + 1_000 + 2 + 2_000);
+		// Folded, not sent: every row has a record, the outbox is empty, and
+		// the account's log holds nothing of the library.
+		expect(c.status().pending).toBe(0);
+		expect(raw.prepare(`SELECT count(*) FROM sync_outbox`).pluck().get()).toBe(0);
+		expect(raw.prepare(`SELECT count(*) FROM sync_state WHERE map = 'trackTags'`).pluck().get()).toBe(4_000);
+		expect(raw.prepare(`SELECT count(*) FROM sync_state WHERE map = 'libraryTracks'`).pluck().get()).toBe(2_000);
+		expect(cloud.log).toEqual([]);
+		// The fold stated the meta cells too, with the drains' baselines, so
+		// nothing is queued or restated afterwards.
+		expect(raw.prepare(`SELECT count(*) FROM track_meta_dirty`).pluck().get()).toBe(0);
+		expect(raw.prepare(`SELECT count(*) FROM track_meta_seen`).pluck().get()).toBe(2_000);
+		await c.syncNow();
+		expect(c.status().pending).toBe(0);
+		expect(cloud.log.filter((o) => o.entity !== 'setting')).toEqual([]);
+	});
+
+	it('a joiner states only what it alone holds, as the initial-push batch', async () => {
+		const cloud = new FakeCloud();
+		cloud.takeSnapshot('u'); // an account with an (empty) base to join
+		const { raw } = freshDb('a', false);
+		legacyLibrary(raw, 2_000);
+		const c = client(raw, cloud.transport('u'), { initialPushChunk: 500 });
+		await c.runInitialPush();
+		expect(c.status().initialPushDone).toBe(true);
+		expect(c.status().pending).toBe(LEGACY_2000_OPS);
+		expect(raw.prepare(`SELECT count(*) FROM sync_outbox WHERE batch_label = 'initial-push'`).pluck().get()).toBe(LEGACY_2000_OPS);
 		await c.syncNow();
 		expect(c.status().pending).toBe(0);
 	});
 
-	it('a second desktop that bootstraps from those ops matches the legacy library', async () => {
-		const cloud = v2Cloud();
+	it('a second desktop that joins from the founder\'s snapshot matches the legacy library', async () => {
+		const cloud = new FakeCloud();
 		const a = freshDb('a', false);
 		legacyLibrary(a.raw, 300);
-		const ca = client(a.raw, cloud.transport('u'));
+		const ca = client(a.raw, cloud.transport('u'), { snapshot: { builder: inlineSnapshotBuilder(a.path) } });
 		await ca.syncNow();
+		await until(() => !ca.status().snapshot.publishing);
+		expect(cloud.published).toHaveLength(1);
 		const b = freshDb('b', false);
 		seedTracks(b.raw, Array.from({ length: 300 }, (_, i) => `lt-${i}`));
 		const cb = client(b.raw, cloud.transport('u'));
 		await cb.syncNow();
+		expect(cloud.calls.storageBootstraps).toBe(1);
 		expect(diffs(a.raw, b.raw)).toEqual([]);
 	});
 
-	it('measures the main-loop stall on a generated library of ~50k op-log rows', async () => {
+	it('measures the main-loop stall of the fold on a generated library of ~50k op-log rows', async () => {
 		const { raw } = freshDb('big', false);
 		legacyLibrary(raw, 12_500); // 25k tag rows + 12.5k members + 6.25k ratings + containers ≈ 44k ops
 		const rows = (raw.prepare(`SELECT (SELECT count(*) FROM track_tag) + (SELECT count(*) FROM playlist_track) + (SELECT count(*) FROM track) AS n`).pluck().get() as number);
 		let worstGap = 0;
 		let last = performance.now();
 		const timer = setInterval(() => { const now = performance.now(); worstGap = Math.max(worstGap, now - last); last = now; }, 1);
-		const r = await initialPushAsync(raw, { chunk: 500 });
+		const r = await foldLibraryAsync(raw, { chunk: 500 });
 		clearInterval(timer);
 		// Reported, not asserted tight: machines differ. A 500-op slice should
 		// stay far under the 18 s single-shot run B measured.
-		console.log(`[initial-push stall] rows=${rows} ops=${r.ops} chunks=${r.chunks} total=${r.ms}ms maxSlice=${r.maxSliceMs.toFixed(1)}ms worstTimerGap=${worstGap.toFixed(1)}ms`);
+		console.log(`[founder-fold stall] rows=${rows} ops=${r.ops} meta=${r.meta} attrs=${r.attrs} chunks=${r.chunks} total=${r.ms}ms maxSlice=${r.maxSliceMs.toFixed(1)}ms worstTimerGap=${worstGap.toFixed(1)}ms`);
 		expect(r.ops).toBeGreaterThan(40_000);
 		expect(r.maxSliceMs).toBeLessThan(2_000);
+		expect(raw.prepare(`SELECT count(*) FROM sync_outbox`).pluck().get()).toBe(0);
+		// The joiner form of the same library, for the record.
+		const j = freshDb('join', false);
+		legacyLibrary(j.raw, 2_000);
+		const jr = await joinPushAsync(j.raw, { chunk: 500 });
+		expect(jr.ops).toBe(LEGACY_2000_OPS);
+		expect(j.raw.prepare(`SELECT count(*) FROM sync_outbox`).pluck().get()).toBe(LEGACY_2000_OPS);
 	}, 120_000);
 });
 
@@ -928,7 +975,9 @@ describe('cycle summary log', () => {
 		const firstB = recs.filter((r) => r.msg === 'sync cycle');
 		expect(firstB).toHaveLength(1);
 		expect(firstB[0]!.level).toBe('info');
-		expect(firstB[0]!.data).toMatchObject({ outcome: 'ok', pulled: cloud.log.length, bootstrapped: false });
+		// B's own first statement (its seeded rows, as ops: a server with no
+		// base) never comes back on its pull.
+		expect(firstB[0]!.data).toMatchObject({ outcome: 'ok', pulled: cloud.log.filter((o) => o.device_id !== cb.status().deviceId).length, bootstrapped: false });
 		expect(firstB[0]!.data!.applied).toBeGreaterThan(0);
 		expect(typeof firstB[0]!.data!.ms).toBe('number');
 

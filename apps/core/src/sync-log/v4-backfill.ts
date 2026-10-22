@@ -49,8 +49,10 @@ export type BackfillRun = { rows: number; emitted: number; chunks: number; maxSl
 // Pages of `page` source rows by rowid, one transaction each (reads + the
 // ops), a yield between; the key is set by a run that finished. Every op is
 // labelled 'backfill': the sync client uploads the lot as one server batch
-// (outbox.ts BATCH_LABELS).
-async function paged<R extends { rid: number }>(raw: Raw, key: string, select: Database.Statement, page: number, build: (rows: R[]) => EmitOp[]): Promise<BackfillRun> {
+// (outbox.ts BATCH_LABELS) — or, for the founder fold, folded locally.
+type BackfillOpts = { page?: number; local?: boolean };
+
+async function paged<R extends { rid: number }>(raw: Raw, key: string, select: Database.Statement, page: number, local: boolean | undefined, build: (rows: R[]) => EmitOp[]): Promise<BackfillRun> {
 	const out: BackfillRun = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	if (!pending(raw, key)) return out;
 	for (let after = 0; ;) {
@@ -60,7 +62,7 @@ async function paged<R extends { rid: number }>(raw: Raw, key: string, select: D
 		after = rows[rows.length - 1]!.rid;
 		raw.transaction(() => {
 			const ops = build(rows);
-			if (ops.length > 0) out.emitted += emitOps(raw, ops, { batchLabel: 'backfill' }).length;
+			if (ops.length > 0) out.emitted += emitOps(raw, ops, { batchLabel: 'backfill', local }).length;
 		})();
 		out.rows += rows.length;
 		out.chunks++;
@@ -77,7 +79,7 @@ function recordValue<T>(raw: Raw, map: string, key: string): T | null {
 	try { return JSON.parse(json) as T; } catch { return null; }
 }
 
-export async function backfillCueOriginsAsync(raw: Raw, opts: { page?: number } = {}): Promise<BackfillRun> {
+export async function backfillCueOriginsAsync(raw: Raw, opts: BackfillOpts = {}): Promise<BackfillRun> {
 	// Own catalogue rows only (a remote row's cues came from the log).
 	// `+t.…`: cue-driven (its rowid range, then each cue's track by key);
 	// SQLite otherwise walks every catalogue row through the derived-copy
@@ -87,7 +89,7 @@ export async function backfillCueOriginsAsync(raw: Raw, opts: { page?: number } 
 		WHERE c.rowid > ? AND c.origin = 'rekordbox' AND c.slot >= 0 AND +t.remote_only = 0 AND +t.derived_from_track_id IS NULL
 		ORDER BY c.rowid LIMIT ?`);
 	const aliased = raw.prepare(`SELECT 1 FROM recording_alias WHERE loser = ?`).pluck();
-	return paged<{ rid: number; track_id: string; slot: number; kind: 'hot' | 'memory'; position_sec: number; length_sec: number | null; color: string | null; name: string | null }>(raw, CUE_ORIGIN_BACKFILL_KEY, select, opts.page ?? 400, (rows) => {
+	return paged<{ rid: number; track_id: string; slot: number; kind: 'hot' | 'memory'; position_sec: number; length_sec: number | null; color: string | null; name: string | null }>(raw, CUE_ORIGIN_BACKFILL_KEY, select, opts.page ?? 400, opts.local, (rows) => {
 		const rec = recordingResolver(raw, rows.map((r) => r.track_id));
 		const ops: EmitOp[] = [];
 		for (const c of rows) {
@@ -106,10 +108,10 @@ export async function backfillCueOriginsAsync(raw: Raw, opts: { page?: number } 
 	});
 }
 
-export async function backfillPlayRefsAsync(raw: Raw, opts: { page?: number } = {}): Promise<BackfillRun> {
+export async function backfillPlayRefsAsync(raw: Raw, opts: BackfillOpts = {}): Promise<BackfillRun> {
 	const select = raw.prepare(`SELECT rowid AS rid, id, rb_content_id, source_track_id FROM play_event
 		WHERE rowid > ? AND (rb_content_id IS NOT NULL OR source_track_id IS NOT NULL) ORDER BY rowid LIMIT ?`);
-	return paged<{ rid: number; id: string; rb_content_id: string | null; source_track_id: string | null }>(raw, PLAY_REFS_BACKFILL_KEY, select, opts.page ?? 500, (rows) => {
+	return paged<{ rid: number; id: string; rb_content_id: string | null; source_track_id: string | null }>(raw, PLAY_REFS_BACKFILL_KEY, select, opts.page ?? 500, opts.local, (rows) => {
 		const ops: EmitOp[] = [];
 		for (const e of rows) {
 			const record = recordValue<Cell<PlayEventBody>>(raw, 'playEvents', e.id);
@@ -125,7 +127,7 @@ export async function backfillPlayRefsAsync(raw: Raw, opts: { page?: number } = 
 	});
 }
 
-export async function backfillRbUnitsV4Async(raw: Raw, opts: { page?: number } = {}): Promise<BackfillRun> {
+export async function backfillRbUnitsV4Async(raw: Raw, opts: BackfillOpts = {}): Promise<BackfillRun> {
 	const select = raw.prepare(`SELECT ta.rowid AS rid, ta.track_id, ta.rb_bpm, ta.rb_key_strength, COALESCE(rl.last_synced_at, ta.analyzed_at) AS at
 		FROM track_analysis ta JOIN track t ON t.id = ta.track_id LEFT JOIN rekordbox_link rl ON rl.track_id = ta.track_id
 		WHERE ta.rowid > ? AND +t.derived_from_track_id IS NULL AND +t.remote_only = 0 AND (ta.rb_bpm IS NOT NULL OR ta.rb_key_strength IS NOT NULL)
@@ -133,7 +135,7 @@ export async function backfillRbUnitsV4Async(raw: Raw, opts: { page?: number } =
 	const aliased = raw.prepare(`SELECT 1 FROM recording_alias WHERE loser = ?`).pluck();
 	// 100 a page: the two columns sit behind the row's grid blobs, so each
 	// read walks overflow pages (~0.3 ms a row on the real library).
-	return paged<{ rid: number; track_id: string; rb_bpm: number | null; rb_key_strength: number | null; at: number | null }>(raw, RB_UNITS_V4_BACKFILL_KEY, select, opts.page ?? 100, (rows) => {
+	return paged<{ rid: number; track_id: string; rb_bpm: number | null; rb_key_strength: number | null; at: number | null }>(raw, RB_UNITS_V4_BACKFILL_KEY, select, opts.page ?? 100, opts.local, (rows) => {
 		const rec = recordingResolver(raw, rows.map((r) => r.track_id));
 		const ops: EmitOp[] = [];
 		for (const r of rows) {

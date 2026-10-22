@@ -78,7 +78,7 @@ function legacyLibrary(raw: Database.Database, p: { tag: string; tagged: string[
 
 // ── 1 ───────────────────────────────────────────────────────────────────────
 
-describe('scenario 1 — initial push from A, B joins empty and converges', () => {
+describe('scenario 1 — A founds the account with its library, B joins empty and converges', () => {
 	const seedA = (raw: Database.Database) => legacyLibrary(raw, {
 		tag: 'leg-warm', tagged: ['trk-0', 'trk-1', 'trk-2'], playlist: 'leg-set', members: ['trk-3', 'trk-1', 'trk-4'], ratings: [['trk-0', 5], ['trk-5', 2]],
 	});
@@ -91,17 +91,26 @@ describe('scenario 1 — initial push from A, B joins empty and converges', () =
 		await a.svc.createPinnedSearch({ name: 'Warm', query: 'tag:warm' });
 	}
 
-	it('via ops: B pulls the initial push and every later op', async () => {
+	it('the library goes up as the base snapshot, not as ops; B bootstraps from it and pulls every later op', async () => {
 		const a = await rig.desktop('a', { seed: seedA });
 		await editBeforeSignIn(a);
 		await a.sync();
-		expect(await a.svc.getCloudSyncStatus()).toMatchObject({ initialPushDone: true, pending: 0, rejected: 0, lastError: null });
-		// The legacy rows reached the cloud (tags, rows, ratings).
-		expect(rig.cloud.log.some((o) => o.entity === 'track_tag' && o.entity_id.startsWith(R('trk-0')))).toBe(true);
+		expect(await a.svc.getCloudSyncStatus()).toMatchObject({ initialPushDone: true, pending: 0, rejected: 0, lastError: null, phase: null });
+		// The founder fold: nothing of the legacy rows reached the log (only
+		// the master setting and the edits made before sign-in, which the
+		// mutators had already recorded as ops), and the base was published.
+		const aId = await a.deviceId();
+		expect(rig.cloud.log.some((o) => o.entity === 'track_tag' || o.entity === 'playlist_track' || o.kind === 'set-rating')).toBe(false);
+		expect(rig.cloud.log.some((o) => o.entity === 'setting' && o.entity_id === 'library.master_device' && (o.payload as { value: string }).value === aId)).toBe(true);
+		expect(rig.cloud.published).toHaveLength(1);
+		expect(rig.cloud.published[0]!.seq).toBe(rig.cloud.maxSeq);
+		// Every outbox row of A's is on the log: the fold wrote none.
+		expect(a.one(`SELECT count(*) FROM sync_outbox`)).toBe(rig.cloud.log.filter((o) => o.device_id === aId).length);
 
 		const b = await rig.desktop('b');
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(0);
+		// Two asks: A's (the founder's, answered empty) and B's, which loaded.
+		expect([rig.cloud.calls.bootstrap, rig.cloud.calls.storageBootstraps]).toEqual([2, 1]);
 		expect(replicaDiff(a, b)).toEqual([]);
 		// Non-trivial on every table the scenario touched.
 		const dump = dumpLibrary(b.raw);
@@ -111,9 +120,13 @@ describe('scenario 1 — initial push from A, B joins empty and converges', () =
 		expect(dump.pinnedSearches).toHaveLength(1);
 		expect(playlistOrder(b, 'leg-set')).toEqual([R('trk-3'), R('trk-1'), R('trk-4')]);
 		expect(b.one(`SELECT rating FROM track WHERE id = 'trk-0'`)).toBe(5);
+		// B joined with nothing of its own: no op of B's on the log but the
+		// ones the scenario did not make (none).
+		const bId = await b.deviceId();
+		expect(rig.cloud.log.filter((o) => o.device_id === bId)).toEqual([]);
 	});
 
-	it('via the snapshot: B bootstraps from it, then pulls the ops after it', async () => {
+	it('via a later snapshot: B bootstraps from it, then pulls the ops after it', async () => {
 		const a = await rig.desktop('a', { seed: seedA });
 		await editBeforeSignIn(a);
 		await a.sync();
@@ -127,7 +140,7 @@ describe('scenario 1 — initial push from A, B joins empty and converges', () =
 
 		const b = await rig.desktop('b');
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(1);
+		expect(rig.cloud.calls.storageBootstraps).toBe(1);
 		expect(readCursor(b.raw)).toMatchObject({ snapshotSeq: snapSeq, lastSeq: rig.cloud.maxSeq });
 		expect(replicaDiff(a, b)).toEqual([]);
 		expect(b.one(`SELECT rating FROM track WHERE id = 'trk-0'`)).toBe(3);
@@ -139,7 +152,7 @@ describe('scenario 1 — initial push from A, B joins empty and converges', () =
 // ── 2 ───────────────────────────────────────────────────────────────────────
 
 describe('scenario 2 — B joins with its own existing library', () => {
-	it('both initial-push; the shared catalogue merges into one library on both', async () => {
+	it('A founds, B binds and pushes only its own; the shared catalogue merges into one library on both', async () => {
 		const a = await rig.desktop('a', {
 			seed: (raw) => legacyLibrary(raw, { tag: 'a-tag', tagged: ['trk-0', 'trk-1'], playlist: 'a-set', members: ['trk-0', 'trk-2'], ratings: [['trk-3', 4]] }),
 		});
@@ -157,6 +170,14 @@ describe('scenario 2 — B joins with its own existing library', () => {
 		// (remote-rows.ts), made from B's base metadata, with its tag and
 		// playlist row.
 		expect(replicaDiff(a, b)).toEqual([]);
+		// B's join push carried its own rows only: its tag, its playlist, its
+		// memberships and ratings, the one recording only it holds — nothing
+		// of A's base (no create for a shared catalogue row).
+		const bId = await b.deviceId();
+		const bOps = rig.cloud.log.filter((o) => o.device_id === bId);
+		expect(bOps.filter((o) => o.entity === 'library_track' && o.kind === 'create').map((o) => o.entity_id)).toEqual([R('b-only')]);
+		expect(bOps.filter((o) => o.entity === 'tag' && o.kind === 'create').map((o) => o.entity_id)).toEqual(['b-tag']);
+		expect(bOps.filter((o) => o.entity === 'playlist' && o.kind === 'create').map((o) => o.entity_id)).toEqual(['b-set']);
 		expect(a.one(`SELECT remote_only FROM track WHERE recording_id = ?`, R('b-only'))).toBe(1);
 		expect(b.one(`SELECT remote_only FROM track WHERE id = 'b-only'`)).toBe(0);
 		// Both libraries' containers on both sides.

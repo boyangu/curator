@@ -26,6 +26,12 @@
 // SNAPSHOT_PART_MAX_BYTES, each a file named by its sha256 in `outDir`, plus
 // the manifest the server is told. Runs in a utility process in the desktop
 // app (main/cloud/snapshot-host.ts); tests and the CLI run it inline.
+//
+// The digest-only form (`buildSnapshotDigest`) streams the same JSON through
+// the sha256 alone, no gzip, no parts: a secondary at the master's published
+// seq compares its own records' digest with the manifest's stateSha256
+// (client.ts, the cross-device check that replaced the server's fold) — a
+// difference means its records drifted from the base, and it reloads.
 
 import Database from 'better-sqlite3';
 import { createHash, type Hash } from 'node:crypto';
@@ -50,7 +56,7 @@ import {
 	type LibraryStateMapName,
 	type SnapshotManifest,
 } from '@curator/protocol';
-import { INITIAL_PUSH_KEY } from './apply.js';
+import { RECORDS_COMPLETE_KEY } from './apply.js';
 import { CLIENT_STATE_KEY, readCursor } from './client.js';
 import { STATE_MAPS, tombClock, type StateMap } from './store.js';
 
@@ -60,6 +66,7 @@ export type SnapshotSkipReason = 'pending_ops' | 'rejected_ops' | 'held_ops' | '
 
 export type SnapshotBuildOk = {
 	ok: true;
+	digestOnly?: false;
 	snapshotSeq: number;
 	manifest: SnapshotManifest;
 	// The local file of each part, in manifest order. All of them live in
@@ -72,13 +79,25 @@ export type SnapshotBuildOk = {
 	// The builder process's peak resident set, when it ran in one of its own.
 	peakRssBytes?: number;
 };
-export type SnapshotBuildResult = SnapshotBuildOk | { ok: false; skipped: SnapshotSkipReason; count?: number };
+export type SnapshotDigestOk = {
+	ok: true;
+	digestOnly: true;
+	snapshotSeq: number;
+	// sha256 of the serialised JSON: what SnapshotManifest.stateSha256 holds.
+	stateSha256: string;
+	records: number;
+	buildMs: number;
+	peakRssBytes?: number;
+};
+export type SnapshotBuildSkipped = { ok: false; skipped: SnapshotSkipReason; count?: number };
+export type SnapshotBuildResult = SnapshotBuildOk | SnapshotDigestOk | SnapshotBuildSkipped;
 
 // What the sync client is given (CoreServiceOptions.cloud.snapshot): the
 // desktop injects one that runs in a utility process, like parseAudio;
 // without it the build runs inline (tests, CLI). Builds the snapshot of
-// `userId`'s library from this database's records.
-export type SnapshotBuilder = (req: { userId: string }) => Promise<SnapshotBuildResult>;
+// `userId`'s library from this database's records — or, with `digestOnly`,
+// only its digest (above).
+export type SnapshotBuilder = (req: { userId: string; digestOnly?: boolean }) => Promise<SnapshotBuildResult>;
 
 // The JSON handed to gzip in pieces of about this many UTF-16 units: big
 // enough that zlib sees long runs, small enough to hold nothing large.
@@ -144,7 +163,7 @@ function entriesOf(db: Raw, map: LibraryStateMapName): Iterable<readonly [string
 
 // The preconditions and the seq, read inside the build's transaction.
 function readPreconditions(db: Raw): { seq: number } | { skipped: SnapshotSkipReason; count?: number } {
-	if (db.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(INITIAL_PUSH_KEY) === undefined) return { skipped: 'records_incomplete' };
+	if (db.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(RECORDS_COMPLETE_KEY) === undefined) return { skipped: 'records_incomplete' };
 	const counts = new Map((db.prepare(`SELECT state, count(*) AS n FROM sync_outbox WHERE state IN ('pending', 'rejected') GROUP BY state`).all() as Array<{ state: string; n: number }>).map((r) => [r.state, r.n]));
 	if (counts.get('pending')) return { skipped: 'pending_ops', count: counts.get('pending')! };
 	if (counts.get('rejected')) return { skipped: 'rejected_ops', count: counts.get('rejected')! };
@@ -205,37 +224,26 @@ class PartWriter {
 	}
 }
 
-export async function buildSnapshotParts(input: { dbPath: string; outDir: string; userId: string; partMaxBytes?: number }): Promise<SnapshotBuildResult> {
-	const started = performance.now();
-	const db = new Database(input.dbPath, { readonly: true, fileMustExist: true });
-	const parts = new PartWriter(input.outDir, input.userId, Math.min(input.partMaxBytes ?? SNAPSHOT_PART_MAX_BYTES, SNAPSHOT_PART_MAX_BYTES));
+// The JSON, streamed in pieces of about FLUSH_CHARS to `feed`, inside one
+// read transaction on the build's own connection; the preconditions and the
+// seq are read in the same transaction. `feed` may await (gzip's drain):
+// that keeps a sync_state iterator open across the await, which is safe on
+// a connection nothing else uses.
+async function streamSnapshot(dbPath: string, feed: (s: string) => Promise<void>): Promise<{ seq: number; records: number } | SnapshotBuildSkipped> {
+	const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 	let open = false;
 	try {
-		mkdirSync(input.outDir, { recursive: true });
 		db.exec('BEGIN');
 		open = true;
 		const pre = readPreconditions(db);
 		if ('skipped' in pre) return { ok: false, skipped: pre.skipped, ...(pre.count !== undefined ? { count: pre.count } : {}) };
-
-		const gz = createGzip();
-		gz.on('data', (chunk: Buffer) => parts.write(chunk));
-		const json = createHash('sha256');
-		let jsonBytes = 0;
-		let records = 0;
-		const feed = async (s: string): Promise<void> => {
-			const buf = Buffer.from(s, 'utf8');
-			json.update(buf);
-			jsonBytes += buf.length;
-			if (!gz.write(buf)) await once(gz, 'drain');
-		};
 		const pieces: string[] = [];
 		let pending = 0;
+		let records = 0;
 		const counted = (map: LibraryStateMapName): Iterable<readonly [string, unknown]> => {
 			const src = entriesOf(db, map);
 			return (function* () { for (const e of src) { records++; yield e; } })();
 		};
-		// Awaiting gzip's drain mid-map keeps a sync_state iterator open across
-		// the await; nothing else uses this connection, so that is safe.
 		for (const piece of serializeLibraryStateChunks(counted)) {
 			pieces.push(piece);
 			pending += piece.length;
@@ -246,15 +254,38 @@ export async function buildSnapshotParts(input: { dbPath: string; outDir: string
 			}
 		}
 		if (pieces.length > 0) await feed(pieces.join(''));
+		db.exec('COMMIT');
+		open = false;
+		return { seq: pre.seq, records };
+	} finally {
+		if (open) { try { db.exec('ROLLBACK'); } catch { /* the transaction already ended */ } }
+		db.close();
+	}
+}
+
+export async function buildSnapshotParts(input: { dbPath: string; outDir: string; userId: string; partMaxBytes?: number }): Promise<SnapshotBuildOk | SnapshotBuildSkipped> {
+	const started = performance.now();
+	const parts = new PartWriter(input.outDir, input.userId, Math.min(input.partMaxBytes ?? SNAPSHOT_PART_MAX_BYTES, SNAPSHOT_PART_MAX_BYTES));
+	try {
+		mkdirSync(input.outDir, { recursive: true });
+		const gz = createGzip();
+		gz.on('data', (chunk: Buffer) => parts.write(chunk));
+		const json = createHash('sha256');
+		let jsonBytes = 0;
+		const r = await streamSnapshot(input.dbPath, async (s) => {
+			const buf = Buffer.from(s, 'utf8');
+			json.update(buf);
+			jsonBytes += buf.length;
+			if (!gz.write(buf)) await once(gz, 'drain');
+		});
+		if ('skipped' in r) { gz.destroy(); parts.abort(); return r; }
 		gz.end();
 		await finished(gz);
 		parts.cut();
-		db.exec('COMMIT');
-		open = false;
 		if (parts.parts.length > MAX_SNAPSHOT_PARTS) throw new Error(`snapshot of ${parts.total} gzip bytes needs ${parts.parts.length} parts, past the ${MAX_SNAPSHOT_PARTS} allowed`);
 		return {
 			ok: true,
-			snapshotSeq: pre.seq,
+			snapshotSeq: r.seq,
 			manifest: {
 				encoding: SNAPSHOT_STORAGE_ENCODING,
 				parts: parts.parts,
@@ -265,22 +296,29 @@ export async function buildSnapshotParts(input: { dbPath: string; outDir: string
 			files: parts.files,
 			dir: input.outDir,
 			jsonBytes,
-			records,
+			records: r.records,
 			buildMs: Math.round(performance.now() - started),
 		};
 	} catch (err) {
 		parts.abort();
 		throw err;
-	} finally {
-		if (open) { try { db.exec('ROLLBACK'); } catch { /* the transaction already ended */ } }
-		db.close();
 	}
+}
+
+// The digest alone (header): the same JSON, hashed, nothing written.
+export async function buildSnapshotDigest(input: { dbPath: string }): Promise<SnapshotDigestOk | SnapshotBuildSkipped> {
+	const started = performance.now();
+	const json = createHash('sha256');
+	const r = await streamSnapshot(input.dbPath, async (s) => { json.update(Buffer.from(s, 'utf8')); });
+	if ('skipped' in r) return r;
+	return { ok: true, digestOnly: true, snapshotSeq: r.seq, stateSha256: json.digest('hex'), records: r.records, buildMs: Math.round(performance.now() - started) };
 }
 
 // The fallback when the host injects no builder (tests, CLI): the same
 // build on this thread, into a fresh directory under `tmpRoot`.
 export function inlineSnapshotBuilder(dbPath: string, tmpRoot: string = tmpdir()): SnapshotBuilder {
-	return async ({ userId }) => {
+	return async ({ userId, digestOnly }) => {
+		if (digestOnly) return buildSnapshotDigest({ dbPath });
 		mkdirSync(tmpRoot, { recursive: true });
 		const outDir = mkdtempSync(join(tmpRoot, 'curator-snapshot-'));
 		try {

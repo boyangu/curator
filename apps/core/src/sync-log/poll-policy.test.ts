@@ -38,7 +38,7 @@ function stubTransport(): StubTransport {
 			push: async (input: PushInput) => { calls.push++; return { accepted: input.ops.length, maxSeq: 0, rejected: [] }; },
 			pull: async (input: PullInput) => { calls.pull++; return { ops: [], nextSeq: input.afterSeq }; },
 		},
-		bootstrap: async () => ({ snapshotSeq: 0, records: [] }),
+		bootstrap: async () => ({ snapshotSeq: 0, baseSeq: 0, records: null }),
 		account: {
 			registerDevice: async () => ({ ok: true as const }),
 			devices: async () => [],

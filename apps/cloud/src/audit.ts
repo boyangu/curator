@@ -78,11 +78,14 @@ export const AUDIT_KINDS = [
 	// set-attrs, album set-meta) from a device that is not the account's
 	// master ({ procedure, master, byKind }). Audit only: the ops are kept.
 	'source_from_non_master',
-	// The verifier CLI (src/snapshot/verify.ts): a server fold of the log
-	// matched, or did not match, a published snapshot's state_sha256
-	// ({ snapshotSeq, baseSeq, opsFolded, stateSha256, foldSha256 }).
-	'snapshot_verified',
-	'snapshot_mismatch',
+	// The compaction sweep (src/sync/compact.ts) raised an account's base
+	// and deleted the log below it ({ through, baseSeq, deleted }). No
+	// request id: the sweep raised it.
+	'ops_compacted',
+	// A pull or bootstrap found an account with a base above 0 and no
+	// snapshot ({ procedure, baseSeq }): a server invariant violation
+	// (base.ts), answered as an internal error.
+	'base_without_snapshot',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -122,8 +125,8 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	batch_expired: 'warn',
 	snapshot_published: 'info',
 	source_from_non_master: 'info',
-	snapshot_verified: 'info',
-	snapshot_mismatch: 'warn',
+	ops_compacted: 'info',
+	base_without_snapshot: 'warn',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

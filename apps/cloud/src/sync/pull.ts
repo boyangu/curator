@@ -7,11 +7,16 @@
 // safety. First, in the same transaction, the revoke gate
 // (account/device-gate.ts): a revoked device, or a session acting as one,
 // reads nothing.
+//
+// A cursor below the account's base (base.ts) gets no page at all: the log
+// no longer holds the ops between it and the base, and a page from the base
+// on would silently skip them. It is told to bootstrap instead.
 
 import { MAX_PULL_OPS, SYNC_FEATURES, type PullInput, type PullResult, type StoredOp } from '@curator/protocol';
 import { num, type Db, type Queryable } from '../db/db.js';
 import { withUserTx, type UserTx } from '../db/user-tx.js';
 import { assertSessionNotRevoked, gateDevice, type Caller } from '../account/device-gate.js';
+import { BaseInvariantError, newestSnapshot, readBase } from './base.js';
 import { VISIBLE_THROUGH } from './visibility.js';
 
 export type PullCall = PullInput;
@@ -46,8 +51,8 @@ type OpRow = {
 	received_at: unknown;
 };
 
-// Shared with the snapshot fold. jsonb is read as text and parsed here so
-// both drivers hand back the same thing.
+// jsonb is read as text and parsed here so both drivers hand back the same
+// thing.
 export const OP_COLUMNS = `seq::float8 as seq, user_id::text as user_id, op_id::text as op_id, device_id,
 	client_ts::float8 as client_ts, schema_version, entity, entity_id, kind, payload::text as payload,
 	floor(extract(epoch from received_at) * 1000)::float8 as received_at`;
@@ -82,23 +87,13 @@ export async function selectOpsAfter(tx: Queryable, afterSeq: number, limit: num
 	return rows.map(toStoredOp);
 }
 
-// The snapshot the far-behind hint names: the newest BODIED one, fence or
-// not (none is ever stored above a fence, so it never covers an op the
-// reader may not see yet; visibility.ts). Not a newer master-published one
-// ('snapshot_storage'): a pull does not say whether its client can read
-// Storage, and a client that cannot would bootstrap to the older bodied
-// snapshot, pull, be told again, and download the library every cycle. Every
-// client can load a bodied snapshot, and one that reads Storage bootstraps
-// to the newest of either, at or past the hint.
-export async function latestSnapshotSeq(tx: Queryable): Promise<number | null> {
-	const [row] = await tx.query<{ seq: unknown }>(
-		`select snapshot_seq::float8 as seq from curator.library_snapshot
-		where user_id = (select auth.uid()) and body is not null
-		order by snapshot_seq desc
-		limit 1`,
-	);
-	return row ? num(row.seq) : null;
-}
+// The snapshot the far-behind hint names is the newest one (base.ts), fence
+// or not: none is ever stored above a fence, so it never covers an op the
+// reader may not see yet (visibility.ts). Every snapshot is a Storage one
+// now and sync.bootstrap serves exactly the newest, so a device sent to it
+// lands at the hinted seq and is not told again on its next pull; a client
+// that cannot read Storage is refused by bootstrap (`update_required`) rather
+// than sent round in circles.
 
 // The skip, as the page query and the far-behind count both apply it.
 type SkipOwn = { deviceId: string; throughSeq: number };
@@ -207,6 +202,18 @@ export async function pull(db: Db, userId: string, caller: Caller, call: PullCal
 	return withUserTx(db, userId, async (tx) => {
 		if (call.deviceId !== undefined) await gateDevice(tx, caller, call.deviceId);
 		else await assertSessionNotRevoked(tx, caller);
+		// One read serves the far-behind hint and `published` (the digest a
+		// device at the snapshot's seq checks itself against).
+		const newest = await newestSnapshot(tx);
+		const published = newest ? { seq: newest.seq, stateSha256: newest.stateSha256 } : undefined;
+		const base = await readBase(tx);
+		if (call.afterSeq < base) {
+			if (!newest) throw new BaseInvariantError(userId, base);
+			// No page: the ops between the cursor and the base are gone, and
+			// the cursor stays where it is so a client that ignores the hint
+			// never advances past the hole.
+			return { result: { ops: [], nextSeq: call.afterSeq, snapshotSeq: newest.seq, published, features: [...SYNC_FEATURES] }, skippedOwn: 0 };
+		}
 		let result: PullResult;
 		let skippedOwn = 0;
 		if (skip) {
@@ -217,10 +224,10 @@ export async function pull(db: Db, userId: string, caller: Caller, call: PullCal
 			const ops = await selectOpsAfter(tx, call.afterSeq, limit);
 			result = { ops, nextSeq: ops.length > 0 ? ops[ops.length - 1]!.seq : call.afterSeq };
 		}
-		const snapshotSeq = await latestSnapshotSeq(tx);
-		if (snapshotSeq !== null && call.afterSeq < snapshotSeq && (await farBehind(tx, call.afterSeq, snapshotSeq, skip, opts))) {
-			result.snapshotSeq = snapshotSeq;
+		if (newest && call.afterSeq < newest.seq && (await farBehind(tx, call.afterSeq, newest.seq, skip, opts))) {
+			result.snapshotSeq = newest.seq;
 		}
+		if (published) result.published = published;
 		result.features = [...SYNC_FEATURES];
 		return { result, skippedOwn };
 	});

@@ -43,7 +43,7 @@ describe('a revoked device reads nothing', () => {
 		await studio.api.sync.push.mutate({ deviceId: studio.deviceId, ops: [opsFor(studio.deviceId)('tag', 'create', randomUUID(), { name: 'x', kind: 'user' })] });
 		// Before the revoke the laptop reads like any device.
 		expect((await laptop.api.sync.pull.query({ afterSeq: 0, deviceId: laptop.deviceId })).ops).toHaveLength(1);
-		await laptop.api.sync.bootstrap.query({ deviceId: laptop.deviceId });
+		await laptop.api.sync.bootstrap.query({ deviceId: laptop.deviceId, storage: true });
 
 		await studio.api.account.revokeDevice.mutate({ deviceId: laptop.deviceId });
 
@@ -146,7 +146,7 @@ describe('the device_reads transition', () => {
 		const userId = await app.createUser();
 		const desk = await install(userId, 'desk');
 		await expect(desk.api.sync.pull.query({ afterSeq: 0 })).resolves.toMatchObject({ ops: [], features: expect.arrayContaining(['device_reads']) });
-		await expect(desk.api.sync.bootstrap.query()).resolves.toMatchObject({ snapshotSeq: 0 });
+		await expect(desk.api.sync.bootstrap.query({ storage: true })).resolves.toMatchObject({ snapshotSeq: 0 });
 	});
 
 	it('cannot judge a session the server never saw: that gap is what requiring the device id closes', async () => {
@@ -164,9 +164,9 @@ describe('the device_reads transition', () => {
 			const s = await strict.signIn();
 			const UPDATE = { code: 'PRECONDITION_FAILED', reason: 'update_required' };
 			expect(await errorReason(s.api.sync.pull.query({ afterSeq: 0 }))).toMatchObject(UPDATE);
-			expect(await errorReason(s.api.sync.bootstrap.query())).toMatchObject(UPDATE);
+			expect(await errorReason(s.api.sync.bootstrap.query({ storage: true }))).toMatchObject(UPDATE);
 			await expect(s.api.sync.pull.query({ afterSeq: 0, deviceId: s.deviceId })).resolves.toMatchObject({ ops: [] });
-			await expect(s.api.sync.bootstrap.query({ deviceId: s.deviceId })).resolves.toMatchObject({ snapshotSeq: 0 });
+			await expect(s.api.sync.bootstrap.query({ deviceId: s.deviceId, storage: true })).resolves.toMatchObject({ snapshotSeq: 0 });
 		} finally {
 			await strict.db.close();
 		}

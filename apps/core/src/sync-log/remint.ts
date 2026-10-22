@@ -19,9 +19,10 @@
 //     them after the backup, the server takes the re-push as a no-op (op id
 //     is the idempotency key within an account), and its echo is skipped
 //     here by op id like any own op.
-//   - `sync.clock`: dropped, so the next op re-derives it from the restored
-//     outbox (outbox.ts readClock) — seq_local continues after the restored
-//     rows and the server floor is learnt again on the next pull.
+//   - `sync.clock`: pinned to the restored outbox (outbox.ts pinClock) with
+//     the server floor forgotten — seq_local and the issued stamp continue
+//     after the restored rows, and the floor is learnt again on the next
+//     pull.
 //   - Client state: `registeredFor` cleared (register the new id) and
 //     `ownThroughSeq` back to 0. The new id has nothing on the server yet,
 //     and the old id's ops past the backup must come back on the pull as
@@ -48,7 +49,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { parseOp, type Op } from '@curator/protocol';
 import { DEVICE_ID_KEY } from './device.js';
-import { CLOCK_KEY } from './outbox.js';
+import { CLOCK_KEY, pinClock } from './outbox.js';
 import { SyncStateStore } from './store.js';
 
 type Raw = Database.Database;
@@ -110,7 +111,14 @@ function swapIdentity(raw: Raw, oldDeviceId: string | null): RemintResult {
 		restamped += slice.length;
 	}
 
-	raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(CLOCK_KEY);
+	// The clock keeps its issued stamp and seq_local, raised to whatever the
+	// restored outbox holds, and forgets the server floor (learnt again on the
+	// next pull). Not dropped: readClock's fallback derives both from the
+	// outbox's maxima, and acked rows are pruned after a week (outbox.ts), so
+	// those maxima can sit below stamps already in the log.
+	pinClock(raw);
+	const clock = readSetting(raw, CLOCK_KEY) as Record<string, unknown> | undefined;
+	if (clock) writeSetting(raw, CLOCK_KEY, { ...clock, lastServerTs: 0 });
 
 	// Server batches ('batches') are per device: the old id's open ones expire
 	// on the server, and their ops, now stamped with the new id, are staged

@@ -307,7 +307,7 @@ export type TrackAttrsDrain = { rows: number; emitted: number; done: boolean };
 // On a secondary (role.ts) only the set-attrs of a recording it did not
 // bring, or the master describes, is skipped (no baseline, so a promotion states it); its
 // curation and cue-edit stamp are the user's and go as everywhere.
-export function drainTrackAttrs(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole } = {}): TrackAttrsDrain {
+export function drainTrackAttrs(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): TrackAttrsDrain {
 	const max = Math.max(1, opts.max ?? CHUNK);
 	return raw.transaction((): TrackAttrsDrain => {
 		const role = opts.role ?? sourceRole(raw);
@@ -396,7 +396,7 @@ export function drainTrackAttrs(raw: Raw, opts: { max?: number; batchLabel?: Bat
 				}
 			}
 		}
-		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel });
+		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel, local: opts.local });
 		const putSeen = raw.prepare(`INSERT INTO track_attrs_seen (track_id, recording_id, digest, seen_at) VALUES (?, ?, ?, ?)
 			ON CONFLICT(track_id) DO UPDATE SET recording_id = excluded.recording_id, digest = excluded.digest, seen_at = excluded.seen_at`);
 		const now = Date.now();
@@ -412,14 +412,14 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 const SLICE_MS = 40;
 // As track-meta.ts's floor.
 const MIN_CHUNK = 20;
-export async function drainTrackAttrsAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
+export async function drainTrackAttrsAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	const fixed = opts.chunk !== undefined;
 	let size = Math.max(1, opts.chunk ?? 20);
 	for (;;) {
 		if (opts.signal?.aborted) break;
 		const t0 = performance.now();
-		const r = drainTrackAttrs(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role });
+		const r = drainTrackAttrs(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role, local: opts.local });
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
 		if (!fixed && r.rows > 0) size = Math.max(MIN_CHUNK, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * SLICE_MS / Math.max(ms, 1))));

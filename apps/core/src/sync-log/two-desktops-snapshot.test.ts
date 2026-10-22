@@ -1,11 +1,11 @@
 // The master-published snapshot ('snapshot_storage'; protocol
 // cloud-service.ts, client.ts publish stage, snapshot-build.ts) across
 // desktops on the rig: the master's records serialise to the server's own
-// fold byte for byte, a new device bootstraps from the master's Storage
-// snapshot and converges, only the master publishes, the preconditions hold
-// a publish back, the server fold still serves an account whose master
-// never published, superseded parts are deleted, and a master change moves
-// the publishing with it.
+// fold (its base plus the log since) byte for byte, a new device bootstraps
+// from the master's Storage snapshot and converges, only the master
+// publishes, the preconditions hold a publish back, a device waits while an
+// account's master has not published, superseded parts are deleted, and a
+// master change moves the publishing with it.
 //
 // Generated DBs only (CLAUDE.md): mkdtempSync + migrate() through the rig;
 // the fake cloud's Storage is an in-memory map; no remoteWritePolicy.
@@ -95,7 +95,8 @@ describe('the master publishes the snapshot from its records', () => {
 		const aId = await a.deviceId();
 		await syncAndPublish(a);
 		// The records as they stand, built directly: the JSON is exactly the
-		// fake server's fold of its log through the master's cursor.
+		// fake server's fold (the base before, plus the log) through the
+		// master's cursor.
 		const direct = await build(a);
 		expect(direct.snapshotSeq).toBe(readCursor(a.raw).lastSeq);
 		expect(direct.snapshotSeq).toBe(rig.cloud.maxSeq);
@@ -106,9 +107,11 @@ describe('the master publishes the snapshot from its records', () => {
 		for (const m of ['tags', 'trackTags', 'playlists', 'playlistTracks', 'libraryTracks', 'cues', 'claims', 'merges', 'recordingAlias', 'artistAliases', 'artistAlias', 'tombstones', 'pinnedSearches', 'settings']) {
 			expect(maps[m]!.length, m).toBeGreaterThan(0);
 		}
-		// Every publish so far came from the master and matched the fold.
-		expect(rig.cloud.publishes.length).toBeGreaterThan(0);
-		expect(rig.cloud.publishes.every((p) => p.deviceId === aId && p.stateMatches)).toBe(true);
+		// Every publish so far came from the master and matched the fold (the
+		// first one, the account's base, has nothing to be checked against).
+		expect(rig.cloud.publishes.length).toBeGreaterThan(1);
+		expect(rig.cloud.publishes.every((p) => p.deviceId === aId && p.stateMatches !== false)).toBe(true);
+		expect(rig.cloud.publishes.slice(1).every((p) => p.stateMatches === true)).toBe(true);
 		const last = rig.cloud.publishes.at(-1)!;
 		expect(last).toMatchObject({ seq: direct.snapshotSeq, status: 'stored' });
 		expect(rig.cloud.published.at(-1)!.manifest.stateSha256).toBe(direct.manifest.stateSha256);
@@ -148,8 +151,10 @@ describe('a new device bootstraps from the master\'s Storage snapshot', () => {
 
 		const c = await rig.desktop('c', { artists });
 		await rig.settle();
-		expect(rig.cloud.calls.storageBootstraps).toBe(1);
-		expect(readCursor(c.raw)).toMatchObject({ snapshotSeq: pub.seq, lastSeq: rig.cloud.maxSeq });
+		// B joined from A's first snapshot; C from this one.
+		expect(rig.cloud.calls.storageBootstraps).toBe(2);
+		expect(readCursor(c.raw).snapshotSeq).toBeGreaterThanOrEqual(pub.seq);
+		expect(readCursor(c.raw).lastSeq).toBe(rig.cloud.maxSeq);
 		expect(replicaDiff(a, c)).toEqual([]);
 		expect(replicaDiff(b, c)).toEqual([]);
 		expect(c.one(`SELECT rating FROM track WHERE id = 'trk-9'`)).toBe(1);
@@ -215,17 +220,30 @@ describe('who publishes, and when not', () => {
 		expect(await buildSnapshotParts({ dbPath: a.path, outDir, userId: USER })).toMatchObject({ ok: false, skipped: 'rejected_ops', count: 1 });
 	});
 
-	it('a master that never publishes: others still bootstrap from the server fold', async () => {
+	it('a master that never publishes: a joining device waits, and joins once a snapshot exists', async () => {
 		const crashing = { snapshot: { everyOps: 1, retryMs: 0, builder: async () => { throw new Error('builder process crashed'); } } };
 		const a = await rig.desktop('a', crashing);
 		await a.svc.setRating(['trk-0'], 4);
-		await rig.settle();
-		await a.publishIdle();
+		await a.sync();
 		expect(rig.cloud.calls.publish).toBe(0);
-		rig.cloud.hintBelow = rig.cloud.takeSnapshot();
+		expect(rig.cloud.published).toEqual([]);
+		// The account has ops (A's master setting, its rating) but no base: C
+		// asks, learns there is nothing to join from, and waits — no push, no
+		// pull, asking again each cycle.
 		const c = await rig.desktop('c');
+		await c.sync();
+		await c.sync();
+		expect((await c.svc.getCloudSyncStatus())).toMatchObject({ phase: 'waiting_for_snapshot', initialPushDone: false, lastError: null });
+		expect(readCursor(c.raw).lastSeq).toBe(0);
+		const cId = await c.deviceId();
+		expect(rig.cloud.log.filter((o) => o.device_id === cId)).toEqual([]);
+		const asks = rig.cloud.calls.bootstrap;
+		expect(asks).toBeGreaterThanOrEqual(3);
+		// The master's publish lands (takeSnapshot stands in for it): C joins.
+		rig.cloud.takeSnapshot();
 		await rig.settle();
-		expect([rig.cloud.calls.bootstrap, rig.cloud.calls.storageBootstraps]).toEqual([1, 0]);
+		expect(rig.cloud.calls.storageBootstraps).toBe(1);
+		expect((await c.svc.getCloudSyncStatus())).toMatchObject({ phase: null, initialPushDone: true });
 		expect(replicaDiff(a, c)).toEqual([]);
 	});
 
@@ -303,6 +321,6 @@ describe('the publish against the server\'s answers', () => {
 		expect(rig.cloud.published).toHaveLength(0);
 		await syncAndPublish(a);
 		expect(rig.cloud.published).toHaveLength(1);
-		expect(rig.cloud.publishes.at(-1)).toMatchObject({ status: 'stored', stateMatches: true });
+		expect(rig.cloud.publishes.at(-1)).toMatchObject({ status: 'stored', stateMatches: null });
 	});
 });

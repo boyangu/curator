@@ -7,15 +7,16 @@
 // driven by snapshot-host.ts, one build per fork: the process exits after
 // it, so the memory a build touched goes back to the OS at once.
 //
-// What crosses the port: { id, op: 'build', dbPath, outDir, userId } →
-// { id, ok, result | message }; log records as { kind: 'log' }. The database
-// is opened read-only; the parts are written under `outDir` (userData).
+// What crosses the port: { id, op: 'build', dbPath, outDir, userId,
+// digestOnly } → { id, ok, result | message }; log records as { kind: 'log' }.
+// The database is opened read-only; the parts are written under `outDir`
+// (userData), none for a digest-only build.
 
 import { setPriority, constants as osConstants } from 'node:os';
-import { buildSnapshotParts, setCoreLogger } from '@curator/core';
+import { buildSnapshotDigest, buildSnapshotParts, setCoreLogger } from '@curator/core';
 import { createLogger, isLogLevel } from '@curator/shared/log';
 
-type BuildRequest = { id: number; op: 'build'; dbPath: string; outDir: string; userId: string };
+type BuildRequest = { id: number; op: 'build'; dbPath: string; outDir: string; userId: string; digestOnly?: boolean };
 
 function post(frame: Record<string, unknown>): void {
 	process.parentPort.postMessage(frame);
@@ -36,7 +37,7 @@ process.parentPort.on('message', (e) => {
 	if (msg?.op !== 'build') return;
 	void (async () => {
 		try {
-			const result = await buildSnapshotParts({ dbPath: msg.dbPath, outDir: msg.outDir, userId: msg.userId });
+			const result = msg.digestOnly ? await buildSnapshotDigest({ dbPath: msg.dbPath }) : await buildSnapshotParts({ dbPath: msg.dbPath, outDir: msg.outDir, userId: msg.userId });
 			// Peak resident set of this process (KiB on every platform).
 			const peakRssBytes = process.resourceUsage().maxRSS * 1024;
 			post({ id: msg.id, ok: true, result: result.ok ? { ...result, peakRssBytes } : result });

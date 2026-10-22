@@ -6,7 +6,13 @@
 // plain pushes; a backlog found pending at upgrade is classified for a batch
 // without losing or doubling an op. And the two-desktop picture: A's
 // backfill is invisible to B until the commit, then B bootstraps from the
-// commit's snapshot and converges.
+// next snapshot and converges.
+//
+// The initial push is a JOINER's (client.ts: a library that signs in to an
+// account with a base states what it alone holds); the first device of an
+// account folds its library instead and sends nothing. Every scenario here
+// therefore starts from an account that has a base: `cloud.takeSnapshot()`
+// publishes the fake's (empty) fold as if a founder had.
 //
 // Generated DBs only (CLAUDE.md): mkdtempSync + migrate(); every transport
 // is the in-memory fake (test-support/fake-cloud.ts), nothing leaves the
@@ -24,7 +30,7 @@ import { createDb } from '../db/client.js';
 import * as mut from '../library/mutators.js';
 import { syncTrackArtistsByIdRaw } from '../library/artists.js';
 import { FakeCloud } from '../test-support/fake-cloud.js';
-import { INITIAL_PUSH_KEY } from './apply.js';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from './apply.js';
 import { CloudTransportError, createSyncClient, type CloudTransport, type SyncClient } from './client.js';
 import { compareDumps, dumpLibrary } from './dump.js';
 import { emitOps } from './outbox.js';
@@ -64,8 +70,15 @@ function legacy(raw: Database.Database, tags = 30): void {
 			tag.run(`lt-${i}`, `Legacy ${i}`, 1_600_000_000_000 + i);
 			tt.run(TRACKS[i % TRACKS.length]!, `lt-${i}`, 1_600_000_000_000 + i);
 		}
-		raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(INITIAL_PUSH_KEY);
+		raw.prepare(`DELETE FROM app_setting WHERE key IN (?, ?)`).run(INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY);
 	})();
+}
+
+// An account with a base to join (header).
+function founded(user = 'u'): FakeCloud {
+	const cloud = new FakeCloud();
+	cloud.takeSnapshot(user);
+	return cloud;
 }
 
 // A backfill's ops, as the v4 backfills emit them: stating rows this
@@ -97,8 +110,8 @@ const logIds = (cloud: FakeCloud): string[] => cloud.log.map((o) => o.op_id);
 const unique = (xs: string[]): boolean => new Set(xs).size === xs.length;
 
 describe('the backlog goes up as a batch', () => {
-	it('stages a first sign-in’s initial push and commits it; plain pushes carry none of it', async () => {
-		const cloud = new FakeCloud();
+	it('stages a joiner’s initial push and commits it; plain pushes carry none of it', async () => {
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		legacy(raw);
 		const c = client(raw, cloud.transport('u'));
@@ -121,7 +134,7 @@ describe('the backlog goes up as a batch', () => {
 	});
 
 	it('pushes everything plainly to a server without the feature, or through a transport without the procedures', async () => {
-		const old = new FakeCloud();
+		const old = founded();
 		old.features = old.features.filter((f) => f !== 'batches');
 		const a = freshDb('a');
 		legacy(a.raw);
@@ -130,7 +143,7 @@ describe('the backlog goes up as a batch', () => {
 		expect(states(a.raw)).toEqual({ acked: opIds(a.raw).length });
 		expect(logIds(old).sort()).toEqual(opIds(a.raw).sort());
 
-		const cloud = new FakeCloud();
+		const cloud = founded('u2');
 		const b = freshDb('b');
 		legacy(b.raw);
 		const t = cloud.transport('u2');
@@ -141,7 +154,7 @@ describe('the backlog goes up as a batch', () => {
 	});
 
 	it('never batches edits, and a small labelled backlog goes plainly too', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		await client(raw, cloud.transport('u')).syncNow();
 		backfill(raw, 5);
@@ -171,7 +184,7 @@ describe('the backlog goes up as a batch', () => {
 	});
 
 	it('labels a large drain (a meta backfill) for a batch, a small one not', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		await client(raw, cloud.transport('u'), { batchMinOps: 5 }).syncNow();
 		const meta = raw.prepare(`SELECT batch_label AS label, count(*) AS n FROM sync_outbox WHERE kind = 'set-meta' GROUP BY batch_label`).all();
@@ -186,7 +199,7 @@ describe('the backlog goes up as a batch', () => {
 
 describe('resuming', () => {
 	it('resumes the open batch after a restart mid-staging, without doubling an op', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		await client(raw, cloud.transport('u')).syncNow();
 		backfill(raw, 1_200);
@@ -204,7 +217,7 @@ describe('resuming', () => {
 		expect(staged).toHaveLength(1_000);
 		const batchId = raw.prepare(`SELECT DISTINCT batch_id FROM sync_outbox WHERE batch_id IS NOT NULL`).pluck().get() as string;
 		expect(JSON.parse(raw.prepare(`SELECT value FROM app_setting WHERE key = 'sync.client'`).pluck().get() as string).batches).toEqual({ backfill: { batchId, committing: false } });
-		expect(cloud.log.length).toBe(opIds(raw, `batch_label IS NULL`).length);
+		expect(cloud.log.length).toBe(opIds(raw, `batch_label IS NULL OR batch_label != 'backfill'`).length);
 
 		// Restart: the same batch, the rest staged, one commit.
 		const second = client(raw, cloud.transport('u'));
@@ -217,7 +230,7 @@ describe('resuming', () => {
 	});
 
 	it('resumes a commit the server was still running when the app quit', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		await client(raw, cloud.transport('u')).syncNow();
 		backfill(raw, 100);
@@ -238,7 +251,7 @@ describe('resuming', () => {
 	});
 
 	it('stages again under a new batch when the server expired the old one', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		const { raw } = freshDb('a');
 		await client(raw, cloud.transport('u')).syncNow();
 		backfill(raw, 300);
@@ -269,7 +282,7 @@ describe('a desktop upgraded mid-backfill', () => {
 	}
 
 	it('labels a pending backlog at upgrade and sends the rest of it as a batch: nothing lost, nothing doubled', async () => {
-		const old = new FakeCloud();
+		const old = founded();
 		old.features = old.features.filter((f) => f !== 'batches');
 		const { path, raw } = freshDb('a');
 		await client(raw, old.transport('u')).syncNow();
@@ -320,7 +333,7 @@ describe('a desktop upgraded mid-backfill', () => {
 
 describe('two desktops', () => {
 	it('A’s backfill in a batch: B sees nothing of it until the commit, then bootstraps from the next snapshot and converges', async () => {
-		const cloud = new FakeCloud();
+		const cloud = founded();
 		cloud.farBehindOps = 50;
 		const a = freshDb('a');
 		const b = freshDb('b');
@@ -346,8 +359,8 @@ describe('two desktops', () => {
 		expect(a.raw.prepare(`SELECT count(*) FROM tag WHERE id LIKE 'b-live-%'`).pluck().get()).toBe(2);
 		const bootsBefore = cloud.calls.bootstrap;
 
-		// Published, then the server's sweep folds a snapshot (the commit
-		// builds none): B is far behind it, so it loads that.
+		// Published, then the master publishes a newer snapshot (takeSnapshot
+		// stands in): B is far behind it, so it loads that.
 		cloud.holdCommits = false;
 		await ca.syncNow();
 		expect(states(a.raw)).toEqual({ acked: opIds(a.raw).length });

@@ -104,7 +104,7 @@ export function playlistAttrsDirtyCount(raw: Raw): number {
 // One chunk in one transaction. Callers check the server reads v4.
 // A provider field a secondary leaves to the master keeps its baseline, so
 // it stays in the diff and a promotion to master states it.
-export function drainPlaylistAttrs(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole } = {}): { rows: number; emitted: number; done: boolean } {
+export function drainPlaylistAttrs(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): { rows: number; emitted: number; done: boolean } {
 	const max = Math.max(1, opts.max ?? 200);
 	return raw.transaction(() => {
 		const role = opts.role ?? sourceRole(raw);
@@ -127,18 +127,18 @@ export function drainPlaylistAttrs(raw: Raw, opts: { max?: number; batchLabel?: 
 			}
 			raw.prepare(`DELETE FROM playlist_attrs_dirty WHERE entity = ? AND id = ?`).run(r.entity, r.id);
 		}
-		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel });
+		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel, local: opts.local });
 		return { rows: rows.length, emitted: ops.length, done: rows.length < max };
 	})();
 }
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-export async function drainPlaylistAttrsAsync(raw: Raw, opts: { batchLabel?: BatchLabel; role?: SourceRole } = {}): Promise<{ rows: number; emitted: number; maxSliceMs: number }> {
+export async function drainPlaylistAttrsAsync(raw: Raw, opts: { batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): Promise<{ rows: number; emitted: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, maxSliceMs: 0 };
 	for (;;) {
 		const t0 = performance.now();
-		const r = drainPlaylistAttrs(raw, { batchLabel: opts.batchLabel, role: opts.role });
+		const r = drainPlaylistAttrs(raw, { batchLabel: opts.batchLabel, role: opts.role, local: opts.local });
 		out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);
 		out.rows += r.rows;
 		out.emitted += r.emitted;

@@ -24,10 +24,11 @@ import {
 	type RejectReason,
 } from '@curator/protocol';
 import type { AuditEmit } from '../audit.js';
-import { num, type Db, type Queryable } from '../db/db.js';
+import { num, type Db } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { CloudError } from '../errors.js';
 import { assertSessionNotRevoked, bindSession, DeviceRevokedError, touchDevice, type Caller, type RevokedVia } from '../account/device-gate.js';
+import { headSeq } from './base.js';
 import { sourceFromNonMaster } from './master.js';
 
 export type PushCall = { deviceId: string; ops: readonly unknown[] };
@@ -131,11 +132,6 @@ export function validatePush(call: PushCall, nowMs: number): Validated {
 	return { valid, rejected, clamped, sentTs };
 }
 
-async function headSeq(tx: Queryable): Promise<number> {
-	const [row] = await tx.query<{ head: unknown }>('select coalesce(max(seq), 0)::float8 as head from curator.library_op where user_id = (select auth.uid())');
-	return num(row!.head);
-}
-
 // `audit` raises the security events (revoked device, rejections, clamps);
 // the request context stamps the request id, user and device on them.
 export async function push(db: Db, audit: AuditEmit, userId: string, caller: Caller, call: PushCall): Promise<PushResult> {
@@ -170,7 +166,7 @@ export async function push(db: Db, audit: AuditEmit, userId: string, caller: Cal
 			events.push(['push_from_revoked_device', { ops: call.ops.length, via: revoked }]);
 			return {
 				accepted: 0,
-				maxSeq: await headSeq(tx),
+				maxSeq: await headSeq(tx, 'all'),
 				rejected: call.ops.map((raw) => ({ opId: rawOpId(raw), reason: 'device_revoked' as const })),
 				clamped: [],
 				batchMaxSeq: 0,
@@ -294,7 +290,9 @@ export async function push(db: Db, audit: AuditEmit, userId: string, caller: Cal
 
 		return {
 			accepted: valid.length,
-			maxSeq: await headSeq(tx),
+			// Never below the base (base.ts): right after a rebase the log holds
+			// only this push, and the head is still the account's.
+			maxSeq: await headSeq(tx, 'all'),
 			rejected,
 			clamped: restamped,
 			batchMaxSeq,

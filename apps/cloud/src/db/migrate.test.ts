@@ -31,12 +31,12 @@ describe('migrations', () => {
 			'catalogue_item',
 			'device',
 			'device_session',
+			'library_base',
 			'library_op',
 			'library_op_batch',
 			'library_op_fence',
 			'library_op_staged',
 			'library_snapshot',
-			'library_snapshot_lease',
 			'request_log',
 			'schema_migration',
 		]);
@@ -60,12 +60,12 @@ describe('migrations', () => {
 			{ relname: 'catalogue_item', relrowsecurity: true },
 			{ relname: 'device', relrowsecurity: true },
 			{ relname: 'device_session', relrowsecurity: true },
+			{ relname: 'library_base', relrowsecurity: true },
 			{ relname: 'library_op', relrowsecurity: true },
 			{ relname: 'library_op_batch', relrowsecurity: true },
 			{ relname: 'library_op_fence', relrowsecurity: true },
 			{ relname: 'library_op_staged', relrowsecurity: true },
 			{ relname: 'library_snapshot', relrowsecurity: true },
-			{ relname: 'library_snapshot_lease', relrowsecurity: true },
 			{ relname: 'request_log', relrowsecurity: true },
 		]);
 	});
@@ -131,26 +131,34 @@ describe('sql/roles.sql', () => {
 		await expect(asSession([`select set_config('role', 'postgres', true)`])).rejects.toThrow(/permission denied/);
 	});
 
-	it('keeps the cross-user snapshot list away from authenticated and anon', async () => {
-		const due = `select * from curator.users_due_for_snapshot(1, interval '1 hour')`;
-		await expect(asRole('curator_api', due)).resolves.toEqual([]);
-		await expect(asRole('authenticated', due)).rejects.toThrow(/permission denied/);
-		await expect(asRole('anon', due)).rejects.toThrow(/permission denied/);
+	it('drops the snapshot-fold rules (0001 / 0007 / 0008) with 0009', async () => {
+		const gone = await t.db.query<{ n: number }>(
+			`select count(*)::int as n from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+			where n.nspname = 'curator' and p.proname like 'users_due_for_snapshot%'`,
+		);
+		expect(gone).toEqual([{ n: 0 }]);
 	});
 
-	it('keeps the 0007 / 0008 cross-user lists (snapshot rules, batch upkeep) for the login role alone', async () => {
+	it('keeps the cross-user lists (batch upkeep, compaction) and the compaction writers for the login role alone', async () => {
 		for (const sql of [
-			`select * from curator.users_due_for_snapshot_v2(1, interval '1 hour', interval '5 minutes', interval '1 hour')`,
 			`select * from curator.batches_to_tend(interval '1 day')`,
-			// 0008's snapshot rule, which leaves a freshly master-published account alone.
-			`select * from curator.users_due_for_snapshot_v3(1, interval '1 hour', interval '5 minutes', interval '1 hour', interval '7 days')`,
+			`select * from curator.users_due_for_compaction(interval '7 days')`,
 		]) {
 			await expect(asRole('curator_api', sql)).resolves.toEqual([]);
 			await expect(asRole('authenticated', sql)).rejects.toThrow(/permission denied/);
 			await expect(asRole('anon', sql)).rejects.toThrow(/permission denied/);
 		}
-		// The batch tables are the user's own, through RLS; never the login role's.
-		for (const table of ['library_op_batch', 'library_op_staged', 'library_op_fence', 'library_snapshot_lease']) {
+		// The writers: callable by the login role (a base of 0 on an account
+		// with no snapshot is the one value set_base_seq takes there), refused
+		// to everyone else.
+		const user = await t.createUser();
+		for (const sql of [`select curator.set_base_seq('${user}', 0)`, `select curator.compact_ops('${user}', 10)`]) {
+			await expect(asRole('curator_api', sql)).resolves.toHaveLength(1);
+			await expect(asRole('authenticated', sql)).rejects.toThrow(/permission denied/);
+			await expect(asRole('anon', sql)).rejects.toThrow(/permission denied/);
+		}
+		// The batch tables and the base are the user's own, through RLS; never the login role's.
+		for (const table of ['library_op_batch', 'library_op_staged', 'library_op_fence', 'library_base']) {
 			await expect(asRole('curator_api', `select * from curator.${table}`)).rejects.toThrow(/permission denied/);
 			await expect(asRole('anon', `select * from curator.${table}`)).rejects.toThrow(/permission denied/);
 		}

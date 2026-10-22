@@ -3,8 +3,9 @@
 // (design: "Server API"; apps/cloud/src/sync/*): one seq per user, duplicate
 // op ids accepted and ignored, per-op rejection without failing the batch,
 // a client_ts clamp far in the future, materialisation with the protocol
-// reducer, a `snapshotSeq` hint for a far-behind cursor, the 'pull_skip_own'
-// feature (or, with `legacy`, a server from before it, strict about its pull
+// reducer, a `snapshotSeq` hint for a cursor below the account's base
+// (`baseSeq`, set by `compact`) or too far behind the newest snapshot, the
+// 'pull_skip_own' feature (or, with `legacy`, a server from before it, strict about its pull
 // input), device revocation as the real server has it since 'device_reads'
 // (a revoked device's pushes come back `device_revoked` op by op, its pulls
 // and bootstraps are refused, and it cannot re-register; each transport is
@@ -15,26 +16,35 @@
 // under fresh seqs (skipping op ids the log holds), takes a snapshot and
 // answers `committed`; `holdCommits` keeps a commit running (it answers
 // `committing`) until a test lets it go, and `farBehindOps` is the server's
-// far-behind rule against that snapshot. And 'snapshot_storage' as the
-// contract states it (protocol cloud-service.ts): an in-memory `snapshots`
-// bucket each session may write only under its own prefix, and
-// publishSnapshot with the server's checks (master by the log's LWW, seq at
-// or below the head, parts present at their sizes, keep-3 prune naming the
-// superseded paths). Each publish is also compared with the fake's own fold
-// at its seq (`publishes[].stateMatches`), as the real server's verifier does.
+// far-behind rule against the newest snapshot. And 'snapshot_storage' as the
+// contract states it (protocol cloud-service.ts): the snapshot is the
+// account's base, published by the master — an in-memory `snapshots` bucket
+// each session may write only under its own prefix, publishSnapshot with
+// the server's checks (master by the log's LWW, seq at or below the head,
+// parts present at their sizes, keep-3 prune naming the superseded paths),
+// a bootstrap that takes `storage: true` only and answers the newest
+// manifest (or the empty state at 0) with `baseSeq`, and every pull naming
+// the newest snapshot (`published`) for the secondaries' digest check. The
+// server never folds: `takeSnapshot()` is a test helper that publishes the
+// fake's own fold as if the master had. Each publish is compared with the
+// fake's fold at its seq (`publishes[].stateMatches`), as the real server's
+// verifier does.
 //
 // Nothing here leaves the process.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import {
 	applyOp,
 	clampClientTs,
-	cloneLibraryState,
 	createLibraryState,
+	deserializeLibraryState,
 	masterDeviceOf,
+	MASTER_DEVICE_SETTING,
 	MAX_PULL_OPS,
 	MAX_PUSH_OPS,
+	SNAPSHOT_PART_MAX_BYTES,
+	SNAPSHOT_STORAGE_ENCODING,
 	snapshotPartPath,
 	safeParseOp,
 	schemaVersionStatus,
@@ -49,6 +59,7 @@ import {
 	type BatchStatus,
 	type BootstrapInput,
 	type DeviceInfo,
+	type LibraryState,
 	type Op,
 	type PublishSnapshotInput,
 	type PublishSnapshotResult,
@@ -87,7 +98,7 @@ export class FakeCloud {
 	readonly rejectIds = new Map<string, RejectReason>();
 	// Failures thrown by the next calls, in order, per procedure.
 	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[]; publish: CloudTransportError[]; upload: Error[] } = { push: [], pull: [], publish: [], upload: [] };
-	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0, chunkedBootstraps: 0, storageBootstraps: 0, batchBegin: 0, batchPush: 0, batchCommit: 0, batchAbort: 0, publish: 0, upload: 0, download: 0 };
+	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0, storageBootstraps: 0, batchBegin: 0, batchPush: 0, batchCommit: 0, batchAbort: 0, publish: 0, upload: 0, download: 0 };
 	// The `snapshots` bucket: path → bytes; and the paths clients removed.
 	readonly storage = new Map<string, Uint8Array>();
 	readonly removed: string[] = [];
@@ -95,16 +106,23 @@ export class FakeCloud {
 	readonly published: FakePublished[] = [];
 	keepSnapshots = 3;
 	// Every publishSnapshot call that passed the checks: who, at what seq,
-	// the outcome, and whether its JSON is the fake's own fold at that seq.
-	readonly publishes: Array<{ deviceId: string; seq: number; status: PublishSnapshotResult['status']; stateMatches: boolean }> = [];
+	// the outcome, and whether its JSON is the fake's own fold at that seq
+	// (`foldAt`): null when nothing before it can say — the account's first
+	// snapshot is its base, and the log alone never folds to it.
+	readonly publishes: Array<{ deviceId: string; seq: number; status: PublishSnapshotResult['status']; stateMatches: boolean | null }> = [];
 	readonly batches = new Map<string, FakeBatch>();
 	// A commit the server is still running: batchCommit answers `committing`
 	// and moves nothing while this is set.
 	holdCommits = false;
 	// The real server's far-behind rule (cloud sync/pull.ts) against the
-	// latest snapshot: more ops than this between the cursor and it, and the
-	// pull answers with the snapshot hint. Null: only `hintBelow`.
+	// newest snapshot: more ops than this between the cursor and it, and the
+	// pull answers with the snapshot hint. Null: only `hintBelow` / `baseSeq`.
 	farBehindOps: number | null = null;
+	// The account's base: ops at or below it are gone from the log (compact).
+	baseSeq = 0;
+	// The user the single account belongs to (the last transport made), for
+	// the paths `takeSnapshot` writes under.
+	private userId = 'user';
 	readonly pushSizes: number[] = [];
 	// Every push call's device and outcome, for "a revoked device stops pushing".
 	readonly pushLog: Array<{ deviceId: string; sent: number; accepted: number }> = [];
@@ -113,11 +131,13 @@ export class FakeCloud {
 	// the v2 mechanics takes 'track_meta' out, so no base-metadata or master
 	// op joins its outbox counts (client.test.ts v2Cloud).
 	features: SyncFeature[] = [...SYNC_FEATURES];
-	private snapshot: { seq: number; json: string } | null = null;
-	// A pull with afterSeq below this gets the snapshot hint.
+	// A pull with afterSeq below this gets the snapshot hint (a newest
+	// snapshot must exist for the hint to name).
 	hintBelow = 0;
 
-	get maxSeq(): number { return this.log.length === 0 ? 0 : this.log[this.log.length - 1]!.seq; }
+	// The head: the last op's seq, never below what compaction removed (a seq
+	// is never reused).
+	get maxSeq(): number { return Math.max(this.log.length === 0 ? 0 : this.log[this.log.length - 1]!.seq, this.baseSeq); }
 
 	revoke(deviceId: string): void {
 		const d = this.devices.get(deviceId);
@@ -202,15 +222,17 @@ export class FakeCloud {
 		if (f) throw f;
 		if ((input.deviceId !== undefined || input.ownThroughSeq !== undefined) && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
 		const skip = input.ownThroughSeq !== undefined;
-		const features = this.legacy ? {} : { features: [...this.features] };
-		// As the real server's: the hint names only a snapshot with a body in
-		// the database (takeSnapshot). A client that then bootstraps with
-		// `storage: true` may land at or past it.
-		if (this.snapshot && input.afterSeq < this.hintBelow) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: this.snapshot.seq, ...features };
-		if (this.snapshot && this.farBehindOps !== null && input.afterSeq < this.snapshot.seq) {
-			const snap = this.snapshot.seq;
-			const gap = this.log.filter((o) => o.seq > input.afterSeq && o.seq <= snap && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!)).length;
-			if (gap > this.farBehindOps) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: snap, ...features };
+		const newest = this.published.at(-1) ?? null;
+		const features = {
+			...(this.legacy ? {} : { features: [...this.features] }),
+			...(newest ? { published: { seq: newest.seq, stateSha256: newest.manifest.stateSha256 } } : {}),
+		};
+		// As the real server's: a cursor below the base, or too far behind the
+		// newest snapshot, is told to bootstrap; the hint names that snapshot.
+		if (newest && (input.afterSeq < this.baseSeq || input.afterSeq < this.hintBelow)) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: newest.seq, ...features };
+		if (newest && this.farBehindOps !== null && input.afterSeq < newest.seq) {
+			const gap = this.log.filter((o) => o.seq > input.afterSeq && o.seq <= newest.seq && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!)).length;
+			if (gap > this.farBehindOps) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: newest.seq, ...features };
 		}
 		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
 		const ops = this.log
@@ -317,15 +339,33 @@ export class FakeCloud {
 		if (b && b.status === 'open') { b.status = 'expired'; b.staged.clear(); }
 	}
 
-	// The fold of the log through `seq`, as the server's verifier builds it.
-	foldAt(seq: number): ReturnType<typeof createLibraryState> {
-		const state = createLibraryState();
+	// A published snapshot's state, read back out of the bucket.
+	private stateOf(pub: FakePublished): LibraryState {
+		const body = Buffer.concat(pub.manifest.parts.map((p) => Buffer.from(this.storage.get(p.path)!)));
+		return deserializeLibraryState(gunzipSync(body).toString('utf8'));
+	}
+
+	// The state through `seq` as a verifier can build it: the newest published
+	// snapshot at or below `seq` (the base — the founder's fold is in it and
+	// nowhere in the log) plus the log after it. `base` false: no snapshot
+	// at or below `seq` exists, and the fold is of the log alone (an account
+	// that was never founded by a fold: the pre-base rig scenarios).
+	foldAt(seq: number): LibraryState {
+		const base = [...this.published].filter((p) => p.seq <= seq).at(-1) ?? null;
+		const state = base ? this.stateOf(base) : createLibraryState();
 		for (const o of this.log) {
+			if (o.seq <= (base?.seq ?? 0)) continue;
 			if (o.seq > seq) break;
 			const { seq: _s, user_id: _u, received_at: _r, ...op } = o;
 			applyOp(state, op as Op);
 		}
 		return state;
+	}
+
+	// Whether a verifier can say anything about a snapshot at `seq`: a base
+	// at or below it exists (foldAt).
+	verifiable(seq: number): boolean {
+		return this.published.some((p) => p.seq <= seq);
 	}
 
 	// ── 'snapshot_storage' (protocol cloud-service.ts) ──────────────────────
@@ -344,7 +384,7 @@ export class FakeCloud {
 		for (const p of m.parts) {
 			if (this.storage.get(p.path)?.byteLength !== p.bytes) throw new CloudTransportError('snapshot_part_missing', 'snapshot_part_missing');
 		}
-		const stateMatches = createHash('sha256').update(serializeLibraryState(this.foldAt(input.snapshotSeq))).digest('hex') === m.stateSha256;
+		const stateMatches = this.verifiable(input.snapshotSeq) ? createHash('sha256').update(serializeLibraryState(this.foldAt(input.snapshotSeq))).digest('hex') === m.stateSha256 : null;
 		let status: PublishSnapshotResult['status'];
 		if (this.published.some((s) => s.seq === input.snapshotSeq)) status = 'exists';
 		else if ((this.published.at(-1)?.seq ?? 0) > input.snapshotSeq) status = 'stale';
@@ -363,9 +403,40 @@ export class FakeCloud {
 		return { status, latestSeq: this.published.at(-1)!.seq, superseded, features: [...this.features] };
 	}
 
-	takeSnapshot(): number {
-		this.snapshot = { seq: this.maxSeq, json: serializeLibraryState(cloneLibraryState(this.state)) };
-		return this.snapshot.seq;
+	// Test helper: the fake's own fold at the head, published into the bucket
+	// as if the master had (no device named: `deviceId` 'fake-master'), so a
+	// scenario can hand a device a snapshot without a master publishing one.
+	// `userId`: whose bucket prefix the parts go under (default: the user of
+	// the last transport made). Returns its seq.
+	takeSnapshot(userId: string = this.userId): number {
+		this.userId = userId;
+		const seq = this.maxSeq;
+		const json = Buffer.from(serializeLibraryState(this.foldAt(seq)), 'utf8');
+		const body = gzipSync(json);
+		const parts: SnapshotManifest['parts'] = [];
+		for (let off = 0; off < body.length; off += SNAPSHOT_PART_MAX_BYTES) {
+			const piece = body.subarray(off, off + SNAPSHOT_PART_MAX_BYTES);
+			const sha256 = createHash('sha256').update(piece).digest('hex');
+			const path = snapshotPartPath(this.userId, sha256);
+			if (!this.storage.has(path)) this.storage.set(path, Uint8Array.from(piece));
+			parts.push({ path, bytes: piece.length, sha256 });
+		}
+		const manifest: SnapshotManifest = { encoding: SNAPSHOT_STORAGE_ENCODING, parts, totalBytes: body.length, sha256: createHash('sha256').update(body).digest('hex'), stateSha256: createHash('sha256').update(json).digest('hex') };
+		const i = this.published.findIndex((p) => p.seq === seq);
+		if (i >= 0) this.published[i] = { seq, deviceId: 'fake-master', manifest };
+		else this.published.push({ seq, deviceId: 'fake-master', manifest });
+		return seq;
+	}
+
+	// The server's compaction, a week after a snapshot: the log forgets every
+	// op at or below `through` (the master setting op stays, as the real
+	// sweep keeps it so a fresh fold still names the master), and the base
+	// moves there. A cursor below it is told to bootstrap.
+	compact(through: number): void {
+		const keep = (o: StoredOp): boolean => o.seq > through || (o.entity === 'setting' && o.entity_id === MASTER_DEVICE_SETTING);
+		for (const o of this.log) if (!keep(o)) this.byId.delete(o.op_id);
+		this.log.splice(0, this.log.length, ...this.log.filter(keep));
+		this.baseSeq = Math.max(this.baseSeq, through);
 	}
 
 	// Test-only: an op stored as a newer client would have sent it.
@@ -375,6 +446,7 @@ export class FakeCloud {
 	// network error (the device is offline; the others are not).
 	transport(userId: string, email = `${userId}@example.test`): FakeTransport {
 		const cloud = this;
+		cloud.userId = userId;
 		const offline = (): void => { if (!t.online) throw new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'); };
 		// The device this session last acted as (apps/cloud device-gate.ts).
 		let actsAs: string | null = null;
@@ -458,26 +530,22 @@ export class FakeCloud {
 					return cloud.pull(input);
 				},
 			},
-			// The protocol's serialised state (gzip + base64 are the HTTP
-			// transport's), decoded by the same function that transport uses.
+			// The newest published snapshot's manifest (the server holds no
+			// body); the HTTP transport's job (download, check, join, inflate)
+			// runs here through the same reader. The desktop transport always
+			// asks with `storage: true`; this one does too, and would refuse a
+			// call without it as the real server does.
 			bootstrap: async (input?: BootstrapInput) => {
 				offline();
 				if (!cloud.legacy) gateRead(input?.deviceId);
 				cloud.calls.bootstrap++;
-				// The pieces are the HTTP transport's to join (desktop
-				// transport.ts); here only that the client asked for them.
-				if (input?.chunked) cloud.calls.chunkedBootstraps++;
-				// The newest snapshot is a published one: the answer is its
-				// manifest, and the HTTP transport's job (download, check, join,
-				// inflate) runs here through the same reader.
+				const asked: BootstrapInput = { ...(input ?? {}), storage: true };
+				if (!asked.storage) throw new CloudTransportError('update_required', 'update_required');
 				const pub = cloud.published.at(-1);
-				if (input?.storage && pub && pub.seq >= (cloud.snapshot?.seq ?? 0)) {
-					cloud.calls.storageBootstraps++;
-					const body = await readStorageSnapshotBody(pub.manifest, (p) => snapshots.download(p), { maxBytes: 1 << 30 });
-					return { snapshotSeq: pub.seq, records: decodeLibraryStateSnapshot(gunzipSync(body).toString('utf8')) };
-				}
-				if (!cloud.snapshot) return { snapshotSeq: 0, records: [] };
-				return { snapshotSeq: cloud.snapshot.seq, records: decodeLibraryStateSnapshot(cloud.snapshot.json) };
+				if (!pub) return { snapshotSeq: 0, baseSeq: cloud.baseSeq, records: null };
+				cloud.calls.storageBootstraps++;
+				const body = await readStorageSnapshotBody(pub.manifest, (p) => snapshots.download(p), { maxBytes: 1 << 30 });
+				return { snapshotSeq: pub.seq, baseSeq: cloud.baseSeq, records: decodeLibraryStateSnapshot(gunzipSync(body).toString('utf8')) };
 			},
 			account: {
 				registerDevice: async (input: { deviceId: string; name: string; platform: DeviceInfo['platform'] }) => {

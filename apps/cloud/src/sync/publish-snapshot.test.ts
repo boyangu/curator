@@ -1,25 +1,13 @@
 // 'snapshot_storage': the master publishes, the server verifies and indexes
-// (src/sync/publish-snapshot.ts), bootstrap hands the manifest to a client
-// that can read Storage and a bodied snapshot to one that cannot, the sweep
-// leaves a freshly published account alone, and pushes of source kinds from
-// a non-master device are audited.
+// (src/sync/publish-snapshot.ts), retention keeps the newest three, bootstrap
+// hands the manifest to a client that can read Storage, the far-behind hint
+// names the newest snapshot, and pushes of source kinds from a non-master
+// device are audited.
 
-import { createHash, randomUUID } from 'node:crypto';
-import {
-	applyOps,
-	createLibraryState,
-	MASTER_DEVICE_SETTING,
-	serializeLibraryState,
-	SNAPSHOT_STORAGE_ENCODING,
-	snapshotPartPath,
-	type Op,
-	type SnapshotManifest,
-} from '@curator/protocol';
+import { randomUUID } from 'node:crypto';
+import { MASTER_DEVICE_SETTING, snapshotPartPath, type Op, type SnapshotManifest } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { asUser, createTestApp, errorReason, opsFor, sampleLibrary, uploadBlob, type TestApp } from '../test/harness.js';
-import { decodeSnapshotBase64 } from '../snapshot/codec.js';
-import { buildSnapshot, DEFAULT_DUE_OPTIONS, runDueSnapshots } from '../snapshot/job.js';
-import { verifyPublishedSnapshot } from '../snapshot/verify.js';
+import { asUser, createTestApp, errorReason, masterOp, opsFor, sampleLibrary, storageManifest, uploadBlob, type TestApp } from '../test/harness.js';
 import { pull } from './pull.js';
 
 let app: TestApp;
@@ -31,36 +19,10 @@ afterAll(() => app.db.close());
 type Signed = Awaited<ReturnType<TestApp['signIn']>>;
 type Api = Signed['api'];
 
-const sha = (s: string) => createHash('sha256').update(s).digest('hex');
-
-// Parts of the given sizes with made-up content: the server never reads
-// the bytes, only the names and sizes Storage records. `shared` reuses
-// another manifest's parts (content addressing: equal bytes, equal path).
-function manifestOf(userId: string, sizes: number[], opts: { stateSha256?: string; shared?: SnapshotManifest['parts'] } = {}): SnapshotManifest {
-	const seed = randomUUID();
-	const parts = [
-		...(opts.shared ?? []),
-		...sizes.map((bytes, i) => {
-			const h = sha(`${seed}:${i}`);
-			return { path: snapshotPartPath(userId, h), bytes, sha256: h };
-		}),
-	];
-	return {
-		encoding: SNAPSHOT_STORAGE_ENCODING,
-		parts,
-		totalBytes: parts.reduce((n, p) => n + p.bytes, 0),
-		sha256: sha(`body:${seed}`),
-		stateSha256: opts.stateSha256 ?? sha(`state:${seed}`),
-	};
-}
+const manifestOf = storageManifest;
 
 async function upload(userId: string, m: SnapshotManifest, skip: ReadonlySet<string> = new Set()): Promise<void> {
 	for (const p of m.parts) if (!skip.has(p.path)) await uploadBlob(app.pg, userId, p.path, p.bytes, 'snapshots');
-}
-
-// The account's master, stated by `as` (any device may state it).
-function masterOp(as: string, master: string, at?: number): Op {
-	return opsFor(as)('setting', 'set', MASTER_DEVICE_SETTING, { value: master }, at);
 }
 
 async function pushOps(api: Api, deviceId: string, ops: Op[]): Promise<number> {
@@ -97,8 +59,8 @@ async function events(userId: string, kind: string): Promise<{ device_id: string
 
 const rowsOf = async (userId: string) =>
 	(
-		await app.pg.query<{ seq: number; bodied: boolean; published_by: string | null }>(
-			`select snapshot_seq::float8 as seq, body is not null as bodied, published_by from curator.library_snapshot where user_id = $1 order by snapshot_seq`,
+		await app.pg.query<{ seq: number; published_by: string }>(
+			`select snapshot_seq::float8 as seq, published_by from curator.library_snapshot where user_id = $1 order by snapshot_seq`,
 			[userId],
 		)
 	).rows;
@@ -112,12 +74,12 @@ describe('sync.publishSnapshot', () => {
 		expect(r).toMatchObject({ status: 'stored', latestSeq: m.head, superseded: [] });
 		expect(r.features).toContain('batches');
 		const [row] = (
-			await app.pg.query<{ storage: SnapshotManifest; state_sha256: string; published_by: string; body: unknown }>(
-				`select storage, state_sha256, published_by, body from curator.library_snapshot where user_id = $1`,
+			await app.pg.query<{ storage: SnapshotManifest; state_sha256: string; published_by: string }>(
+				`select storage, state_sha256, published_by from curator.library_snapshot where user_id = $1`,
 				[m.userId],
 			)
 		).rows;
-		expect(row).toEqual({ storage: manifest, state_sha256: manifest.stateSha256, published_by: m.deviceId, body: null });
+		expect(row).toEqual({ storage: manifest, state_sha256: manifest.stateSha256, published_by: m.deviceId });
 		expect(await events(m.userId, 'snapshot_published')).toEqual([
 			{ device_id: m.deviceId, detail: { snapshotSeq: m.head, bytes: 8000, parts: 2, pruned: 0, superseded: 0 } },
 		]);
@@ -131,7 +93,7 @@ describe('sync.publishSnapshot', () => {
 			// Another user's prefix.
 			manifestOf(other.userId, [100]),
 			// A path that is not the part's own hash.
-			{ ...good, parts: [{ ...good.parts[0]!, sha256: sha('something else') }, good.parts[1]!] },
+			{ ...good, parts: [{ ...good.parts[0]!, sha256: 'b'.repeat(64) }, good.parts[1]!] },
 			// The same part twice.
 			{ ...good, parts: [good.parts[0]!, good.parts[0]!], totalBytes: 200 },
 			// Sizes that do not add up.
@@ -221,16 +183,12 @@ describe('sync.publishSnapshot', () => {
 		const late = manifestOf(m.userId, [30]);
 		await upload(m.userId, late);
 		expect(await publish(m, older, late)).toMatchObject({ status: 'stale', latestSeq: m.head, superseded: [late.parts[0]!.path] });
-		expect(await rowsOf(m.userId)).toEqual([{ seq: m.head, bodied: false, published_by: m.deviceId }]);
+		expect(await rowsOf(m.userId)).toEqual([{ seq: m.head, published_by: m.deviceId }]);
 		expect(await events(m.userId, 'snapshot_published')).toHaveLength(1);
 	});
 
-	it('keeps three snapshots and always the newest bodied one; superseded is the pruned parts no kept row lists', async () => {
+	it('keeps the newest three snapshots; superseded is the pruned parts no kept row lists', async () => {
 		const m = await masterWithLibrary();
-		// The fold's snapshot: the fallback base.
-		const built = await buildSnapshot(app.db, m.userId);
-		expect(built.status).toBe('built');
-		const bodiedSeq = m.head;
 		const published: { seq: number; manifest: SnapshotManifest }[] = [];
 		let prevParts: SnapshotManifest['parts'] = [];
 		for (let i = 0; i < 4; i++) {
@@ -244,9 +202,8 @@ describe('sync.publishSnapshot', () => {
 			published.push({ seq, manifest });
 			prevParts = manifest.parts;
 			if (i === 2) {
-				// Four rows: three published, plus the bodied one at the bottom.
 				expect(r.superseded).toEqual([]);
-				expect((await rowsOf(m.userId)).map((x) => [x.seq, x.bodied])).toEqual([[bodiedSeq, true], ...published.map((p) => [p.seq, false])]);
+				expect((await rowsOf(m.userId)).map((x) => x.seq)).toEqual(published.map((p) => p.seq));
 			}
 			if (i === 3) {
 				// The first published one goes; its parts are named except the
@@ -255,7 +212,7 @@ describe('sync.publishSnapshot', () => {
 				const stillListed = new Set(published.slice(1).flatMap((p) => p.manifest.parts.map((q) => q.path)));
 				expect(r.superseded).toEqual(firstParts.filter((p) => !stillListed.has(p)).sort());
 				expect(r.superseded.length).toBeGreaterThan(0);
-				expect((await rowsOf(m.userId)).map((x) => [x.seq, x.bodied])).toEqual([[bodiedSeq, true], ...published.slice(1).map((p) => [p.seq, false])]);
+				expect((await rowsOf(m.userId)).map((x) => x.seq)).toEqual(published.slice(1).map((p) => p.seq));
 			}
 		}
 		expect((await events(m.userId, 'snapshot_published')).at(-1)!.detail).toMatchObject({ pruned: 1 });
@@ -279,7 +236,7 @@ describe('sync.publishSnapshot', () => {
 		// b names a's parts: they are not b's paths.
 		expect(await errorReason(publish(b, b.head, aManifest))).toMatchObject({ reason: 'snapshot_part_invalid' });
 		// b cannot plant a part in a's prefix, nor see a's parts or rows.
-		await expect(uploadBlob(app.pg, b.userId, snapshotPartPath(a.userId, sha('planted')), 10, 'snapshots')).rejects.toThrow(/row-level security/);
+		await expect(uploadBlob(app.pg, b.userId, snapshotPartPath(a.userId, 'c'.repeat(64)), 10, 'snapshots')).rejects.toThrow(/row-level security/);
 		const seen = await asUser(app.pg, b.userId, async (tx) => ({
 			rows: (await tx.query(`select snapshot_seq from curator.library_snapshot where user_id = $1`, [a.userId])).rows,
 			objects: (await tx.query(`select name from storage.objects where bucket_id = 'snapshots' and name like $1`, [`${a.userId}/%`])).rows,
@@ -310,186 +267,61 @@ describe('sync.publishSnapshot', () => {
 });
 
 describe('bootstrap and the far-behind hint with published snapshots', () => {
-	it('gives a Storage-capable client the manifest, and any other client the newest bodied snapshot', async () => {
+	it('gives a Storage-capable client the newest manifest, and refuses any other client (update_required)', async () => {
 		const m = await masterWithLibrary(2);
-		// Published only: an older client gets the empty state, a newer one the manifest.
 		const first = manifestOf(m.userId, [10]);
 		await upload(m.userId, first);
 		await publish(m, m.head, first);
-		expect(await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true })).toEqual({
-			snapshot: '',
-			snapshotSeq: m.head,
-			encoding: 'curator.library-state.v1+json+gzip+base64',
-			storage: first,
-		});
-		const empty = await m.api.sync.bootstrap.query({ deviceId: m.deviceId });
-		expect(empty.snapshotSeq).toBe(0);
-		expect(serializeLibraryState(await decodeSnapshotBase64(empty.snapshot))).toBe(serializeLibraryState(createLibraryState()));
+		expect(await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true })).toEqual({ storage: first, snapshotSeq: m.head, baseSeq: 0 });
+		expect(await errorReason(m.api.sync.bootstrap.query({ deviceId: m.deviceId }))).toMatchObject({ code: 'PRECONDITION_FAILED', reason: 'update_required' });
+		expect(await errorReason(m.api.sync.bootstrap.query())).toMatchObject({ reason: 'update_required' });
 
-		// More ops, a server fold above it (bodied), then a newer publish.
-		const mid = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId));
-		await app.pg.query(`update curator.library_snapshot set created_at = now() - interval '8 days' where user_id = $1`, [m.userId]);
-		expect(await buildSnapshot(app.db, m.userId)).toMatchObject({ status: 'built', snapshotSeq: mid, fromSeq: 0 });
+		// A newer publish: the newest manifest.
 		const top = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId).slice(0, 3));
 		const second = manifestOf(m.userId, [20]);
 		await upload(m.userId, second);
 		await publish(m, top, second);
-
-		expect((await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true })).storage).toEqual(second);
-		// An older client: the bodied snapshot at `mid`, inline or chunked.
-		const inline = await m.api.sync.bootstrap.query({ deviceId: m.deviceId });
-		expect(inline).toMatchObject({ snapshotSeq: mid });
-		expect(inline.storage).toBeUndefined();
-		const chunked = await m.api.sync.bootstrap.query({ deviceId: m.deviceId, chunked: true });
-		expect(chunked).toMatchObject({ snapshot: '', snapshotSeq: mid, chunked: { totalBytes: Buffer.from(inline.snapshot, 'base64').length } });
-		// A Storage client asking chunked still gets the manifest (it is the newest).
-		expect(await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true, chunked: true })).toMatchObject({ snapshotSeq: top, storage: second });
-		// snapshotChunk serves bodied rows only.
-		expect(await errorReason(m.api.sync.snapshotChunk.query({ deviceId: m.deviceId, snapshotSeq: top, offset: 0, length: 10 }))).toMatchObject({ reason: 'snapshot_gone' });
-		expect((await m.api.sync.snapshotChunk.query({ deviceId: m.deviceId, snapshotSeq: mid, offset: 0, length: 10 })).data.length).toBeGreaterThan(0);
+		expect(await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true })).toEqual({ storage: second, snapshotSeq: top, baseSeq: 0 });
 		await app.audit.flush();
 		const served = await app.pg.query<{ detail: Record<string, unknown> }>(
-			`select detail from curator.audit_event where user_id = $1 and kind = 'bootstrap_served' and (detail ->> 'storage')::boolean order by id desc limit 1`,
+			`select detail from curator.audit_event where user_id = $1 and kind = 'bootstrap_served' order by id desc limit 1`,
 			[m.userId],
 		);
-		expect(served.rows[0]!.detail).toMatchObject({ snapshotSeq: top, bytes: 20, storage: true });
+		expect(served.rows[0]!.detail).toEqual({ snapshotSeq: top, baseSeq: 0, bytes: 20, storage: true });
 	});
 
-	it('names a bodied snapshot in the far-behind hint, so an older client is never sent to a seq it cannot load', async () => {
+	it('names the newest snapshot in the far-behind hint and carries its digest as `published`', async () => {
 		const m = await masterWithLibrary();
 		const caller = { sessionId: null };
 		const opts = { farBehindOps: 3, farBehindMs: 1e15 };
-		// Only a published snapshot: no hint (nothing every client can load).
+		// No snapshot: no hint, nothing published.
+		const none = (await pull(app.db, m.userId, caller, { afterSeq: 0 }, opts)).result;
+		expect(none.snapshotSeq).toBeUndefined();
+		expect(none.published).toBeUndefined();
+
 		const pub = manifestOf(m.userId, [10]);
 		await upload(m.userId, pub);
 		await publish(m, m.head, pub);
-		expect((await pull(app.db, m.userId, caller, { afterSeq: 0 }, opts)).result.snapshotSeq).toBeUndefined();
+		const hinted = (await pull(app.db, m.userId, caller, { afterSeq: 0 }, opts)).result;
+		expect(hinted.snapshotSeq).toBe(m.head);
+		expect(hinted.published).toEqual({ seq: m.head, stateSha256: pub.stateSha256 });
 
-		// A bodied snapshot above it (the master went quiet, the fold ran), then
-		// a newer publish far above both.
-		const mid = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId));
-		await app.pg.query(`update curator.library_snapshot set created_at = now() - interval '8 days' where user_id = $1`, [m.userId]);
-		expect((await buildSnapshot(app.db, m.userId)).status).toBe('built');
+		// A newer publish far above: the hint moves to it, and a device that
+		// bootstrapped to the older one is sent on (it can load the newer).
 		const top = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId));
 		const newer = manifestOf(m.userId, [10]);
 		await upload(m.userId, newer);
 		await publish(m, top, newer);
-
-		const hint = (await pull(app.db, m.userId, caller, { afterSeq: 0 }, opts)).result.snapshotSeq;
-		expect(hint).toBe(mid);
-		// The older client bootstraps to exactly that seq...
-		const boot = await bootstrapAs(m, false);
-		expect(boot.snapshotSeq).toBe(hint);
-		// ...and pulling from it is not told to bootstrap again, however far
-		// the published snapshot is ahead.
-		expect((await pull(app.db, m.userId, caller, { afterSeq: boot.snapshotSeq }, opts)).result.snapshotSeq).toBeUndefined();
-		// A Storage client lands at or past the hint.
-		expect((await bootstrapAs(m, true)).snapshotSeq).toBe(top);
-	});
-});
-
-async function bootstrapAs(s: Signed, storage: boolean) {
-	return s.api.sync.bootstrap.query({ deviceId: s.deviceId, ...(storage ? { storage: true as const } : {}) });
-}
-
-describe('the snapshot sweep with published snapshots', () => {
-	const opts = { ...DEFAULT_DUE_OPTIONS, minOps: 1 };
-	const mine = (r: Awaited<ReturnType<typeof runDueSnapshots>>, id: string) => r.filter((x) => x.userId === id);
-
-	it('skips an account whose master published within a week, then folds it from the bodied base', async () => {
-		const m = await masterWithLibrary();
-		const built = await buildSnapshot(app.db, m.userId);
-		expect(built.status).toBe('built');
-		const bodiedSeq = m.head;
-		const mid = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId));
-		const manifest = manifestOf(m.userId, [10]);
-		await upload(m.userId, manifest);
-		await publish(m, mid, manifest);
-		const more = sampleLibrary(m.deviceId).slice(0, 5);
-		const head = await pushOps(m.api, m.deviceId, more);
-		// Worth a snapshot by every other rule: new ops, a quiet log, an old fold.
-		await app.pg.query(`update curator.library_op set received_at = now() - interval '2 days' where user_id = $1`, [m.userId]);
-		await app.pg.query(`update curator.library_snapshot set created_at = now() - interval '2 days' where user_id = $1 and body is not null`, [m.userId]);
-		expect(mine(await runDueSnapshots(app.db, app.deps.log, opts), m.userId)).toEqual([]);
-
-		// The master went quiet: a week-old publish no longer holds the fold back.
-		await app.pg.query(`update curator.library_snapshot set created_at = now() - interval '8 days' where user_id = $1 and storage is not null`, [m.userId]);
-		const [r] = mine(await runDueSnapshots(app.db, app.deps.log, opts), m.userId);
-		expect(r).toMatchObject({ status: 'built', fromSeq: bodiedSeq, snapshotSeq: head });
-		// The fold equals every op, and the published row was left for its master to prune.
-		const all = (await app.pg.query<{ n: number }>(`select count(*)::int as n from curator.library_op where user_id = $1`, [m.userId])).rows[0]!.n;
-		expect(r!.status === 'built' && r!.opsFolded).toBe(all - (m.ops.length));
-		const state = await decodeSnapshotBase64((await bootstrapAs(m, false)).snapshot);
-		const direct = await foldAllOf(m.userId);
-		expect(serializeLibraryState(state)).toBe(serializeLibraryState(direct));
-		expect((await rowsOf(m.userId)).map((x) => [x.seq, x.bodied])).toEqual([
-			[bodiedSeq, true],
-			[mid, false],
-			[head, true],
-		]);
-		// Nothing new: up to date.
-		expect(await buildSnapshot(app.db, m.userId)).toEqual({ userId: m.userId, status: 'up_to_date', snapshotSeq: head });
-	});
-
-	it('treats a published snapshot at the head as up to date for a direct build', async () => {
-		const m = await masterWithLibrary();
-		const manifest = manifestOf(m.userId, [10]);
-		await upload(m.userId, manifest);
-		await publish(m, m.head, manifest);
-		expect(await buildSnapshot(app.db, m.userId)).toEqual({ userId: m.userId, status: 'up_to_date', snapshotSeq: m.head });
-	});
-
-	it('the fold’s retention prunes bodied rows only', async () => {
-		const m = await masterWithLibrary();
-		const seqs: number[] = [];
-		for (let i = 0; i < 3; i++) {
-			const seq = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId).slice(0, 2));
-			const manifest = manifestOf(m.userId, [10 + i]);
-			await upload(m.userId, manifest);
-			await publish(m, seq, manifest);
-			seqs.push(seq);
-		}
-		const head = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId).slice(0, 2));
-		expect(await buildSnapshot(app.db, m.userId, { pageSize: 1000, keep: 2 })).toMatchObject({ status: 'built', fromSeq: 0, snapshotSeq: head });
-		expect((await rowsOf(m.userId)).map((x) => [x.seq, x.bodied])).toEqual([...seqs.map((s) => [s, false]), [head, true]]);
-	});
-});
-
-async function foldAllOf(userId: string) {
-	const rows = await app.pg.query<{ op: Op }>(
-		`select jsonb_build_object('op_id', op_id::text, 'device_id', device_id, 'client_ts', client_ts, 'schema_version', schema_version,
-			'entity', entity, 'entity_id', entity_id, 'kind', kind, 'payload', payload) as op
-		from curator.library_op where user_id = $1 order by seq`,
-		[userId],
-	);
-	return applyOps(createLibraryState(), rows.rows.map((r) => r.op)).state;
-}
-
-describe('the verifier', () => {
-	it('matches a published hash of the state the log folds to, and catches one that is not', async () => {
-		const m = await masterWithLibrary(2);
-		expect(await verifyPublishedSnapshot(app.db, m.userId)).toEqual({ userId: m.userId, status: 'no_published_snapshot' });
-		// A bodied base below, so the fold starts from it.
-		expect((await buildSnapshot(app.db, m.userId)).status).toBe('built');
-		const top = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId));
-		const truth = createHash('sha256').update(serializeLibraryState(await foldAllOf(m.userId)), 'utf8').digest('hex');
-		const good = manifestOf(m.userId, [10], { stateSha256: truth });
-		await upload(m.userId, good);
-		await publish(m, top, good);
-		expect(await verifyPublishedSnapshot(app.db, m.userId, 7)).toMatchObject({
-			status: 'match',
-			snapshotSeq: top,
-			baseSeq: m.head,
-			publishedBy: m.deviceId,
-			stateSha256: truth,
-			foldSha256: truth,
-		});
-
-		const after = await pushOps(m.api, m.deviceId, sampleLibrary(m.deviceId).slice(0, 2));
-		const bad = manifestOf(m.userId, [10], { stateSha256: truth });
-		await upload(m.userId, bad);
-		await publish(m, after, bad);
-		expect(await verifyPublishedSnapshot(app.db, m.userId)).toMatchObject({ status: 'mismatch', snapshotSeq: after, stateSha256: truth });
+		const again = (await pull(app.db, m.userId, caller, { afterSeq: m.head }, opts)).result;
+		expect(again.snapshotSeq).toBe(top);
+		expect(again.published).toEqual({ seq: top, stateSha256: newer.stateSha256 });
+		// A bootstrap lands exactly on the hinted seq, and pulling from there
+		// is not told again: `published` still rides along for the digest check.
+		const boot = await m.api.sync.bootstrap.query({ deviceId: m.deviceId, storage: true });
+		expect(boot.snapshotSeq).toBe(top);
+		const at = (await pull(app.db, m.userId, caller, { afterSeq: boot.snapshotSeq }, opts)).result;
+		expect(at.snapshotSeq).toBeUndefined();
+		expect(at.published).toEqual({ seq: top, stateSha256: newer.stateSha256 });
 	});
 });
 

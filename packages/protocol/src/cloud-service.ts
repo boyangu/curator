@@ -12,7 +12,6 @@ import type {
 	CataloguePutResult,
 } from './catalogue.js';
 import type { Op, RejectReason } from './ops.js';
-import type { SNAPSHOT_ENCODING } from './snapshot.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -65,37 +64,26 @@ export type PushInput = {
 //     claims, rb bpm / key_strength). Before it a desktop emits and pushes
 //     none of them: a v3 server answers a v4 op `server_outdated` for the
 //     whole push.
-//   - 'snapshot_chunks': sync.bootstrap takes `chunked: true` and answers
-//     with the snapshot's seq and size instead of its body, which the client
-//     then reads with sync.snapshotChunk, at most MAX_SNAPSHOT_CHUNK_BYTES a
-//     call. The main library's snapshot is 36.7 MB gzipped (227 MB of JSON,
-//     2026-10-21, protocol v4): one inline response of ~49 MB base64 is one
-//     request that must not time out, held whole in the server's and the
-//     desktop's memory as a string; pieces keep every response small and
-//     resumable, still read from Postgres under the user's own RLS (the API
-//     holds no Storage service key; see apps/cloud README).
 //   - 'batches': a device may upload a large one-time backlog (the initial
 //     push, a backfill) as a per-user virtual transaction instead of plain
 //     pushes: sync.batchBegin opens (or resumes) a batch per device and
 //     label, sync.batchPush stages ops into it with push's own validation,
 //     caps and per-op rejections, and sync.batchCommit moves them into the
 //     log under fresh seqs and only then makes them visible, all at once
-//     with one wake-up (the snapshot sweep folds them later, once the log is
-//     quiet). Staged ops are never seen by a pull, a bootstrap or a
-//     snapshot. Normal edits never ride a batch. Without the feature a
+//     with one wake-up. Staged ops are never seen by a pull or a bootstrap. Normal edits never ride a batch. Without the feature a
 //     client pushes everything plainly.
-//   - 'snapshot_storage': the account's master device publishes the
-//     snapshot itself (section below): it uploads the gzipped state in
-//     content-addressed parts to the private `snapshots` bucket with its own
-//     session and names them in sync.publishSnapshot, which the server only
-//     verifies and indexes. sync.bootstrap takes `storage: true` and, when
-//     the newest snapshot is such a one, answers its manifest; the client
-//     downloads and joins the parts. A client without the feature (or that
-//     does not ask) still gets the newest snapshot the server folded into
-//     Postgres, and the far-behind hint only ever names one of those. The
-//     server's own fold remains the fallback, for an account whose master
-//     never published or has gone quiet (a week).
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'snapshot_chunks', 'batches', 'snapshot_storage'] as const;
+//   - 'snapshot_storage': the snapshot is the account's BASE, published by
+//     its master device (section below): the first device folds its library
+//     into its own records and publishes them whole; a joining device
+//     bootstraps from the newest snapshot, binds its rows to the account's
+//     recordings and sends only what it alone holds. The log carries only
+//     the changes since a base, and the server deletes what the oldest kept
+//     snapshot covers after a week (`baseSeq`: a cursor below it must
+//     bootstrap). The server never folds the log and holds no snapshot
+//     body: sync.bootstrap takes `storage: true` and answers the manifest of
+//     the newest snapshot (or the empty state while an account has none); a
+//     client that cannot read Storage is answered `update_required`.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -283,35 +271,11 @@ export type PullInput = {
 };
 
 // sync.bootstrap's input ('device_reads'). An older client sends none.
-// `chunked` ('snapshot_chunks'): answer with the size, not the body.
-// `storage` ('snapshot_storage'): the client can read a Storage snapshot;
-// when the newest one is, the answer carries its manifest.
+// `storage` ('snapshot_storage'): the client can read a Storage snapshot. A
+// server that holds no other kind answers a call without it `update_required`.
 export type BootstrapInput = {
 	deviceId?: string;
-	chunked?: true;
 	storage?: true;
-};
-
-// The most bytes of snapshot body one sync.snapshotChunk returns (before
-// base64).
-export const MAX_SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
-
-// sync.snapshotChunk ('snapshot_chunks'): bytes [offset, offset + length) of
-// the gzipped body of the snapshot at `snapshotSeq`. A snapshot pruned since
-// the bootstrap answered (`snapshot_gone`) means bootstrap again.
-export type SnapshotChunkInput = {
-	deviceId?: string;
-	snapshotSeq: number;
-	offset: number;
-	length: number;
-};
-
-export type SnapshotChunkResult = {
-	snapshotSeq: number;
-	offset: number;
-	// base64 of the bytes; shorter than `length` only at the end.
-	data: string;
-	totalBytes: number;
 };
 
 export type PullResult = {
@@ -324,28 +288,29 @@ export type PullResult = {
 	// so a run of own ops never stalls the cursor. Pull again from it until a
 	// page comes back empty, and keep `nextSeq` from that empty page too.
 	nextSeq: number;
-	// Present when the caller is too far behind to replay (more than 50k ops,
-	// or a cursor older than tombstone compaction): bootstrap instead.
+	// Present when the caller cannot replay from its cursor: it is below the
+	// account's base (the log no longer holds those ops), more than 50k ops
+	// behind, or older than tombstone compaction. Bootstrap instead; the
+	// value is the newest snapshot's seq.
 	snapshotSeq?: number;
+	// 'snapshot_storage': the newest published snapshot, so a device whose
+	// cursor is exactly at it can compare its own state digest with the
+	// master's (the cross-device check that replaced the server's fold).
+	published?: { seq: number; stateSha256: string };
 	features?: SyncFeature[];
 };
 
 export type BootstrapResult = {
-	// The reducer's raw `LibraryState` after every op up to `snapshotSeq`,
-	// inline: `serializeLibraryState` JSON, gzipped, base64 (snapshot.ts).
-	// v1 keeps snapshots in Postgres, so there is no signed URL to fetch; an
-	// account with no snapshot yet gets the empty state at seq 0, so the
-	// client has one code path. Load it, then pull after `snapshotSeq`.
-	// Empty when `chunked` is set: read the body with sync.snapshotChunk.
-	snapshot: string;
-	snapshotSeq: number;
-	encoding: typeof SNAPSHOT_ENCODING;
-	// 'snapshot_chunks', answering `chunked: true`: the gzipped body's size.
-	chunked?: { totalBytes: number };
-	// 'snapshot_storage', answering `storage: true` when the newest snapshot
-	// is in Storage: download and join its parts (`snapshot` is empty and
-	// `chunked` absent). A Postgres snapshot answers as before.
+	// The newest snapshot: the reducer's raw `LibraryState` after every op
+	// up to `snapshotSeq`, as parts in Storage (snapshot.ts, the section
+	// above). Download and join them, load, then pull after `snapshotSeq`.
+	// Absent, with `snapshotSeq` 0, for an account that holds none yet: the
+	// empty state, which is exactly "pull everything".
 	storage?: SnapshotManifest;
+	snapshotSeq: number;
+	// The account's base: ops at or below it are gone from the log. 0 until
+	// the first compaction. A cursor below it must bootstrap, never pull.
+	baseSeq: number;
 };
 
 // Why the server refused a whole call (as opposed to one op, which rides in
@@ -381,9 +346,6 @@ export const CALL_ERROR_REASONS = [
 	// catalogue.put: the account has no catalogue entitlement (the owner
 	// adds it). Lookups still answer; do not upload.
 	'catalogue_not_entitled',
-	// sync.snapshotChunk: the snapshot named was pruned by a newer build
-	// since the bootstrap answered. Bootstrap again.
-	'snapshot_gone',
 	// sync.batchPush / batchCommit: no such open batch for this device (never
 	// begun, aborted, or expired after a day idle). Its staged ops are gone:
 	// stage them again in a new batch.
@@ -426,7 +388,6 @@ export interface CloudService {
 		push(input: PushInput): Promise<PushResult>;
 		pull(input: PullInput): Promise<PullResult>;
 		bootstrap(input?: BootstrapInput): Promise<BootstrapResult>;
-		snapshotChunk(input: SnapshotChunkInput): Promise<SnapshotChunkResult>;
 		// 'batches'.
 		batchBegin(input: BatchBeginInput): Promise<BatchBeginResult>;
 		batchPush(input: BatchPushInput): Promise<BatchPushResult>;

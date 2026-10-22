@@ -13,7 +13,7 @@ function status(patch: Partial<CloudSyncStatusReport> = {}): CloudSyncStatusRepo
 	return {
 		enabled: true, signedIn: true, userId: 'u1', email: 'dj@example.test', deviceId: 'this', pending: 0, rejected: 0,
 		lastPushAt: NOW - 30_000, lastPullAt: NOW - 30_000, lastCheckedAt: NOW - 12_000, lastChangedAt: NOW - 360_000, transferring: false, lastSeq: 10, lastError: null, needsUpdate: false, revoked: false, boundUserId: 'u1',
-		initialPushDone: true, initialPush: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null }, nextRetryAt: null,
+		initialPushDone: true, initialPush: null, phase: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null, verifying: false, digest: null }, nextRetryAt: null,
 		poll: { policy: { activeSec: 60, idleSec: 600, idleAfterSec: 600 }, active: true, nextPollAt: null },
 		...patch,
 	};
@@ -111,6 +111,8 @@ describe('account panel: the library status line', () => {
 		expect(syncLine(account, status({ running: true }), NOW)).toEqual({ text: 'Up to date · last checked 12s ago', tone: 'ok' });
 		expect(syncLine(account, status({ lastCheckedAt: NOW - 6 * 60_000 }), NOW).text).toBe('Up to date · last checked 6m ago');
 		expect(syncLine(account, status({ pending: 4 }), NOW).text).toBe('4 changes waiting to sync · last checked 12s ago');
+		// A joining computer on an account whose master has not published yet.
+		expect(syncLine(account, status({ phase: 'waiting_for_snapshot', initialPushDone: false }), NOW).text).toMatch(/Waiting for your main computer/);
 	});
 	it('says syncing only while changes actually move', () => {
 		expect(syncLine(account, status({ running: true, transferring: true }), NOW)).toEqual({ text: 'Syncing…', tone: 'ok' });

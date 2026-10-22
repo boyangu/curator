@@ -1,9 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { MAX_PUSH_OPS, MAX_PULL_OPS, SCHEMA_VERSION, SYNC_FEATURES, trackTagEntityId } from '@curator/protocol';
+import { applyOps, createLibraryState, MAX_PUSH_OPS, MAX_PULL_OPS, SCHEMA_VERSION, SYNC_FEATURES, trackTagEntityId, type Op } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestApp, errorReason, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
-import { buildSnapshot } from '../snapshot/job.js';
-import { decodeSnapshotBase64 } from '../snapshot/codec.js';
+import { createTestApp, errorReason, insertSnapshot, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
 import { hasUnstorableText } from './push.js';
 
 let app: TestApp;
@@ -281,13 +279,12 @@ describe('protocol v4 kinds (the zero-loss release)', () => {
 		expect(res.rejected.map((r) => r.reason)).toEqual(ops.map(() => 'invalid_payload'));
 	});
 
-	it('folds them into the snapshot: a bootstrap carries the feed decisions and releases (new maps) and the attribute cells', async () => {
-		const { deviceId, api, userId } = await app.signIn();
+	it('stores them whole: pulled back and folded, the feed decisions and releases (new maps) and the attribute cells are there', async () => {
+		const { deviceId, api } = await app.signIn();
 		const ops = v4Ops(deviceId);
 		await api.sync.push.mutate({ deviceId, ops });
-		const built = await buildSnapshot(app.db, userId);
-		expect(built.status).toBe('built');
-		const state = await decodeSnapshotBase64((await api.sync.bootstrap.query()).snapshot);
+		const pulled = (await api.sync.pull.query({ afterSeq: 0 })).ops.map(({ seq: _s, user_id: _u, received_at: _r, ...op }) => op as Op);
+		const state = applyOps(createLibraryState(), pulled).state;
 		expect(state.feedItems.get('isrc:GB0000000001')?.fields['state']?.value).toBe('archived');
 		expect(state.feedSuppressions.get('artist:ar1')?.fields['active']?.value).toBe(true);
 		expect(state.albums.get('spotify:al1')?.fields['label']?.value).toBe('Ninja Tune');
@@ -425,11 +422,9 @@ describe('far-behind hint', () => {
 			// No snapshot yet: nothing better to offer than replay.
 			expect((await api.sync.pull.query({ afterSeq: 0 })).snapshotSeq).toBeUndefined();
 
-			const { buildSnapshot } = await import('../snapshot/job.js');
-			const snap = await buildSnapshot(small.db, userId);
-			expect(snap.status).toBe('built');
-			const snapshotSeq = snap.status === 'built' ? snap.snapshotSeq : -1;
 			const all = (await api.sync.pull.query({ afterSeq: 0 })).ops;
+			const snapshotSeq = all[all.length - 1]!.seq;
+			await insertSnapshot(small.pg, userId, snapshotSeq);
 
 			expect((await api.sync.pull.query({ afterSeq: 0 })).snapshotSeq).toBe(snapshotSeq);
 			// 10 ops behind the snapshot is not "more than 10".

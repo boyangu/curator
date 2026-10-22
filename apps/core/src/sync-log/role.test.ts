@@ -124,8 +124,9 @@ describe('playlists', () => {
 		const a = await rig.desktop('a', { catalogue: ['trk-0'], seed: seedPlaylist('pl-a', 'x') });
 		await rig.desktop('b', { catalogue: [] });
 		await rig.settle();
+		// The playlist's details went up in the founder's base, not as an op.
 		const n = (await attrsOps(a, 'pl-a')).length;
-		expect(n).toBe(1);
+		expect(n).toBe(0);
 		for (const host of ['fa', 'ak', 'fa']) {
 			a.raw.prepare(`UPDATE playlist SET cover_url = ? WHERE id = 'pl-a'`).run(`https://image-cdn-${host}.spotifycdn.com/image/ab67706c0000da84aaaa`);
 			await rig.settle();

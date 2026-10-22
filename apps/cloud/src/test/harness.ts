@@ -3,21 +3,25 @@
 // whose `fetch` is the app's handler. Nothing here opens a socket or talks
 // to a network service.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGlite, type Transaction } from '@electric-sql/pglite';
 import {
 	keyBetween,
 	type CataloguePolicy,
+	MASTER_DEVICE_SETTING,
 	parseOp,
 	SCHEMA_VERSION,
+	SNAPSHOT_STORAGE_ENCODING,
+	snapshotPartPath,
 	cueEntityId,
 	trackTagEntityId,
 	type Entity,
 	type KindOf,
 	type Op,
 	type PayloadOf,
+	type SnapshotManifest,
 } from '@curator/protocol';
 import { createTRPCClient, httpLink, TRPCClientError } from '@trpc/client';
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
@@ -124,6 +128,50 @@ export async function uploadBlob(pg: PGlite, userId: string, path: string, size:
 			bucket,
 		]),
 	);
+}
+
+// ── snapshots ───────────────────────────────────────────────────────────────
+
+const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+
+// A manifest of parts of the given sizes with made-up content: the server
+// never reads the bytes, only the names and sizes Storage records. `shared`
+// reuses another manifest's parts (content addressing: equal bytes, equal
+// path).
+export function storageManifest(userId: string, sizes: number[], opts: { stateSha256?: string; shared?: SnapshotManifest['parts'] } = {}): SnapshotManifest {
+	const seed = randomUUID();
+	const parts = [
+		...(opts.shared ?? []),
+		...sizes.map((bytes, i) => {
+			const h = sha(`${seed}:${i}`);
+			return { path: snapshotPartPath(userId, h), bytes, sha256: h };
+		}),
+	];
+	return {
+		encoding: SNAPSHOT_STORAGE_ENCODING,
+		parts,
+		totalBytes: parts.reduce((n, p) => n + p.bytes, 0),
+		sha256: sha(`body:${seed}`),
+		stateSha256: opts.stateSha256 ?? sha(`state:${seed}`),
+	};
+}
+
+// A published snapshot row as the owner writes it, for tests that need "a
+// snapshot at seq N" without the master ceremony (sync.publishSnapshot has
+// its own suite). `ageMs` backdates it, for the compaction age rule.
+export async function insertSnapshot(pg: PGlite, userId: string, snapshotSeq: number, opts: { ageMs?: number; publishedBy?: string; manifest?: SnapshotManifest } = {}): Promise<SnapshotManifest> {
+	const manifest = opts.manifest ?? storageManifest(userId, [10]);
+	await pg.query(
+		`insert into curator.library_snapshot (user_id, snapshot_seq, storage, state_sha256, published_by, created_at)
+		values ($1, $2, $3, $4, $5, now() - make_interval(secs => $6::float8))`,
+		[userId, snapshotSeq, JSON.stringify(manifest), manifest.stateSha256, opts.publishedBy ?? 'master', (opts.ageMs ?? 0) / 1000],
+	);
+	return manifest;
+}
+
+// The account's master, stated by `as` (any device may state it).
+export function masterOp(as: string, master: string, at?: number): Op {
+	return opsFor(as)('setting', 'set', MASTER_DEVICE_SETTING, { value: master }, at);
 }
 
 export async function wakeups(pg: PGlite, userId?: string): Promise<{ topic: string; event: string; payload: { seq: number } }[]> {

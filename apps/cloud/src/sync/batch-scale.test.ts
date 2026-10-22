@@ -13,15 +13,13 @@
 // the full size (~2 min). Measured 2026-10-21 at 120k set-meta ops, PGlite
 // on the dev machine: staging 53 ms median / 72 ms max per 500-op call; the
 // commit's move in 16 statements of up to ~8k ops (the size follows a 3 s
-// target), median 2.97 s, max 3.31 s; the snapshot build 15.2 s (10 MB
-// body); the whole commit 57 s. The commit built that snapshot then; it no
-// longer does (the sweep builds it after the commit), so the commit is the
-// moves plus the publish, and the build is timed on its own here.
+// target), median 2.97 s, max 3.31 s; the whole commit 57 s including the
+// 15.2 s snapshot build it ran then. The server builds no snapshot any more
+// (the master publishes), so the commit is the moves plus the publish.
 
 import { randomUUID } from 'node:crypto';
 import { SCHEMA_VERSION, opSchemaVersion, type Op } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { buildSnapshot } from '../snapshot/job.js';
 import { asUser, createTestApp, opsFor, type TestApp } from '../test/harness.js';
 import type { CommitStep } from './batch.js';
 
@@ -61,7 +59,7 @@ function backfillOps(deviceId: string, n: number): Op[] {
 }
 
 describe(`a ${OPS.toLocaleString('en')}-op batch`, () => {
-	it('stages, commits in bounded statements, publishes, and snapshots after', { timeout: 30 * 60_000 }, async () => {
+	it('stages, commits in bounded statements, and publishes', { timeout: 30 * 60_000 }, async () => {
 		const { userId, deviceId, api } = await app.signIn();
 		const ops = backfillOps(deviceId, OPS);
 		expect(opSchemaVersion(ops[0]!)).toBeLessThanOrEqual(SCHEMA_VERSION);
@@ -115,18 +113,11 @@ describe(`a ${OPS.toLocaleString('en')}-op batch`, () => {
 		// A pull right after publishing pages the log as usual.
 		const page = await api.sync.pull.query({ afterSeq: 0, deviceId });
 		expect(page.ops.length).toBe(1000);
-		// What the sweep does after the commit, timed for the record.
-		const s0 = performance.now();
-		const built = await buildSnapshot(app.db, userId);
-		const snapshotMs = performance.now() - s0;
-		expect(built.status).toBe('built');
 		const report = {
 			ops: OPS,
 			stagePer500: stats(stageMs),
 			moveChunks: stats(moveMs),
 			commitTotalMs: Math.round(totalMs),
-			snapshotMs: Math.round(snapshotMs),
-			snapshotBytes: built.status === 'built' ? built.bytes : 0,
 		};
 		console.log('batch scale', JSON.stringify(report));
 

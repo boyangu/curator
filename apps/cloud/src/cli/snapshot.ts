@@ -1,35 +1,42 @@
-// `pnpm --filter @curator/cloud snapshot [--user <uuid>] [--prune-logs [--older-than '90 days']]`
-// (or `node dist/snapshot.js` in the image). Without --user it runs the same
-// sweep the server runs every 15 min (batch upkeep, then the due
-// snapshots); with it, builds one user's snapshot now regardless of the
-// thresholds (still not past an open batch: its commit builds that one). Runs as the API role
-// (DATABASE_URL), so each fold is under that user's RLS like a request.
+// `pnpm --filter @curator/cloud snapshot <command> [options]` (or
+// `node dist/snapshot.js` in the image, from `fly ssh console` or a one-off
+// machine). Runs as the API role (DATABASE_URL): the compaction functions
+// are SECURITY DEFINER and granted to it (sql/roles.sql); the reads run as
+// the user under RLS like a request.
 //
-// `--prune-logs` instead runs the access-log retention the server runs
-// daily (curator.prune_request_log; audit_event is never pruned).
-//
-// `verify --user <uuid>` folds the log up to the user's newest
-// master-published snapshot and compares its hash with the one the master
-// stated (src/snapshot/verify.ts); the verdict is printed and lands in
-// audit_event (`snapshot_verified` / `snapshot_mismatch`). It holds the whole
-// library in memory, which is why only a person runs it, never the timer.
-//
-// `--db-size [--user <uuid>]` prints the size of every curator table and,
-// with a user, what that user holds in each Storage bucket.
+//   (no command)        the batch sweep the server runs every 15 min
+//                       (expire idle batches, finish stalled commits).
+//   base --user <uuid>  the account's base, its newest and oldest snapshot
+//                       seqs, and how many ops the log holds.
+//   compact --user <uuid> --through <seq> [--limit 5000]
+//                       raises the account's base to <seq> (refused above
+//                       its oldest kept snapshot) and deletes the log below
+//                       it in chunks, printing progress. This is the rebase:
+//                       after the master has published at <seq>, the ops it
+//                       covers leave the log (README "Snapshots").
+//   --prune-logs [--older-than '90 days']
+//                       the access-log retention the server runs daily
+//                       (curator.prune_request_log; audit_event is never
+//                       pruned).
+//   --db-size [--user <uuid>]
+//                       the size of every curator table and, with a user,
+//                       what that user holds in each Storage bucket.
 
 import { parseArgs } from 'node:util';
 import { AuditWriter, pruneRequestLog, REQUEST_LOG_RETENTION } from '../audit.js';
-import { createPostgresDb, num, type Db } from '../db/db.js';
+import { createPostgresDb, num, numOrNull, type Db } from '../db/db.js';
 import { withUserTx } from '../db/user-tx.js';
 import { createLogger } from '../log.js';
-import { buildSnapshot, runDueSnapshots } from '../snapshot/job.js';
-import { verifyPublishedSnapshot } from '../snapshot/verify.js';
+import { BASE_SEQ } from '../sync/base.js';
 import { DEFAULT_BATCH_OPTIONS, tendBatches } from '../sync/batch.js';
+import { compactUser, DEFAULT_COMPACT_OPTIONS } from '../sync/compact.js';
 
 const { values, positionals } = parseArgs({
 	allowPositionals: true,
 	options: {
 		user: { type: 'string' },
+		through: { type: 'string' },
+		limit: { type: 'string', default: String(DEFAULT_COMPACT_OPTIONS.limit) },
 		'prune-logs': { type: 'boolean' },
 		'older-than': { type: 'string', default: REQUEST_LOG_RETENTION },
 		'db-size': { type: 'boolean' },
@@ -42,12 +49,22 @@ if (!url) {
 	process.exit(2);
 }
 const command = positionals[0];
-if (command !== undefined && command !== 'verify') {
-	console.error(`unknown command ${command} (expected: verify)`);
+if (command !== undefined && command !== 'base' && command !== 'compact') {
+	console.error(`unknown command ${command} (expected: base, compact)`);
 	process.exit(2);
 }
-if (command === 'verify' && !values.user) {
-	console.error('verify needs --user <uuid>');
+if (command !== undefined && !values.user) {
+	console.error(`${command} needs --user <uuid>`);
+	process.exit(2);
+}
+const through = values.through === undefined ? undefined : Number(values.through);
+if (command === 'compact' && (through === undefined || !Number.isInteger(through) || through < 0)) {
+	console.error('compact needs --through <seq> (a non-negative integer)');
+	process.exit(2);
+}
+const limit = Number(values.limit);
+if (!Number.isInteger(limit) || limit < 1) {
+	console.error(`--limit must be a positive integer, not ${values.limit}`);
 	process.exit(2);
 }
 
@@ -74,25 +91,51 @@ async function dbSize(db: Db, userId: string | undefined): Promise<Record<string
 	return out;
 }
 
+// The account as the base model sees it. The op count is exact (one index
+// walk of the user's log), which is what the rebase wants to see before and
+// after; it is not something a request does.
+async function baseReport(db: Db, userId: string): Promise<Record<string, unknown>> {
+	return withUserTx(db, userId, async (tx) => {
+		const [b] = await tx.query<{ base: unknown; compacted_at: string | null }>(
+			`select coalesce(min(base_seq), 0)::float8 as base, min(compacted_at)::text as compacted_at from curator.library_base where user_id = (select auth.uid())`,
+		);
+		const [s] = await tx.query<{ newest: unknown; oldest: unknown; n: unknown }>(
+			`select max(snapshot_seq)::float8 as newest, min(snapshot_seq)::float8 as oldest, count(*)::float8 as n
+			from curator.library_snapshot where user_id = (select auth.uid())`,
+		);
+		const [o] = await tx.query<{ n: unknown; head: unknown; below: unknown; master_ops: unknown }>(
+			`select count(*)::float8 as n, coalesce(max(seq), 0)::float8 as head,
+				count(*) filter (where seq <= ${BASE_SEQ} and not (entity = 'setting' and entity_id = 'library.master_device'))::float8 as below,
+				count(*) filter (where entity = 'setting' and entity_id = 'library.master_device')::float8 as master_ops
+			from curator.library_op where user_id = (select auth.uid())`,
+		);
+		return {
+			userId,
+			baseSeq: num(b!.base),
+			compactedAt: b!.compacted_at,
+			snapshots: num(s!.n),
+			newestSnapshotSeq: numOrNull(s!.newest),
+			oldestSnapshotSeq: numOrNull(s!.oldest),
+			ops: num(o!.n),
+			// What compact would still delete (master-device setting ops excluded).
+			opsBelowBase: num(o!.below),
+			masterOps: num(o!.master_ops),
+			head: Math.max(num(o!.head), num(b!.base)),
+		};
+	});
+}
+
 const log = createLogger();
 const db = createPostgresDb(url, { max: 1 });
 try {
-	if (command === 'verify') {
-		const r = await verifyPublishedSnapshot(db, values.user!);
-		log.info('snapshot_verify', { ...r });
-		if (r.status !== 'no_published_snapshot') {
-			const audit = new AuditWriter({ db, log });
-			try {
-				const { userId, status, publishedBy, ...detail } = r;
-				audit.event({ at: new Date().toISOString(), request_id: null, user_id: userId, device_id: publishedBy, kind: status === 'match' ? 'snapshot_verified' : 'snapshot_mismatch', detail });
-			} finally {
-				await audit.close();
-			}
-			if (r.status === 'mismatch') process.exitCode = 1;
-		}
+	if (command === 'base') log.info('base', await baseReport(db, values.user!));
+	else if (command === 'compact') {
+		log.info('compact_start', { ...(await baseReport(db, values.user!)), through, limit });
+		const r = await compactUser(db, values.user!, through!, { limit }, (deleted) => log.info('compact_progress', { userId: values.user, deleted }));
+		log.info('compact_done', { ...r });
+		log.info('base', await baseReport(db, values.user!));
 	} else if (values['db-size']) log.info('db_size', await dbSize(db, values.user));
 	else if (values['prune-logs']) log.info('request_log_pruned', { olderThan: values['older-than'], deleted: await pruneRequestLog(db, values['older-than']) });
-	else if (values.user) log.info('snapshot', { ...(await buildSnapshot(db, values.user)) });
 	else {
 		// Expiry and commit events land in audit_event as the server's do.
 		const audit = new AuditWriter({ db, log });
@@ -101,7 +144,6 @@ try {
 		} finally {
 			await audit.close();
 		}
-		log.info('snapshot_sweep', { users: (await runDueSnapshots(db, log)).length });
 	}
 } catch (e) {
 	log.error('snapshot_cli_failed', { error: e });

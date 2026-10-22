@@ -151,7 +151,9 @@ export function trackMetaDirtyCount(raw: Raw): number {
 // On a secondary (role.ts) a recording it did not bring, or the master
 // describes, is skipped with
 // no baseline written, so a later promotion to master states it.
-export function drainTrackMeta(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole } = {}): TrackMetaDrain {
+// `local`: the founder fold's form (outbox.ts EmitOptions.local): the cells
+// land in the records and the baseline, no op is sent.
+export function drainTrackMeta(raw: Raw, opts: { max?: number; batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): TrackMetaDrain {
 	const max = Math.max(1, opts.max ?? CHUNK);
 	return raw.transaction((): TrackMetaDrain => {
 		const role = opts.role ?? sourceRole(raw);
@@ -215,7 +217,7 @@ export function drainTrackMeta(raw: Raw, opts: { max?: number; batchLabel?: Batc
 			ops.push({ entity: 'library_track', entity_id: rec, kind: 'set-meta', payload: meta });
 			seen.push([row.id, rec, digest]);
 		}
-		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel });
+		if (ops.length > 0) emitOps(raw, ops, { batchLabel: opts.batchLabel, local: opts.local });
 		for (const [id, rec, digest] of seen) putSeen.run(id, rec, digest, now);
 		raw.prepare(`DELETE FROM track_meta_dirty WHERE track_id IN (${marks})`).run(...ids);
 		if (tooLarge > 0) tlog.warn('rows whose meta is too large for an op stay device-local', { count: tooLarge });
@@ -236,14 +238,14 @@ const META_SLICE_MS = 40;
 // collapsed the drain to 5-row chunks — thousands of transactions for a
 // backfill (2026-10-22 sync review).
 const MIN_CHUNK = 20;
-export async function drainTrackMetaAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
+export async function drainTrackMetaAsync(raw: Raw, opts: { chunk?: number; signal?: { aborted: boolean }; batchLabel?: BatchLabel; role?: SourceRole; local?: boolean } = {}): Promise<{ rows: number; emitted: number; chunks: number; maxSliceMs: number }> {
 	const out = { rows: 0, emitted: 0, chunks: 0, maxSliceMs: 0 };
 	const fixed = opts.chunk !== undefined;
 	let size = Math.max(1, opts.chunk ?? 20);
 	for (;;) {
 		if (opts.signal?.aborted) break;
 		const t0 = performance.now();
-		const r = drainTrackMeta(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role });
+		const r = drainTrackMeta(raw, { max: size, batchLabel: opts.batchLabel, role: opts.role, local: opts.local });
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
 		if (!fixed && r.rows > 0) size = Math.max(MIN_CHUNK, Math.min(CHUNK * 5, Math.ceil(size * 1.5), Math.round(r.rows * META_SLICE_MS / Math.max(ms, 1))));

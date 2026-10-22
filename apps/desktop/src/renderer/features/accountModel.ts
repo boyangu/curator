@@ -45,6 +45,10 @@ export function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null, now 
 	// at once (other devices see none of it until the commit is done).
 	if (s.batch?.phase === 'uploading') return { text: `Uploading your library (batch)… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
 	if (s.batch?.phase === 'committing') return { text: `Publishing your library upload… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
+	// The account has changes but its master has not published the library
+	// snapshot a new computer joins from yet (core client.ts): asked again
+	// every sync, nothing of this library is sent meanwhile.
+	if (s.phase === 'waiting_for_snapshot') return { text: 'Waiting for your main computer to publish the library — this computer joins as soon as it has.', tone: 'ok' };
 	if (s.lastError) return { text: `${s.lastError}${s.pending > 0 ? ` · ${s.pending.toLocaleString()} changes waiting` : ''}`, tone: 'error' };
 	// "Syncing…" only while changes actually move; a routine check (every
 	// minute or on focus) moves nothing and must not flip the label.

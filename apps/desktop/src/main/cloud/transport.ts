@@ -28,7 +28,6 @@ import { createTRPCUntypedClient, httpLink, TRPCClientError } from '@trpc/client
 import { CatalogueBlobError, CloudTransportError, decodeLibraryStateSnapshot, readStorageSnapshotBody, type CloudTransport } from '@curator/core';
 import {
 	CALL_ERROR_REASONS,
-	SNAPSHOT_ENCODING,
 	type BatchAbortInput,
 	type BatchAbortResult,
 	type BatchBeginInput,
@@ -54,10 +53,8 @@ import {
 	type PushInput,
 	type PushResult,
 	type RegisterDeviceInput,
-	type SnapshotChunkResult,
 } from '@curator/protocol';
 import { mainLog } from '../log.js';
-import { readSnapshotBody } from './snapshot-chunks.js';
 import { createSnapshotBlobStore } from './blobs.js';
 import type { CloudAccount } from './account.js';
 
@@ -71,7 +68,6 @@ const PROCS = {
 	push: { path: 'sync.push', type: 'mutation' },
 	pull: { path: 'sync.pull', type: 'query' },
 	bootstrap: { path: 'sync.bootstrap', type: 'query' },
-	snapshotChunk: { path: 'sync.snapshotChunk', type: 'query' },
 	// 'batches': the sync client calls these only after the server named the
 	// feature.
 	batchBegin: { path: 'sync.batchBegin', type: 'mutation' },
@@ -144,7 +140,6 @@ function mapError(err: unknown): CloudTransportError {
 		// The server is older than this client's ops (a deploy-order slip):
 		// retry later, the ops stay pending.
 		if (reason === 'server_outdated') return new CloudTransportError('server', reason, retryMs);
-		if (reason === 'snapshot_gone') return new CloudTransportError('server', reason);
 		if (reason === 'batch_gone') return new CloudTransportError('batch_gone', reason);
 		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
 		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
@@ -295,39 +290,28 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			publishSnapshot: (input: PublishSnapshotInput) => call<PublishSnapshotResult>(PROCS.publishSnapshot, input),
 		},
 		snapshots,
-		// The snapshot arrives inline (base64 gzip of the serialised state).
-		// gunzip runs on libuv's pool; the JSON parse and flatten are the one
-		// synchronous step (~100–300 ms for a 40k-track library, once).
-		// `input` only when the server offers 'device_reads' (the sync client
-		// decides); without it an older server's input-less query is sent.
-		// `chunked` ('snapshot_chunks', the sync client asks): the answer names
-		// the body's size and it is read in MAX_SNAPSHOT_CHUNK_BYTES pieces,
-		// each a small request. A newer snapshot pruning this one mid-read
-		// (`snapshot_gone`) starts over from the new one, a few times at most.
-		// `storage` ('snapshot_storage', the sync client asks): an answer with
-		// a manifest is a master-published snapshot, downloaded from Storage
-		// with this user's session, every part and the joined body checked
-		// against the manifest before anything inflates (core
-		// snapshot-storage.ts). A part pruned meanwhile (not_found) also
-		// starts over from the newer snapshot.
+		// The account's base ('snapshot_storage'): the bootstrap names the
+		// master-published snapshot's manifest, downloaded from Storage with this
+		// user's session, every part and the joined body checked against the
+		// manifest before anything inflates (core snapshot-storage.ts); gunzip
+		// runs on libuv's pool, and the JSON parse and flatten are the one
+		// synchronous step (~100–300 ms for a 40k-track library, once). Always
+		// `storage: true` (a server that holds no other kind refuses a call
+		// without it); `deviceId` when the sync client says the server reads it.
+		// A part pruned meanwhile (not_found: a newer snapshot replaced it
+		// mid-read) starts over from the newer one, a few times at most. No
+		// snapshot (an account without a base yet) is `records: null` with the
+		// account's baseSeq, for the client to found or wait.
 		async bootstrap(input?: BootstrapInput) {
 			for (let attempt = 0; ; attempt++) {
-				const res = await call<BootstrapResult>(PROCS.bootstrap, input);
+				const res = await call<BootstrapResult>(PROCS.bootstrap, { ...(input ?? {}), storage: true });
+				if (!res.storage) return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: null };
 				let body: Buffer;
 				try {
-					if (res.storage) {
-						const t0 = performance.now();
-						body = await readStorageSnapshotBody(res.storage, (path) => snapshots.download(path), { maxBytes: MAX_INFLATED_BYTES });
-						clog.info('bootstrap: snapshot read from storage', { snapshotSeq: res.snapshotSeq, parts: res.storage.parts.length, bytes: body.length, ms: Math.round(performance.now() - t0) });
-					} else {
-						if (res.encoding !== SNAPSHOT_ENCODING) throw new CloudTransportError('bad_request', `unknown snapshot encoding ${String(res.encoding)}`);
-						body = await readSnapshotBody(res, (offset, length) => call<SnapshotChunkResult>(PROCS.snapshotChunk, {
-							...(input?.deviceId !== undefined ? { deviceId: input.deviceId } : {}),
-							snapshotSeq: res.snapshotSeq, offset, length,
-						}), MAX_INFLATED_BYTES);
-					}
+					const t0 = performance.now();
+					body = await readStorageSnapshotBody(res.storage, (path) => snapshots.download(path), { maxBytes: MAX_INFLATED_BYTES });
+					clog.info('bootstrap: snapshot read from storage', { snapshotSeq: res.snapshotSeq, parts: res.storage.parts.length, bytes: body.length, ms: Math.round(performance.now() - t0) });
 				} catch (err) {
-					if (err instanceof CloudTransportError && err.message === 'snapshot_gone' && attempt < 3) continue;
 					if (err instanceof CatalogueBlobError) {
 						if (err.kind === 'not_found' && attempt < 3) continue;
 						throw new CloudTransportError(err.kind === 'transient' ? 'network' : err.kind === 'denied' ? 'auth' : 'server', `snapshot part: ${err.kind}`);
@@ -335,7 +319,7 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 					throw err;
 				}
 				const json = await gunzipAsync(body, { maxOutputLength: MAX_INFLATED_BYTES });
-				return { snapshotSeq: res.snapshotSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
+				return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
 			}
 		},
 		account: {

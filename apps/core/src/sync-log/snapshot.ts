@@ -6,9 +6,10 @@
 // clock of every cell.
 //
 // Wire format: @curator/protocol snapshot.ts (`serializeLibraryState` JSON,
-// gzipped, base64, inline in `sync.bootstrap`). The transport does base64 +
-// gunzip; `decodeLibraryStateSnapshot` parses with the protocol's decoder
-// and flattens the state into records.
+// gzipped, in parts in Storage, published by the account's master;
+// `sync.bootstrap` names the manifest). The transport downloads, checks and
+// inflates (snapshot-storage.ts); `decodeLibraryStateSnapshot` parses with
+// the protocol's decoder and flattens the state into records.
 //
 // Loading is a state join (store.ts joinRecord), then the same projection
 // applyOps uses, for every record that changed. Merges replay first, as

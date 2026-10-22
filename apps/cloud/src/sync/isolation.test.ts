@@ -4,8 +4,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { asUser, createTestApp, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
-import { buildSnapshot } from '../snapshot/job.js';
+import { asUser, createTestApp, insertSnapshot, opsFor, sampleLibrary, wakeups, type TestApp } from '../test/harness.js';
 
 let app: TestApp;
 beforeAll(async () => {
@@ -96,11 +95,12 @@ describe('per-user isolation', () => {
 		expect(await wakeups(app.pg, b.userId)).toEqual([]);
 		expect((await wakeups(app.pg, a.userId)).length).toBe(1);
 
-		await buildSnapshot(app.db, a.userId);
-		const bBoot = await b.api.sync.bootstrap.query();
-		expect(bBoot.snapshotSeq).toBe(0);
-		const aBoot = await a.api.sync.bootstrap.query();
-		expect(aBoot.snapshotSeq).toBeGreaterThan(0);
+		const head = (await a.api.sync.pull.query({ afterSeq: 0 })).nextSeq;
+		await insertSnapshot(app.pg, a.userId, head);
+		const bBoot = await b.api.sync.bootstrap.query({ storage: true });
+		expect(bBoot).toEqual({ snapshotSeq: 0, baseSeq: 0 });
+		const aBoot = await a.api.sync.bootstrap.query({ storage: true });
+		expect(aBoot.snapshotSeq).toBe(head);
 		const snapshotsSeenByB = await asUser(app.pg, b.userId, async (tx) => (await tx.query('select * from curator.library_snapshot')).rows);
 		expect(snapshotsSeenByB).toEqual([]);
 	});

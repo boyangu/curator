@@ -56,7 +56,7 @@ describe('audit 1 — plays stay linked to their tracks on another device', () =
 		rig.cloud.hintBelow = rig.cloud.takeSnapshot();
 		const c = await rig.desktop('c', { catalogue: [] });
 		await rig.settle();
-		expect(rig.cloud.calls.bootstrap).toBe(1);
+		expect(rig.cloud.calls.storageBootstraps).toBe(1);
 		const links = playLinks(c);
 		expect(Object.keys(links)).toHaveLength(40);
 		expect(links).toEqual(Object.fromEntries(tracks.map((t) => [`p-${t}`, R(t)])));
@@ -65,8 +65,9 @@ describe('audit 1 — plays stay linked to their tracks on another device', () =
 
 	it('adopt: a recording whose row arrives after its plays (a bound import) shows them', async () => {
 		// A v2 server: records, no meta, so no remote rows — the plays are
-		// projected with no track to land on.
-		rig.cloud.features = rig.cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4');
+		// projected with no track to land on. Without v3 no device can be the
+		// master, so no base either: the library goes up as ops.
+		rig.cloud.features = rig.cloud.features.filter((f) => f !== 'track_meta' && f !== 'zero_loss_v4' && f !== 'snapshot_storage');
 		const a = await rig.desktop('a', { catalogue: ['trk-0', 'trk-1'] });
 		await playAll(a, ['trk-0', 'trk-1']);
 		await rig.settle();

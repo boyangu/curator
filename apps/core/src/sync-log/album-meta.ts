@@ -77,7 +77,8 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 // from another device's fill (applySyncedAlbumMetaRaw writes the same
 // columns, and a seam merge can carry a second id onto it), and restating it
 // here would echo it back under a newer clock.
-export async function albumMetaBackfillAsync(raw: Raw, opts: { page?: number } = {}): Promise<{ albums: number; emitted: number; maxSliceMs: number }> {
+// `local`: the founder fold's form (outbox.ts EmitOptions.local).
+export async function albumMetaBackfillAsync(raw: Raw, opts: { page?: number; local?: boolean } = {}): Promise<{ albums: number; emitted: number; maxSliceMs: number }> {
 	const page = Math.max(1, opts.page ?? 300);
 	const out = { albums: 0, emitted: 0, maxSliceMs: 0 };
 	// A secondary only marks it done: a promotion to master re-runs it
@@ -114,7 +115,7 @@ export async function albumMetaBackfillAsync(raw: Raw, opts: { page?: number } =
 					}
 				}
 				// A one-time backlog: uploaded as a server batch (outbox.ts BATCH_LABELS).
-				out.emitted += emitOps(raw, ops, { batchLabel: 'backfill' }).length;
+				out.emitted += emitOps(raw, ops, { batchLabel: 'backfill', local: opts.local }).length;
 			})();
 			out.albums += batch.length;
 			out.maxSliceMs = Math.max(out.maxSliceMs, performance.now() - t0);

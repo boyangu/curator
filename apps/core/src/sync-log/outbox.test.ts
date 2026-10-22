@@ -10,7 +10,7 @@ import { migrate } from '../db/migrate.js';
 import { createDb, type Db } from '../db/client.js';
 import type Database from 'better-sqlite3';
 import { CLOCK_KEY, emitOps, readOutbox } from './outbox.js';
-import { applyOps, INITIAL_PUSH_KEY, SyncRecordsIncompleteError } from './apply.js';
+import { applyOps, INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY, SyncRecordsIncompleteError } from './apply.js';
 import { initialPush } from './initial-push.js';
 import { compareDumps, dumpLibrary, dumpView } from './dump.js';
 import { recordingIdForTrack } from './recording-id.js';
@@ -181,7 +181,7 @@ describe('applyOps', () => {
 		migrate(p);
 		const { sqlite: raw } = createDb(p);
 		open.push(raw);
-		raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(INITIAL_PUSH_KEY);
+		raw.prepare(`DELETE FROM app_setting WHERE key IN (?, ?)`).run(INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY);
 		raw.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES ('p', 'local', 'p', 'P')`).run();
 		// Re-migrating a non-empty library must not mark it either.
 		migrate(p);
