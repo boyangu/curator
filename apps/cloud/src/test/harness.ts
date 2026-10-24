@@ -69,7 +69,9 @@ export type TestDb = {
 	pg: PGlite;
 	db: Db;
 	// A row in the shimmed auth.users, which the op/device FKs point at.
-	createUser(): Promise<string>;
+	// `id`: a given user (the e2e signs in as the library's bound account);
+	// a fresh UUID otherwise.
+	createUser(id?: string): Promise<string>;
 };
 
 // The unnumbered setup scripts the owner pastes into the SQL editor.
@@ -89,9 +91,9 @@ export async function createTestDb(opts: { migrate?: boolean } = {}): Promise<Te
 	return {
 		pg,
 		db,
-		async createUser() {
-			const id = randomUUID();
-			await pg.query('insert into auth.users (id) values ($1)', [id]);
+		async createUser(given?: string) {
+			const id = given ?? randomUUID();
+			await pg.query('insert into auth.users (id) values ($1) on conflict do nothing', [id]);
 			return id;
 		},
 	};

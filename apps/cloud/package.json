@@ -3,6 +3,9 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
+	"exports": {
+		"./testing": "./src/test/harness.ts"
+	},
 	"files": [
 		"dist",
 		"sql"

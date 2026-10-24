@@ -60,6 +60,8 @@ import { RekordboxSidecar, type SidecarError, type RekordboxScope } from './side
 import { advanceRbBaselineAfterPull, eqArr, seqIn } from './order-util.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from './rb-slot.js';
 import { log } from '../log.js';
+import { CUES_EDITED_CELL, CURATION_CELL_PREFIX, type Cell, type LwwRecord } from '@curator/protocol';
+import { commentFreeText } from '../sync-log/track-curation.js';
 
 const ilog = log.for('rekordbox-import');
 
@@ -318,6 +320,35 @@ function historyStmts(raw: Database.Database): HistoryStmts {
 	return st;
 }
 
+// The first-link rule's reads (applyFirstLinkRule and the membership checks),
+// prepared once per handle: a device's first import makes EVERY matched
+// track a first link, so these run once per track of the library.
+type FirstLinkStmts = {
+	record: Database.Statement; cueClock: Database.Statement;
+	hasTag: Database.Statement; tagRemoval: Database.Statement; playlistRemovals: Database.Statement;
+};
+const FIRST_LINK_STMTS = new WeakMap<Database.Database, FirstLinkStmts>();
+function firstLinkStmts(raw: Database.Database): FirstLinkStmts {
+	let st = FIRST_LINK_STMTS.get(raw);
+	if (!st) {
+		st = {
+			record: raw.prepare(`SELECT value FROM sync_state WHERE map = 'libraryTracks' AND key = ?`).pluck(),
+			// Any cue write the account holds, deletes included.
+			cueClock: raw.prepare(`SELECT max(at) FROM (
+					SELECT json_extract(value, '$.cell.clock.ts') AS at FROM sync_state WHERE recording_id = ? AND map = 'cues'
+					UNION ALL SELECT client_ts FROM tombstone WHERE recording_id = ? AND entity = 'cue')`).pluck(),
+			hasTag: raw.prepare(`SELECT 1 FROM track_tag WHERE track_id = ? AND tag_id = ?`).pluck(),
+			tagRemoval: raw.prepare(`SELECT client_ts FROM tombstone WHERE entity = 'track_tag' AND entity_id = ?`).pluck(),
+			// Per recording, the latest removal of one of the playlist's rows.
+			playlistRemovals: raw.prepare(`SELECT s.recording_id AS rec, max(t.client_ts) AS ts FROM sync_state s
+				JOIN tombstone t ON t.entity = 'playlist_track' AND t.entity_id = s.key
+				WHERE s.map = 'playlistTracks' AND s.parent_id = ? AND s.recording_id IS NOT NULL GROUP BY s.recording_id`),
+		};
+		FIRST_LINK_STMTS.set(raw, st);
+	}
+	return st;
+}
+
 // A track column against a pull-patch value: timestamps by instant, json
 // columns by their serialisation, null and undefined alike. Only used to
 // skip writes, so a false "different" costs a redundant write, never data.
@@ -362,6 +393,85 @@ export function decideRbWins(rbTs: Date | null, curatorTs: Date, seen: Date | nu
 	return rbChanged;
 }
 
+// ── First-link rule: later write wins, per field ────────────────────────────
+//
+// decideRbWins' rule 1 ("no baseline → rekordbox wins") was written for a
+// library that rekordbox seeded. On a second machine whose library came from
+// the account, the first link would let that machine's rekordbox — possibly
+// months stale — overwrite the account's values, and the pull then states
+// them as ops, rolling every device back. Decided 2026-10-24 (Guy): on a
+// FIRST link (no rekordbox_link for the content row yet), each field goes to
+// the side that wrote it later.
+//
+//   rekordbox's clock  djmdContent.updated_at of the content row (the only
+//                      edit stamp the reader carries; it stands in for every
+//                      field of the row, so it is coarse: any rb edit of the
+//                      row makes all of its fields "newer")
+//   the account clock  the record's cell for the field (sync_state):
+//     rating           `rating` cell
+//     comment          `curation.comment` cell (compared as free text, the
+//                      MyTag block is a per-machine derivation)
+//     colour           `curation.color_label` cell
+//     cues (whole set) `cues_edited_at` cell value, or the latest cue record
+//     MyTag membership the track_tag tombstone (an account REMOVAL) — an add
+//                      the account holds is already in Curator and survives
+//                      the additive merge, so only removals are contested
+//     playlist member  the playlist_track tombstone, same reasoning
+//
+// Per field:
+//   1. No account clock for the field → today's behaviour (rekordbox wins,
+//      with the null-preservation that keeps a Curator value rb lacks). So a
+//      first device, or a recording the log never described, is unchanged.
+//   2. Only one side holds a value → that side's value.
+//   3. Both hold different values → the later clock; a tie, or rekordbox
+//      reporting no timestamp, keeps the account's (as decideRbWins rule 2).
+// A taken rekordbox value is written through the mutators, so it is stated as
+// an op with a fresh clock; a kept account value leaves the baseline at
+// rekordbox's value, so the next push writes the account's into rekordbox.
+// Title/artist/album/genre/label are not decided here: their account values
+// are overrides, which the bootstrap leaves shadowing the canonical columns
+// rekordbox's values land in (catalogue data, no op) — the push sends them.
+// Later pulls (link exists) never reach this: the three-way merge owns them.
+export type FirstLinkSide = 'rb' | 'account';
+export function decideFirstLinkSide(rbHas: boolean, accountHas: boolean, rbTs: number | null, accountTs: number | null): FirstLinkSide {
+	if (accountTs == null) return 'rb';  // 1. the account never described it
+	if (!accountHas) return 'rb';        // 2. only rekordbox has a value
+	if (!rbHas) return 'account';        // 2. only the account has a value
+	return rbTs != null && rbTs > accountTs ? 'rb' : 'account'; // 3.
+}
+
+// A membership the account REMOVED (tombstone at `removedTs`) that rekordbox
+// still holds: the removal is the account's write. Later write wins; an rb
+// row without a timestamp, or a tie, keeps the removal.
+export function firstLinkMembershipSide(rbTs: number | null, removedTs: number): FirstLinkSide {
+	return rbTs != null && rbTs > removedTs ? 'rb' : 'account';
+}
+
+type FirstLinkField = 'rating' | 'comment' | 'colorLabel' | 'cues' | 'mytags' | 'playlists';
+
+// What the track pass learned about a first-linked track, before any write of
+// this run could add cells to its record. Later passes (cues, MyTags,
+// playlists) decide from it.
+interface FirstLink {
+	recordingId: string | null;
+	rbTs: number | null;
+	// The account's cue clock, or null when the account holds no cue write.
+	cuesAt: number | null;
+	// The account carries a cue-edit stamp: someone claimed this track's cue
+	// set in Curator, so even an empty set is a value (the exporter's
+	// empty-set rule reads the same stamp).
+	cuesClaimed: boolean;
+}
+
+interface FirstLinkStats {
+	firstLinks: number;
+	// First links whose recording carried account cells.
+	withAccount: number;
+	rbWon: number;
+	accountWon: number;
+	byField: Partial<Record<FirstLinkField, { rb: number; account: number }>>;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Importer — owns the sidecar event-stream subscription for the duration of
 // one runImport() call. Re-entry while another import is in-flight throws.
@@ -373,6 +483,10 @@ export class RekordboxImporter extends EventEmitter {
 	// to decide whether to overwrite Curator's data for that track. Reset
 	// per runImport() call.
 	private rbWinsTracks = new Set<string>();
+	// curator trackId → first link made this run (see decideFirstLinkSide),
+	// and the run's tally for the one summary log line. Reset per runImport().
+	private firstLinks = new Map<string, FirstLink>();
+	private firstLinkStats: FirstLinkStats = { firstLinks: 0, withAccount: 0, rbWon: 0, accountWon: 0, byField: {} };
 
 	constructor(
 		private readonly db: Db,
@@ -535,6 +649,8 @@ export class RekordboxImporter extends EventEmitter {
 
 		// Fresh decision set for this run.
 		this.rbWinsTracks.clear();
+		this.firstLinks.clear();
+		this.firstLinkStats = { firstLinks: 0, withAccount: 0, rbWon: 0, accountWon: 0, byField: {} };
 
 		this.sidecar.on('event', onSidecarEvent);
 		try {
@@ -610,6 +726,7 @@ export class RekordboxImporter extends EventEmitter {
 			}
 			// Subset reads must not advance the library-wide incremental cursor.
 			if (!scoped) this.saveWatermarks(result.watermarks);
+			if (this.firstLinkStats.firstLinks > 0) ilog.info('first-link rule', { ...this.firstLinkStats });
 			ilog.info('completed', { totals });
 			emitEvent({ kind: 'completed', totals, cancelled: result.cancelled });
 			return totals;
@@ -825,8 +942,15 @@ export class RekordboxImporter extends EventEmitter {
 			// NEXT pull merges per field. Overrides are left in place (they
 			// shadow canonical values; the first merged push writes them to
 			// rb and the baselines converge from there).
+			//
+			// A first link decides rating / comment / colour per field by the
+			// first-link rule (decideFirstLinkSide): a field the account wrote
+			// later is dropped from the pull, and the snapshot still records
+			// rb's value, so the push writes the account's.
+			let pull = rbFields;
+			if (!existingLink) pull = this.applyFirstLinkRule(existing, row, rbFields);
 			if (rbWins) {
-				Object.assign(patch, buildPullPatch(rbFields, existing.overrides, { nullPreserve: true, clearOverrides: false, protect }));
+				Object.assign(patch, buildPullPatch(pull, existing.overrides, { nullPreserve: true, clearOverrides: false, protect }));
 			}
 			nextFieldsSeen = rbFields;
 		}
@@ -932,6 +1056,66 @@ export class RekordboxImporter extends EventEmitter {
 			.run();
 	}
 
+	// The first-link rule over the track row's fields (decideFirstLinkSide):
+	// returns rb's pull with every field the account wrote later removed, and
+	// records what the later passes need. Reads the record BEFORE this run
+	// writes the row, so a value the pull itself states never counts as the
+	// account's.
+	private applyFirstLinkRule(existing: typeof track.$inferSelect, row: TrackDeltaRow, rbFields: FieldsSeen): FieldsSeen {
+		const st = firstLinkStmts(rawOf(this.db));
+		const rec = (existing.recordingId as string | null) ?? null;
+		const rbTs = row.rb_updated_at_ms ?? null;
+		let cells: Record<string, Cell> = {};
+		let cueClock: number | null = null;
+		if (rec) {
+			const json = st.record.get(rec) as string | undefined;
+			if (json) { try { cells = (JSON.parse(json) as LwwRecord).fields ?? {}; } catch { /* unreadable record: no account cells */ } }
+			cueClock = (st.cueClock.get(rec, rec) as number | null) ?? null;
+		}
+		const cuesCell = cells[CUES_EDITED_CELL]?.value;
+		const cuesEdited = typeof cuesCell === 'number' ? cuesCell : null;
+		const cuesAt = cuesEdited != null || cueClock != null ? Math.max(cuesEdited ?? 0, cueClock ?? 0) : null;
+		this.firstLinks.set(existing.id, { recordingId: rec, rbTs, cuesAt, cuesClaimed: cuesEdited != null });
+		const stats = this.firstLinkStats;
+		stats.firstLinks++;
+		if (Object.keys(cells).length > 0 || cueClock != null) stats.withAccount++;
+
+		const pull: FieldsSeen = { ...rbFields };
+		// The account's clock for a field: its cell's, unless the row has
+		// moved on from the cell (a local edit the log has not heard yet —
+		// then that edit, at track.updatedAt, is the later Curator write).
+		const accountTs = (cellName: string, current: unknown): number | null => {
+			const cell = cells[cellName];
+			if (!cell) return null;
+			return (cell.value ?? null) === current ? cell.clock.ts : Math.max(cell.clock.ts, existing.updatedAt.getTime());
+		};
+		const decide = (field: FirstLinkField & keyof FieldsSeen, rbVal: unknown, curVal: unknown, has: (v: unknown) => boolean, cellName: string): void => {
+			const rbHas = has(rbVal);
+			const curHas = has(curVal);
+			if (!rbHas && !curHas) return;
+			if (rbHas && curHas && rbVal === curVal) return;
+			const ts = accountTs(cellName, curVal);
+			if (ts == null) return; // rule 1: today's behaviour
+			const side = decideFirstLinkSide(rbHas, curHas, rbTs, ts);
+			if (side === 'account') delete pull[field];
+			this.countFirstLink(field, side);
+		};
+		const rated = (v: unknown): boolean => v != null && Number(v) > 0;
+		const text = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
+		decide('rating', row.rating == null ? null : Number(row.rating), existing.rating, rated, 'rating');
+		decide('comment', commentFreeText(row.comment), commentFreeText(existing.comment), text, `${CURATION_CELL_PREFIX}comment`);
+		decide('colorLabel', row.color_label, existing.colorLabel, text, `${CURATION_CELL_PREFIX}color_label`);
+		return pull;
+	}
+
+	private countFirstLink(field: FirstLinkField, side: FirstLinkSide): void {
+		const stats = this.firstLinkStats;
+		const f = (stats.byField[field] ??= { rb: 0, account: 0 });
+		f[side]++;
+		if (side === 'rb') stats.rbWon++;
+		else stats.accountWon++;
+	}
+
 	// buildPullPatch lives in ../sync/apply.ts — shared with the conflict-
 	// resolution path so "apply an rb value to Curator" has exactly one
 	// implementation (override clearing, ascii mirrors, no updatedAt bump).
@@ -1017,8 +1201,13 @@ export class RekordboxImporter extends EventEmitter {
 				const oursRows = cueRowsByTrack.get(link.trackId) ?? [];
 
 				if (overwriteCurator || link.cuesSeen == null) {
+					// A first link whose account holds cues decides the whole
+					// set by the first-link rule. The account's set kept: no
+					// write, and the baseline below records rb's set, so the
+					// push replaces it with the account's.
+					const keepAccount = !overwriteCurator && this.firstLinkCueSide(link.trackId, rbUnits, oursRows) === 'account';
 					// Cue ops (whole-cue upsert/delete) for what the bootstrap changed.
-					mut.recordCueChanges(this.db, [link.trackId], () => this.bootstrapTrackCues(link.trackId, rbUnits, oursRows, overwriteCurator, totals));
+					if (!keepAccount) mut.recordCueChanges(this.db, [link.trackId], () => this.bootstrapTrackCues(link.trackId, rbUnits, oursRows, overwriteCurator, totals));
 					if (overwriteCurator) {
 						this.db.delete(syncConflict)
 							.where(and(
@@ -1085,6 +1274,29 @@ export class RekordboxImporter extends EventEmitter {
 
 	// (Cue-row rebuilding lives in ../sync/apply.ts:applyCueOpsToTrack —
 	// shared with the conflict-resolution path.)
+
+	// The first-link rule for a track's cue set (whole set: the account's
+	// clock is one stamp for the set). Null when the track was not first
+	// linked this run, or its account holds no cue write — the legacy
+	// bootstrap then runs as before.
+	private firstLinkCueSide(
+		trackId: string,
+		rbUnits: CueUnit[],
+		oursRows: Array<{ slot: number; kind: 'hot' | 'memory'; positionSec: number; lengthSec: number | null; color: string | null; name: string | null }>,
+	): FirstLinkSide | null {
+		const fl = this.firstLinks.get(trackId);
+		if (!fl || fl.cuesAt == null) return null;
+		const ours = oursRows.filter((r) => r.slot >= 0);
+		const unitKey = (u: { kind: string; slot: number; positionSec: number; lengthSec: number | null; color: string | null; name: string | null }): string =>
+			JSON.stringify([u.kind, u.slot, Math.round(u.positionSec * 1000), u.lengthSec == null ? null : Math.round(u.lengthSec * 1000), u.color ?? null, u.name ?? null]);
+		const rbKeys = rbUnits.map(unitKey).sort();
+		const ourKeys = ours.map(unitKey).sort();
+		// Same set on both sides: nothing to decide, and nothing to write.
+		if (eqArr(rbKeys, ourKeys)) return 'account';
+		const side = decideFirstLinkSide(rbUnits.length > 0, ours.length > 0 || fl.cuesClaimed, fl.rbTs, fl.cuesAt);
+		this.countFirstLink('cues', side);
+		return side;
+	}
 
 	// Legacy first-sync semantics, scoped per track: wipe rekordbox-origin
 	// rows (slot ordinals from older imports don't round-trip), land rb's
@@ -1418,6 +1630,8 @@ export class RekordboxImporter extends EventEmitter {
 		// Decide inclusion per rb member id (the only kind R carries).
 		const includeRb = new Set<string>();        // rb content ids kept in Curator
 		const removeFromRbTombstoned = new Set<string>(); // tombstoned ids present in R → mark for rb removal
+		const removeFromRbAccount = new Set<string>();    // account removals that won the first link → same
+		const accountRemovals: { map?: Map<string, number> } = {};
 		const allRbIds = new Set<string>([...rSet, ...curRbOrder, ...baseRbOrder]);
 		for (const cid of allRbIds) {
 			const k = key('rb', cid);
@@ -1432,6 +1646,14 @@ export class RekordboxImporter extends EventEmitter {
 			}
 			if (inR) {
 				if (inB && !inC) continue;            // Curator deleted → don't re-add
+				// First-link rule (decideFirstLinkSide): a track first linked
+				// this run that the account removed from this playlist later
+				// than rekordbox last touched the content row stays removed,
+				// and goes to the baseline so the push removes it from rb.
+				if (!inB && !inC && this.firstLinkKeepsPlaylistRemoval(id, cid, trackIdMap, accountRemovals)) {
+					removeFromRbAccount.add(cid);
+					continue;
+				}
 				includeRb.add(cid);                   // add / unchanged / both-added
 			} else {
 				if (inC && inB) continue;             // rb deleted → drop from Curator
@@ -1530,7 +1752,7 @@ export class RekordboxImporter extends EventEmitter {
 			}
 			// Tombstoned-but-still-in-rb members: seed a baseline row so the
 			// exporter's B-vs-C diff issues a targeted remove from rekordbox.
-			for (const cid of removeFromRbTombstoned) {
+			for (const cid of [...removeFromRbTombstoned, ...removeFromRbAccount]) {
 				tx.insert(rekordboxMembershipBaseline)
 					.values({ rbPlaylistId, memberKind: 'rb', memberId: cid, position: 0, updatedAt: new Date() })
 					.onConflictDoNothing()
@@ -1588,14 +1810,64 @@ export class RekordboxImporter extends EventEmitter {
 		// only works at the track level. If a user removes a track from an
 		// rb tag in Rekordbox, they'll need to also remove it in Curator.
 		// (When per-field LMW lands we can do better here.)
+		//
+		// One exception, the first-link rule (decideFirstLinkSide): a track
+		// first linked this run whose account REMOVED it from this tag later
+		// than rekordbox last touched the content row keeps the removal — the
+		// additive add would restate it with a fresh clock and resurrect it on
+		// every device. Its push then writes Curator's tag set to rekordbox
+		// (only a non-empty one: the exporter never pushes an empty set).
 		const members: string[] = [];
 		for (const rbContentId of row.tracks) {
 			const trackId = this.resolveTrackId(rbContentId, idMap);
-			if (trackId) members.push(trackId);
+			if (!trackId) continue;
+			const fl = this.firstLinks.get(trackId);
+			if (fl?.recordingId) {
+				const removedTs = this.accountTagRemoval(trackId, fl.recordingId, tagId);
+				if (removedTs != null) {
+					const side = firstLinkMembershipSide(fl.rbTs, removedTs);
+					this.countFirstLink('mytags', side);
+					if (side === 'account') continue;
+				}
+			}
+			members.push(trackId);
 		}
 		// One track_tag add per assignment that is new.
 		mut.tagTracks(this.db, members, tagId);
 		totals.myTagsUpserted++;
+	}
+
+	// The account's removal of a track from a tag that Curator does not hold
+	// (the tombstone's clock), or null: no removal, or the membership is
+	// already in Curator (nothing to decide).
+	private accountTagRemoval(trackId: string, recordingId: string, tagId: string): number | null {
+		const st = firstLinkStmts(rawOf(this.db));
+		if (st.hasTag.get(trackId, tagId)) return null;
+		return (st.tagRemoval.get(`${recordingId}:${tagId}`) as number | undefined) ?? null;
+	}
+
+	// For an rb member of `playlistId` that Curator does not hold: true when
+	// its track was first linked this run and the account's removal of it
+	// from the playlist wins. `removals` is the playlist's account removals
+	// per recording (the latest tombstone over its rows), loaded once per
+	// playlist on first need; a row the account still holds alive would be
+	// in Curator already, so only removals are read.
+	private firstLinkKeepsPlaylistRemoval(
+		playlistId: string,
+		rbContentId: string,
+		trackIdMap: Map<string, string>,
+		removals: { map?: Map<string, number> },
+	): boolean {
+		if (this.firstLinks.size === 0) return false;
+		const trackId = this.resolveTrackId(rbContentId, trackIdMap);
+		const fl = trackId ? this.firstLinks.get(trackId) : undefined;
+		if (!fl?.recordingId) return false;
+		removals.map ??= new Map((firstLinkStmts(rawOf(this.db)).playlistRemovals.all(playlistId) as Array<{ rec: string; ts: number }>).map((r) => [r.rec, r.ts]));
+		const removedTs = removals.map.get(fl.recordingId);
+		if (removedTs == null) return false;
+		const side = firstLinkMembershipSide(fl.rbTs, removedTs);
+		this.countFirstLink('playlists', side);
+		return side === 'account';
 	}
 
 	// rekordbox soft-deleted these MyTags (rb_local_deleted=1) — they are gone

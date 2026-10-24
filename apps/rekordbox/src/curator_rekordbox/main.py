@@ -44,6 +44,7 @@ before the cancel, so the importer can persist them.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import threading
@@ -166,6 +167,45 @@ def _rollback_quietly(db: Any) -> None:
         sys.stderr.write(f"rollback after failed commit also failed: {exc}\n")
 
 
+# Set by the rekordbox end-to-end run (e2e/, `pnpm e2e:rekordbox`), which
+# drives this sidecar against a work-dir COPY of master.db: every path a
+# write-side RPC would write to (the db itself, its timestamped backups next
+# to it, a restore target) must resolve inside this directory. A wrong path —
+# the live library under %APPDATA%/Pioneer — is then a refusal, not a write.
+# Unset (the desktop), nothing changes.
+WRITE_ROOT_ENV = "CURATOR_RB_WRITE_ROOT"
+
+
+def write_root_refusal(*paths: str) -> Optional[str]:
+    """None when every path is inside CURATOR_RB_WRITE_ROOT (or it is unset);
+    otherwise the refusal message. Resolved with realpath, so `..` segments,
+    symlinks and junctions cannot step outside, and compared case-folded on
+    Windows (normcase)."""
+    root = os.environ.get(WRITE_ROOT_ENV)
+    if not root:
+        return None
+    real_root = os.path.normcase(os.path.realpath(root))
+    for p in paths:
+        real = os.path.normcase(os.path.realpath(p))
+        try:
+            inside = os.path.commonpath([real_root, real]) == real_root
+        except ValueError:  # different drives
+            inside = False
+        if not inside:
+            return f"refusing to write {p!r}: outside {WRITE_ROOT_ENV}={root!r}"
+    return None
+
+
+def _refuse_outside_write_root(req_id: int, *paths: str) -> bool:
+    """Emits the error frame and returns True when a path is outside the root."""
+    refusal = write_root_refusal(*paths)
+    if refusal is None:
+        return False
+    sys.stderr.write(refusal + "\n")
+    _write({"id": req_id, "error": {"kind": "internal", "message": refusal}})
+    return True
+
+
 def _close_current_db() -> None:
     """Tear down the in-process db handle AND its temp snapshot directory.
 
@@ -250,6 +290,8 @@ def _handle_backup(req_id: int, params: dict[str, Any]) -> None:
     if not db_path:
         _write({"id": req_id, "error": {"kind": "internal", "message": "missing dbPath"}})
         return
+    if _refuse_outside_write_root(req_id, db_path):
+        return
     try:
         result = backup_mod.backup_master_db(db_path)
     except Exception as exc:  # noqa: BLE001
@@ -310,6 +352,8 @@ def _handle_open_for_write(req_id: int, params: dict[str, Any]) -> None:
     key = params.get("key")
     if not db_path:
         _write({"id": req_id, "error": {"kind": "internal", "message": "missing dbPath"}})
+        return
+    if _refuse_outside_write_root(req_id, db_path):
         return
 
     _close_current_db()
@@ -504,6 +548,8 @@ def _handle_clear_backups(req_id: int, params: dict[str, Any]) -> None:
     if not db_dir:
         _write({"id": req_id, "error": {"kind": "internal", "message": "missing dbDir"}})
         return
+    if _refuse_outside_write_root(req_id, db_dir):
+        return
     try:
         result = backup_mod.clear_backups(db_dir)
     except Exception as exc:  # noqa: BLE001
@@ -517,6 +563,8 @@ def _handle_restore_backup(req_id: int, params: dict[str, Any]) -> None:
     db_path = params.get("dbPath")
     if not backup_path or not db_path:
         _write({"id": req_id, "error": {"kind": "internal", "message": "missing backupPath or dbPath"}})
+        return
+    if _refuse_outside_write_root(req_id, backup_path, db_path):
         return
     # Sanity: if a write session is open against the same db_path, close
     # it first so the file-level swap doesn't race a live session.

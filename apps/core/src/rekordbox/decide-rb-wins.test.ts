@@ -4,7 +4,7 @@
 // state on every import, so every decision-table row is pinned.
 
 import { describe, expect, it } from 'vitest';
-import { decideRbWins } from './importer.js';
+import { decideFirstLinkSide, decideRbWins, firstLinkMembershipSide } from './importer.js';
 
 const at = (ms: number): Date => new Date(ms);
 
@@ -44,5 +44,38 @@ describe('decideRbWins', () => {
 		expect(decideRbWins(at(2_000), at(3_000), at(2_000))).toBe(false);
 		// curator == seen, rb > seen → only rb changed.
 		expect(decideRbWins(at(3_000), at(2_000), at(2_000))).toBe(true);
+	});
+});
+
+// The first-link rule (no rekordbox_link yet): later write wins, per field.
+// Args: rbHas, accountHas, rbTs, accountTs.
+describe('decideFirstLinkSide', () => {
+	it('no account clock: today\'s behaviour, rekordbox wins', () => {
+		expect(decideFirstLinkSide(true, true, 1_000, null)).toBe('rb');
+		expect(decideFirstLinkSide(false, true, 1_000, null)).toBe('rb');
+	});
+
+	it('only one side has a value: that side, whatever the clocks', () => {
+		expect(decideFirstLinkSide(true, false, 1_000, 9_000)).toBe('rb');
+		expect(decideFirstLinkSide(false, true, 9_000, 1_000)).toBe('account');
+	});
+
+	it('both have values: the later write wins', () => {
+		expect(decideFirstLinkSide(true, true, 9_000, 1_000)).toBe('rb');
+		expect(decideFirstLinkSide(true, true, 1_000, 9_000)).toBe('account');
+	});
+
+	it('a tie, or rekordbox without a timestamp, keeps the account', () => {
+		expect(decideFirstLinkSide(true, true, 4_000, 4_000)).toBe('account');
+		expect(decideFirstLinkSide(true, true, null, 4_000)).toBe('account');
+	});
+});
+
+describe('firstLinkMembershipSide (an account removal vs rekordbox still holding it)', () => {
+	it('the later write wins; a tie or no rb timestamp keeps the removal', () => {
+		expect(firstLinkMembershipSide(9_000, 1_000)).toBe('rb');
+		expect(firstLinkMembershipSide(1_000, 9_000)).toBe('account');
+		expect(firstLinkMembershipSide(4_000, 4_000)).toBe('account');
+		expect(firstLinkMembershipSide(null, 4_000)).toBe('account');
 	});
 });

@@ -7,7 +7,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./ingest": "./src/ingest/index.ts"
+    "./ingest": "./src/ingest/index.ts",
+    "./e2e": "./src/e2e.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit && node scripts/check-console.mjs",

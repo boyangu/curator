@@ -17,6 +17,7 @@
     "typecheck": "pnpm -r typecheck",
     "db:migrate": "pnpm rebuild:node && pnpm --filter @curator/core db:migrate",
     "db:seed": "pnpm rebuild:node && pnpm --filter @curator/core db:seed",
+    "e2e:rekordbox": "pnpm rebuild:node && pnpm --filter @curator/e2e rekordbox",
     "rebuild:node": "node scripts/rebuild-node.mjs",
     "rebuild:electron": "pnpm --filter @curator/desktop rebuild:electron",
     "build:sidecars": "node scripts/build-sidecars.mjs"
