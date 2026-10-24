@@ -7,7 +7,10 @@ pyrekordbox's built-in key, runs SELECTs only, never commits.
 <content-ids.json>: the rekordbox content ids Curator links (a JSON list).
 Every playlist is dumped (membership filtering happens in TypeScript); per
 content: Title, the four relation names, Rating, Commnt, ColorID,
-rb_local_deleted; live cues; live MyTag membership by name.
+rb_local_deleted, the key (as the sidecar's reader parses it, so it compares
+with the rb slot Curator keeps) and updated_at (the row's edit stamp, for
+telling an edit Curator never pulled from a push it never made); live cues;
+live MyTag membership by name.
 """
 
 from __future__ import annotations
@@ -17,6 +20,24 @@ import os
 import sys
 from typing import Any
 
+# The sidecar's own key parser (apps/rekordbox/src): the e2e runs this with
+# apps/rekordbox as the working directory.
+sys.path.insert(0, os.path.join(os.getcwd(), "src"))
+
+
+def _ms(v: Any) -> int | None:
+    """updated_at as epoch ms: a datetime from the ORM, or rekordbox's text
+    form ("2026-10-21 13:09:21.446 +00:00") from a raw SELECT."""
+    if v is None:
+        return None
+    if hasattr(v, "timestamp"):
+        return int(v.timestamp() * 1000)
+    import datetime
+    try:
+        return int(datetime.datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S.%f %z").timestamp() * 1000)
+    except ValueError:
+        return None
+
 
 def main() -> None:
     db_path, ids_path, out_path = sys.argv[1:4]
@@ -25,6 +46,7 @@ def main() -> None:
 
     from pyrekordbox import Rekordbox6Database
     from sqlalchemy import text
+    from curator_rekordbox.reader import _parse_rekordbox_key as parse_key
 
     db = Rekordbox6Database(db_path, db_dir=os.path.dirname(os.path.abspath(db_path)))
     s = db.session
@@ -42,8 +64,10 @@ def main() -> None:
 
     contents: dict[str, Any] = {}
     for r in chunked(
-        """SELECT c.ID, c.Title, ar.Name, al.Name, lb.Name, g.Name, c.Rating, c.Commnt, c.ColorID, c.rb_local_deleted, c.FolderPath
+        """SELECT c.ID, c.Title, ar.Name, al.Name, lb.Name, g.Name, c.Rating, c.Commnt, c.ColorID, c.rb_local_deleted, c.FolderPath,
+            k.ScaleName, c.updated_at
         FROM djmdContent c
+        LEFT JOIN djmdKey k ON k.ID = c.KeyID
         LEFT JOIN djmdArtist ar ON ar.ID = c.ArtistID
         LEFT JOIN djmdAlbum al ON al.ID = c.AlbumID
         LEFT JOIN djmdLabel lb ON lb.ID = c.LabelID
@@ -54,6 +78,7 @@ def main() -> None:
             "title": r[1], "artist": r[2], "album": r[3], "label": r[4], "genre": r[5],
             "rating": r[6], "comment": r[7], "colorId": None if r[8] is None else str(r[8]),
             "deleted": int(r[9] or 0), "path": r[10],
+            "keyCamelot": parse_key(r[11])[0], "updatedAtMs": _ms(r[12]),
         }
 
     cues: dict[str, list[list[Any]]] = {}

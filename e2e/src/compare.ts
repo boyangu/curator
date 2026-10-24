@@ -10,12 +10,25 @@
 import { createHash } from 'node:crypto';
 import { compareDumps, dumpLibrary, type LibraryDump } from '@curator/core/e2e';
 import type Database from 'better-sqlite3';
+import type { Classified, DiffClass } from './classify.js';
 
 export const DIFF_SAMPLE = 50;
 
-export type DiffRow = { table: string; key: string; left: unknown; right: unknown };
-export type TableDiff = { table: string; left: number; right: number; equal: boolean; onlyLeft: number; onlyRight: number; changed: number };
-export type DumpDiff = { equal: boolean; tables: TableDiff[]; rows: DiffRow[] };
+// `class` / `note`: classify.ts, when the check classifies its differences.
+export type DiffRow = { table: string; key: string; left: unknown; right: unknown; class?: DiffClass; note?: string };
+export type TableDiff = { table: string; left: number; right: number; equal: boolean; onlyLeft: number; onlyRight: number; changed: number; byClass?: Record<DiffClass, number> };
+export type DumpDiff = { equal: boolean; tables: TableDiff[]; rows: DiffRow[]; failures: number };
+export type DumpClassifier = (table: string, left: Record<string, unknown> | null, right: Record<string, unknown> | null) => Classified;
+
+const CLASS_ORDER: Record<DiffClass, number> = { failure: 0, artefact: 1, expected: 2 };
+
+// Failures first, so a thousand expected rows cannot push the one that
+// matters out of the sample; the order within a class is kept.
+export function takeSample(rows: readonly DiffRow[], n: number): DiffRow[] {
+	return rows.map((r, i) => ({ r, i }))
+		.sort((a, b) => CLASS_ORDER[a.r.class ?? 'failure'] - CLASS_ORDER[b.r.class ?? 'failure'] || a.i - b.i)
+		.slice(0, n).map((x) => x.r);
+}
 
 const KEYS: Record<string, (r: Record<string, unknown>) => string> = {
 	tags: (r) => String(r['id']),
@@ -84,13 +97,16 @@ function changedFields(l: Record<string, unknown>, r: Record<string, unknown>): 
 const briefRow = (r: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, brief(v)]));
 
 // Up to `perTable` sample rows from each differing table, `sample` in all,
-// so one table's thousands of rows cannot hide another's few.
-export function diffDumps(leftRaw: LibraryDump, rightRaw: LibraryDump, sample = DIFF_SAMPLE, perTable = 10): DumpDiff {
+// so one table's thousands of rows cannot hide another's few. With
+// `classify`, every differing row is classed (classify.ts) and `failures`
+// counts the failures; without, every difference is one.
+export function diffDumps(leftRaw: LibraryDump, rightRaw: LibraryDump, sample = DIFF_SAMPLE, perTable = 10, classify?: DumpClassifier): DumpDiff {
 	const left = canonicalDump(leftRaw);
 	const right = canonicalDump(rightRaw);
 	const reports = compareDumps(left, right, 0);
 	const tables: TableDiff[] = [];
-	const rows: DiffRow[] = [];
+	const perTableRows: DiffRow[][] = [];
+	let failures = 0;
 	for (const rep of reports) {
 		const key = KEYS[rep.table] ?? ((r: Record<string, unknown>) => JSON.stringify(r));
 		const l = new Map(rowsOf(left, rep.table).map((r) => [key(r), r]));
@@ -98,28 +114,37 @@ export function diffDumps(leftRaw: LibraryDump, rightRaw: LibraryDump, sample = 
 		let onlyLeft = 0;
 		let onlyRight = 0;
 		let changed = 0;
-		let taken = 0;
-		const take = (row: DiffRow): void => {
-			if (taken < perTable && rows.length < sample) { rows.push(row); taken++; }
+		const byClass: Record<DiffClass, number> = { expected: 0, artefact: 0, failure: 0 };
+		const found: DiffRow[] = [];
+		const take = (row: Omit<DiffRow, 'class' | 'note'>, lv: Record<string, unknown> | null, rv: Record<string, unknown> | null): void => {
+			const c: Classified = classify ? classify(rep.table, lv, rv) : { class: 'failure', note: '' };
+			byClass[c.class]++;
+			found.push(classify ? { ...row, class: c.class, note: c.note } : row);
 		};
 		if (!rep.equal) {
 			for (const [k, lv] of l) {
 				const rv = r.get(k);
-				if (rv === undefined) { onlyLeft++; take({ table: rep.table, key: k, left: briefRow(lv), right: null }); continue; }
+				if (rv === undefined) { onlyLeft++; take({ table: rep.table, key: k, left: briefRow(lv), right: null }, lv, null); continue; }
 				if (JSON.stringify(lv) === JSON.stringify(rv)) continue;
 				changed++;
 				const [a, b] = changedFields(lv, rv);
-				take({ table: rep.table, key: k, left: a, right: b });
+				take({ table: rep.table, key: k, left: a, right: b }, lv, rv);
 			}
 			for (const [k, rv] of r) {
 				if (l.has(k)) continue;
 				onlyRight++;
-				take({ table: rep.table, key: k, left: null, right: briefRow(rv) });
+				take({ table: rep.table, key: k, left: null, right: briefRow(rv) }, null, rv);
 			}
 		}
-		tables.push({ table: rep.table, left: rep.left, right: rep.right, equal: rep.equal, onlyLeft, onlyRight, changed });
+		// A table that differs only in what compareDumps sees (no keyed row
+		// differs) is still a failure.
+		if (!rep.equal && found.length === 0) byClass.failure++;
+		failures += byClass.failure;
+		perTableRows.push(takeSample(found, perTable));
+		tables.push({ table: rep.table, left: rep.left, right: rep.right, equal: rep.equal, onlyLeft, onlyRight, changed, ...(classify ? { byClass } : {}) });
 	}
-	return { equal: tables.every((t) => t.equal), tables, rows };
+	const rows = takeSample(perTableRows.flat(), sample);
+	return { equal: tables.every((t) => t.equal), tables, rows, failures };
 }
 
 export function dumpOf(raw: Database.Database): LibraryDump {

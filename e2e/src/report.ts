@@ -43,7 +43,7 @@ function html(r: Report): string {
 <h2>${badge(c.status)} ${esc(c.title)} <code>${esc(c.name)}</code></h2>
 <p>${esc(c.summary)}</p>
 ${c.details !== undefined ? `<details><summary>details</summary><pre>${json(c.details)}</pre></details>` : ''}
-${c.rows && c.rows.length > 0 ? `<table><thead><tr><th>table / field</th><th>key</th><th>left</th><th>right</th></tr></thead><tbody>${c.rows.map((d) => `<tr><td>${esc(d.table)}</td><td><code>${esc(d.key)}</code></td><td><pre>${json(d.left)}</pre></td><td><pre>${json(d.right)}</pre></td></tr>`).join('')}</tbody></table>` : ''}
+${c.rows && c.rows.length > 0 ? `<table><thead><tr><th>table / field</th><th>key</th><th>left</th><th>right</th>${c.rows.some((d) => d.class) ? '<th>class</th>' : ''}</tr></thead><tbody>${c.rows.map((d) => `<tr><td>${esc(d.table)}</td><td><code>${esc(d.key)}</code></td><td><pre>${json(d.left)}</pre></td><td><pre>${json(d.right)}</pre></td>${d.class ? `<td>${badge(d.class === 'failure' ? 'fail' : d.class === 'expected' ? 'info' : 'warn')} ${esc(d.class)}<br><span class="muted">${esc(d.note ?? '')}</span></td>` : c.rows!.some((x) => x.class) ? '<td></td>' : ''}</tr>`).join('')}</tbody></table>` : ''}
 </section>`).join('');
 	return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

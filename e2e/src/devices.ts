@@ -74,8 +74,11 @@ export function openDevice(opts: { name: string; dir: string; dbPath: string; tr
 		name: opts.name, dir: opts.dir, dbPath: opts.dbPath, svc, raw: sqlite, transport: opts.transport, upstream, audit,
 		async close() {
 			try { svc.close(); } catch { /* already closed */ }
-			// The sidecar's shutdown and the scanner's watchers finish async.
-			await new Promise((r) => setTimeout(r, 200));
+			// The sidecar's shutdown and the scanner's watchers finish async;
+			// svc.close() does not wait for them. The rekordbox sidecar may take
+			// its whole 2 s grace (RekordboxSidecar.shutdown) before it lets go
+			// of its read snapshot under the work dir's tmp/.
+			await new Promise((r) => setTimeout(r, opts.rekordbox ? 2_500 : 200));
 			try { sqlite.close(); } catch { /* */ }
 		},
 	};

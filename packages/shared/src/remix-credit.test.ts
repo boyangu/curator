@@ -82,6 +82,15 @@ describe('formatTrackTitle', () => {
 		expect(formatTrackTitle('Track (Original Mix) - X Remix', [{ name: 'A' }, rmx('X')], 'parenthesis')).toBe('Track (Original Mix) (X Remix)');
 		expect(formatTrackTitle('Plain', [{ name: 'A' }, rmx('X')], 'dash')).toBe('Plain - X Remix');
 	});
+	it('reads every name of a collaboration segment as mentioned', () => {
+		expect(formatTrackTitle('Paper Lantern (Orin Vale & Teo Mar Remix)', [{ name: 'Kade Lumi' }, rmx('Orin Vale'), rmx('Teo Mar')], 'parenthesis')).toBe('Paper Lantern (Orin Vale & Teo Mar Remix)');
+		expect(formatTrackTitle('Driftwood (Ilo & Sev Remix)', [{ name: 'Pell Arno' }, rmx('Ilo'), rmx('Sev')], 'dash')).toBe('Driftwood - Ilo & Sev Remix');
+		// Second name first: the segment is still the remixers' own.
+		expect(formatTrackTitle('Home - Ajna & Samm Remix', [{ name: 'CamelPhat' }, rmx('Samm')], 'parenthesis')).toBe('Home (Ajna & Samm Remix)');
+		expect(formatTrackTitle('You (Frankey & Sandrino Remix)', [{ name: 'Eelke Kleijn' }, rmx('Frankey & Sandrino')], 'parenthesis')).toBe('You (Frankey & Sandrino Remix)');
+		// A remixer the segment does not name still gets their credit.
+		expect(formatTrackTitle('Track (A & B Remix)', [{ name: 'M' }, rmx('A'), rmx('C')], 'parenthesis')).toBe('Track (A & B Remix) (C Remix)');
+	});
 });
 
 describe('applyRemixers', () => {

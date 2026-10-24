@@ -32,6 +32,7 @@ import { MASTER_DEVICE_SETTING } from '@curator/protocol';
 import { createLogger, type LogRecord } from '@curator/shared/log';
 import { fileSink } from '@curator/shared/log-node';
 import { startLocalCloud, type LocalCloud } from './cloud.js';
+import { afterLinkClassifier, rekordboxClassifier, type DiffClass } from './classify.js';
 import { diffDumps, dumpOf } from './compare.js';
 import { diffRekordbox, type RbDump } from './compare-rb.js';
 import { copyCuratorDb, copyRekordbox } from './copies.js';
@@ -71,6 +72,15 @@ export type RunOptions = {
 const DEFAULT_PHASE_TIMEOUT_MS = 45 * 60_000;
 
 const KEY_ORDER_NOTE = 'JSON key order of rekordbox phrases and object-valued account settings is ignored: the snapshot load stores them key-sorted (compare.ts canonicalDump)';
+const CLASS_NOTE = 'expected = the fresh desktop did what the master\'s Curator would (rekordbox behind Curator, or an edit Curator never pulled); artefact = the run\'s setup (another recording for the file); failure = anything else. Only failures fail the check (classify.ts).';
+
+const count = (r: Record<string, number>): number => Object.values(r).reduce((a, b) => a + b, 0);
+function sumClasses(xs: ReadonlyArray<Record<DiffClass, number> | undefined>): Record<DiffClass, number> {
+	const out: Record<DiffClass, number> = { expected: 0, artefact: 0, failure: 0 };
+	for (const x of xs) if (x) for (const k of Object.keys(out) as DiffClass[]) out[k] += x[k];
+	return out;
+}
+const classSummary = (c: Record<DiffClass, number>): string => `${c.expected} expected, ${c.artefact} artefacts, ${c.failure} failures`;
 
 // The folders the source library's music lives in: its watched folders and
 // the folder of every local file row. Read through a read-only handle.
@@ -292,17 +302,10 @@ export async function runRekordboxE2E(opts: RunOptions): Promise<Report> {
 		});
 
 		await opts.hooks?.beforeRekordboxCompare?.(hookCtx());
-		{
-			const d = await phase('compare after linking', () => diffDumps(founded, dumpOf(joiner.raw)));
-			checks.push({
-				name: 'cloud.afterLink', title: 'Fresh desktop after linking rekordbox vs master',
-				status: d.equal ? 'pass' : 'fail',
-				summary: d.equal ? 'linking changed no Curator-owned state' : `linking changed ${d.tables.filter((t) => !t.equal).map((t) => `${t.table} (−${t.onlyLeft} +${t.onlyRight} ~${t.changed})`).join(', ')}`,
-				details: { tables: d.tables, normalised: KEY_ORDER_NOTE }, rows: d.rows,
-			});
-		}
-
-		// ── 6. rekordbox compare ────────────────────────────────────────────
+		// Both rekordbox copies, read once: the rekordbox check compares them,
+		// and the after-link check reads what rekordbox really holds from the
+		// untouched one (classify.ts).
+		let rb: { pushed: RbDump; reference: RbDump } | null = null;
 		if (!dryRun) {
 			const ids = join(paths.tmp, 'linked-ids.json');
 			writeFileSync(ids, JSON.stringify(links), 'utf8');
@@ -312,12 +315,36 @@ export async function runRekordboxE2E(opts: RunOptions): Promise<Report> {
 				await runPythonScript('rb_dump.py', [rbDb, ids, outA], { tmpDir: paths.tmp });
 				await runPythonScript('rb_dump.py', [refDb, ids, outB], { tmpDir: paths.tmp });
 			});
-			const d = diffRekordbox(JSON.parse(readFileSync(outA, 'utf8')) as RbDump, JSON.parse(readFileSync(outB, 'utf8')) as RbDump, links);
+			rb = { pushed: JSON.parse(readFileSync(outA, 'utf8')) as RbDump, reference: JSON.parse(readFileSync(outB, 'utf8')) as RbDump };
+		}
+
+		{
+			// Linking takes what rekordbox holds and Curator never pulled; only
+			// a change rekordbox does not explain fails (classify.ts).
+			const classify = rb ? afterLinkClassifier(joiner.raw, rb.reference) : undefined;
+			const d = await phase('compare after linking', () => diffDumps(founded, dumpOf(joiner.raw), undefined, undefined, classify));
+			const differing = d.tables.filter((t) => !t.equal);
+			const classes = sumClasses(differing.map((t) => t.byClass));
+			checks.push({
+				name: 'cloud.afterLink', title: 'Fresh desktop after linking rekordbox vs master',
+				status: d.equal ? 'pass' : d.failures > 0 ? 'fail' : 'warn',
+				summary: d.equal ? 'linking changed no Curator-owned state'
+					: `linking changed ${differing.map((t) => `${t.table} (−${t.onlyLeft} +${t.onlyRight} ~${t.changed})`).join(', ')}${classify ? `; ${classSummary(classes)}` : ''}`,
+				details: { tables: d.tables, normalised: KEY_ORDER_NOTE, ...(classify ? { classes, classified: CLASS_NOTE } : {}) }, rows: d.rows,
+			});
+		}
+
+		// ── 6. rekordbox compare ────────────────────────────────────────────
+		if (rb) {
+			const d = diffRekordbox(rb.pushed, rb.reference, links, undefined, rekordboxClassifier(founder.raw, joiner.raw, rb.reference));
+			const failing = Object.entries(d.byClass.failure);
+			const classes = { expected: count(d.byClass.expected), artefact: count(d.byClass.artefact), failure: count(d.byClass.failure) };
 			checks.push({
 				name: 'rekordbox.compare', title: 'rekordbox after the push vs the real rekordbox',
-				status: d.equal ? 'pass' : 'fail',
-				summary: d.equal ? `${d.compared} linked rows and their playlists equal` : `differs: ${Object.entries(d.fields).map(([f, n]) => `${f} ${n}`).join(', ')}`,
-				details: { linked: d.linked, compared: d.compared, missing: d.missing, fields: d.fields }, rows: d.rows,
+				status: d.equal ? 'pass' : failing.length > 0 ? 'fail' : 'warn',
+				summary: d.equal ? `${d.compared} linked rows and their playlists equal`
+					: `differs: ${Object.entries(d.fields).map(([f, n]) => `${f} ${n}`).join(', ')}; ${classSummary(classes)}${failing.length > 0 ? ` (failing: ${failing.map(([f, n]) => `${f} ${n}`).join(', ')})` : ''}`,
+				details: { linked: d.linked, compared: d.compared, missing: d.missing, fields: d.fields, byClass: d.byClass, classified: CLASS_NOTE }, rows: d.rows,
 			});
 		}
 
@@ -351,7 +378,16 @@ export async function runRekordboxE2E(opts: RunOptions): Promise<Report> {
 	};
 	if (existsSync(workDir)) {
 		writeReport(workDir, report);
-		if (!opts.keep) prune(workDir);
+		if (!opts.keep) {
+			const left = await prune(workDir);
+			if (left.length > 0) {
+				// The report is already on disk; what could not be removed is
+				// added to it rather than thrown.
+				say(`! could not remove from the work dir (still in use?): ${left.join('; ')}`);
+				report.facts['pruneLeftovers'] = left;
+				writeReport(workDir, report);
+			}
+		}
 	}
 	return report;
 }
@@ -378,10 +414,25 @@ function outboxSummary(raw: Raw, afterSeqLocal: number): OutboxSummary {
 	};
 }
 
-// Without --keep: the report and the logs stay, the copies go.
-function prune(workDir: string): void {
-	for (const name of readdirSync(workDir)) {
-		if (name === 'report.json' || name === 'report.html' || name.endsWith('.jsonl')) continue;
-		rmSync(join(workDir, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+// Without --keep: the report and the logs stay, the copies go. A child
+// process can hold a file a moment past the services' close — the rekordbox
+// sidecar's read snapshot under tmp/ (its shutdown has a 2 s grace), which
+// Windows then refuses to delete (EBUSY) — so each pass is retried for a
+// while, and whatever is still held comes back as a list, never a throw.
+async function prune(workDir: string, deadlineMs = 15_000): Promise<string[]> {
+	const keep = (name: string): boolean => name === 'report.json' || name === 'report.html' || name.endsWith('.jsonl');
+	const until = Date.now() + deadlineMs;
+	for (;;) {
+		const failed: string[] = [];
+		for (const name of readdirSync(workDir)) {
+			if (keep(name)) continue;
+			try {
+				rmSync(join(workDir, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+			} catch (err) {
+				failed.push(`${name}: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}`);
+			}
+		}
+		if (failed.length === 0 || Date.now() > until) return failed;
+		await new Promise((r) => setTimeout(r, 500));
 	}
 }

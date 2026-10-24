@@ -9,17 +9,23 @@
 // sampler, smart rules, the folder tree) and every unlinked content row.
 
 import { parseTagComment } from '@curator/core/e2e';
-import { DIFF_SAMPLE, type DiffRow } from './compare.js';
+import type { Classified, DiffClass, RbDiffItem } from './classify.js';
+import { DIFF_SAMPLE, takeSample, type DiffRow } from './compare.js';
 
 export type RbDump = {
-	contents: Record<string, { title: string | null; artist: string | null; album: string | null; label: string | null; genre: string | null; rating: number | null; comment: string | null; colorId: string | null; deleted: number; path: string | null }>;
+	// keyCamelot / updatedAtMs are read for the classification (classify.ts),
+	// never compared: Curator does not write the key, and the stamp moves on
+	// every write.
+	contents: Record<string, { title: string | null; artist: string | null; album: string | null; label: string | null; genre: string | null; rating: number | null; comment: string | null; colorId: string | null; deleted: number; path: string | null; keyCamelot?: string | null; updatedAtMs?: number | null }>;
 	cues: Record<string, Array<[number, number, number | null, number | null, string]>>;
 	myTags: Record<string, string[]>;
 	playlists: Array<{ id: string; name: string | null; attribute: number | null; parentId: string | null; deleted: number; smart: boolean; members: string[] }>;
 };
 
 export type RbFieldCounts = Record<string, number>;
-export type RbDiff = { equal: boolean; linked: number; compared: number; missing: { pushed: number; reference: number }; fields: RbFieldCounts; rows: DiffRow[] };
+// `byClass`: per class, per field (classify.ts); without a classifier every
+// difference is a failure.
+export type RbDiff = { equal: boolean; linked: number; compared: number; missing: { pushed: number; reference: number }; fields: RbFieldCounts; byClass: Record<DiffClass, RbFieldCounts>; rows: DiffRow[] };
 
 const s = (v: string | null | undefined): string => (v ?? '').trim();
 
@@ -45,10 +51,18 @@ function contentView(d: RbDump, id: string): Record<string, unknown> | null {
 	};
 }
 
-export function diffRekordbox(pushed: RbDump, reference: RbDump, linked: readonly string[], sample = DIFF_SAMPLE): RbDiff {
-	const rows: DiffRow[] = [];
+export function diffRekordbox(pushed: RbDump, reference: RbDump, linked: readonly string[], sample = DIFF_SAMPLE, classify?: (d: RbDiffItem) => Classified): RbDiff {
+	const all: DiffRow[] = [];
 	const fields: RbFieldCounts = {};
-	const bump = (f: string): void => { fields[f] = (fields[f] ?? 0) + 1; };
+	const byClass: Record<DiffClass, RbFieldCounts> = { expected: {}, artefact: {}, failure: {} };
+	const unclassified: Classified = { class: 'failure', note: 'not classified' };
+	// One difference: counted per field and per class, kept for the sample.
+	const note = (f: string, row: Omit<DiffRow, 'class' | 'note'>, item: RbDiffItem | null): void => {
+		fields[f] = (fields[f] ?? 0) + 1;
+		const c = item && classify ? classify(item) : unclassified;
+		byClass[c.class][f] = (byClass[c.class][f] ?? 0) + 1;
+		all.push({ ...row, class: c.class, note: c.note });
+	};
 	const ids = [...new Set(linked)].sort();
 	const missing = { pushed: 0, reference: 0 };
 	let compared = 0;
@@ -58,15 +72,13 @@ export function diffRekordbox(pushed: RbDump, reference: RbDump, linked: readonl
 		if (!a || !b) {
 			if (!a) missing.pushed++;
 			if (!b) missing.reference++;
-			bump('content-missing');
-			if (rows.length < sample) rows.push({ table: 'content', key: id, left: a, right: b });
+			note('content-missing', { table: 'content', key: id, left: a, right: b }, null);
 			continue;
 		}
 		compared++;
 		for (const f of Object.keys(a)) {
 			if (JSON.stringify(a[f]) === JSON.stringify(b[f])) continue;
-			bump(f);
-			if (rows.length < sample) rows.push({ table: `content.${f}`, key: id, left: a[f], right: b[f] });
+			note(f, { table: `content.${f}`, key: id, left: a[f], right: b[f] }, { kind: 'content', contentId: id, field: f, pushed: a[f], reference: b[f] });
 		}
 	}
 	// Playlists: live, non-folder (Attribute 1), non-smart (Attribute 4 /
@@ -81,18 +93,16 @@ export function diffRekordbox(pushed: RbDump, reference: RbDump, linked: readonl
 		const a = pa.get(id);
 		const b = pb.get(id);
 		if (!a || !b) {
-			bump('playlist-missing');
-			if (rows.length < sample) rows.push({ table: 'playlist', key: id, left: a ?? null, right: b ?? null });
+			note('playlist-missing', { table: 'playlist', key: id, left: a ?? null, right: b ?? null }, null);
 			continue;
 		}
 		if (a.name !== b.name) {
-			bump('playlist.name');
-			if (rows.length < sample) rows.push({ table: 'playlist.name', key: id, left: a.name, right: b.name });
+			note('playlist.name', { table: 'playlist.name', key: id, left: a.name, right: b.name }, { kind: 'playlist', playlistId: id, field: 'playlist.name', pushed: a.name, reference: b.name });
 		}
 		if (JSON.stringify(a.members) !== JSON.stringify(b.members)) {
-			bump(new Set(a.members).size === new Set(b.members).size && a.members.every((m) => b.members.includes(m)) ? 'playlist.order' : 'playlist.members');
-			if (rows.length < sample) rows.push({ table: 'playlist.members', key: `${id} (${a.name})`, left: a.members, right: b.members });
+			const f = new Set(a.members).size === new Set(b.members).size && a.members.every((m) => b.members.includes(m)) ? 'playlist.order' : 'playlist.members';
+			note(f, { table: 'playlist.members', key: `${id} (${a.name})`, left: a.members, right: b.members }, { kind: 'playlist', playlistId: id, field: f, pushed: a.members, reference: b.members });
 		}
 	}
-	return { equal: Object.keys(fields).length === 0, linked: ids.length, compared, missing, fields, rows };
+	return { equal: Object.keys(fields).length === 0, linked: ids.length, compared, missing, fields, byClass, rows: takeSample(all, sample) };
 }

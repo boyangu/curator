@@ -40,6 +40,7 @@ import {
 	playlistConflict,
 	playSession,
 	playEvent,
+	appSetting,
 	type NewPlaylist,
 	type NewPlaylistFolder,
 	type NewCue,
@@ -62,6 +63,7 @@ import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from './rb-slot.
 import { log } from '../log.js';
 import { CUES_EDITED_CELL, CURATION_CELL_PREFIX, type Cell, type LwwRecord } from '@curator/protocol';
 import { commentFreeText } from '../sync-log/track-curation.js';
+import { rbUnitMirrors } from '../sync-log/rows.js';
 
 const ilog = log.for('rekordbox-import');
 
@@ -360,6 +362,38 @@ function sameColumnValue(a: unknown, b: unknown): boolean {
 	return false;
 }
 
+// rekordbox's Title and Artist are the strings the exporter COMPOSED from
+// Curator's credits (the remix segment re-styled, remixers on the artist
+// line), not the release title and credit list they came from. Pulling one
+// back is not a fixed point: the artist string re-splits with no roles and
+// normalizeIncomingCredits re-reads remixers from the title against today's
+// artist table, so a pull with no baseline (a first link, a second desktop,
+// "Sync Everything") rewrote credits rekordbox never changed — "Patrice" as
+// remixer became "Patrice" + "Patrice Bäumel", and the next push doubled
+// titles and grew the artist line (e2e run 2026-10-24: 78 credits, 18
+// titles, 61 artists). A value equal to what Curator would push says
+// nothing, so it is not pulled; the baseline still records it. The
+// three-way merge compares the same composed view (mergeTrackFields).
+function withoutRestatedCredits(rbFields: FieldsSeen, existing: typeof track.$inferSelect, fmt: ArtistCreditFormat): FieldsSeen {
+	const ours = curatorFieldsView(existing, fmt);
+	let out = rbFields;
+	for (const f of ['title', 'artist'] as const) {
+		if (rbFields[f] == null || rbFields[f] === '' || rbFields[f] !== ours[f]) continue;
+		if (out === rbFields) out = { ...rbFields };
+		delete out[f];
+	}
+	return out;
+}
+
+// rekordbox's key for a content row, as Camelot (the one key Curator stores).
+function rbKeyOf(row: TrackDeltaRow): string | null {
+	return row.key_camelot ?? keyToCamelot(row.key_musical);
+}
+
+// The one-time re-read of rekordbox's key into the rb slot (rereadRbKeys).
+// Set once done; a device-local key, never an op.
+export const KEY_REREAD_SETTING = 'rekordbox.key_reread_v1_at';
+
 // Last-modified-wins decision for a single track.
 //
 // rbTs      = Rekordbox's djmdContent.updated_at for this delta row (null if
@@ -487,6 +521,15 @@ export class RekordboxImporter extends EventEmitter {
 	// and the run's tally for the one summary log line. Reset per runImport().
 	private firstLinks = new Map<string, FirstLink>();
 	private firstLinkStats: FirstLinkStats = { firstLinks: 0, withAccount: 0, rbWon: 0, accountWon: 0, byField: {} };
+	// Twin rekordbox entries (two content rows for two local files of one
+	// track): matches for a track with no rekordbox_link yet, held until the
+	// track pass ends so exactly one is linked (flushFirstLinks), and the
+	// count of twins skipped this run. Reset per runImport().
+	private pendingFirstLinks = new Map<string, TrackDeltaRow[]>();
+	private twinsSkipped = 0;
+	// Set while the one-time key re-read scan runs: its track rows feed the
+	// re-read, never the track pass (rereadRbKeys).
+	private keyRereadSink: ((row: TrackDeltaRow) => void) | null = null;
 
 	constructor(
 		private readonly db: Db,
@@ -602,12 +645,16 @@ export class RekordboxImporter extends EventEmitter {
 			});
 		};
 
+		const flushFirstLinks = (): void => {
+			if (this.pendingFirstLinks.size > 0) this.flushFirstLinks(trackIdByRbId, totals, overwrite);
+		};
+
 		const onSidecarEvent = ({ event, frame }: { event: string; frame: Record<string, unknown> }): void => {
 			try {
 				if (event === 'progress') {
 					emitEvent({
 						kind: 'progress',
-						phase: String(frame['phase']),
+						phase: this.keyRereadSink ? 'key-reread' : String(frame['phase']),
 						done: Number(frame['done'] ?? 0),
 						total: Number(frame['total'] ?? 0),
 					});
@@ -615,6 +662,14 @@ export class RekordboxImporter extends EventEmitter {
 				}
 				const row = frame['row'] as Record<string, unknown> | undefined;
 				if (!row) return;
+				if (this.keyRereadSink) {
+					if (event === 'track') this.keyRereadSink(row as unknown as TrackDeltaRow);
+					return;
+				}
+				// The track pass is over once any other pass streams: the held
+				// first links land before a playlist, tag, cue or history row
+				// needs their content ids resolved.
+				if (event !== 'track') flushFirstLinks();
 				if (event === 'track') {
 					this.applyTrackDelta(row as unknown as TrackDeltaRow, opts.flags, trackIdByRbId, totals, overwrite);
 				} else if (event === 'cues') {
@@ -651,6 +706,9 @@ export class RekordboxImporter extends EventEmitter {
 		this.rbWinsTracks.clear();
 		this.firstLinks.clear();
 		this.firstLinkStats = { firstLinks: 0, withAccount: 0, rbWon: 0, accountWon: 0, byField: {} };
+		this.pendingFirstLinks.clear();
+		this.twinsSkipped = 0;
+		this.keyRereadSink = null;
 
 		this.sidecar.on('event', onSidecarEvent);
 		try {
@@ -660,6 +718,13 @@ export class RekordboxImporter extends EventEmitter {
 			// rows anyway) and no persistence (a subset read mustn't move the
 			// library-wide cursor).
 			const scoped = !!opts.target;
+			// The one-time key re-read rides the first whole-library pull that
+			// reads tracks. Decided before the scan: links this pull makes read
+			// rekordbox's key as they land, so a device with none yet has
+			// nothing stale.
+			const keyReread = !scoped && opts.flags.syncTracks && this.keyRereadDue()
+				? { linkedBefore: this.db.select({ n: sql<number>`count(*)` }).from(rekordboxLink).get()?.n ?? 0 }
+				: null;
 			const watermarks = scoped || opts.mode === 'full' ? {} : this.loadWatermarks();
 			const scopes: RekordboxScope[] = [];
 			if (opts.flags.syncTracks) scopes.push('tracks');
@@ -687,6 +752,8 @@ export class RekordboxImporter extends EventEmitter {
 				targetContentIds: opts.target?.rbContentIds,
 				targetPlaylistIds: opts.target?.rbPlaylistIds,
 			});
+			// A scan of the track pass alone ends with first links still held.
+			flushFirstLinks();
 			// Drain the waveform buffer — anything still pending when the scan
 			// finished (tail of the last batch) gets one final transaction.
 			flushWaveforms();
@@ -726,6 +793,12 @@ export class RekordboxImporter extends EventEmitter {
 			}
 			// Subset reads must not advance the library-wide incremental cursor.
 			if (!scoped) this.saveWatermarks(result.watermarks);
+			if (keyReread && !result.cancelled) {
+				// A full read already restated every content row's key.
+				if (keyReread.linkedBefore === 0 || opts.mode === 'full') this.markKeyRereadDone(null);
+				else await this.rereadRbKeys(opts.peaksDir, emitEvent);
+			}
+			if (this.twinsSkipped > 0) ilog.info('rekordbox twin entries skipped: another content row of the same track is linked', { twins: this.twinsSkipped });
 			if (this.firstLinkStats.firstLinks > 0) ilog.info('first-link rule', { ...this.firstLinkStats });
 			ilog.info('completed', { totals });
 			emitEvent({ kind: 'completed', totals, cancelled: result.cancelled });
@@ -735,6 +808,7 @@ export class RekordboxImporter extends EventEmitter {
 			// batched-but-not-yet-committed waveforms. If the flush itself
 			// throws, swallow it — the outer throw below is what the caller
 			// wants to see.
+			try { flushFirstLinks(); } catch { /* */ }
 			try { flushWaveforms(); } catch { /* */ }
 			try { flushHistory(); } catch { /* */ }
 			const e = err as SidecarError;
@@ -744,6 +818,7 @@ export class RekordboxImporter extends EventEmitter {
 			throw err;
 		} finally {
 			this.sidecar.off('event', onSidecarEvent);
+			this.keyRereadSink = null;
 			this.running = false;
 		}
 	}
@@ -751,6 +826,96 @@ export class RekordboxImporter extends EventEmitter {
 	cancel(): void {
 		if (!this.running) return;
 		this.sidecar.cancel().catch((err) => ilog.error('cancel failed', err));
+	}
+
+	// ──────────────────────────────────────────────────────────────────────
+	// One-time key re-read. The rb slot's key unit on a library linked before
+	// the slot existed is stale: seeded from track.key_camelot (a tag or
+	// enrichment key, not rekordbox's), or empty — the measured master
+	// (2026-10-24) held 783 such seeds and 1,513 empties of 4,754 links. The
+	// track pass lands rekordbox's key only for rows rekordbox changed (USN
+	// gate), so those never heal by themselves. This reads every linked
+	// content row once, regardless of USN — a read of rekordbox, never a
+	// write — and states each key through the track pass's own path
+	// (recordRbAnalysisChanges: the baseline, the set-rb-analysis op), only
+	// where it differs. Its per-unit hold stands: a slot whose baseline
+	// already is rekordbox's key holds another desktop's synced value.
+
+	private keyRereadDue(): boolean {
+		return this.db.select({ key: appSetting.key }).from(appSetting).where(eq(appSetting.key, KEY_REREAD_SETTING)).get() == null;
+	}
+
+	private markKeyRereadDone(stats: { checked: number; corrected: number; filled: number } | null): void {
+		mut.setSetting(this.db, KEY_REREAD_SETTING, Date.now());
+		if (stats) ilog.info('rekordbox key re-read', stats);
+	}
+
+	private async rereadRbKeys(peaksDir: string, emitEvent: (e: RekordboxImportEvent) => void): Promise<void> {
+		const trackByRbId = new Map(
+			this.db.select({ trackId: rekordboxLink.trackId, rbContentId: rekordboxLink.rbContentId }).from(rekordboxLink).all()
+				.map((l) => [l.rbContentId, l.trackId]),
+		);
+		if (trackByRbId.size === 0) { this.markKeyRereadDone(null); return; }
+		const rows: TrackDeltaRow[] = [];
+		this.keyRereadSink = (r) => { rows.push(r); };
+		let cancelled: boolean;
+		try {
+			// Targeted read: every linked row at its current state, past the
+			// USN gate, with no watermark moved.
+			const result = await this.sidecar.scan({
+				watermarks: {},
+				scopes: ['tracks'],
+				peaksDir,
+				targetContentIds: [...trackByRbId.keys()],
+			});
+			cancelled = result.cancelled;
+		} catch (err) {
+			// The pull itself completed; the re-read stays due for the next one.
+			ilog.warn('rekordbox key re-read failed; retried on the next pull', undefined, err);
+			return;
+		} finally {
+			this.keyRereadSink = null;
+		}
+		if (cancelled) return;
+
+		const stats = { checked: 0, corrected: 0, filled: 0 };
+		const raw = rawOf(this.db);
+		const BATCH = 500;
+		for (let i = 0; i < rows.length; i += BATCH) {
+			emitEvent({ kind: 'progress', phase: 'key-reread', done: i, total: rows.length });
+			const keys = new Map<string, string>();
+			for (const r of rows.slice(i, i + BATCH)) {
+				const trackId = trackByRbId.get(String(r.rb_content_id));
+				if (!trackId || r.rb_local_deleted) continue;
+				stats.checked++;
+				const key = rbKeyOf(r);
+				// Same gate as the track pass: a differing slot, or a baseline
+				// that has not seen rekordbox's key yet.
+				if (key == null || (readRbSlot(raw, trackId)?.rb_key_camelot === key && mut.rbUnitSeen(raw, trackId, 'key') === key)) continue;
+				keys.set(trackId, key);
+			}
+			if (keys.size === 0) continue;
+			this.db.transaction(() => {
+				const before = new Map([...keys.keys()].map((id) => [id, readRbSlot(raw, id)?.rb_key_camelot || null]));
+				mut.recordRbAnalysisChanges(this.db, new Map([...keys.keys()].map((id) => [id, ['key'] as const])), (raw) => {
+					for (const [id, key] of keys) writeRbSlot(raw, id, { keyCamelot: key });
+				});
+				for (const [id, was] of before) {
+					const after = readRbSlot(raw, id);
+					const now = after?.rb_key_camelot || null;
+					if (now === was) continue;
+					if (was == null) stats.filled++;
+					else stats.corrected++;
+					// The track row carries rekordbox's key as the track pass
+					// writes it, and as another device projecting this op does.
+					rbUnitMirrors(raw, id, after, 'key');
+				}
+			});
+			// Yield between batches: the re-read walks every link.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		emitEvent({ kind: 'progress', phase: 'key-reread', done: rows.length, total: rows.length });
+		this.markKeyRereadDone(stats);
 	}
 
 	// ──────────────────────────────────────────────────────────────────────
@@ -821,14 +986,82 @@ export class RekordboxImporter extends EventEmitter {
 			return;
 		}
 
+		// Twin entries: a track with two local files can have two rekordbox
+		// content rows, and both match it. They are one Curator track, so the
+		// linked row speaks for it and the twin is skipped by every pass — it
+		// never maps to the track, so its rating, cues, tags and playlist
+		// places never land (e2e 2026-10-24: a twin's first link pushed its
+		// rating 5 onto the linked row, and the upsert below re-homed the
+		// link to whichever row came last). A different content row at the
+		// LINKED file is not a twin but the same file re-added in rekordbox,
+		// and re-homes the link as before. A track not linked yet is held
+		// until the track pass ends, so one of its rows is picked knowing all
+		// of them (flushFirstLinks).
+		const held = this.db
+			.select({ rbContentId: rekordboxLink.rbContentId, rbFilePath: rekordboxLink.rbFilePath })
+			.from(rekordboxLink)
+			.where(eq(rekordboxLink.trackId, link.trackId))
+			.get();
+		if (!held) {
+			const list = this.pendingFirstLinks.get(link.trackId);
+			if (list) list.push(row);
+			else this.pendingFirstLinks.set(link.trackId, [row]);
+			return;
+		}
+		if (held.rbContentId !== row.rb_content_id && held.rbFilePath !== row.file_path) {
+			this.twinsSkipped++;
+			return;
+		}
+		this.landTrackDelta(row, link.trackId, idMap, totals, overwriteCurator);
+	}
+
+	// The held first links (applyTrackDelta): one content row per track is
+	// linked, the rest are twins. The pick is deterministic whatever order
+	// rekordbox streamed them in: the row at the track's primary file — its
+	// first live local file, the one it was minted from (source_link rows are
+	// updated in place, so rowid keeps that order) — else the lowest content
+	// id. An incremental pull may carry only one of a pair; that one links,
+	// and the other is a twin when it next arrives.
+	private flushFirstLinks(idMap: Map<string, string>, totals: ImportTotals, overwriteCurator: boolean): void {
+		const pending = [...this.pendingFirstLinks];
+		this.pendingFirstLinks.clear();
+		const primaryOf = rawOf(this.db).prepare(`SELECT file_path FROM source_link
+			WHERE track_id = ? AND source = 'local' AND file_path IS NOT NULL
+			ORDER BY missing_at IS NOT NULL, rowid LIMIT 1`).pluck();
+		const byContentId = (a: TrackDeltaRow, b: TrackDeltaRow): number => {
+			const x = String(a.rb_content_id), y = String(b.rb_content_id);
+			return x.length - y.length || (x < y ? -1 : x > y ? 1 : 0);
+		};
+		for (const [trackId, rows] of pending) {
+			let pick = rows[0]!;
+			if (rows.length > 1) {
+				const primary = primaryOf.get(trackId) as string | undefined;
+				pick = rows.find((r) => r.file_path === primary) ?? [...rows].sort(byContentId)[0]!;
+				this.twinsSkipped += rows.length - 1;
+			}
+			try {
+				this.landTrackDelta(pick, trackId, idMap, totals, overwriteCurator);
+			} catch (err) {
+				ilog.error('event handler threw', err, { event: 'track' });
+			}
+		}
+	}
+
+	private landTrackDelta(
+		row: TrackDeltaRow,
+		trackId: string,
+		idMap: Map<string, string>,
+		totals: ImportTotals,
+		overwriteCurator: boolean,
+	): void {
 		totals.tracksMatched++;
-		idMap.set(row.rb_content_id, link.trackId);
+		idMap.set(row.rb_content_id, trackId);
 		// Periodic progress for very large libraries — every 500 considered.
 		if (totals.tracksConsidered % 500 === 0) {
 			ilog.debug('tracks progress', { considered: totals.tracksConsidered, matched: totals.tracksMatched });
 		}
 
-		const existing = this.db.select().from(track).where(eq(track.id, link.trackId)).get();
+		const existing = this.db.select().from(track).where(eq(track.id, trackId)).get();
 		if (!existing) return;
 
 		// Existing rekordbox_link tells us the baseline timestamps. First
@@ -848,7 +1081,7 @@ export class RekordboxImporter extends EventEmitter {
 		// Beatport/MusicBrainz, for example).
 		const rbWins = overwriteCurator || decideRbWins(rbTs, existing.updatedAt, existingLink?.rbUpdatedAtSeen ?? null);
 
-		if (rbWins) this.rbWinsTracks.add(link.trackId);
+		if (rbWins) this.rbWinsTracks.add(trackId);
 
 		// None of the patches below bump track.updatedAt — that field tracks
 		// the last Curator-side change, and an import that bumps it would
@@ -863,7 +1096,7 @@ export class RekordboxImporter extends EventEmitter {
 		// Key is stored canonically as Camelot only. Prefer rb's Camelot; if rb
 		// only carried a musical spelling, convert at this boundary (rb's two
 		// key fields can disagree — Camelot is the one we trust/keep).
-		const rbCamelot = row.key_camelot ?? keyToCamelot(row.key_musical);
+		const rbCamelot = rbKeyOf(row);
 		if (rbCamelot != null) patch['keyCamelot'] = rbCamelot;
 		if (row.play_count != null) patch['playCount'] = row.play_count;
 		if (row.last_played_at_ms != null) patch['lastPlayedAt'] = new Date(row.last_played_at_ms);
@@ -888,9 +1121,9 @@ export class RekordboxImporter extends EventEmitter {
 			// "Sync Everything" — rb wins the whole surface, but keep the
 			// per-field null-preservation: empty rb values never erase
 			// Curator's non-null data (Beatport/MusicBrainz genre + label).
-			Object.assign(patch, buildPullPatch(rbFields, existing.overrides, { nullPreserve: true, clearOverrides: true, protect }));
+			Object.assign(patch, buildPullPatch(withoutRestatedCredits(rbFields, existing, this.creditFormat()), existing.overrides, { nullPreserve: true, clearOverrides: true, protect }));
 			this.db.delete(syncConflict)
-				.where(and(eq(syncConflict.provider, 'rekordbox'), eq(syncConflict.trackId, link.trackId)))
+				.where(and(eq(syncConflict.provider, 'rekordbox'), eq(syncConflict.trackId, trackId)))
 				.run();
 			nextFieldsSeen = rbFields;
 		} else if (baseline != null) {
@@ -906,7 +1139,7 @@ export class RekordboxImporter extends EventEmitter {
 			this.db.delete(syncConflict)
 				.where(and(
 					eq(syncConflict.provider, 'rekordbox'),
-					eq(syncConflict.trackId, link.trackId),
+					eq(syncConflict.trackId, trackId),
 					eq(syncConflict.kind, 'field'),
 				))
 				.run();
@@ -914,7 +1147,7 @@ export class RekordboxImporter extends EventEmitter {
 				this.db.insert(syncConflict).values({
 					id: randomUUID(),
 					provider: 'rekordbox',
-					trackId: link.trackId,
+					trackId,
 					kind: 'field',
 					fieldKey: c.field,
 					baseJson: c.base,
@@ -947,8 +1180,8 @@ export class RekordboxImporter extends EventEmitter {
 			// first-link rule (decideFirstLinkSide): a field the account wrote
 			// later is dropped from the pull, and the snapshot still records
 			// rb's value, so the push writes the account's.
-			let pull = rbFields;
-			if (!existingLink) pull = this.applyFirstLinkRule(existing, row, rbFields);
+			let pull = withoutRestatedCredits(rbFields, existing, this.creditFormat());
+			if (!existingLink) pull = this.applyFirstLinkRule(existing, row, pull);
 			if (rbWins) {
 				Object.assign(patch, buildPullPatch(pull, existing.overrides, { nullPreserve: true, clearOverrides: false, protect }));
 			}
@@ -992,10 +1225,10 @@ export class RekordboxImporter extends EventEmitter {
 			// A pulled rating or a cleared override is library state: the diff
 			// seam emits one op per synced field the patch changed (canonical
 			// fields — bpm, key, title, … — are catalogue data and do not).
-			mut.recordTrackStateChanges(this.db, [link.trackId], () => {
-				this.db.update(track).set(patch).where(eq(track.id, link.trackId)).run();
-				if ('artists' in patch || 'overrides' in patch) syncTrackArtistsById(this.db, [link.trackId]);
-				if ('albumTitle' in patch || 'artists' in patch || 'overrides' in patch) syncTrackAlbumsById(this.db, [link.trackId]);
+			mut.recordTrackStateChanges(this.db, [trackId], () => {
+				this.db.update(track).set(patch).where(eq(track.id, trackId)).run();
+				if ('artists' in patch || 'overrides' in patch) syncTrackArtistsById(this.db, [trackId]);
+				if ('albumTitle' in patch || 'artists' in patch || 'overrides' in patch) syncTrackAlbumsById(this.db, [trackId]);
 			});
 			totals.tracksUpdated++;
 		}
@@ -1010,8 +1243,8 @@ export class RekordboxImporter extends EventEmitter {
 		// rekordbox changing it here (mutators.ts recordRbAnalysisChanges).
 		if (rbCamelot != null) {
 			const raw = rawOf(this.db);
-			if (readRbSlot(raw, link.trackId)?.rb_key_camelot !== rbCamelot || mut.rbUnitSeen(raw, link.trackId, 'key') !== rbCamelot) {
-				mut.recordRbAnalysisChanges(this.db, new Map([[link.trackId, ['key'] as const]]), (raw) => writeRbSlot(raw, link.trackId, { keyCamelot: rbCamelot }));
+			if (readRbSlot(raw, trackId)?.rb_key_camelot !== rbCamelot || mut.rbUnitSeen(raw, trackId, 'key') !== rbCamelot) {
+				mut.recordRbAnalysisChanges(this.db, new Map([[trackId, ['key'] as const]]), (raw) => writeRbSlot(raw, trackId, { keyCamelot: rbCamelot }));
 			}
 		}
 
@@ -1020,7 +1253,7 @@ export class RekordboxImporter extends EventEmitter {
 		// regardless of who won (conflicted fields excepted — their baseline
 		// entries were held back by the merge above).
 		const linkRow: NewRekordboxLink = {
-			trackId: link.trackId,
+			trackId,
 			rbContentId: row.rb_content_id,
 			rbLocalUsn: row.rb_local_usn,
 			rbFilePath: row.file_path,
@@ -1037,7 +1270,7 @@ export class RekordboxImporter extends EventEmitter {
 		// trackId, so without this it would trip the separate rb_content_id
 		// unique index (SQLITE_CONSTRAINT_UNIQUE) instead of re-homing the link.
 		this.db.delete(rekordboxLink)
-			.where(and(eq(rekordboxLink.rbContentId, row.rb_content_id), ne(rekordboxLink.trackId, link.trackId)))
+			.where(and(eq(rekordboxLink.rbContentId, row.rb_content_id), ne(rekordboxLink.trackId, trackId)))
 			.run();
 		this.db.insert(rekordboxLink)
 			.values(linkRow)
@@ -1703,10 +1936,18 @@ export class RekordboxImporter extends EventEmitter {
 		// removal on the next push and delete it from rekordbox.
 		const adoptedRb = new Set<string>();
 		const writtenTracks = new Set<string>();
-		for (const cid of mergedRbIds) {
-			const trackId = this.resolveTrackId(cid, trackIdMap);
+		// Two rb ids resolving to one track keep one place: the track's
+		// linked content row, the same choice the track pass made (a twin is
+		// skipped there, so it normally does not resolve at all), else the
+		// first in order.
+		const resolved = mergedRbIds.map((cid) => [cid, this.resolveTrackId(cid, trackIdMap)] as const);
+		const placeOf = new Map<string, string>();
+		for (const [cid, trackId] of resolved) {
+			if (trackId && (!placeOf.has(trackId) || this.linkedContentOf(trackId) === cid)) placeOf.set(trackId, cid);
+		}
+		for (const [cid, trackId] of resolved) {
 			if (!trackId) continue;
-			if (writtenTracks.has(trackId)) continue; // two rb ids resolving to one track: keep the first
+			if (placeOf.get(trackId) !== cid || writtenTracks.has(trackId)) continue;
 			writtenTracks.add(trackId);
 			adoptedRb.add(cid);
 			desired.push({ trackId, addedAt: curAddedAt.get(trackId) ?? new Date(), addedBy: 'rekordbox', sourceTrackId: cid });
@@ -2216,6 +2457,10 @@ export class RekordboxImporter extends EventEmitter {
 			return link.trackId;
 		}
 		return null;
+	}
+
+	private linkedContentOf(trackId: string): string | null {
+		return this.db.select({ rbContentId: rekordboxLink.rbContentId }).from(rekordboxLink).where(eq(rekordboxLink.trackId, trackId)).get()?.rbContentId ?? null;
 	}
 
 	private loadWatermarks(): Record<string, number> {

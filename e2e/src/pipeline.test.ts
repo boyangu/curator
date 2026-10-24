@@ -70,7 +70,8 @@ describe.skipIf(blocked !== null)('rekordbox e2e pipeline (fixture)', () => {
 		expect(trip.rows!.some((d) => d.table === 'tracks')).toBe(true);
 		const rb = r.checks.find((c) => c.name === 'rekordbox.compare')!;
 		expect(rb.status).toBe('fail');
-		expect(rb.rows).toContainEqual({ table: 'content.title', key: '1003', left: 'Changed behind our back', right: 'Title 3' });
+		// The master would push 'Title 3': a difference it would not make.
+		expect(rb.rows).toContainEqual(expect.objectContaining({ table: 'content.title', key: '1003', left: 'Changed behind our back', right: 'Title 3', class: 'failure' }));
 	});
 
 	it('a dry run stops before rekordbox', async () => {

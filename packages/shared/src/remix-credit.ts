@@ -137,11 +137,16 @@ export function formatTrackTitle(title: string, artists: readonly TrackArtist[] 
 	if (tag) return formatTrackTitle(untagged, artists, style) + tag;
 	const remixers = (artists ?? []).filter((a) => a?.role === 'remixer' && a.name).map((a) => a.name);
 	if (remixers.length === 0 || !title) return title;
-	const keys = remixers.map((n) => searchFold(n).replace(/[^\p{L}\p{N}&]/gu, ''));
-	const names = (core: string): boolean => {
-		const k = searchFold(core).replace(/[^\p{L}\p{N}&]/gu, '');
-		return !!k && keys.some((r) => k.startsWith(r) || r.startsWith(k));
-	};
+	const keyOf = (s: string): string => searchFold(s).replace(/[^\p{L}\p{N}&]/gu, '');
+	const keys = remixers.map(keyOf);
+	// A collaboration segment names each of its remixers: "Adam Ten & Rafael
+	// Remix" mentions Adam Ten AND Rafael. Comparing only the whole core
+	// matched the first name and appended "(Rafael Remix)" for the second —
+	// the doubled titles the e2e run found in rekordbox (2026-10-24). The
+	// whole core stays a candidate for a duo credited as one remixer.
+	const partsOf = (core: string): string[] => [core, ...core.split(/\s*[,;&+]\s*|\s+(?:x|vs\.?)\s+/i)].map(keyOf).filter(Boolean);
+	const named = (k: string): boolean => keys.some((r) => k.startsWith(r) || r.startsWith(k));
+	const names = (core: string): boolean => partsOf(core).some(named);
 	// Spans to lift: bracket groups + the " - X" tail, each ending with a
 	// mix-type word and naming a remixer.
 	const spans: Array<{ start: number; end: number; text: string }> = [];
@@ -159,9 +164,9 @@ export function formatTrackTitle(title: string, artists: readonly TrackArtist[] 
 	base = base.replace(/\s{2,}/g, ' ').trim();
 	const segs = spans.sort((a, b) => a.start - b.start).map((s) => s.text);
 	// Remixers the title never mentioned still get their credit.
-	const mentioned = segs.map((s) => searchFold(coreOf(s)).replace(/[^\p{L}\p{N}&]/gu, ''));
+	const mentioned = segs.flatMap((s) => partsOf(coreOf(s)));
 	for (const r of remixers) {
-		const k = searchFold(r).replace(/[^\p{L}\p{N}&]/gu, '');
+		const k = keyOf(r);
 		if (!mentioned.some((m) => m.startsWith(k) || k.startsWith(m))) segs.push(`${r} Remix`);
 	}
 	if (segs.length === 0) return title;

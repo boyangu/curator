@@ -63,8 +63,14 @@ function rbDelta(over: Partial<{ rating: number | null; comment: string | null; 
 function pull(row: ReturnType<typeof rbDelta>): void {
 	const importer = new RekordboxImporter(db, {} as never);
 	const totals = new Proxy({}, { get: () => 0, set: () => true });
-	(importer as unknown as { applyTrackDelta: (r: unknown, f: unknown, m: Map<string, string>, t: unknown) => void })
-		.applyTrackDelta(row, {}, new Map(), totals);
+	const idMap = new Map<string, string>();
+	const i = importer as unknown as {
+		applyTrackDelta: (r: unknown, f: unknown, m: Map<string, string>, t: unknown) => void;
+		// A first link is held until the track pass ends (twin rekordbox entries).
+		flushFirstLinks: (m: Map<string, string>, t: unknown, o: boolean) => void;
+	};
+	i.applyTrackDelta(row, {}, idMap, totals);
+	i.flushFirstLinks(idMap, totals, false);
 }
 
 function updatesScope(): string[] {

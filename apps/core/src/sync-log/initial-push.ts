@@ -60,6 +60,7 @@ import { drainPlaylistAttrsAsync, queuePlaylistAttrsBackfill } from './playlist-
 import { drainTrackAnalysisAsync, queueTrackAnalysisBackfillAsync } from './track-analysis.js';
 import { drainTrackAttrsAsync, queueTrackAttrsBackfillAsync } from './track-attrs.js';
 import { drainTrackMetaAsync, queueTrackMetaBackfillAsync } from './track-meta.js';
+import { emitV4 } from './features.js';
 import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async } from './v4-backfill.js';
 import {
 	claimOp, cueUpsertOp, folderCreateOp, overrideOp, parseOverrides, pinnedCreateOp, playlistCreateOps, ratingOp, rbUnitOp, rbUnitValue, recordingResolver, stateOp, tagCreateOp,
@@ -216,8 +217,10 @@ function estimateRecordingOps(raw: Raw): number {
 }
 
 // Every op the initial push would emit, in library order, each stamped with
-// its row's own time.
-function* initialPushOps(raw: Raw): Generator<EmitOp> {
+// its row's own time. `v4`: cues go out in the v4 shape, origin included —
+// the founder's fold always (its records are local; records carry no
+// protocol version), a joiner once the server reads v4 (emitV4).
+function* initialPushOps(raw: Raw, opts: { v4: boolean }): Generator<EmitOp> {
 	// Rows are read with .all(), not .iterate(): better-sqlite3 refuses a
 	// write on a connection with an open iterator, and the chunks flush
 	// mid-scan.
@@ -271,14 +274,20 @@ function* initialPushOps(raw: Raw): Generator<EmitOp> {
 		yield stamp({ entity: 'track_tag', entity_id: key, kind: 'add', payload: {} }, r.added_at);
 	}
 
-	// Cues, at the track's cue-edit stamp (or the cue's own creation).
-	for (const r of raw.prepare(`SELECT c.track_id, c.slot, c.kind, c.position_sec, c.length_sec, c.color, c.name, c.created_at, t.cues_edited_at
+	// Cues, at the track's cue-edit stamp (or the cue's own creation), with
+	// their origin when v4 is spoken. A v1 upsert left the origin to the cue
+	// origin backfill, which must restate with a FRESH clock (v4-backfill.ts)
+	// — so a founded base carried every rekordbox cue at founding time, and
+	// the first-link rule (importer.ts) then let that "edit" beat every real
+	// rekordbox cue edit made before it (e2e run 2026-10-24: a fresh desktop's
+	// push wiped newer hot cues on 6 tracks).
+	for (const r of raw.prepare(`SELECT c.track_id, c.slot, c.kind, c.position_sec, c.length_sec, c.color, c.name, c.origin, c.created_at, t.cues_edited_at
 		FROM cue c JOIN track t ON t.id = c.track_id WHERE c.slot >= 0 AND t.remote_only = 0 ORDER BY c.track_id, c.kind, c.slot`).all() as Array<CueRow & { track_id: string; created_at: number; cues_edited_at: number | null }>) {
 		const recording = rec(r.track_id);
 		if (!recording) continue;
 		const key = cueEntityId(recording, r.slot, r.kind);
 		if (has('cues', key) || tombstoned('cue', key)) continue;
-		yield stamp(cueUpsertOp(recording, r), r.cues_edited_at ?? r.created_at);
+		yield stamp(cueUpsertOp(recording, r, opts.v4), r.cues_edited_at ?? r.created_at);
 	}
 
 	// Recordings: each row's create and claims, before the state that
@@ -392,7 +401,7 @@ export function initialPush(raw: Raw, opts: { chunk?: number } = {}): InitialPus
 	const byEntity: Record<string, number> = {};
 	let total = 0;
 	let pending: EmitOp[] = [];
-	for (const op of initialPushOps(raw)) {
+	for (const op of initialPushOps(raw, { v4: emitV4(raw) })) {
 		pending.push(op);
 		total++;
 		if (pending.length >= chunk) { emitChunk(raw, pending, byEntity, 'initial-push'); pending = []; }
@@ -421,7 +430,7 @@ export type DriveOptions = { chunk?: number; onProgress?: (p: InitialPushProgres
 // The joiner (header): after the bootstrap and the bind sweep, what this
 // library alone holds goes up as the 'initial-push' batch.
 export async function joinPushAsync(raw: Raw, opts: DriveOptions = {}): Promise<InitialPushAsyncResult> {
-	return driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => markStated(raw), 'initial-push', false, opts);
+	return driveAsync(raw, initialPushOps(raw, { v4: emitV4(raw) }), estimateInitialPush(raw), () => markStated(raw), 'initial-push', false, opts);
 }
 
 export type FoldLibraryResult = InitialPushAsyncResult & {
@@ -448,7 +457,7 @@ export async function foldLibraryAsync(
 	opts: DriveOptions & { feed?: { backfill(o: { local: true }): Promise<{ emitted: number }> } } = {},
 ): Promise<FoldLibraryResult> {
 	const started = Date.now();
-	const r = await driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { /* marked below, after the drains */ }, 'initial-push', true, opts);
+	const r = await driveAsync(raw, initialPushOps(raw, { v4: true }), estimateInitialPush(raw), () => { /* marked below, after the drains */ }, 'initial-push', true, opts);
 	const out: FoldLibraryResult = { ...r, meta: 0, attrs: 0, analysis: 0, playlistAttrs: 0, v4: 0, claims: 0, albums: 0, feed: 0 };
 	if (opts.signal?.aborted) return out;
 	const slice = (ms: number): void => { out.maxSliceMs = Math.max(out.maxSliceMs, ms); };
