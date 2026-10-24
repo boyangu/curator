@@ -321,7 +321,7 @@ export async function runRekordboxE2E(opts: RunOptions): Promise<Report> {
 		{
 			// Linking takes what rekordbox holds and Curator never pulled; only
 			// a change rekordbox does not explain fails (classify.ts).
-			const classify = rb ? afterLinkClassifier(joiner.raw, rb.reference) : undefined;
+			const classify = rb ? afterLinkClassifier(founder.raw, joiner.raw, rb.reference) : undefined;
 			const d = await phase('compare after linking', () => diffDumps(founded, dumpOf(joiner.raw), undefined, undefined, classify));
 			const differing = d.tables.filter((t) => !t.equal);
 			const classes = sumClasses(differing.map((t) => t.byClass));

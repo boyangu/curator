@@ -61,9 +61,10 @@ import { RekordboxSidecar, type SidecarError, type RekordboxScope } from './side
 import { advanceRbBaselineAfterPull, eqArr, seqIn } from './order-util.js';
 import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from './rb-slot.js';
 import { log } from '../log.js';
-import { CUES_EDITED_CELL, CURATION_CELL_PREFIX, type Cell, type LwwRecord } from '@curator/protocol';
+import { CUES_EDITED_CELL, CURATION_CELL_PREFIX, resolveTrackMeta, type Cell, type LwwRecord } from '@curator/protocol';
 import { commentFreeText } from '../sync-log/track-curation.js';
-import { rbUnitMirrors } from '../sync-log/rows.js';
+import { OVERRIDE_FIELD_OF, rbUnitMirrors } from '../sync-log/rows.js';
+import { masterDevice } from '../sync-log/role.js';
 
 const ilog = log.for('rekordbox-import');
 
@@ -446,6 +447,10 @@ export function decideRbWins(rbTs: Date | null, curatorTs: Date, seen: Date | nu
 //     comment          `curation.comment` cell (compared as free text, the
 //                      MyTag block is a per-machine derivation)
 //     colour           `curation.color_label` cell
+//     title / artist   the later of the recording's meta cell (the master's
+//                      `meta.<device>`, resolveTrackMeta) and the field's
+//                      override cell; compared as the composed strings the
+//                      push writes (curatorFieldsView)
 //     cues (whole set) `cues_edited_at` cell value, or the latest cue record
 //     MyTag membership the track_tag tombstone (an account REMOVAL) — an add
 //                      the account holds is already in Curator and survives
@@ -462,8 +467,8 @@ export function decideRbWins(rbTs: Date | null, curatorTs: Date, seen: Date | nu
 // A taken rekordbox value is written through the mutators, so it is stated as
 // an op with a fresh clock; a kept account value leaves the baseline at
 // rekordbox's value, so the next push writes the account's into rekordbox.
-// Title/artist/album/genre/label are not decided here: their account values
-// are overrides, which the bootstrap leaves shadowing the canonical columns
+// Album/genre/label are not decided here: their account values are
+// overrides, which the bootstrap leaves shadowing the canonical columns
 // rekordbox's values land in (catalogue data, no op) — the push sends them.
 // Later pulls (link exists) never reach this: the three-way merge owns them.
 export type FirstLinkSide = 'rb' | 'account';
@@ -481,7 +486,7 @@ export function firstLinkMembershipSide(rbTs: number | null, removedTs: number):
 	return rbTs != null && rbTs > removedTs ? 'rb' : 'account';
 }
 
-type FirstLinkField = 'rating' | 'comment' | 'colorLabel' | 'cues' | 'mytags' | 'playlists';
+type FirstLinkField = 'rating' | 'comment' | 'colorLabel' | 'title' | 'artist' | 'cues' | 'mytags' | 'playlists';
 
 // What the track pass learned about a first-linked track, before any write of
 // this run could add cells to its record. Later passes (cues, MyTags,
@@ -527,6 +532,13 @@ export class RekordboxImporter extends EventEmitter {
 	// count of twins skipped this run. Reset per runImport().
 	private pendingFirstLinks = new Map<string, TrackDeltaRow[]>();
 	private twinsSkipped = 0;
+	// Tracks with twins whose pick waits for the playlist pass (settleTwins),
+	// and every content id they hold.
+	private heldTwins = new Map<string, TrackDeltaRow[]>();
+	private heldTwinIds = new Set<string>();
+	// The account's master device, read once per run (the first-link rule's
+	// title/artist clocks).
+	private masterId: string | null | undefined = undefined;
 	// Set while the one-time key re-read scan runs: its track rows feed the
 	// re-read, never the track pass (rereadRbKeys).
 	private keyRereadSink: ((row: TrackDeltaRow) => void) | null = null;
@@ -645,8 +657,32 @@ export class RekordboxImporter extends EventEmitter {
 			});
 		};
 
+		// A track with twins is picked knowing rekordbox's playlists when the
+		// pass will stream them (pickFirstLink): its pick, the waveform rows
+		// of its candidates and every playlist row wait for the end of the
+		// playlist pass, so no playlist merges before the track has its link.
+		const holdTwins = opts.flags.syncPlaylists;
+		let heldPlaylists: PlaylistDeltaRow[] = [];
+		const heldWaveforms: WaveformDeltaRow[] = [];
 		const flushFirstLinks = (): void => {
-			if (this.pendingFirstLinks.size > 0) this.flushFirstLinks(trackIdByRbId, totals, overwrite);
+			if (this.pendingFirstLinks.size > 0) this.flushFirstLinks(trackIdByRbId, totals, overwrite, holdTwins);
+		};
+		const settleTwins = (): void => {
+			if (this.heldTwins.size === 0) return;
+			const playlists = heldPlaylists;
+			heldPlaylists = [];
+			this.landHeldTwins(playlists, trackIdByRbId, totals, overwrite);
+			if (heldWaveforms.length > 0) {
+				waveformBatch.push(...heldWaveforms.splice(0, heldWaveforms.length));
+				flushWaveforms();
+			}
+			for (const r of playlists) {
+				try {
+					this.applyPlaylistDelta(r, trackIdByRbId, playlistIdByRbId, totals);
+				} catch (err) {
+					ilog.error('event handler threw', err, { event: 'playlist' });
+				}
+			}
 		};
 
 		const onSidecarEvent = ({ event, frame }: { event: string; frame: Record<string, unknown> }): void => {
@@ -670,6 +706,8 @@ export class RekordboxImporter extends EventEmitter {
 				// first links land before a playlist, tag, cue or history row
 				// needs their content ids resolved.
 				if (event !== 'track') flushFirstLinks();
+				// The playlist pass is over once anything after it streams.
+				if (this.heldTwins.size > 0 && event !== 'cues' && event !== 'waveform' && event !== 'playlist') settleTwins();
 				if (event === 'track') {
 					this.applyTrackDelta(row as unknown as TrackDeltaRow, opts.flags, trackIdByRbId, totals, overwrite);
 				} else if (event === 'cues') {
@@ -683,7 +721,8 @@ export class RekordboxImporter extends EventEmitter {
 					if (list) list.push(cueRow);
 					else cueBuffer.set(cueRow.rb_content_id, [cueRow]);
 				} else if (event === 'playlist') {
-					this.applyPlaylistDelta(row as unknown as PlaylistDeltaRow, trackIdByRbId, playlistIdByRbId, totals);
+					if (this.heldTwins.size > 0) heldPlaylists.push(row as unknown as PlaylistDeltaRow);
+					else this.applyPlaylistDelta(row as unknown as PlaylistDeltaRow, trackIdByRbId, playlistIdByRbId, totals);
 				} else if (event === 'playlist_index') {
 					playlistIndex = row as unknown as PlaylistIndexRow;
 				} else if (event === 'mytag') {
@@ -691,7 +730,9 @@ export class RekordboxImporter extends EventEmitter {
 					if (mt.rb_local_deleted) deadMyTags.push(mt);
 					else this.applyMyTagDelta(mt, opts.flags, trackIdByRbId, totals);
 				} else if (event === 'waveform') {
-					waveformBatch.push(row as unknown as WaveformDeltaRow);
+					const wf = row as unknown as WaveformDeltaRow;
+					if (this.heldTwinIds.has(String(wf.rb_content_id))) heldWaveforms.push(wf);
+					else waveformBatch.push(wf);
 					if (waveformBatch.length >= WAVEFORM_BATCH_SIZE) flushWaveforms();
 				} else if (event === 'history') {
 					historyBatch.push(row as unknown as HistoryDeltaRow);
@@ -708,6 +749,9 @@ export class RekordboxImporter extends EventEmitter {
 		this.firstLinkStats = { firstLinks: 0, withAccount: 0, rbWon: 0, accountWon: 0, byField: {} };
 		this.pendingFirstLinks.clear();
 		this.twinsSkipped = 0;
+		this.heldTwins.clear();
+		this.heldTwinIds.clear();
+		this.masterId = undefined;
 		this.keyRereadSink = null;
 
 		this.sidecar.on('event', onSidecarEvent);
@@ -752,8 +796,10 @@ export class RekordboxImporter extends EventEmitter {
 				targetContentIds: opts.target?.rbContentIds,
 				targetPlaylistIds: opts.target?.rbPlaylistIds,
 			});
-			// A scan of the track pass alone ends with first links still held.
+			// A scan of the track pass alone ends with first links still held,
+			// and one whose playlist pass ended the stream with twins held.
 			flushFirstLinks();
+			settleTwins();
 			// Drain the waveform buffer — anything still pending when the scan
 			// finished (tail of the last batch) gets one final transaction.
 			flushWaveforms();
@@ -809,6 +855,7 @@ export class RekordboxImporter extends EventEmitter {
 			// throws, swallow it — the outer throw below is what the caller
 			// wants to see.
 			try { flushFirstLinks(); } catch { /* */ }
+			try { settleTwins(); } catch { /* */ }
 			try { flushWaveforms(); } catch { /* */ }
 			try { flushHistory(); } catch { /* */ }
 			const e = err as SidecarError;
@@ -1016,34 +1063,95 @@ export class RekordboxImporter extends EventEmitter {
 	}
 
 	// The held first links (applyTrackDelta): one content row per track is
-	// linked, the rest are twins. The pick is deterministic whatever order
-	// rekordbox streamed them in: the row at the track's primary file — its
-	// first live local file, the one it was minted from (source_link rows are
-	// updated in place, so rowid keeps that order) — else the lowest content
-	// id. An incremental pull may carry only one of a pair; that one links,
-	// and the other is a twin when it next arrives.
-	private flushFirstLinks(idMap: Map<string, string>, totals: ImportTotals, overwriteCurator: boolean): void {
+	// linked, the rest are twins. A track with twins waits for the playlist
+	// pass when one runs (`holdTwins`; settleTwins → landHeldTwins), the rest
+	// land now. An incremental pull may carry only one of a pair; that one
+	// links, and the other is a twin when it next arrives.
+	private flushFirstLinks(idMap: Map<string, string>, totals: ImportTotals, overwriteCurator: boolean, holdTwins: boolean): void {
 		const pending = [...this.pendingFirstLinks];
 		this.pendingFirstLinks.clear();
-		const primaryOf = rawOf(this.db).prepare(`SELECT file_path FROM source_link
-			WHERE track_id = ? AND source = 'local' AND file_path IS NOT NULL
-			ORDER BY missing_at IS NOT NULL, rowid LIMIT 1`).pluck();
-		const byContentId = (a: TrackDeltaRow, b: TrackDeltaRow): number => {
-			const x = String(a.rb_content_id), y = String(b.rb_content_id);
-			return x.length - y.length || (x < y ? -1 : x > y ? 1 : 0);
-		};
 		for (const [trackId, rows] of pending) {
-			let pick = rows[0]!;
-			if (rows.length > 1) {
-				const primary = primaryOf.get(trackId) as string | undefined;
-				pick = rows.find((r) => r.file_path === primary) ?? [...rows].sort(byContentId)[0]!;
-				this.twinsSkipped += rows.length - 1;
+			if (rows.length > 1 && holdTwins) {
+				this.heldTwins.set(trackId, rows);
+				for (const r of rows) this.heldTwinIds.add(String(r.rb_content_id));
+				continue;
 			}
-			try {
-				this.landTrackDelta(pick, trackId, idMap, totals, overwriteCurator);
-			} catch (err) {
-				ilog.error('event handler threw', err, { event: 'track' });
+			this.landFirstLink(trackId, rows, null, idMap, totals, overwriteCurator);
+		}
+	}
+
+	// The held twins, picked knowing the playlist pass's rows.
+	private landHeldTwins(playlists: readonly PlaylistDeltaRow[], idMap: Map<string, string>, totals: ImportTotals, overwriteCurator: boolean): void {
+		const held = [...this.heldTwins];
+		const ids = this.heldTwinIds;
+		this.heldTwins = new Map();
+		this.heldTwinIds = new Set();
+		// Per candidate content row, the live rekordbox playlists holding it.
+		const playlistsOf = new Map<string, string[]>();
+		for (const p of playlists) {
+			if (p.rb_local_deleted || p.is_folder || p.is_smart) continue;
+			for (const t of p.tracks) {
+				const cid = String(t.rb_content_id);
+				if (!ids.has(cid)) continue;
+				const list = playlistsOf.get(cid);
+				if (list) list.push(p.rb_playlist_id);
+				else playlistsOf.set(cid, [p.rb_playlist_id]);
 			}
+		}
+		const placed = rawOf(this.db).prepare(`SELECT 1 FROM playlist_track WHERE playlist_id = ? AND track_id = ? LIMIT 1`).pluck();
+		for (const [trackId, rows] of held) {
+			const evidence = new Map(rows.map((r) => {
+				const pids = playlistsOf.get(String(r.rb_content_id)) ?? [];
+				return [String(r.rb_content_id), { account: pids.filter((pid) => placed.get(`rb_${pid}`, trackId) != null).length, rb: pids.length }] as const;
+			}));
+			this.landFirstLink(trackId, rows, evidence, idMap, totals, overwriteCurator);
+		}
+	}
+
+	// One content row of a first-linked track is linked; the others are its
+	// twins. The pick is deterministic whatever order rekordbox streamed them
+	// in, and the same on every device:
+	//   1. the row in the most rekordbox playlists where the account places
+	//      the track — a twin linked instead was pushed into every one of
+	//      them beside the row already there (e2e 2026-10-24: one song twice
+	//      in 7 playlists, the second desktop's file order having picked the
+	//      other copy);
+	//   2. the row in the most rekordbox playlists (what rekordbox itself
+	//      uses: a twin's playlists never resolve, so they would hold nothing
+	//      Curator links);
+	//   3. the row at the track's primary file — its first live local file,
+	//      the one it was minted from (source_link rows are updated in place,
+	//      so rowid keeps that order);
+	//   4. the lowest content id.
+	// `evidence` is null when no playlist pass ran: 3 and 4 decide.
+	private landFirstLink(
+		trackId: string,
+		rows: TrackDeltaRow[],
+		evidence: ReadonlyMap<string, { account: number; rb: number }> | null,
+		idMap: Map<string, string>,
+		totals: ImportTotals,
+		overwriteCurator: boolean,
+	): void {
+		let pick = rows[0]!;
+		if (rows.length > 1) {
+			const primary = rawOf(this.db).prepare(`SELECT file_path FROM source_link
+				WHERE track_id = ? AND source = 'local' AND file_path IS NOT NULL
+				ORDER BY missing_at IS NOT NULL, rowid LIMIT 1`).pluck().get(trackId) as string | undefined;
+			const score = (r: TrackDeltaRow): { account: number; rb: number } => evidence?.get(String(r.rb_content_id)) ?? { account: 0, rb: 0 };
+			const byContentId = (a: TrackDeltaRow, b: TrackDeltaRow): number => {
+				const x = String(a.rb_content_id), y = String(b.rb_content_id);
+				return x.length - y.length || (x < y ? -1 : x > y ? 1 : 0);
+			};
+			pick = [...rows].sort((a, b) => score(b).account - score(a).account
+				|| score(b).rb - score(a).rb
+				|| Number(b.file_path === primary) - Number(a.file_path === primary)
+				|| byContentId(a, b))[0]!;
+			this.twinsSkipped += rows.length - 1;
+		}
+		try {
+			this.landTrackDelta(pick, trackId, idMap, totals, overwriteCurator);
+		} catch (err) {
+			ilog.error('event handler threw', err, { event: 'track' });
 		}
 	}
 
@@ -1322,12 +1430,11 @@ export class RekordboxImporter extends EventEmitter {
 			if (!cell) return null;
 			return (cell.value ?? null) === current ? cell.clock.ts : Math.max(cell.clock.ts, existing.updatedAt.getTime());
 		};
-		const decide = (field: FirstLinkField & keyof FieldsSeen, rbVal: unknown, curVal: unknown, has: (v: unknown) => boolean, cellName: string): void => {
+		const decide = (field: FirstLinkField & keyof FieldsSeen, rbVal: unknown, curVal: unknown, has: (v: unknown) => boolean, ts: number | null): void => {
 			const rbHas = has(rbVal);
 			const curHas = has(curVal);
 			if (!rbHas && !curHas) return;
 			if (rbHas && curHas && rbVal === curVal) return;
-			const ts = accountTs(cellName, curVal);
 			if (ts == null) return; // rule 1: today's behaviour
 			const side = decideFirstLinkSide(rbHas, curHas, rbTs, ts);
 			if (side === 'account') delete pull[field];
@@ -1335,9 +1442,36 @@ export class RekordboxImporter extends EventEmitter {
 		};
 		const rated = (v: unknown): boolean => v != null && Number(v) > 0;
 		const text = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
-		decide('rating', row.rating == null ? null : Number(row.rating), existing.rating, rated, 'rating');
-		decide('comment', commentFreeText(row.comment), commentFreeText(existing.comment), text, `${CURATION_CELL_PREFIX}comment`);
-		decide('colorLabel', row.color_label, existing.colorLabel, text, `${CURATION_CELL_PREFIX}color_label`);
+		decide('rating', row.rating == null ? null : Number(row.rating), existing.rating, rated, accountTs('rating', existing.rating));
+		decide('comment', commentFreeText(row.comment), commentFreeText(existing.comment), text, accountTs(`${CURATION_CELL_PREFIX}comment`, commentFreeText(existing.comment)));
+		decide('colorLabel', row.color_label, existing.colorLabel, text, accountTs(`${CURATION_CELL_PREFIX}color_label`, existing.colorLabel));
+
+		// Title and artist, compared as the strings the push composes (a
+		// restated one is already gone from the pull: withoutRestatedCredits).
+		// The account's clock is the later of the recording's meta cell (the
+		// master's `meta.<device>`, resolveTrackMeta) and the field's override
+		// cell. rekordbox winning keeps today's path (the pull lands rb's
+		// string: an override in place, else the credits rebuilt from it);
+		// the account winning pulls nothing, and the push sends the account's
+		// composition — a first link let a stale rekordbox artist line
+		// rebuild the account's credits (e2e 2026-10-24: two main artists and
+		// a remixer became one run-together main name and a re-cased
+		// remixer).
+		// An account with no credits takes rekordbox's artist (rule 2).
+		if (('title' in pull || 'artist' in pull) && rec) {
+			if (this.masterId === undefined) this.masterId = masterDevice(rawOf(this.db));
+			const metaTs = resolveTrackMeta({ fields: cells }, this.masterId)?.clock.ts ?? null;
+			const overrideTs = (key: 'title' | 'artists'): number | null => {
+				const cell = cells[`override.${OVERRIDE_FIELD_OF[key]}`];
+				if (!cell) return null;
+				const same = JSON.stringify(cell.value ?? null) === JSON.stringify(existing.overrides?.[key] ?? null);
+				return same ? cell.clock.ts : Math.max(cell.clock.ts, existing.updatedAt.getTime());
+			};
+			const later = (a: number | null, b: number | null): number | null => (a == null ? b : b == null ? a : Math.max(a, b));
+			const ours = curatorFieldsView(existing, this.creditFormat());
+			if ('title' in pull) decide('title', row.title, ours.title, text, later(metaTs, overrideTs('title')));
+			if ('artist' in pull) decide('artist', row.artist, ours.artist, text, later(metaTs, overrideTs('artists')));
+		}
 		return pull;
 	}
 
@@ -1953,19 +2087,34 @@ export class RekordboxImporter extends EventEmitter {
 			desired.push({ trackId, addedAt: curAddedAt.get(trackId) ?? new Date(), addedBy: 'rekordbox', sourceTrackId: cid });
 		}
 		// Curator-only members (kind='curator') — rb can't track them, so keep
-		// whatever Curator currently has, in Curator order.
+		// whatever Curator currently has, each where Curator has it: after the
+		// member it follows in Curator's order (the nearest earlier one still
+		// in the list), or first. Appending them after every rb member moved
+		// one the moment Curator added linked tracks after it, and stated the
+		// move as an op (e2e 2026-10-24: a member with no rekordbox row moved
+		// behind the 11 tracks added after it).
+		const inDesired = new Set(desired.map((d) => d.trackId));
+		const after = new Map<string | null, mut.DesiredMember[]>();
+		let anchor: string | null = null;
 		for (const m of curMembers) {
-			if (m.kind !== 'curator') continue;
+			if (m.kind !== 'curator') {
+				if (inDesired.has(m.trackId)) anchor = m.trackId;
+				continue;
+			}
 			if (writtenTracks.has(m.trackId)) continue;
 			writtenTracks.add(m.trackId);
-			desired.push({ trackId: m.trackId, addedAt: m.addedAt ?? new Date(), addedBy: m.addedBy, sourceTrackId: m.sourceTrackId });
+			const list = after.get(anchor);
+			const member = { trackId: m.trackId, addedAt: m.addedAt ?? new Date(), addedBy: m.addedBy, sourceTrackId: m.sourceTrackId };
+			if (list) list.push(member);
+			else after.set(anchor, [member]);
 		}
+		const ordered: mut.DesiredMember[] = [...(after.get(null) ?? []), ...desired.flatMap((d) => [d, ...(after.get(d.trackId) ?? [])])];
 
 		this.db.transaction((tx) => {
 			// A diff against the current rows (add/move/remove ops for what
 			// changed), not a wipe: unchanged members keep their row ids, so a
 			// pull that changed nothing writes nothing.
-			mut.reconcileMembership(this.db, id, desired, 'rekordbox');
+			mut.reconcileMembership(this.db, id, ordered, 'rekordbox');
 			// Advance the rb-kind baseline to what both sides now hold (see
 			// advanceRbBaselineAfterPull for the per-member rules) so the push
 			// doesn't mistake rb-originated adds/order for Curator edits. Held

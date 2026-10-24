@@ -169,6 +169,28 @@ describe('import: rb→Curator 3-way merge', () => {
 		expect(members(pid)).toEqual(['tA']);
 	});
 
+	it('a Curator-only member keeps its place, ahead of linked tracks Curator added after it', () => {
+		seedTrack('tA', 'A'); seedTrack('tX', null); seedTrack('tB', 'B'); seedTrack('tC', 'C');
+		const pid = seedPlaylist('P');
+		// A second desktop's first pull: no baseline, rekordbox holds A only;
+		// X has no rekordbox file, B and C were added in Curator after it.
+		setMembers(pid, ['tA', 'tX', 'tB', 'tC']);
+		const keyOf = (t: string): string => sqlite.prepare(`SELECT order_key FROM playlist_track WHERE playlist_id = ? AND track_id = ?`).pluck().get(pid, t) as string;
+		const before = keyOf('tX');
+		runImportMerge(pid, 'P', ['A']);
+		expect(members(pid)).toEqual(['tA', 'tX', 'tB', 'tC']);
+		expect(keyOf('tX')).toBe(before);
+	});
+
+	it('a Curator-only member follows its predecessor through a rekordbox reorder, and leads when it led', () => {
+		seedTrack('tA', 'A'); seedTrack('tB', 'B'); seedTrack('tX', null); seedTrack('tY', null);
+		const pid = seedPlaylist('P');
+		setBaseline('P', [{ kind: 'rb', id: 'A' }, { kind: 'rb', id: 'B' }]);
+		setMembers(pid, ['tY', 'tA', 'tX', 'tB']);
+		runImportMerge(pid, 'P', ['B', 'A']);   // only rekordbox reordered
+		expect(members(pid)).toEqual(['tY', 'tB', 'tA', 'tX']);
+	});
+
 	it('honors the tombstone: rb re-add of deleted content is not imported, and is queued for rb removal', () => {
 		seedTrack('tA', 'A'); seedTrack('tB', 'B');
 		const pid = seedPlaylist('P');

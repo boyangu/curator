@@ -29,7 +29,6 @@ const STRONG = 'remix|rmx|re-mix|remake|rework|re-work|reworked|bootleg|refix|fl
 const WEAK = 'edit|re-edit|version|mix|dub|vip|interpretation|treatment|e-mix';
 const TYPE_END_RE = new RegExp(`\\s*\\b(${STRONG}|${WEAK})\\s*$`, 'i');
 const STRONG_END_RE = new RegExp(`\\b(${STRONG})\\s*$`, 'i');
-const SEG_RE = /[([]([^()[\]]*)[)\]]/g;
 const DASH_TAIL_RE = /\s-\s([^-]+)$/;
 
 // Words that describe a mix rather than name an artist. Stripped from the
@@ -57,13 +56,48 @@ const POSS_S_RE = /[’'‘´`]s$/;
 const POSS_OWNER_RE = /^(.+?)[’'‘´`]s\b/;
 const isGeneric = (w: string): boolean => GENERIC.has(w.toLowerCase().replace(POSS_S_RE, '')) || /^\d{2,4}$/.test(w);
 
+// Every balanced bracket pair of a title, as [start, end) spans in order of
+// start (an outer pair before the pairs inside it). Found with a stack, so
+// an unclosed "(" leaves the pairs after it standing; a stray closer is text.
+function bracketPairs(title: string): Array<{ start: number; end: number }> {
+	const pairs: Array<{ start: number; end: number }> = [];
+	const open: Array<{ ch: string; at: number }> = [];
+	for (let i = 0; i < title.length; i++) {
+		const ch = title[i]!;
+		if (ch === '(' || ch === '[') { open.push({ ch, at: i }); continue; }
+		if (ch !== ')' && ch !== ']') continue;
+		const want = ch === ')' ? '(' : '[';
+		let k = open.length - 1;
+		while (k >= 0 && open[k]!.ch !== want) k--;
+		if (k < 0) continue;
+		pairs.push({ start: open[k]!.at, end: i + 1 });
+		open.length = k;
+	}
+	return pairs.sort((a, b) => a.start - b.start);
+}
+
+// The bracket groups `accept` takes, outermost first: "(A, B (NL) Remix)"
+// is ONE group — an innermost-group match only ever saw "(NL)" and
+// appended both remixers again on every push. A group it does not take is
+// searched for one inside it ("(Night Set (X Dub Mix))"), and a group's
+// redundant wrapping brackets are not its text ("((X remix))" → "X remix").
+function bracketGroups(title: string, accept: (text: string) => boolean): Array<{ start: number; end: number; text: string }> {
+	const out: Array<{ start: number; end: number; text: string }> = [];
+	for (const p of bracketPairs(title)) {
+		if (out.some((g) => p.start >= g.start && p.end <= g.end)) continue;
+		let text = title.slice(p.start + 1, p.end - 1).trim();
+		while (bracketPairs(text).some((q) => q.start === 0 && q.end === text.length)) text = text.slice(1, -1).trim();
+		if (accept(text)) out.push({ ...p, text });
+	}
+	return out;
+}
+
 // Remix-shaped segments of a title: every bracketed group plus a trailing
 // " - X" tail (Spotify's "Title - X Remix"), kept only when they end with
 // a mix-type word. Returns [segment, strong?].
 function remixSegments(title: string): Array<{ seg: string; strong: boolean }> {
 	const out: Array<{ seg: string; strong: boolean }> = [];
-	const segs: string[] = [];
-	for (const m of title.matchAll(SEG_RE)) segs.push(m[1]!.trim());
+	const segs: string[] = bracketGroups(title, (text) => TYPE_END_RE.test(text)).map((g) => g.text);
 	const tail = title.match(DASH_TAIL_RE);
 	if (tail) segs.push(tail[1]!.trim());
 	for (const seg of segs) {
@@ -130,48 +164,89 @@ function resolveName(candidate: string, strong: boolean, isKnown: (fold: string)
 // with no matching segment (credited by hand) gets "<name> Remix". The
 // stored title is never touched — Settings → User Interface picks the
 // style; see artist-credit.ts ArtistCreditFormat.
+//
+// It is a fixed point: formatting its own output again gives the same
+// string, and no remixer is named by two segments. rekordbox holds what was
+// pushed and a first link can pull it back as the title, so anything else
+// grows the title by a segment on every push (e2e 2026-10-24: "T (A, B (NL)
+// Remix)" held in rekordbox as "T (A, B (NL) Remix) (B (NL) Remix)", pushed
+// back as that plus "(A Remix) (B (NL) Remix)").
 export function formatTrackTitle(title: string, artists: readonly TrackArtist[] | null | undefined, style: 'parenthesis' | 'dash'): string {
 	// A converted copy's "[WAV]" tag stays last — lifting the remix segment
 	// would otherwise re-attach it after the tag ("Song [WAV] (X Remix)").
 	const { base: untagged, tag } = stripFormatTag(title);
 	if (tag) return formatTrackTitle(untagged, artists, style) + tag;
-	const remixers = (artists ?? []).filter((a) => a?.role === 'remixer' && a.name).map((a) => a.name);
-	if (remixers.length === 0 || !title) return title;
 	const keyOf = (s: string): string => searchFold(s).replace(/[^\p{L}\p{N}&]/gu, '');
-	const keys = remixers.map(keyOf);
+	// One credit per remixer, however often the list repeats it.
+	const remixers: string[] = [];
+	const keys: string[] = [];
+	for (const a of artists ?? []) {
+		if (a?.role !== 'remixer' || !a.name) continue;
+		const k = keyOf(a.name);
+		if (!k || keys.includes(k)) continue;
+		remixers.push(a.name);
+		keys.push(k);
+	}
+	if (remixers.length === 0 || !title) return title;
 	// A collaboration segment names each of its remixers: "Adam Ten & Rafael
-	// Remix" mentions Adam Ten AND Rafael. Comparing only the whole core
-	// matched the first name and appended "(Rafael Remix)" for the second —
-	// the doubled titles the e2e run found in rekordbox (2026-10-24). The
-	// whole core stays a candidate for a duo credited as one remixer.
+	// Remix" mentions Adam Ten AND Rafael, "A, B (NL) Remix" both of its
+	// names. The whole core stays a candidate for a duo credited as one
+	// remixer.
 	const partsOf = (core: string): string[] => [core, ...core.split(/\s*[,;&+]\s*|\s+(?:x|vs\.?)\s+/i)].map(keyOf).filter(Boolean);
-	const named = (k: string): boolean => keys.some((r) => k.startsWith(r) || r.startsWith(k));
-	const names = (core: string): boolean => partsOf(core).some(named);
-	// Spans to lift: bracket groups + the " - X" tail, each ending with a
-	// mix-type word and naming a remixer.
-	const spans: Array<{ start: number; end: number; text: string }> = [];
-	for (const m of title.matchAll(SEG_RE)) {
-		const seg = m[1]!.trim();
-		if (TYPE_END_RE.test(seg) && names(coreOf(seg))) spans.push({ start: m.index!, end: m.index! + m[0].length, text: seg });
-	}
-	const tail = title.match(DASH_TAIL_RE);
-	if (tail && tail.index != null) {
-		const seg = tail[1]!.trim();
-		if (TYPE_END_RE.test(seg) && names(coreOf(seg)) && !spans.some((s) => s.start >= tail.index!)) spans.push({ start: tail.index, end: tail.index + tail[0].length, text: seg });
-	}
-	let base = title;
-	for (const s of [...spans].sort((a, b) => b.start - a.start)) base = base.slice(0, s.start) + base.slice(s.end);
-	base = base.replace(/\s{2,}/g, ' ').trim();
-	const segs = spans.sort((a, b) => a.start - b.start).map((s) => s.text);
+	// The remixers a segment names, as indices into `remixers`. Read from the
+	// core with its generic tail words stripped and with only the mix-type
+	// word stripped: a remixer whose name ends in generic words ("Sunset
+	// Dub") strips to nothing, and would be appended again on every format.
+	const namedBy = (seg: string): Set<number> => {
+		const parts = [...partsOf(coreOf(seg)), ...partsOf(seg.replace(TYPE_END_RE, '').trim())];
+		const out = new Set<number>();
+		keys.forEach((r, i) => { if (parts.some((k) => k.startsWith(r) || r.startsWith(k))) out.add(i); });
+		return out;
+	};
+	type Span = { start: number; end: number; text: string; named: Set<number> };
+	const spans: Span[] = [];
+	for (const g of bracketGroups(title, (text) => TYPE_END_RE.test(text) && namedBy(text).size > 0)) spans.push({ ...g, named: namedBy(g.text) });
+	// " - X Remix" parts: each spaced dash outside a bracket group starts one,
+	// running to the next such dash or the end — the dash style's own output
+	// ("T - A Remix - B Remix") reads back as both parts, and a hyphenated
+	// name ("Jean-Michel") never splits one. A lifted group inside a part is
+	// not part of its text.
+	const inSpan = (i: number, list: ReadonlyArray<{ start: number; end: number }>): boolean => list.some((s) => i >= s.start && i < s.end);
+	const liftedGroups = [...spans];
+	const pairs = bracketPairs(title);
+	const dashes = [...title.matchAll(/\s-\s/g)].filter((m) => !inSpan(m.index!, pairs));
+	dashes.forEach((m, d) => {
+		const start = m.index!;
+		const end = d + 1 < dashes.length ? dashes[d + 1]!.index! : title.length;
+		let text = '';
+		for (let i = start + m[0].length; i < end; i++) text += inSpan(i, liftedGroups) ? ' ' : title[i];
+		text = text.replace(/\s+/g, ' ').trim();
+		if (!TYPE_END_RE.test(text)) return;
+		const named = namedBy(text);
+		if (named.size > 0) spans.push({ start, end, text, named });
+	});
+	spans.sort((a, b) => a.start - b.start);
+	// One segment per remixer: a segment whose remixers another one already
+	// names is lifted and dropped — the copies earlier pushes appended. The
+	// list naming more is kept; of two naming the same, the first.
+	const within = (a: Set<number>, b: Set<number>): boolean => [...a].every((i) => b.has(i));
+	const kept = spans.filter((s, i) => !spans.some((o, j) => j !== i && within(s.named, o.named) && (o.named.size > s.named.size || j < i)));
+	let base = '';
+	for (let i = 0; i < title.length; i++) if (!inSpan(i, spans)) base += title[i];
+	// An empty "()" is what an earlier formatter left of "((X Remix))"; a
+	// segment lifted from inside a group leaves a space before its closer.
+	base = base.replace(/\(\s*\)|\[\s*\]/g, ' ').replace(/\s+([)\]])/g, '$1').replace(/\s{2,}/g, ' ').trim();
+	// Nothing but remix segments: there is no title to attach them to.
+	if (!base) return title;
+	const segs = kept.map((s) => s.text);
 	// Remixers the title never mentioned still get their credit.
-	const mentioned = segs.flatMap((s) => partsOf(coreOf(s)));
-	for (const r of remixers) {
-		const k = keyOf(r);
-		if (!mentioned.some((m) => m.startsWith(k) || k.startsWith(m))) segs.push(`${r} Remix`);
-	}
-	if (segs.length === 0) return title;
-	const wrapped = style === 'dash' ? segs.map((s) => ` - ${s}`).join('') : segs.map((s) => ` (${s})`).join('');
-	return (base || title) + wrapped;
+	const mentioned = new Set(kept.flatMap((s) => [...s.named]));
+	remixers.forEach((r, i) => { if (!mentioned.has(i)) segs.push(`${r} Remix`); });
+	// A segment holding a spaced dash of its own ("X Remix - Extended
+	// Version") stays bracketed in the dash style: as a dash part it would
+	// read back as two.
+	const wrapped = segs.map((s) => (style === 'dash' && !/\s-\s/.test(s) ? ` - ${s}` : ` (${s})`)).join('');
+	return base + wrapped;
 }
 
 export function extractRemixers(title: string, opts: RemixCreditOptions = {}): string[] {

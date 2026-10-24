@@ -281,3 +281,57 @@ describe('no account records for the recording', () => {
 		expect(row().rating).toBe(2);
 	});
 });
+
+// Title and artist: compared as the strings the push composes; the account's
+// clock is the recording's meta cell (the master's, else the best device's)
+// and the field's override cell. e2e 2026-10-24: a stale rekordbox artist
+// line rebuilt the account's three credits into two.
+describe('first link: title and artist follow the same rule', () => {
+	const ACCOUNT_CREDITS = [{ name: 'Ilo Marsh' }, { name: 'Rook Hale' }, { name: 'Pell Arno', role: 'remixer' }];
+	const meta = (artists: unknown[], ts: number) => ({
+		'meta.desk-a': { value: { source: 'local', title: 'Low Tide', artists, album_title: null, duration_sec: 300, isrc: null, release_date: null, label: null, genre: null, cover_url: null }, ts },
+	});
+	const seedCredits = (artists: unknown[], overrides: unknown = null): void => {
+		seedTrack();
+		sqlite.prepare(`UPDATE track SET title = 'Low Tide', artists = ?, overrides = ? WHERE id = 't1'`).run(JSON.stringify(artists), overrides == null ? null : JSON.stringify(overrides));
+	};
+	const credits = () => JSON.parse(sqlite.prepare(`SELECT artists FROM track WHERE id = 't1'`).pluck().get() as string) as Array<{ name: string; role?: string }>;
+	const titleOf = () => sqlite.prepare(`SELECT title FROM track WHERE id = 't1'`).pluck().get() as string;
+	// rekordbox's stale line: the names run together, the remixer re-cased.
+	const staleRb = { title: 'Low Tide (Pell arno Rmx)', artist: 'Rook Hale Ilo Marsh, Pell arno' };
+
+	it('the account wrote later: nothing is pulled, and the push sends the account\'s composition', async () => {
+		seedCredits(ACCOUNT_CREDITS);
+		seedAccountRecord(meta(ACCOUNT_CREDITS, NEWER));
+		const importer = await pull([trackFrame(staleRb)]);
+		expect(credits()).toEqual(ACCOUNT_CREDITS);
+		expect(titleOf()).toBe('Low Tide');
+		expect((statsOf(importer) as { byField: Record<string, unknown> }).byField).toMatchObject({ title: { rb: 0, account: 1 }, artist: { rb: 0, account: 1 } });
+		expect(opOf(pushOps(), 'track')!.fields).toMatchObject({ Title: 'Low Tide (Pell Arno Remix)', ArtistName: 'Ilo Marsh, Rook Hale, Pell Arno' });
+	});
+
+	it('rekordbox wrote later: its strings are pulled, as before', async () => {
+		seedCredits(ACCOUNT_CREDITS);
+		seedAccountRecord(meta(ACCOUNT_CREDITS, OLDER));
+		await pull([trackFrame(staleRb)]);
+		expect(titleOf()).toBe(staleRb.title);
+		expect(credits().map((a) => a.name)).toContain('Rook Hale Ilo Marsh');
+	});
+
+	it('a later override cell is the account\'s clock for its field', async () => {
+		seedCredits(ACCOUNT_CREDITS, { title: 'Low Tide (Long Version)' });
+		seedAccountRecord({ ...meta(ACCOUNT_CREDITS, OLDER), 'override.title': { value: 'Low Tide (Long Version)', ts: NEWER } });
+		await pull([trackFrame(staleRb)]);
+		const overrides = JSON.parse(sqlite.prepare(`SELECT overrides FROM track WHERE id = 't1'`).pluck().get() as string) as { title?: string };
+		expect(overrides.title).toBe('Low Tide (Long Version)');
+		// The artist line has no override: the meta cell is older, rb wins it.
+		expect(credits().map((a) => a.name)).toContain('Rook Hale Ilo Marsh');
+	});
+
+	it('an account with no credits takes rekordbox\'s artist even when the account is newer', async () => {
+		seedCredits([]);
+		seedAccountRecord(meta([], NEWER));
+		await pull([trackFrame({ title: 'Low Tide', artist: 'Kova Lune' })]);
+		expect(credits()).toEqual([{ name: 'Kova Lune' }]);
+	});
+});

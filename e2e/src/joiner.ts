@@ -35,8 +35,11 @@ export function attachLocalSources(master: Raw, joiner: Raw): AttachResult {
 	const cols = (joiner.prepare(`PRAGMA table_info(source_link)`).all() as Array<{ name: string }>).map((c) => c.name).filter((c) => c !== 'id' && c !== 'track_id');
 	const masterCols = new Set((master.prepare(`PRAGMA table_info(source_link)`).all() as Array<{ name: string }>).map((c) => c.name));
 	const shared = cols.filter((c) => masterCols.has(c));
+	// In the master's own file order (rowid): a track's first file stays its
+	// primary file here too, so a twin pick that no playlist decides falls
+	// the same way on both (importer.ts landFirstLink).
 	const links = master.prepare(`SELECT sl.*, t.recording_id AS recording_id FROM source_link sl JOIN track t ON t.id = sl.track_id
-		WHERE sl.source = 'local' AND t.derived_from_track_id IS NULL AND t.remote_only = 0 ORDER BY sl.track_id, sl.id`).all() as LinkRow[];
+		WHERE sl.source = 'local' AND t.derived_from_track_id IS NULL AND t.remote_only = 0 ORDER BY sl.track_id, sl.rowid`).all() as LinkRow[];
 	const out: AttachResult = { masterLinks: links.length, attached: 0, noHash: 0, noClaim: 0, noRow: 0, duplicatePath: 0, recordingMismatch: 0, samples: [] };
 	const note = (reason: string, l: LinkRow): void => {
 		if (out.samples.length < 50) out.samples.push({ reason, masterTrackId: l.track_id, recordingId: l.recording_id, filePath: l.file_path });

@@ -20,7 +20,7 @@
 
 import type Database from 'better-sqlite3';
 import { effectiveAlbum, effectiveArtistName, effectiveGenre, effectiveLabel, effectiveTitle } from '@curator/core/e2e';
-import type { ArtistCreditFormat, TrackArtist, TrackOverrides } from '@curator/shared';
+import { searchFold, type ArtistCreditFormat, type TrackArtist, type TrackOverrides } from '@curator/shared';
 import type { RbDump } from './compare-rb.js';
 
 type Raw = Database.Database;
@@ -119,7 +119,7 @@ export function rekordboxClassifier(founder: Raw, joiner: Raw, reference: RbDump
 	const joined = linksOf(joiner);
 	const tagStmt = founder.prepare(`SELECT g.name FROM track_tag tt JOIN tag g ON g.id = tt.tag_id WHERE tt.track_id = ? AND tt.tag_id LIKE 'rb\\_%' ESCAPE '\\'`).pluck();
 	const cueStmt = founder.prepare(`SELECT slot, kind, position_sec AS positionSec, length_sec AS lengthSec, color, name FROM cue WHERE track_id = ?`);
-	const memberStmt = founder.prepare(`SELECT l.rb_content_id FROM playlist_track pt JOIN rekordbox_link l ON l.track_id = pt.track_id WHERE pt.playlist_id = ?`).pluck();
+	const memberStmt = founder.prepare(`SELECT l.rb_content_id FROM playlist_track pt JOIN rekordbox_link l ON l.track_id = pt.track_id WHERE pt.playlist_id = ? ORDER BY pt.order_key, pt.id`).pluck();
 
 	const masterValue = (m: MasterLink, field: string): MasterValue => {
 		const text = (v: string | null): MasterValue => (nonEmpty(v) ? v.trim() : NO_OPINION);
@@ -166,12 +166,25 @@ export function rekordboxClassifier(founder: Raw, joiner: Raw, reference: RbDump
 
 	return (d) => {
 		if (d.kind === 'playlist') {
-			if (d.field !== 'playlist.members' || !Array.isArray(d.pushed)) return { class: 'failure', note: 'no master view for this playlist difference' };
+			if ((d.field !== 'playlist.members' && d.field !== 'playlist.order') || !Array.isArray(d.pushed)) return { class: 'failure', note: 'no master view for this playlist difference' };
 			const linked = new Set(joined.keys());
 			const members = (memberStmt.all(`rb_${d.playlistId}`) as string[]).filter((c) => linked.has(c));
-			return sameSet(d.pushed, members)
-				? { class: 'expected', note: 'rekordbox behind Curator: the master\'s playlist holds these members' }
-				: { class: 'failure', note: 'pushed members differ from the master\'s playlist' };
+			if (d.field === 'playlist.members') {
+				return sameSet(d.pushed, members)
+					? { class: 'expected', note: 'rekordbox behind Curator: the master\'s playlist holds these members' }
+					: { class: 'failure', note: 'pushed members differ from the master\'s playlist' };
+			}
+			// Order. rekordbox reordered and the master never pulled it: the
+			// joiner's pull adopts rekordbox's order (no baseline, so rekordbox's
+			// order leads), the push writes it back, and there is no difference
+			// to see. So an order difference is expected only as the master's
+			// own order (the master reordered and never pushed); anything else
+			// (TrackNo renumbering, duplicates, unlinked members interleaved) is
+			// the push writing an order neither side holds.
+			const pushedOrder = (d.pushed as unknown[]).map(String);
+			return JSON.stringify(pushedOrder) === JSON.stringify([...new Set(members)])
+				? { class: 'expected', note: 'rekordbox behind Curator: the master\'s playlist order, never pushed' }
+				: { class: 'failure', note: 'pushed order matches neither the master\'s playlist nor rekordbox' };
 		}
 		const m = master.get(d.contentId);
 		const j = joined.get(d.contentId);
@@ -191,10 +204,17 @@ export function rekordboxClassifier(founder: Raw, joiner: Raw, reference: RbDump
 }
 
 // cloud.afterLink: what linking changed on the joiner, judged by what the
-// untouched rekordbox holds for the row the joiner linked.
-export function afterLinkClassifier(joiner: Raw, reference: RbDump): (table: string, left: Record<string, unknown> | null, right: Record<string, unknown> | null) => Classified {
+// untouched rekordbox holds for the row the joiner linked, and by the master
+// (the founder copy) for what the account held.
+export function afterLinkClassifier(founder: Raw, joiner: Raw, reference: RbDump): (table: string, left: Record<string, unknown> | null, right: Record<string, unknown> | null) => Classified {
 	const contentOf = new Map<string, string>();
 	for (const [cid, l] of linksOf(joiner)) if (l.recordingId) contentOf.set(l.recordingId, cid);
+	const master = linksOf(founder);
+	const accountCredits = founder.prepare(`SELECT artists FROM track WHERE recording_id = ? AND derived_from_track_id IS NULL ORDER BY deleted_at IS NOT NULL LIMIT 1`).pluck();
+	const creditsOf = (v: unknown): TrackArtist[] => (Array.isArray(v) ? v as TrackArtist[] : json<TrackArtist[]>(typeof v === 'string' ? v : null, []));
+	const nameKey = (v: string): string => searchFold(v).replace(/[^\p{L}\p{N}]/gu, '');
+	// rekordbox's artist line names it (fold, punctuation and spaces aside).
+	const rbNames = (artist: string | null | undefined, name: string): boolean => !!artist && nameKey(name) !== '' && nameKey(artist).includes(nameKey(name));
 	const livePlaylists = new Map(reference.playlists.filter((p) => !p.deleted).map((p) => [p.id, p]));
 	const rbPlaylist = (playlistId: unknown): string | null => (typeof playlistId === 'string' && playlistId.startsWith('rb_') ? playlistId.slice(3) : null);
 	const fail = (note: string): Classified => ({ class: 'failure', note });
@@ -202,7 +222,29 @@ export function afterLinkClassifier(joiner: Raw, reference: RbDump): (table: str
 		const row = right ?? left!;
 		const cid = contentOf.get(String(row['recordingId'] ?? ''));
 		const rb = cid ? reference.contents[cid] : undefined;
+		// The run's own setup: the joiner bound this file to another
+		// recording than the master's (joiner.ts attach, by audio hash).
+		const m = cid ? master.get(cid) : undefined;
+		if (m?.recordingId && row['recordingId'] && m.recordingId !== row['recordingId']) {
+			return { class: 'artefact', note: `the joiner's row for this file is recording ${String(row['recordingId'])}, the master's ${m.recordingId}` };
+		}
 		switch (table) {
+			case 'credits': {
+				// The account had no credits: rekordbox's artist line is the
+				// only value, and the first link takes it (decideFirstLinkSide
+				// rule 2).
+				const now = creditsOf(right?.['artists']);
+				if (creditsOf(left?.['artists']).length === 0 && now.length > 0 && now.every((a) => rbNames(rb?.artist, a.name))) {
+					return { class: 'expected', note: 'the account had no credits; rekordbox\'s artist, taken by the first link' };
+				}
+				return fail('linking rekordbox should never change this table');
+			}
+			case 'trackArtists': {
+				if (!left && right && creditsOf(accountCredits.get(String(right['recordingId'])) ?? null).length === 0 && rbNames(rb?.artist, String(right['artist'] ?? ''))) {
+					return { class: 'expected', note: 'the account had no credits; rekordbox\'s artist, taken by the first link' };
+				}
+				return fail('linking rekordbox should never change this table');
+			}
 			case 'rbAnalysis': {
 				const keyOnly = !!right && (!left || (JSON.stringify(left['grid']) === JSON.stringify(right['grid']) && left['segments'] === right['segments']));
 				if (keyOnly && rb && right!['key'] === rb.keyCamelot) return { class: 'expected', note: 'rekordbox holds this key; the master\'s rb slot was empty or stale (its pull re-reads only rows rekordbox changed)' };
@@ -229,11 +271,15 @@ export function afterLinkClassifier(joiner: Raw, reference: RbDump): (table: str
 			case 'playlistTracks': {
 				const pid = rbPlaylist(row['playlistId']);
 				const p = pid ? livePlaylists.get(pid) : undefined;
-				if (!p || !cid) return fail('a membership change outside rekordbox\'s playlists');
+				if (!p) return fail('a membership change outside rekordbox\'s playlists');
+				if (!cid) return fail('a member the joiner has not linked to rekordbox (Curator-only) changed in a rekordbox playlist');
 				const member = p.members.includes(cid);
 				if (right && !left) return member ? { class: 'expected', note: 'a rekordbox membership the master never pulled' } : fail('added a member rekordbox does not hold');
 				if (left && !right) return member ? fail('removed a member rekordbox still holds') : { class: 'expected', note: 'a member rekordbox removed' };
-				return { class: 'expected', note: 'rekordbox\'s playlist order, adopted by the pull' };
+				// A move: rekordbox's order explains it only for a member
+				// rekordbox's playlist holds (a twin linked in its place moved
+				// to the end, e2e 2026-10-24).
+				return member ? { class: 'expected', note: 'rekordbox\'s playlist order, adopted by the pull' } : fail('moved a member rekordbox\'s playlist does not hold');
 			}
 			default:
 				return fail('linking rekordbox should never change this table');

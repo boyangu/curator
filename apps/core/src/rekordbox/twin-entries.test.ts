@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 import Database from 'better-sqlite3';
 import { migrate } from '../db/migrate.js';
 import { createDb, type Db } from '../db/client.js';
-import { RekordboxImporter, type RunImportOptions } from './importer.js';
+import { RekordboxImporter, type ImportTotals, type RunImportOptions } from './importer.js';
 import type { RekordboxSidecar } from './sidecar.js';
 
 let dir: string;
@@ -38,15 +38,16 @@ function stubSidecar(frames: Frame[]): RekordboxSidecar {
 	}) as unknown as RekordboxSidecar;
 }
 
-async function pull(frames: Frame[]): Promise<RekordboxImporter> {
+let lastTotals: ImportTotals | null = null;
+async function pull(frames: Frame[], flags: Partial<RunImportOptions['flags']> = {}): Promise<RekordboxImporter> {
 	const opts: RunImportOptions = {
 		mode: 'full',
-		flags: { syncTracks: true, syncPlaylists: true, syncMyTags: true, syncCuesGridsPhrases: true, syncWaveformPeaks: false, syncHistory: false },
+		flags: { syncTracks: true, syncPlaylists: true, syncMyTags: true, syncCuesGridsPhrases: true, syncWaveformPeaks: false, syncHistory: false, ...flags },
 		dbPath: join(dir, 'master.db'), // never opened — stub sidecar
 		peaksDir: join(dir, 'peaks'),
 	};
 	const importer = new RekordboxImporter(db, stubSidecar(frames));
-	await importer.runImport(opts);
+	lastTotals = await importer.runImport(opts);
 	return importer;
 }
 
@@ -77,6 +78,15 @@ const cueFrame = (id: string, slot: number, positionSec: number): Frame => ({
 const playlistFrame = (pid: string, ids: string[]): Frame => ({
 	event: 'playlist', row: { rb_playlist_id: pid, rb_local_usn: 2, rb_local_deleted: false, parent_folder_id: null, name: pid, is_folder: false, is_smart: false, position: 0, tracks: ids.map((id, i) => ({ rb_content_id: id, position: i })) },
 });
+const waveformFrame = (id: string): Frame => ({
+	event: 'waveform', row: { rb_content_id: id, peaks_lo_path: null, peaks_hi_path: null, beatgrid_sec: [0.5, 1, 1.5, 2], downbeats_sec: [0.5], segments: null },
+});
+// The account's own copy of rekordbox playlist `pid`, holding the track.
+const accountPlaylist = (pid: string): void => {
+	sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name, is_smart) VALUES (?, 'rekordbox', ?, ?, 0)`).run(`rb_${pid}`, pid, pid);
+	sqlite.prepare(`INSERT INTO playlist_track (id, order_key, playlist_id, track_id, position, source_track_id, added_by) VALUES (?, 'a0', ?, 't1', 0, 't1', NULL)`).run(`pt_${pid}`, `rb_${pid}`);
+};
+const baselineOf = (pid: string) => sqlite.prepare(`SELECT member_id FROM rekordbox_membership_baseline WHERE rb_playlist_id = ? AND member_kind = 'rb'`).pluck().all(pid) as string[];
 const mytagFrame = (tid: string, ids: string[]): Frame => ({
 	event: 'mytag', row: { rb_tag_id: tid, rb_local_usn: 3, rb_local_deleted: false, name: tid, color: null, tracks: ids },
 });
@@ -182,5 +192,62 @@ describe('twin rekordbox entries: a track with no link links exactly one', () =>
 		sqlite.prepare(`UPDATE source_link SET missing_at = 1 WHERE file_path = ?`).run(FILE_A);
 		await pull([trackFrame('5', FILE_A), trackFrame('9', FILE_B)]);
 		expect(linkOf()).toEqual({ id: '9', path: FILE_B });
+	});
+});
+
+// A second desktop's first link: its file order (rowid) is its own, so the
+// primary file is no guide to which copy the account's rekordbox playlists
+// hold. e2e 2026-10-24: the joiner linked the other copy and pushed it into
+// the 7 playlists already holding the first.
+describe("twin rekordbox entries: the pick follows rekordbox's playlists", () => {
+	it('links the copy rekordbox lists where the account places the track, and lands its waveform, tags and place', async () => {
+		seedTrack([FILE_A, FILE_B]);
+		accountPlaylist('P');
+		const i = await pull([
+			trackFrame('C1', FILE_A, { rating: 3 }),
+			trackFrame('C2', FILE_B, { rating: 5 }),
+			cueFrame('C1', 0, 10),
+			cueFrame('C2', 1, 99),
+			waveformFrame('C2'),
+			playlistFrame('P', ['C2']),
+			mytagFrame('M2', ['C2']),
+		]);
+		expect(twinsOf(i)).toBe(1);
+		expect(linkOf()).toEqual({ id: 'C2', path: FILE_B });
+		expect(ratingOf()).toBe(5);
+		expect(cueSlots()).toEqual([{ slot: 1, pos: 99 }]);
+		expect(tagsOf()).toEqual(['rb_M2']);
+		expect(lastTotals?.waveformsUpserted).toBe(1);
+		// One place at the copy rekordbox holds, agreed in the baseline: the
+		// push has nothing to add.
+		expect(membersOf('P')).toEqual([{ trackId: 't1', cid: 'C2' }]);
+		expect(baselineOf('P')).toEqual(['C2']);
+	});
+
+	it("the account's placement outweighs a playlist only rekordbox has", async () => {
+		seedTrack([FILE_A, FILE_B]);
+		accountPlaylist('P');
+		await pull([
+			trackFrame('C1', FILE_A),
+			trackFrame('C2', FILE_B),
+			playlistFrame('Q', ['C1']),
+			playlistFrame('R', ['C1']),
+			playlistFrame('P', ['C2']),
+		]);
+		expect(linkOf()).toEqual({ id: 'C2', path: FILE_B });
+	});
+
+	it("with no placement in the account, the copy in rekordbox's playlists links over the primary file", async () => {
+		seedTrack([FILE_A, FILE_B]);
+		await pull([trackFrame('C1', FILE_A), trackFrame('C2', FILE_B), playlistFrame('Q', ['C2'])]);
+		expect(linkOf()).toEqual({ id: 'C2', path: FILE_B });
+		expect(membersOf('Q')).toEqual([{ trackId: 't1', cid: 'C2' }]);
+	});
+
+	it('without a playlist pass the primary file decides, as before', async () => {
+		seedTrack([FILE_A, FILE_B]);
+		await pull([trackFrame('C2', FILE_B), trackFrame('C1', FILE_A), waveformFrame('C1')], { syncPlaylists: false });
+		expect(linkOf()).toEqual({ id: 'C1', path: FILE_A });
+		expect(lastTotals?.waveformsUpserted).toBe(1);
 	});
 });
