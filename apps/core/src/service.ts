@@ -71,6 +71,7 @@ import { remoteRowCount, requestRematerialize } from './sync-log/remote-rows.js'
 import { requestRestatement } from './sync-log/restate.js';
 import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
+import { getDeviceId as getSyncDeviceId } from './sync-log/device.js';
 import type { DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
 
@@ -238,7 +239,8 @@ import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import { AnalyzerSidecar } from './analyzer/sidecar.js';
 import { AnalysisQueue, formatAnalyzerTrackName, splitFileless, type AnalysisJobEvent } from './analyzer/queue.js';
-import { type AnalysisFlags, type AutoAnalyzeSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, analysisFlagsToOptions } from './analyzer/flags.js';
+import { type AnalysisFlags, type AutoAnalyzeSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
+import { runModelsRepair } from './analyzer/models-repair.js';
 import { CutoffStore } from './analyzer/cutoffs.js';
 import { homedir, hostname } from 'node:os';
 import { WavConverter } from './wav/convert-run.js';
@@ -414,6 +416,12 @@ export interface CoreServiceOptions {
 		transport: CloudTransport;
 		// `seq`: the head a Realtime ping names, when the server sent one.
 		subscribeWakeups?: (onWake: (reason?: WakeReason, seq?: number) => void) => () => void;
+		// Whether the Realtime channel behind those pings is joined (desktop
+		// main: the channel's SUBSCRIBED / CLOSED / error statuses, and the
+		// network going away). While it is not, the poll keeps the active
+		// cadence. Omitted ⇒ never joined: no host that cannot hear pings
+		// lets the poll decay.
+		onRealtimeChange?: (onChange: (live: boolean) => void) => () => void;
 		// Whether the user is using the app, decided by the host (desktop
 		// main: window focus + OS idle time). Started with startCloudSync;
 		// `idleAfterMs` is pushed whenever the poll setting changes. Omitted ⇒
@@ -799,7 +807,15 @@ export interface CoreService {
 	// Lookup order: analyzer-generated file at <peaksDir>/<tier>/<trackId>.cpk
 	// (Essentia worker), then the rekordbox-imported file at
 	// <peaksDir>/<tier>/rb_<rbContentId>.cpk via the rekordbox_link table.
+	// A `hi` request with no hi file falls back to the lo tier (a waveform
+	// fetched from the account may only exist at lo).
 	resolveTrackPeaksPath(trackId: string, tier: 'lo' | 'hi'): Promise<string | null>;
+	// Fetch one track's waveform from the account's catalogue (protocol v5:
+	// the catalogue no longer moves peaks in the background) — hi when the
+	// account holds it, else lo. The tier now on disk, or null (nothing to
+	// fetch, signed out, no catalogue). The player calls it for a track it
+	// found no peaks for, then asks for them again.
+	fetchTrackPeaks(trackId: string): Promise<'hi' | 'lo' | null>;
 	hasTidalDownloadSession(): Promise<boolean>;
 	downloadTidalTrack(trackId: string, progress?: DownloadProgressFn): Promise<{ outputPath: string; bytes: number }>;
 	enqueueTidalDownloads(items: { trackId: string; trackTitle: string; artistName: string }[]): Promise<void>;
@@ -2206,6 +2222,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		})
 		: null;
 	let cloudWakeUnsub: (() => void) | null = null;
+	let cloudRealtimeUnsub: (() => void) | null = null;
 	let cloudActivity: CloudActivityWatcher | null = null;
 
 	// ─── Shared analysis catalogue ─────────────────────────────────────
@@ -2249,6 +2266,37 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			}
 		});
 	}
+	// An analysis that finished here is a statement the account is owed
+	// (set-analysis, sync-log/track-analysis.ts): the next cycle states it,
+	// soon rather than at the next poll. Trailing, so a backlog of analyses
+	// costs a cycle every few seconds, not one each.
+	if (cloudClient && analysisQueue) {
+		let analysisWake: ReturnType<typeof setTimeout> | null = null;
+		analysisQueue.on('event', (evt: AnalysisJobEvent) => {
+			if (evt.kind !== 'completed' || analysisWake) return;
+			analysisWake = setTimeout(() => { analysisWake = null; cloudClient.wake('local'); }, 5_000);
+			analysisWake.unref?.();
+		});
+	}
+
+	// The models-missing repair (analyzer/models-repair.ts), once per launch
+	// from the post-bootstrap slot: re-analyses with the advanced stage what
+	// the 2026-10-17 bundle left with a brightness and no power. Only where
+	// the library's sources live — the account's master, or a device with no
+	// account master at all; a secondary's copies come from the master.
+	// Priority 100 like the Analyze modal: the background lane waits for
+	// auto-analyze, which may be off, and the repair must happen.
+	let modelsRepairRan = false;
+	const repairMissingModelAnalyses = (): void => {
+		if (modelsRepairRan || !analysisQueue || analyzerSidecar?.disabled) return;
+		modelsRepairRan = true;
+		const master = masterDevice(sqlite);
+		if (master !== null && master !== getSyncDeviceId(sqlite)) return;
+		void runModelsRepair(sqlite, (ids) => svcRef!.enqueueAnalysis(ids, { priority: 100, force: true, analyzeFlags: { ...DEFAULT_MANUAL_FLAGS } }))
+			.then((n) => { if (n > 0) log.for('analyzer').info('re-analysing tracks a bundle without its scoring models left with a brightness and no power', { tracks: n }); })
+			.catch((err: unknown) => { log.for('analyzer').warn('models-missing repair could not enqueue; retrying next launch', undefined, err); });
+	};
+
 	const catalogueStatusReport = (): CatalogueStatus => catalogue
 		? catalogue.status()
 		: {
@@ -2269,7 +2317,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
 			lastPushAt: null, lastPullAt: null, lastCheckedAt: null, lastChangedAt: null, transferring: false, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
 			initialPush: null, phase: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null, verifying: false, digest: null }, nextRetryAt: null,
-			poll: { policy: readPollPolicy(sqlite), active: true, nextPollAt: null },
+			poll: { policy: readPollPolicy(sqlite), active: true, realtimeLive: false, nextPollAt: null },
 		};
 
 	// Shared body of deleteTracks (soft == every source; hard == row DELETE)
@@ -2643,25 +2691,36 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 
 		async resolveTrackPeaksPath(trackId, tier) {
 			if (!opts.peaksDir) return null;
+			const peaksDir = opts.peaksDir;
 			const { join } = await import('node:path');
 			const { existsSync } = await import('node:fs');
-			// Analyzer-generated file uses the canonical track UUID — checked
-			// first because Essentia output is deterministic and we always
-			// prefer our own analysis when both are available.
-			const analyzerPath = join(opts.peaksDir, tier, `${trackId}.cpk`);
-			if (existsSync(analyzerPath)) return analyzerPath;
-			// Fallback: rekordbox-imported file keyed on the rekordbox content
-			// id. rekordbox_link is the bridge from our trackId → rb id.
 			const link = db
 				.select({ rbContentId: rekordboxLink.rbContentId })
 				.from(rekordboxLink)
 				.where(eq(rekordboxLink.trackId, trackId))
 				.get();
-			if (link?.rbContentId) {
-				const rbPath = join(opts.peaksDir, tier, `rb_${link.rbContentId}.cpk`);
-				if (existsSync(rbPath)) return rbPath;
-			}
-			return null;
+			const find = (t: 'lo' | 'hi'): string | null => {
+				// Analyzer-generated file uses the canonical track UUID — checked
+				// first because Essentia output is deterministic and we always
+				// prefer our own analysis when both are available.
+				const analyzerPath = join(peaksDir, t, `${trackId}.cpk`);
+				if (existsSync(analyzerPath)) return analyzerPath;
+				// Fallback: rekordbox-imported file keyed on the rekordbox content
+				// id. rekordbox_link is the bridge from our trackId → rb id.
+				if (link?.rbContentId) {
+					const rbPath = join(peaksDir, t, `rb_${link.rbContentId}.cpk`);
+					if (existsSync(rbPath)) return rbPath;
+				}
+				return null;
+			};
+			// hi → lo: the catalogue's on-demand fetch writes lo when the
+			// account holds no hi tier, and a low-res strip beats none.
+			return find(tier) ?? (tier === 'hi' ? find('lo') : null);
+		},
+
+		async fetchTrackPeaks(trackId) {
+			if (!catalogue || !opts.peaksDir) return null;
+			return catalogue.fetchPeaks(trackId);
 		},
 
 		async getTrackSourceLinks(trackId) {
@@ -4196,6 +4255,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// Same once-per-launch slot: plays a quit or crash left open are
 			// finalised and synced. A failure must not stop the watcher.
 			try { plays.finalizeInterruptedPlays(db, { before: startedAt }); } catch (err) { log.for('plays').warn('finalising interrupted plays failed', undefined, err); }
+			repairMissingModelAnalyses();
 			await libraryScanner.startAll();
 		},
 		recomputeMembership() {
@@ -5607,6 +5667,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				// actions wake it otherwise (start, settings, backfill).
 				if (reason === 'session' || reason === 'network') catalogue?.wake(reason);
 			}) ?? (() => { /* no wake source */ });
+			cloudRealtimeUnsub = opts.cloud?.onRealtimeChange?.((live) => cloudClient.setRealtimeLive(live)) ?? null;
 			cloudActivity = opts.cloud?.watchActivity?.((active) => cloudClient.setActive(active)) ?? null;
 			cloudActivity?.setIdleAfterMs(readPollPolicy(sqlite).idleAfterSec * 1000);
 		},
@@ -5636,6 +5697,8 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// Stop cloud sync before the DB closes: a cycle mid-apply would
 			// otherwise write into a closed handle.
 			cloudWakeUnsub?.();
+			cloudRealtimeUnsub?.();
+			cloudRealtimeUnsub = null;
 			cloudActivity?.stop();
 			cloudActivity = null;
 			cloudClient?.stop();

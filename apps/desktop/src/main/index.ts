@@ -576,11 +576,17 @@ async function handlePeaksRequest(request: Request, svc: CoreService): Promise<R
 		// channel→frequency conventions, and the renderer's display-colour
 		// mapping needs to know which it's looking at.
 		const source = /[\\/]rb_[^\\/]+\.cpk$/i.test(path) ? 'rekordbox' : 'essentia';
+		// A hi request answered from the lo tier (the core's hi → lo
+		// fallback) must not be cached as hi: the hi file may arrive later.
+		const fallback = !new RegExp(`[\\\\/]${tier}[\\\\/][^\\\\/]+\\.cpk$`, 'i').test(path);
 		return new Response(data as unknown as BodyInit, {
 			headers: {
 				'Content-Type': 'application/octet-stream',
-				'Cache-Control': 'public, max-age=86400',
+				'Cache-Control': fallback ? 'no-store' : 'public, max-age=86400',
 				'X-Peaks-Source': source,
+				// The tier actually served: a reconnect asks the account again
+				// for a track the player shows at lo.
+				'X-Peaks-Tier': fallback ? 'lo' : tier,
 			},
 		});
 	} catch (err) {
@@ -992,7 +998,8 @@ function registerIpc(svc: CoreService): void {
 	// sign-out changes the status too, so re-broadcast it then.
 	svc.subscribeCloudSync((e) => {
 		if (e.kind === 'status') broadcastEvent('cloud-sync:status', { ...e.status, enabled: true });
-		else broadcastEvent('sync:applied', e.applied);
+		else if (e.kind === 'applied') broadcastEvent('sync:applied', e.applied);
+		else broadcastEvent('cloud-sync:reconnected', { at: e.at });
 	});
 	cloudAccount?.onChange(() => {
 		void svc.getCloudSyncStatus().then((s) => broadcastEvent('cloud-sync:status', s), () => { /* closing */ });
@@ -1197,6 +1204,9 @@ app.whenReady().then(async () => {
 			? {
 				transport: cloudTransport,
 				subscribeWakeups: (onWake) => accountForCore.subscribeWakeups(onWake),
+				// The Realtime channel's health: down, the poll stays at the
+				// active cadence even when idle.
+				onRealtimeChange: (onChange) => accountForCore.onRealtimeChange(onChange),
 				// Focus + OS idle time decide the fallback poll's cadence.
 				watchActivity: (onChange) => watchAppActivity(() => mainWindow, onChange),
 				device: { name: profileDeviceName(hostname(), PROFILE), platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32' },

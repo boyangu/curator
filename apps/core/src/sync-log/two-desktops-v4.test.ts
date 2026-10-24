@@ -545,7 +545,7 @@ describe('a v3 client holds v4 ops aside', () => {
 		await rig.settle();
 		const v4 = v4Ops();
 		expect(v4.length).toBeGreaterThan(0);
-		expect(SCHEMA_VERSION).toBe(4);
+		expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(4);
 		expect(v4.every((o) => schemaVersionStatus(o.schema_version, 3) === 'ahead')).toBe(true);
 		// What a v3 build's pull does with them (client.ts: held by version
 		// before any parse), then the same database under this build.

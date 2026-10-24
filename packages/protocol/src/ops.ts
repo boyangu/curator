@@ -33,7 +33,12 @@ import { isRbGridValue } from './rb-grid.js';
 // instead of holding it aside. A v3 server answers a v4 op `server_outdated`
 // for the whole push, so a desktop emits none before the server advertises
 // 'zero_loss_v4'.
-export const SCHEMA_VERSION = 4;
+//
+// Version 5 (2026-10-23) adds one kind, `library_track.set-analysis` (the
+// analyzer's results as part of the library, not only the catalogue), stamped
+// 5; a v4 server answers it `server_outdated`, so a desktop emits none before
+// the server advertises 'analysis_v5'.
+export const SCHEMA_VERSION = 5;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
 export const MAX_OP_PAYLOAD_BYTES = 16 * 1024;
@@ -499,6 +504,71 @@ export const ZCurationField = z.discriminatedUnion('field', [
 	z.object({ field: z.literal('color_label'), value: z.string().min(1).max(32).nullable() }).strict(),
 ]);
 export const ZLibraryTrackSetCuration = defineOp('library_track', 'set-curation', ZCurationField);
+
+// Since v5. ONE device's analyzer result for the recording (its Curator
+// analysis slot, never the rekordbox one — that rides set-rb-analysis): what
+// lets a device without the file, or one that has not analysed it, show the
+// tempo, key, grid, structure and learned scores without waiting on the
+// shared catalogue (2026-10-23: a second profile still had ~2,400 tracks
+// waiting 20 minutes after it had the library). Filed like set-meta under
+// `analysis.<device_id>`; the view picks the master's cell first
+// (state.ts resolveTrackAnalysis). `analysis: null` withdraws the device's
+// cell (its row lost the analysis it had stated).
+//
+// Sized to ride under MAX_OP_PAYLOAD_BYTES: scalars at 3 decimals; `grid`
+// is the analyzer's beats and downbeats in the rb-grid compact form (whole
+// ms — the analyzer's sub-ms precision is dropped, < 0.5 ms, below anything
+// a deck or a waveform shows); `segments` are tuples
+//   [startSec, endSec, label, confidence, energy]
+// where `label` is an index into ANALYSIS_SEGMENT_LABELS (the analyzer's
+// vocabulary) or the label itself for one outside it. Not carried: the
+// Essentia feature bundle (features_json, ~4.5 KB a track, read by no UI;
+// it stays in the catalogue) and the peaks (blobs; the catalogue, on
+// demand). A writer whose op would still exceed the cap drops segments,
+// then the grid, never the scalars.
+//
+// The refine is the catalogue's `advancedLegacy` rule (desktop
+// catalogue/local.ts): a brightness without a power is the old raw-centroid
+// value under a newer stamp (an analysis bundle missing its scoring models),
+// not a learned score, so no device may state one.
+export const ANALYSIS_SEGMENT_LABELS = ['intro', 'build', 'drop', 'breakdown', 'main', 'outro', 'unknown'] as const;
+const ZAnalysisScalar = z.number().finite().nullable();
+const ZAnalysisSec = z.number().finite().nonnegative();
+export const ZAnalysisSegment = z.tuple([
+	ZAnalysisSec,
+	ZAnalysisSec,
+	z.union([z.number().int().min(0).max(ANALYSIS_SEGMENT_LABELS.length - 1), z.string().min(1).max(32)]),
+	ZAnalysisScalar,
+	ZAnalysisScalar,
+]);
+export type AnalysisSegment = z.infer<typeof ZAnalysisSegment>;
+export const ZTrackAnalysis = z
+	.object({
+		audio_hash: z.string().min(1).max(128),
+		analyzer_version: z.string().max(32).regex(/^\d+(\.\d+)*$/, { message: 'a dotted analyzer version' }),
+		analyzed_at: ZMs,
+		duration: z.number().finite().positive().nullable(),
+		bpm: z.number().positive().max(1000).nullable(),
+		key_camelot: z.string().min(1).max(8).nullable(),
+		key_strength: ZAnalysisScalar,
+		brightness: ZAnalysisScalar,
+		power: ZAnalysisScalar,
+		dynamic_complexity: ZAnalysisScalar,
+		loudness_range_lu: ZAnalysisScalar,
+		dissonance: ZAnalysisScalar,
+		density: ZAnalysisScalar,
+		intro_length_sec: ZAnalysisScalar,
+		outro_length_sec: ZAnalysisScalar,
+		first_drop_sec: ZAnalysisScalar,
+		drop_count: ZCount.nullable(),
+		breakdown_count: ZCount.nullable(),
+		grid: z.array(z.number()).refine(isRbGridValue, { message: 'not an rb grid (rb-grid.ts)' }).nullable(),
+		segments: z.array(ZAnalysisSegment).max(2048).nullable(),
+	})
+	.strict()
+	.refine((a) => a.brightness === null || a.power !== null, { message: 'brightness without power (advancedLegacy) is never stated' });
+export type TrackAnalysis = z.infer<typeof ZTrackAnalysis>;
+export const ZLibraryTrackSetAnalysis = defineOp('library_track', 'set-analysis', z.object({ analysis: ZTrackAnalysis.nullable() }).strict());
 export const ZLibraryTrackDelete = defineOp('library_track', 'delete', empty());
 export const ZLibraryTrackUndelete = defineOp('library_track', 'undelete', empty());
 
@@ -802,6 +872,7 @@ export const OP_SCHEMAS = [
 	ZLibraryTrackSetAttrs,
 	ZLibraryTrackSetCuesEdited,
 	ZLibraryTrackSetCuration,
+	ZLibraryTrackSetAnalysis,
 	ZLibraryTrackDelete,
 	ZLibraryTrackUndelete,
 	ZCueUpsert,
@@ -919,6 +990,7 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 	['feed_item/mark-listened', 4],
 	['feed_suppression/set', 4],
 	['album/set-meta', 4],
+	['library_track/set-analysis', 5],
 ]);
 
 // Account setting keys added after v1. A `setting.set` is a v1 kind, but an

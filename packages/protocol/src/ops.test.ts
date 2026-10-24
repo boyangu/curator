@@ -150,6 +150,20 @@ const SAMPLES: [Entity, string, string, unknown][] = [
 	['feed_item', 'mark-listened', 'spotify:album:4aawyAB9vmqN3uQ7FjRGTy', { source_track_id: '7mCHjSQsqvTMfRotUfNob5' }],
 	['feed_suppression', 'set', 'artist:0cmWgDlu9CwTgxPhf403hb', { scope: 'artist', active: true }],
 	['album', 'set-meta', 'spotify:4aawyAB9vmqN3uQ7FjRGTy', { album_type: 'album', total_tracks: 12, release_date: '2022-01-14', label: 'Ninja Tune', upc: '5054429150000', cover_url: null, artists: ['Bonobo'], various: false }],
+	// v5
+	[
+		'library_track',
+		'set-analysis',
+		REC_A,
+		{
+			analysis: {
+				audio_hash: 'a'.repeat(64), analyzer_version: '2.4.0', analyzed_at: 1_700_000_000_000, duration: 312.5,
+				bpm: 122.5, key_camelot: '8A', key_strength: 0.81, brightness: 1.234, power: 0.5, dynamic_complexity: 3.1,
+				loudness_range_lu: 6.2, dissonance: 0.44, density: 12.1, intro_length_sec: 16, outro_length_sec: 24.5, first_drop_sec: 64,
+				drop_count: 2, breakdown_count: 1, grid: [1, 3, 1, 123, 468, 1, 0], segments: [[0, 16, 0, 0.9, 0.2], [16, 64, 'riser', null, null]],
+			},
+		},
+	],
 ];
 
 describe('every (entity, kind) parses', () => {
@@ -322,7 +336,7 @@ describe('protocol v4: the zero-loss additions', () => {
 	] as const;
 
 	it('is v4 with the minimum unchanged; every v4 kind is stamped 4 and every older kind keeps its version', () => {
-		expect(SCHEMA_VERSION).toBe(4);
+		expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(4);
 		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
 		for (const [e, k] of V4_KINDS) expect(opSchemaVersion({ entity: e, kind: k }), `${e}.${k}`).toBe(4);
 		expect(opSchemaVersion({ entity: 'cue', kind: 'upsert' })).toBe(1);
@@ -379,5 +393,36 @@ describe('protocol v4: the zero-loss additions', () => {
 		expect(ok('library_track', 'set-curation', aid, { field: 'color_label', value: null })).toBe(true);
 		expect(ok('library_track', 'set-curation', aid, { field: 'comment', value: '' })).toBe(false);
 		expect(ok('library_track', 'set-curation', aid, { field: 'rating', value: 3 })).toBe(false);
+	});
+});
+
+describe('protocol v5: set-analysis', () => {
+	const [, , id, p] = SAMPLES.find(([e, k]) => e === 'library_track' && k === 'set-analysis')!;
+	const a = (p as { analysis: Record<string, unknown> }).analysis;
+	const ok = (payload: unknown, version = SCHEMA_VERSION) => safeParseOp({ ...envelope('library_track', 'set-analysis', id, payload), schema_version: version }).ok;
+
+	it('is v5, stamped 5; a v4 client must hold it, so it is refused stamped 4', () => {
+		expect(SCHEMA_VERSION).toBe(5);
+		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
+		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-analysis' })).toBe(5);
+		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-attrs' })).toBe(4);
+		expect(ok(p, 4)).toBe(false);
+		expect(ok(p, 5)).toBe(true);
+	});
+
+	it('withdraws with null and validates the shape strictly', () => {
+		expect(ok({ analysis: null })).toBe(true);
+		expect(ok({})).toBe(false);
+		expect(ok({ analysis: { ...a, features: {} } })).toBe(false);
+		expect(ok({ analysis: { ...a, analyzer_version: 'rekordbox' } })).toBe(false);
+		expect(ok({ analysis: { ...a, grid: [1, 2, 3] } })).toBe(false);
+		expect(ok({ analysis: { ...a, segments: [[0, 1, 99, null, null]] } })).toBe(false);
+		expect(ok({ analysis: { ...a, segments: [[0, 1, 'x', null]] } })).toBe(false);
+		expect(ok({ analysis: { ...a, bpm: 0 } })).toBe(false);
+	});
+
+	it('never carries a brightness without a power (the advancedLegacy rule)', () => {
+		expect(ok({ analysis: { ...a, power: null } })).toBe(false);
+		expect(ok({ analysis: { ...a, brightness: null, power: null } })).toBe(true);
 	});
 });

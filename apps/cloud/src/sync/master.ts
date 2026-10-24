@@ -53,7 +53,7 @@ export async function readMaster(tx: Queryable, extra: readonly Op[] = []): Prom
 // playlist.set-attrs' provider fields are master-only on the client too, but
 // they are fields of an op every device sends, so counting them here would
 // be noise.
-export const SOURCE_KINDS = ['library_track.set-meta', 'library_track.set-attrs', 'album.set-meta'] as const;
+export const SOURCE_KINDS = ['library_track.set-meta', 'library_track.set-attrs', 'library_track.set-analysis', 'album.set-meta'] as const;
 const SOURCE_KIND_SET: ReadonlySet<string> = new Set(SOURCE_KINDS);
 
 export function countSourceKinds(ops: readonly Op[]): Record<string, number> | null {

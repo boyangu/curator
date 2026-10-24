@@ -80,7 +80,10 @@ const fmtMin = (sec: number): string => `${sec % 60 === 0 ? sec / 60 : Math.roun
 
 function pollLine(s: CloudSyncStatusReport): string {
 	const p = s.poll.policy;
-	return `Checking every ${p.activeSec} s · every ${fmtMin(p.idleSec)} after ${fmtMin(p.idleAfterSec)} idle · ${s.poll.active ? 'in use now' : 'idle now'}`;
+	// Without the live channel nothing announces another device's change, so
+	// the client keeps the in-use cadence (sync-log/client.ts pollEverySec).
+	const live = s.poll.realtimeLive ? '' : ` · live updates down — every ${p.activeSec} s even when idle`;
+	return `Checking every ${p.activeSec} s · every ${fmtMin(p.idleSec)} after ${fmtMin(p.idleAfterSec)} idle · ${s.poll.active ? 'in use now' : 'idle now'}${live}`;
 }
 
 function pollFieldValue(p: SyncPollPolicy, f: (typeof POLL_FIELDS)[number]): number {

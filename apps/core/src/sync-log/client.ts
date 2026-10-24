@@ -125,9 +125,10 @@ import type { SnapshotBuilder, SnapshotBuildOk } from './snapshot-build.js';
 import type { SnapshotBlobStore } from './snapshot-storage.js';
 import { healPlayHistoryAsync, playHealPending } from './play-heal.js';
 import { reconcileProviderClaimsAsync } from './claim-reconcile.js';
-import { featuresReadV4, pushableSchemaVersion, recordServerV4 } from './features.js';
+import { ANALYSIS_FEATURE, featuresReadV4, featuresReadV5, pushableSchemaVersion, recordServerV4 } from './features.js';
 import { FIRST_PULL_KEY, firstPullDone, sourceRole } from './role.js';
 import { drainTrackAttrsAsync, queueTrackAttrsBackfillAsync, trackAttrsBackfillPending, trackAttrsDirtyCount } from './track-attrs.js';
+import { drainTrackAnalysisAsync, queueTrackAnalysisBackfillAsync, trackAnalysisBackfillPending, trackAnalysisDirtyCount } from './track-analysis.js';
 import { drainPlaylistAttrsAsync, playlistAttrsBackfillPending, playlistAttrsDirtyCount, queuePlaylistAttrsBackfill } from './playlist-attrs.js';
 import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async, v4BackfillsPending } from './v4-backfill.js';
 import { albumMetaBackfillAsync, albumMetaBackfillPending } from './album-meta.js';
@@ -258,8 +259,9 @@ export type CloudSyncStatus = {
 	// When the next retry fires after a transient failure.
 	nextRetryAt: number | null;
 	// The fallback poll: the cadence in force, whether the host reports the
-	// app in use (false = the idle cadence applies), and when it next fires.
-	poll: { policy: SyncPollPolicy; active: boolean; nextPollAt: number | null };
+	// app in use, whether the Realtime wake channel is joined (the idle
+	// cadence applies only when both say so), and when it next fires.
+	poll: { policy: SyncPollPolicy; active: boolean; realtimeLive: boolean; nextPollAt: number | null };
 };
 
 export type CloudSyncApplied = {
@@ -271,12 +273,18 @@ export type CloudSyncApplied = {
 	entities: EntityRef[];
 };
 
+// 'reconnected': the first cycle that went through after a 'network' wake
+// (the host saw the device come back online). Whatever the player is
+// showing may have been asked of the account while it could not answer.
 export type CloudSyncEvent =
 	| { kind: 'status'; status: CloudSyncStatus }
-	| { kind: 'applied'; applied: CloudSyncApplied };
+	| { kind: 'applied'; applied: CloudSyncApplied }
+	| { kind: 'reconnected'; at: number };
 
 // 'resume': the host reported the app back in use after an idle spell.
-export type WakeReason = 'realtime' | 'focus' | 'network' | 'session' | 'local' | 'interval' | 'resume' | 'manual';
+// 'rejoin': the Realtime wake channel came back; pings sent while it was
+// down were lost.
+export type WakeReason = 'realtime' | 'focus' | 'network' | 'session' | 'local' | 'interval' | 'resume' | 'rejoin' | 'manual';
 // What a cycle's summary line names as its cause: the wake reasons it
 // coalesced, or the backoff timer.
 type CycleReason = WakeReason | 'retry';
@@ -385,6 +393,11 @@ export interface SyncClient {
 	// The host's verdict on whether the app is in use. Idle → in use syncs
 	// once right away ('resume') and returns to the active cadence.
 	setActive(active: boolean): void;
+	// Whether the Realtime wake channel is joined (false until the host says
+	// so). While it is not, nothing rings this device when another one
+	// pushes, so the poll keeps the active cadence even when idle. Down →
+	// live syncs once ('rejoin').
+	setRealtimeLive(live: boolean): void;
 	start(): void;
 	stop(): void;
 	status(): CloudSyncStatus;
@@ -555,6 +568,27 @@ function writePublishRecord(raw: Raw, rec: PublishRecord): void {
 		.run(SNAPSHOT_PUBLISH_KEY, JSON.stringify(rec), Date.now());
 }
 
+// Device-local: a publish asked for ahead of the cadence — the master's
+// one-time analysis backfill (v5), whose statements belong in the base
+// rather than in a log every later device replays. `owed` while the
+// backfill still drains (nothing to publish yet), then `at` (when it was
+// stated): the next publish whose build started after that clears it.
+export const SNAPSHOT_PUBLISH_REQUEST_KEY = 'sync.snapshot_publish_requested';
+type PublishRequest = { owed: true } | { at: number };
+
+function readPublishRequest(raw: Raw): PublishRequest | null {
+	const json = raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).pluck().get(SNAPSHOT_PUBLISH_REQUEST_KEY) as string | undefined;
+	if (!json) return null;
+	try { return JSON.parse(json) as PublishRequest; } catch { return null; }
+}
+
+function writePublishRequest(raw: Raw, req: PublishRequest | null): void {
+	if (req === null) { raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(SNAPSHOT_PUBLISH_REQUEST_KEY); return; }
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+		.run(SNAPSHOT_PUBLISH_REQUEST_KEY, JSON.stringify(req), Date.now());
+}
+
 // Device-local: the last digest check a secondary ran against the master's
 // snapshot (the header), so one seq is checked once.
 export const SNAPSHOT_DIGEST_KEY = 'sync.digest_checked';
@@ -612,6 +646,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// cadence change takes effect without waiting out the old period.
 	let pollPolicy = normalizePollPolicy(opts.pollPolicy);
 	let active = true;
+	let realtimeLive = false;
+	// A 'network' wake whose cycle has not gone through yet: the next one
+	// that does announces the reconnect ('reconnected').
+	let reconnectOwed = false;
 	let pollTimer: ReturnType<typeof setTimeout> | null = null;
 	// When the current poll period started counting (start, last poll, or a
 	// return to use).
@@ -700,7 +738,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				};
 			})(),
 			nextRetryAt,
-			poll: { policy: { ...pollPolicy }, active, nextPollAt },
+			poll: { policy: { ...pollPolicy }, active, realtimeLive, nextPollAt },
 		};
 	};
 
@@ -785,6 +823,10 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 		return s;
 	};
+
+	// The highest op version the last push (or batch stage) sent: what a
+	// `server_outdated` refusal of it says the server no longer reads.
+	let sentVersion = 0;
 
 	const toOps = (rows: readonly OutboxRow[]): { ops: Op[]; all: boolean } => {
 		// Fill to the byte cap; one op alone is always under it (16 KB max).
@@ -873,6 +915,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		if (rows.length === 0) return { pushed: 0, rejected: 0, more: false, stopped: null };
 		const { ops, all } = toOps(rows);
 		if (ops.length > 0) markMoving();
+		sentVersion = Math.max(0, ...ops.map((o) => o.schema_version));
 		const res = await transport.sync.push({ deviceId, ops });
 		learnFeatures(res.features);
 		const s = settle(ops, res, (op) => { markAcked.run(op.op_id); }, followOwn(res.batchMaxSeq, res.priorOwnMaxSeq));
@@ -997,6 +1040,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				markMoving();
 				batchProgress = { label, phase: 'uploading', done: staged, total };
 				emitStatus({ progress: true });
+				sentVersion = Math.max(0, ...ops.map((o) => o.schema_version));
 				const res = await api.batchPush({ deviceId, batchId: rec.batchId, ops });
 				learnFeatures(res.features);
 				const id = rec.batchId;
@@ -1402,7 +1446,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 					onProgress: progress,
 					...(opts.feed ? { feed: { backfill: (o: { local: true }) => opts.feed!.backfill(o) } } : {}),
 				});
-				slog.info('founder: library folded into the records as the account base; nothing sent', { ops: r.ops, meta: r.meta, attrs: r.attrs, playlistAttrs: r.playlistAttrs, v4: r.v4, claims: r.claims, albums: r.albums, feed: r.feed, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+				slog.info('founder: library folded into the records as the account base; nothing sent', { ops: r.ops, meta: r.meta, attrs: r.attrs, analysis: r.analysis, playlistAttrs: r.playlistAttrs, v4: r.v4, claims: r.claims, albums: r.albums, feed: r.feed, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
 				return 'founded';
 			} else if (masterDevice(raw) === deviceId) {
 				// The records already name this device the master (nothing to
@@ -1652,6 +1696,31 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		return emitted;
 	};
 
+	// ── protocol v5: the analysis ───────────────────────────────────────
+	// Once the server reads v5 (features.ts): the one-time backfill of every
+	// own analysed row, then the drain of what changed (an analysis that
+	// finished, a re-analysis, a file that went missing). On the master the
+	// backfill also asks for a snapshot publish once it is all stated, so the
+	// account's base carries the analysis (SNAPSHOT_PUBLISH_REQUEST_KEY).
+	const syncV5 = async (): Promise<number> => {
+		if (!featuresReadV5(features) || !serverReadsTrackMeta(features) || !recordsComplete(raw) || !initialPushDone() || !firstPullDone(raw)) return 0;
+		if (trackAnalysisBackfillPending(raw)) {
+			const queued = await queueTrackAnalysisBackfillAsync(raw);
+			slog.info('track analysis: queued every own analysed row for the one-time backfill', { rows: queued });
+			if (masterDevice(raw) === deviceId) writePublishRequest(raw, { owed: true });
+		}
+		const dirty = trackAnalysisDirtyCount(raw);
+		let emitted = 0;
+		if (dirty > 0) {
+			const r = await drainTrackAnalysisAsync(raw, { batchLabel: drainLabel(dirty) });
+			emitted = r.emitted;
+			if (r.emitted > 0) slog.info('track analysis: stated', { rows: r.rows, emitted: r.emitted, chunks: r.chunks, maxSliceMs: Math.round(r.maxSliceMs) });
+		}
+		const req = readPublishRequest(raw);
+		if (req && 'owed' in req && trackAnalysisDirtyCount(raw) === 0) writePublishRequest(raw, { at: Date.now() });
+		return emitted;
+	};
+
 	// Feed decisions a pull brought, into feed.db.
 	const applyFeedDecisions = async (): Promise<void> => {
 		if (!opts.feed || opts.feed.pending() === 0) return;
@@ -1699,6 +1768,8 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		const seq = readCursor(raw).lastSeq;
 		if (seq < 1) return false;
 		if (!rec || rec.seq < 1) return true;
+		const req = readPublishRequest(raw);
+		if (req && 'at' in req && seq > rec.seq) return true;
 		if (seq - rec.seq >= publishEveryOps) return true;
 		return seq > rec.seq && Date.now() - rec.at >= publishEveryMs;
 	};
@@ -1722,6 +1793,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 		const asDevice = deviceId;
 		const t0 = performance.now();
+		const startedAt = Date.now();
 		const built = await publishOpts.builder({ userId: session.userId });
 		if (!built.ok) {
 			slog.debug('snapshot: not now', { skipped: built.skipped, count: built.count });
@@ -1729,7 +1801,11 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		}
 		if (built.digestOnly) return;
 		try {
-			await uploadAndPublish(built, asDevice, store, publish, t0);
+			if (await uploadAndPublish(built, asDevice, store, publish, t0)) {
+				// A request made before this build is answered by it.
+				const req = readPublishRequest(raw);
+				if (req && 'at' in req && req.at <= startedAt) writePublishRequest(raw, null);
+			}
 		} finally {
 			await rm(built.dir, { recursive: true, force: true }).catch((err: unknown) => slog.warn('snapshot: could not remove the build directory', undefined, err));
 		}
@@ -1741,14 +1817,14 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		store: SnapshotBlobStore,
 		publish: NonNullable<CloudTransport['sync']['publishSnapshot']>,
 		t0: number,
-	): Promise<void> => {
+	): Promise<boolean> => {
 		const facts = { snapshotSeq: built.snapshotSeq, parts: built.files.length, gzipBytes: built.manifest.totalBytes, jsonBytes: built.jsonBytes, records: built.records, buildMs: built.buildMs, ...(built.peakRssBytes ? { peakRssMb: Math.round(built.peakRssBytes / 1048576) } : {}) };
 		// Stopped (the database may be closing) or unlinking (a new device id):
 		// nothing more is read, uploaded or published.
 		const halted = (): boolean => publishHalted || detaching || deviceId !== asDevice;
-		if (halted()) return;
+		if (halted()) return false;
 		const rec = readPublishRecord(raw);
-		if (rec && built.snapshotSeq <= rec.seq) { slog.debug('snapshot: nothing newer than the last publish', facts); return; }
+		if (rec && built.snapshotSeq <= rec.seq) { slog.debug('snapshot: nothing newer than the last publish', facts); return false; }
 		const tUp = performance.now();
 		let next = 0;
 		const uploader = async (): Promise<void> => {
@@ -1758,7 +1834,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			}
 		};
 		await Promise.all(Array.from({ length: Math.min(SNAPSHOT_UPLOAD_CONCURRENCY, built.files.length) }, uploader));
-		if (halted()) return;
+		if (halted()) return false;
 		const uploadMs = Math.round(performance.now() - tUp);
 		let res: PublishSnapshotResult;
 		try {
@@ -1770,7 +1846,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				// the master cell here changes.
 				writePublishRecord(raw, { seq: rec?.seq ?? 0, at: rec?.at ?? 0, refusedMaster: masterCellNow(), orphans: rec?.orphans ?? [] });
 				slog.warn('snapshot: the server says this device is not the master; not publishing until the master changes', facts);
-				return;
+				return false;
 			}
 			throw err;
 		}
@@ -1793,6 +1869,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		// this new: recorded, and the next is due from there.
 		writePublishRecord(raw, { seq: Math.max(built.snapshotSeq, res.latestSeq), at: Date.now(), refusedMaster: null, orphans });
 		slog.info('snapshot: published', { ...facts, status: res.status, latestSeq: res.latestSeq, superseded: res.superseded.length, uploadMs, ms: Math.round(performance.now() - t0) });
+		return true;
 	};
 
 	// ── a secondary's digest check (the header) ─────────────────────────
@@ -1947,6 +2024,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	};
 
 	const runOnce = async (): Promise<void> => {
+		if (reasons.has('network')) reconnectOwed = true;
 		const reason = takeReason();
 		const session = transport.session();
 		if (!session) {
@@ -1997,10 +2075,12 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 				await stage('track meta', syncTrackMeta);
 				await stage('provider claims (v4)', reconcileClaims);
 				await stage('zero-loss v4', syncV4);
+				await stage('analysis v5', syncV5);
 				if ((await pushAll()) === 'device_revoked') outcome = 'device_revoked';
 			};
 			const metaBeforePull = serverReadsTrackMeta(features) && !pushRefused;
 			const v4BeforePull = featuresReadV4(features);
+			const v5BeforePull = featuresReadV5(features);
 			if (metaBeforePull) await metaStage();
 			if (outcome === 'device_revoked') return;
 			await pullOnce();
@@ -2018,7 +2098,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// Likewise when the pull was the first answer naming protocol v4 (a
 			// server upgraded since the last push): the v4 statements go now,
 			// not a poll later.
-			if (((!metaBeforePull && serverReadsTrackMeta(features)) || (!v4BeforePull && featuresReadV4(features))) && !pushRefused) {
+			if (((!metaBeforePull && serverReadsTrackMeta(features)) || (!v4BeforePull && featuresReadV4(features)) || (!v5BeforePull && featuresReadV5(features))) && !pushRefused) {
 				await metaStage();
 				if (outcome === 'device_revoked') return;
 				await pullOnce();
@@ -2039,10 +2119,17 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// The server no longer reads what this device last heard it read (a
 			// rolled-back server refusing a v4 op, whole call): stop sending v4
 			// until an answer names it again, so the rest of the outbox flows.
-			if (err instanceof CloudTransportError && err.kind === 'server' && /server_outdated/.test(err.message) && featuresReadV4(features)) {
-				features = (features ?? []).filter((f) => f !== 'zero_loss_v4');
-				recordServerV4(raw, false);
-				slog.warn('the server refused protocol v4 ops; holding them until it reads v4 again');
+			// The refused push names how far: below the newest version it sent
+			// (a v5 op refused leaves v4 standing; a v4 one refused, v5 goes too).
+			if (err instanceof CloudTransportError && err.kind === 'server' && /server_outdated/.test(err.message)) {
+				if (sentVersion >= 5 && featuresReadV5(features)) {
+					features = (features ?? []).filter((f) => f !== ANALYSIS_FEATURE);
+					slog.warn('the server refused protocol v5 ops; holding them until it reads v5 again');
+				} else if (featuresReadV4(features)) {
+					features = (features ?? []).filter((f) => f !== 'zero_loss_v4' && f !== ANALYSIS_FEATURE);
+					recordServerV4(raw, false);
+					slog.warn('the server refused protocol v4 ops; holding them until it reads v4 again');
+				}
 			}
 			if (err instanceof CloudTransportError && err.kind === 'update_required') { pushRefused = true; return; }
 			if (err instanceof CloudTransportError && err.kind === 'device_revoked') { markRevoked(); return; }
@@ -2057,8 +2144,16 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			// saying nothing. Anything that moved or failed is info.
 			const moved = t.pushed + t.rejected + t.held + t.pulled > 0 || t.bootstrapped;
 			const fields = { reason, outcome, pushed: t.pushed, rejected: t.rejected, held: t.held, pulled: t.pulled, applied: t.applied, bootstrapped: t.bootstrapped, snapshotRecords: t.snapshotRecords, needsUpdate: pushRefused || heldCount(raw) > 0, ms: Date.now() - started };
-			if (moved || outcome !== 'ok') slog.info('sync cycle', fields);
+			// A reconnect's cycle is info even when quiet: it is the line that
+			// says the device caught up after the outage.
+			if (moved || outcome !== 'ok' || reconnectOwed) slog.info('sync cycle', fields);
 			else slog.debug('sync cycle', fields);
+			// Only a cycle that went through (a failure leaves it owed): the
+			// renderer asks again for what the player is missing.
+			if (reconnectOwed && outcome === 'ok' && lastError === null) {
+				reconnectOwed = false;
+				emit({ kind: 'reconnected', at: Date.now() });
+			}
 		}
 	};
 
@@ -2090,6 +2185,9 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		// a backoff; a Realtime ping or a focus is not (the outage that caused
 		// it is likely still there, and the retry timer will run anyway).
 		if (reason === 'network' || reason === 'session' || reason === 'manual') { attempt = 0; clearRetry(); }
+		// The cycle this wakes is the check the outage postponed: the next
+		// poll counts from it, not from a tick that fell while offline.
+		if (reason === 'network' && !stopped) { pollBase = Date.now(); armPoll(); }
 		if (nextRetryAt !== null) return;
 		if (reason === 'realtime') {
 			const numbered = typeof seq === 'number' && Number.isFinite(seq);
@@ -2175,7 +2273,11 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		await cycle();
 	};
 
-	const pollPeriodMs = (): number => (active ? pollPolicy.activeSec : pollPolicy.idleSec) * 1000;
+	// Idle decays the poll only while the Realtime channel is joined: without
+	// it the poll is the only way a change from another device arrives, and
+	// it must arrive within a minute (2026-10-23).
+	const pollEverySec = (): number => (active || !realtimeLive ? pollPolicy.activeSec : pollPolicy.idleSec);
+	const pollPeriodMs = (): number => pollEverySec() * 1000;
 
 	const clearPoll = (): void => {
 		if (pollTimer) clearTimeout(pollTimer);
@@ -2201,7 +2303,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		pollTimer.unref?.();
 	};
 
-	const cadenceFields = (): Record<string, unknown> => ({ everySec: active ? pollPolicy.activeSec : pollPolicy.idleSec, ...pollPolicy });
+	const cadenceFields = (): Record<string, unknown> => ({ everySec: pollEverySec(), realtimeLive, ...pollPolicy });
 
 	const setPollPolicy = (p: Partial<SyncPollPolicy>): void => {
 		const next = normalizePollPolicy({ ...pollPolicy, ...Object.fromEntries(Object.entries(p).filter(([, v]) => v !== undefined)) });
@@ -2227,6 +2329,19 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		emitStatus();
 	};
 
+	const setRealtimeLive = (next: boolean): void => {
+		if (next === realtimeLive) return;
+		realtimeLive = next;
+		slog.info(`realtime wake channel ${next ? 'live' : 'down'} — polling every ${pollEverySec()}s`, cadenceFields());
+		// Pings broadcast while the channel was down never reached this
+		// device: one cycle picks up whatever they announced.
+		if (next && !stopped) wake('rejoin');
+		// Down while idle: the period shrinks, and a due time already past
+		// polls now.
+		armPoll();
+		emitStatus();
+	};
+
 	return {
 		pushOnce,
 		pullOnce,
@@ -2236,6 +2351,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		wake,
 		setPollPolicy,
 		setActive,
+		setRealtimeLive,
 		start() {
 			if (!stopped) return;
 			stopped = false;

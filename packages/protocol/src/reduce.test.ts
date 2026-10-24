@@ -362,7 +362,7 @@ describe('merge rules', () => {
 			op('library_track', 'set-rating', A, { rating: 2 }, { ts: T(9, 0) }),
 		]);
 		expect(view.libraryTracks).toEqual([
-			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' }, meta: null, attrs: null, cuesEditedAt: null, curation: {} },
+			{ recordingId: A, addedAt: null, rating: 2, state: null, favourite: false, deletedAt: null, overrides: { bpm: 124 }, rb: { key: '8A' }, meta: null, attrs: null, cuesEditedAt: null, curation: {}, analysis: null },
 		]);
 	});
 

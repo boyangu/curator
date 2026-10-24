@@ -26,6 +26,13 @@
 //              ≤ 2 in flight at ≤ maxKBps, puts of ≤ 100 items, superseded
 //              blobs deleted.
 //
+// Since protocol v5 ('analysis_v5' in the server's features) the analysis
+// itself is library data (sync-log/track-analysis.ts): the hydrator stops,
+// and a waveform is fetched one track at a time when the player asks for one
+// this device does not have (fetchPeaks: the account's hi tier, else lo).
+// Pull-before-compute and the uploads are unchanged, so another account (or
+// a device on a v4 server) still reuses what this one analysed.
+//
 // Disabled is a supported state at every level: no cloud option = no layer;
 // signed out, setting off, a server without 'catalogue' in its features or
 // without our entitlement = no calls, prepare answers at once, the analyzer
@@ -66,8 +73,10 @@ import { CloudTransportError } from '../sync-log/client.js';
 import { masterDevice } from '../sync-log/track-meta.js';
 import {
 	PEAKS_HI,
+	PEAKS_LO,
 	acceptable,
 	allowedKeys,
+	claimedHashes,
 	durationMatches,
 	hasPeaks,
 	inlineItemsFor,
@@ -149,6 +158,7 @@ export interface CatalogueLayerDeps {
 	uploadDebounceMs?: number;
 	busyPollMs?: number;
 	hydrateBatch?: number;
+	peaksRetryMs?: number;
 }
 
 export interface CatalogueLayer {
@@ -167,6 +177,10 @@ export interface CatalogueLayer {
 	syncNow(): Promise<void>;
 	// Upload what is kicked (and the backfill, while running) now.
 	uploadNow(): Promise<void>;
+	// One track's waveform from the account, for the player: the hi tier
+	// when the account holds it, else lo. The tier written, or null (nothing
+	// to fetch, not usable now, or the file is already here).
+	fetchPeaks(trackId: string): Promise<'hi' | 'lo' | null>;
 	// Uploading the backfill right now (the backup scheduler yields to it).
 	isUploading(): boolean;
 	stats(): { maxSliceMs: number; maxSliceAt: string; lookups: number; puts: number; blobUploads: number; blobDownloads: number };
@@ -181,6 +195,7 @@ const DEFAULTS = {
 	uploadDebounceMs: 2_000,
 	busyPollMs: 5_000,
 	hydrateBatch: MAX_CATALOGUE_LOOKUP_HASHES,
+	peaksRetryMs: 30_000,
 };
 
 // Uploads: tracks per derived-pending page, blobs in flight, and how much of
@@ -344,6 +359,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		uploadDebounceMs: deps.uploadDebounceMs ?? DEFAULTS.uploadDebounceMs,
 		busyPollMs: deps.busyPollMs ?? DEFAULTS.busyPollMs,
 		hydrateBatch: Math.min(deps.hydrateBatch ?? DEFAULTS.hydrateBatch, MAX_CATALOGUE_LOOKUP_HASHES),
+		peaksRetryMs: deps.peaksRetryMs ?? DEFAULTS.peaksRetryMs,
 	};
 
 	let settings: CatalogueSettings = readCatalogueSettings(raw);
@@ -601,15 +617,16 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	// the blobs into temp files. No database writes here; `onlyTrack`
 	// narrows to one track (prepare) and leaves the mirror's verdicts alone,
 	// since other tracks with the hash may still lack the unit.
-	const fetchPlan = async (hashes: readonly string[], items: LookupMap, keys: readonly UnitKey[], onlyTrack: string | null): Promise<HydratePlan> => {
+	const fetchPlan = async (hashes: readonly string[], items: LookupMap, keys: readonly UnitKey[], onlyTrack: string | null, opts: { fileless?: boolean } = {}): Promise<HydratePlan> => {
 		const plan: HydratePlan = { tracks: new Map(), marks: [], retry: new Set(), tmpFiles: [], skippedGuard: 0, skippedAmbiguous: 0 };
 		const keySet = new Set(keys.map(keyId));
 		const byHash = slice(() => readLocalTracksByHash(raw, hashes), 'plan:read');
 		// Rows without the file take the account's analysis too, through
 		// their recording's audio-hash claim (the 2026-10-21 audit: a fresh
 		// device restored none of 5,101 analysed recordings). Not for prepare
-		// (`onlyTrack`): that is an analysis job, which only a file can have.
-		const fileless = onlyTrack ? null : slice(() => readFilelessTracksByHash(raw, hashes, masterDevice(raw)), 'plan:fileless');
+		// (`onlyTrack`): that is an analysis job, which only a file can have —
+		// unless the caller asks (the player's on-demand waveform).
+		const fileless = onlyTrack && !opts.fileless ? null : slice(() => readFilelessTracksByHash(raw, hashes, masterDevice(raw)), 'plan:fileless');
 		if (fileless) {
 			plan.skippedAmbiguous = fileless.ambiguousRecordings;
 			for (const [h, list] of fileless.byHash) byHash.set(h, [...(byHash.get(h) ?? []), ...list]);
@@ -774,7 +791,7 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 					// The persist path, as on the device that has the file: the
 					// Curator slot, its track mirrors, the stamp. `path` names the
 					// link a fingerprint lands on; a file-less row takes none.
-					persistAnalysisResult(db, partialResult(t, items), t.path ?? '', { audioHash: t.hash });
+					persistAnalysisResult(db, partialResult(t, items), t.path ?? '', { audioHash: t.hash, pulled: true });
 					fillTrackMirrors(t.trackId, items);
 					units += items.length;
 					landed.add(t.trackId);
@@ -830,6 +847,10 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	// Inline units and the lo tier first, the hi tier after (D-b), so a new
 	// device's library lights up before the bulky downloads.
 	const hydrateAll = async (): Promise<void> => {
+		// v5: the analysis arrives with the library, and peaks only when the
+		// player asks (fetchPeaks) — 426 of the catalogue's 482 MB were peaks
+		// a device mostly never showed.
+		if (deps.serverFeatures()?.includes('analysis_v5')) return;
 		const keys = allowedKeys(policy, { peaks: !!peaksDir });
 		const phases = [keys.filter((k) => keyId(k) !== keyId(PEAKS_HI)), keys.filter((k) => keyId(k) === keyId(PEAKS_HI))].filter((p) => p.length > 0);
 		for (const phase of phases) {
@@ -974,6 +995,83 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 		if (!t || !t.hash || !trusted(t)) return 1;
 		const entries = readEntries(raw, [t.hash]).get(t.hash);
 		return remainingWork(jobNeeds(options, t, peaksDir), coverage(t, entries, new Set(), peaksDir)).count;
+	};
+
+	// ── on-demand peaks (v5) ────────────────────────────────────────────
+	// The player asked for a waveform this device has no file of. One hash,
+	// one lookup, the existing plan/commit path (temp file + rename, the
+	// checks of a hydrate). Joined per track while one runs; a track the
+	// account had nothing for is not asked again for a while.
+
+	const peaksInflight = new Map<string, Promise<'hi' | 'lo' | null>>();
+	const peaksMissed = new Map<string, number>();
+	const PEAKS_MISS_TTL_MS = 10 * 60_000;
+	// A fetch that failed on something passing (a timeout, a 5xx, a dropped
+	// download) is tried once more on its own: the player asks once per track
+	// per session, and would otherwise stay blank until a restart. The
+	// result goes out as 'hydrated', which reloads the playing track.
+	const peaksRetries = new Map<string, ReturnType<typeof setTimeout>>();
+	const RETRIED_KINDS: ReadonlySet<FailureKind> = new Set(['offline', 'rate', 'device', 'other']);
+	const schedulePeaksRetry = (trackId: string, f: Failure): void => {
+		if (!RETRIED_KINDS.has(f.kind) || peaksRetries.has(trackId)) return;
+		const t = setTimeout(() => {
+			peaksRetries.delete(trackId);
+			void fetchPeaks(trackId, { retry: true }).then((tier) => {
+				if (tier) emit({ kind: 'hydrated', trackIds: [trackId] });
+			});
+		}, Math.max(cfg.peaksRetryMs, f.retryAfterMs ?? 0));
+		t.unref?.();
+		peaksRetries.set(trackId, t);
+	};
+
+	// `retry`: the one retry above. It goes past the breaker this failure
+	// tripped (one request, not a pass over the library) and schedules none.
+	const fetchPeaksOnce = async (trackId: string, retry: boolean): Promise<'hi' | 'lo' | null> => {
+		if (!peaksDir || !usable() || !ensureAccount() || !policy || (!retry && Date.now() < breakerUntil)) return null;
+		if (hasPeaks(peaksDir, 'hi', trackId)) return 'hi';
+		const missed = peaksMissed.get(trackId);
+		if (missed !== undefined && Date.now() - missed < PEAKS_MISS_TTL_MS) return null;
+		const own = slice(() => readLocalTrack(raw, trackId), 'peaks:read');
+		// A row with a file speaks for its own hash; one without takes its
+		// recording's claimed hash (local.ts readFilelessTracksByHash).
+		const hash = own?.hash ?? slice(() => {
+			const rec = raw.prepare(`SELECT recording_id FROM track WHERE id = ?`).pluck().get(trackId) as string | undefined;
+			return rec ? claimedHashes(raw, [rec], masterDevice(raw)).get(rec)?.hash ?? null : null;
+		}, 'peaks:hash');
+		if (!hash) { peaksMissed.set(trackId, Date.now()); return null; }
+		const keys = allowedKeys(policy, { peaks: true }).filter((k) => k.unit === 'peaks');
+		if (keys.length === 0) return null;
+		try {
+			const items = await lookup([hash], keys);
+			// hi when the account has it, else lo: one download, not two.
+			const got = items.get(hash) ?? [];
+			const pick = got.find((i) => i.variant === PEAKS_HI.variant) ?? got.find((i) => i.variant === PEAKS_LO.variant);
+			if (!pick) { peaksMissed.set(trackId, Date.now()); return null; }
+			// The account's best is the lo tier this device already holds (a
+			// reconnect asks again for a track showing lo): nothing to move.
+			if (pick.variant !== PEAKS_HI.variant && hasPeaks(peaksDir, 'lo', trackId)) { succeeded(); return 'lo'; }
+			const key: UnitKey = { unit: 'peaks', variant: pick.variant };
+			const plan = await fetchPlan([hash], new Map([[hash, [pick]]]), [key], trackId, { fileless: !own?.hash });
+			const r = await commitPlan(plan);
+			succeeded();
+			if (r.peaks === 0) { peaksMissed.set(trackId, Date.now()); return null; }
+			lastHydrateAt = Date.now();
+			clog.info('waveform fetched on demand', { tier: pick.variant });
+			return pick.variant === 'hi' ? 'hi' : 'lo';
+		} catch (err) {
+			const f = fail('on-demand waveform', err);
+			if (!retry && started) schedulePeaksRetry(trackId, f);
+			return null;
+		}
+	};
+
+	const fetchPeaks = (trackId: string, o: { retry?: boolean } = {}): Promise<'hi' | 'lo' | null> => {
+		let p = peaksInflight.get(trackId);
+		if (!p) {
+			p = fetchPeaksOnce(trackId, o.retry === true).finally(() => { peaksInflight.delete(trackId); });
+			peaksInflight.set(trackId, p);
+		}
+		return p;
 	};
 
 	// ── uploader ────────────────────────────────────────────────────────
@@ -1288,6 +1386,10 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 	let intervalTimer: ReturnType<typeof setInterval> | null = null;
 
 	const wake = (reason: CatalogueWakeReason): void => {
+		// Back online (or a new session): the player's next ask for a
+		// waveform goes out, whatever the outage made the account seem to
+		// lack.
+		if (reason === 'network' || reason === 'session') peaksMissed.clear();
 		if (!started) return;
 		// A regained network, a new session, a server that now lists the
 		// feature or the user's own action end any backoff; a focus or an
@@ -1385,9 +1487,12 @@ export function createCatalogueLayer(deps: CatalogueLayerDeps): CatalogueLayer {
 			if (intervalTimer) clearInterval(intervalTimer);
 			intervalTimer = null;
 			clearRetry();
+			for (const t of peaksRetries.values()) clearTimeout(t);
+			peaksRetries.clear();
 		},
 		syncNow,
 		uploadNow,
+		fetchPeaks,
 		isUploading: () => uploadingBackfill,
 		stats: () => ({ ...stats }),
 	};

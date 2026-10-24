@@ -170,11 +170,8 @@ export class FakeCloud {
 		// apps/cloud sync/push.ts: an op from a newer protocol than this server
 		// reads fails the whole call (`server_outdated`, a 'server' error on the
 		// desktop transport). A fake that does not advertise 'zero_loss_v4'
-		// stands for a v3 server.
-		const reads = this.features.includes('zero_loss_v4') ? 4 : 3;
-		if (input.ops.some((o) => typeof (o as { schema_version?: unknown }).schema_version === 'number' && (o as { schema_version: number }).schema_version > reads)) {
-			throw new CloudTransportError('server', 'server_outdated');
-		}
+		// stands for a v3 server, one without 'analysis_v5' for a v4 server.
+		this.refuseAhead(input.ops);
 		const rejected: PushResult['rejected'] = [];
 		const clamped: NonNullable<PushResult['clamped']> = [];
 		const batchIds = new Set<string>();
@@ -267,10 +264,26 @@ export class FakeCloud {
 		return { batchId: b.id, status: 'open', resumed: false, stagedOps: 0, features: [...this.features] };
 	}
 
+	// The protocol version this fake reads, by what it advertises.
+	get readsVersion(): number {
+		if (!this.features.includes('zero_loss_v4')) return 3;
+		return this.features.includes('analysis_v5') ? 5 : 4;
+	}
+
+	// apps/cloud sync/push.ts validate: an op stamped above what the server
+	// reads fails the whole call (push and batchPush alike).
+	private refuseAhead(ops: readonly unknown[]): void {
+		const reads = this.readsVersion;
+		if (ops.some((o) => typeof (o as { schema_version?: unknown }).schema_version === 'number' && (o as { schema_version: number }).schema_version > reads)) {
+			throw new CloudTransportError('server', 'server_outdated');
+		}
+	}
+
 	batchPush(input: BatchPushInput): BatchPushResult {
 		this.calls.batchPush++;
 		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
 		if (input.ops.length > MAX_PUSH_OPS) throw new CloudTransportError('bad_request', 'batch too large');
+		this.refuseAhead(input.ops);
 		const b = this.liveBatch(input.batchId, input.deviceId);
 		if (b.status === 'committing') throw new CloudTransportError('batch_committing', 'batch_committing');
 		if (b.status !== 'open') throw new CloudTransportError('batch_gone', 'batch_gone');

@@ -443,6 +443,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'analysis:cancel':           async (trackId)        => svc.cancelAnalysis(trackId),
 		'analysis:job':              async (trackId)        => svc.getAnalysisJob(trackId),
 		'analysis:get':              async (trackId)        => svc.getTrackAnalysis(trackId),
+		'analysis:fetch-peaks':      async (trackId)        => svc.fetchTrackPeaks(trackId),
 		'analysis:cues':             async (trackId)        => svc.getTrackCues(trackId),
 		'cue:upsert':                async (input)          => svc.upsertCue(input),
 		'cue:update':                async (cueId, patch)   => svc.updateCue(cueId, patch),

@@ -12,20 +12,20 @@
 //     the master (client.ts; snapshot-build.ts). The main library is ~127k
 //     ops that the log, and every later device, no longer carries. The fold
 //     covers everything the one-time backfills would have restated (the
-//     rekordbox units, recordings and claims, track meta / attributes,
-//     playlist details, cue origins, play references, album metadata, feed
-//     decisions): each runs here in its local form and marks its own key,
-//     and the drains' baselines (track_meta_seen, track_attrs_seen,
-//     playlist_attrs_seen) are seeded by the drains themselves, so nothing
-//     is re-queued afterwards.
+//     rekordbox units, recordings and claims, track meta / attributes /
+//     analysis, playlist details, cue origins, play references, album
+//     metadata, feed decisions): each runs here in its local form and marks
+//     its own key, and the drains' baselines (track_meta_seen,
+//     track_attrs_seen, track_analysis_seen, playlist_attrs_seen) are seeded
+//     by the drains themselves, so nothing is re-queued afterwards.
 //   - `joinPushAsync`, a JOINER: a device that bootstrapped from the
 //     account's snapshot and bound its rows to the account's recordings
 //     (join-bind.ts) emits what only it holds, as real ops under the
 //     'initial-push' batch label ('batches', client.ts). The generator's
 //     "already recorded?" probes are what keep it to that: a bound row's
-//     create, claims and tags are in the records already. Its meta and
-//     attributes are the drains' (client.ts), gated by role.ts to the
-//     recordings it created.
+//     create, claims and tags are in the records already. Its meta,
+//     attributes and analysis are the drains' (client.ts), gated by role.ts
+//     to the recordings it created.
 //   - `initialPush`, the synchronous joiner form (tests, replay-check, the
 //     headless CLI).
 //
@@ -57,6 +57,7 @@ import { albumMetaBackfillAsync } from './album-meta.js';
 import { reconcileProviderClaimsAsync } from './claim-reconcile.js';
 import { emitOps, type BatchLabel, type EmitOp } from './outbox.js';
 import { drainPlaylistAttrsAsync, queuePlaylistAttrsBackfill } from './playlist-attrs.js';
+import { drainTrackAnalysisAsync, queueTrackAnalysisBackfillAsync } from './track-analysis.js';
 import { drainTrackAttrsAsync, queueTrackAttrsBackfillAsync } from './track-attrs.js';
 import { drainTrackMetaAsync, queueTrackMetaBackfillAsync } from './track-meta.js';
 import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async } from './v4-backfill.js';
@@ -427,6 +428,7 @@ export type FoldLibraryResult = InitialPushAsyncResult & {
 	// Cells the drains folded beside the generator's ops.
 	meta: number;
 	attrs: number;
+	analysis: number;
 	playlistAttrs: number;
 	v4: number;
 	claims: number;
@@ -447,7 +449,7 @@ export async function foldLibraryAsync(
 ): Promise<FoldLibraryResult> {
 	const started = Date.now();
 	const r = await driveAsync(raw, initialPushOps(raw), estimateInitialPush(raw), () => { /* marked below, after the drains */ }, 'initial-push', true, opts);
-	const out: FoldLibraryResult = { ...r, meta: 0, attrs: 0, playlistAttrs: 0, v4: 0, claims: 0, albums: 0, feed: 0 };
+	const out: FoldLibraryResult = { ...r, meta: 0, attrs: 0, analysis: 0, playlistAttrs: 0, v4: 0, claims: 0, albums: 0, feed: 0 };
 	if (opts.signal?.aborted) return out;
 	const slice = (ms: number): void => { out.maxSliceMs = Math.max(out.maxSliceMs, ms); };
 	// The drains' one-time queues, drained here in their local form: the
@@ -460,6 +462,12 @@ export async function foldLibraryAsync(
 	const attrs = await drainTrackAttrsAsync(raw, { local: true, signal: opts.signal });
 	out.attrs = attrs.emitted;
 	slice(attrs.maxSliceMs);
+	// The analyzer's results (v5), so a new library's base carries them from
+	// the start; the queue marks its key.
+	await queueTrackAnalysisBackfillAsync(raw);
+	const analysis = await drainTrackAnalysisAsync(raw, { local: true, signal: opts.signal });
+	out.analysis = analysis.emitted;
+	slice(analysis.maxSliceMs);
 	queuePlaylistAttrsBackfill(raw);
 	const pl = await drainPlaylistAttrsAsync(raw, { local: true });
 	out.playlistAttrs = pl.emitted;

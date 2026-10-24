@@ -56,6 +56,7 @@ import { requestRestatement } from './restate.js';
 import { OVERRIDE_KEY_OF, parseOverrides, RB_UNITS, RB_UNITS_V4, rbSegmentsValue } from './rows.js';
 import type { FlushResult, SyncStateStore } from './store.js';
 import { projectPlaylistAttrs } from './playlist-attrs.js';
+import { projectTrackAnalysis } from './track-analysis.js';
 import { projectTrackAttrs } from './track-attrs.js';
 import { projectCuration } from './track-curation.js';
 import { masterDevice } from './track-meta.js';
@@ -561,6 +562,9 @@ export function project(
 		// remote row the winner's key replaces the rb key's mirror
 		// (track-attrs.ts).
 		for (const t of projectTrackAttrs(raw, recId, rec, master())) tracksTouched.add(t);
+		// v5 analysis, after the attributes: its tempo / key fill only what
+		// the account's attributes left empty (track-analysis.ts).
+		for (const t of projectTrackAnalysis(raw, recId, rec, master())) tracksTouched.add(t);
 		// Comment and colour: LWW onto own and remote rows (track-curation.ts).
 		for (const t of projectCuration(raw, recId, rec)) tracksTouched.add(t);
 	}

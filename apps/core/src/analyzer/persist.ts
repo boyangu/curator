@@ -6,10 +6,11 @@
 // pass that skipped them, the fingerprint on the analysed file's link. It
 // needs no analyzer sidecar: a pulled unit is just a partial AnalyzeResult.
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { sourceLink, track, trackAnalysis, type NewTrackAnalysis } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
 import { addClaims } from '../library/mutators.js';
+import { log } from '../log.js';
 import type { AnalyzeResult } from './sidecar.js';
 
 export type PersistOptions = {
@@ -19,7 +20,12 @@ export type PersistOptions = {
 	// alone. The caller decides — it is the one that knows whether the row
 	// was already about this audio (see analyzer/queue.ts stampFor).
 	audioHash?: string | null;
+	// The result is units pulled from the catalogue, not a pass of the
+	// analyzer here (only the log below reads it).
+	pulled?: boolean;
 };
+
+let modelsMissingLogged = false;
 
 // `filePath` is the local source_link path this result was computed from
 // (the one pickBatch dispatched) — the fingerprint is a property of that
@@ -101,13 +107,32 @@ export function persistAnalysisResult(db: Db, result: AnalyzeResult, filePath: s
 	if (row.density !== null) advancedSet.density = row.density;
 	if (featuresHasData) advancedSet.featuresJson = row.featuresJson;
 
-	const trackAdvancedSet: Record<string, number | null> = {};
+	// The advanced stage ran — its Essentia scalars came back — and the
+	// learned scores did not: a bundle without its scoring models (341 tracks
+	// on the master, 2026-10-17, stamped 2.4.0). Preserving the prior
+	// brightness then keeps a pre-2.3 raw-centroid value (248–1770 on a
+	// −0.3…4.4 scale) under the new stamp, where every reader takes it for a
+	// learned score; a brightness with no power beside it is that value, so
+	// it is cleared instead. A real brightness (one with a power) stays, as
+	// for any skipped field.
+	const advancedRan = result.dynamic_complexity !== null || result.loudness_range_lu !== null || result.dissonance !== null || result.density !== null;
+	const modelsMissing = advancedRan && result.brightness === null && result.power === null;
+	if (modelsMissing) {
+		(advancedSet as Record<string, unknown>).brightness = sql`CASE WHEN ${trackAnalysis.power} IS NULL THEN NULL ELSE ${trackAnalysis.brightness} END`;
+		if (!opts.pulled && !modelsMissingLogged) {
+			modelsMissingLogged = true;
+			log.for('analyzer').warn('analysis_models_missing: the advanced stage returned no brightness or power — the analyzer bundle lacks its scoring models; a legacy brightness without power is cleared', { trackId: result.track_id, version: result.analyzer_version });
+		}
+	}
+
+	const trackAdvancedSet: Record<string, number | null | SQL> = {};
 	if (result.brightness !== null) trackAdvancedSet.brightness = result.brightness;
 	if (result.power !== null) trackAdvancedSet.power = result.power;
 	if (result.dynamic_complexity !== null) trackAdvancedSet.dynamicComplexity = result.dynamic_complexity;
 	if (result.loudness_range_lu !== null) trackAdvancedSet.loudnessRangeLu = result.loudness_range_lu;
 	if (result.dissonance !== null) trackAdvancedSet.dissonance = result.dissonance;
 	if (result.density !== null) trackAdvancedSet.density = result.density;
+	if (modelsMissing) trackAdvancedSet.brightness = sql`CASE WHEN ${track.power} IS NULL THEN NULL ELSE ${track.brightness} END`;
 
 	// Segment stage outputs are treated as an atomic group: either it ran
 	// (segments array OR scalar counts are non-null) and we overwrite the

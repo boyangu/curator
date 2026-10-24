@@ -83,7 +83,13 @@ export type PushInput = {
 //     body: sync.bootstrap takes `storage: true` and answers the manifest of
 //     the newest snapshot (or the empty state while an account has none); a
 //     client that cannot read Storage is answered `update_required`.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage'] as const;
+//   - 'analysis_v5': the server reads protocol v5 — `library_track
+//     .set-analysis`, the analyzer's results as library data. Before it a
+//     desktop emits and pushes none (a v4 server answers a v5 op
+//     `server_outdated` for the whole push) and keeps hydrating analysis
+//     from the catalogue; with it the catalogue moves only waveform peaks,
+//     one track at a time when the player asks.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {

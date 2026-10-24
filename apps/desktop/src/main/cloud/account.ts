@@ -16,6 +16,9 @@
 // (the server's push trigger broadcasts `wake` there; the channel policy on
 // realtime.messages admits only the owner, hence `private: true` and the
 // setAuth before subscribing), window focus, network regain, and sign-in.
+// Whether that channel is joined goes to the sync client too
+// (onRealtimeChange): while it is not, the client polls at the active
+// cadence, idle or not, so a change pushed elsewhere still lands in a minute.
 //
 // Logging (area `cloud-account`): sign-in outcomes with the method and
 // Supabase's error code, sign-out, refresh failures, and the Realtime
@@ -29,6 +32,7 @@ import { createClient, type AuthError, type RealtimeChannel, type Session, type 
 import type { CloudSession, WakeReason } from '@curator/core';
 import { mainLog } from '../log.js';
 import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from '../cloud-config.js';
+import { initialConnectivity, realtimeLiveFor, stepConnectivity } from './connectivity.js';
 
 const alog = mainLog.for('cloud-account');
 
@@ -140,6 +144,8 @@ export class CloudAccount {
 	private channelUser: string | null = null;
 	private readonly changeListeners = new Set<(s: AccountState) => void>();
 	private readonly wakeListeners = new Set<(reason: WakeReason, seq?: number) => void>();
+	private readonly realtimeListeners = new Set<(live: boolean) => void>();
+	private realtimeLive = false;
 	private ready: Promise<void>;
 	private signingOut = false;
 
@@ -278,11 +284,24 @@ export class CloudAccount {
 		this.wakeListeners.add(onWake);
 		const onFocus = (): void => this.wake('focus');
 		app.on('browser-window-focus', onFocus);
-		let online = net.isOnline();
+		let conn = initialConnectivity(net.isOnline(), Date.now());
+		if (!conn.online) alog.info('went offline', { atStart: true });
 		const poll = setInterval(() => {
-			const now = net.isOnline();
-			if (now && !online) this.wake('network');
-			online = now;
+			const { next, change } = stepConnectivity(conn, net.isOnline(), Date.now());
+			conn = next;
+			if (!change) return;
+			if (change.kind === 'offline') {
+				alog.info('went offline');
+				// Nothing rings while offline, whatever the channel last said;
+				// Supabase reports SUBSCRIBED again once it has rejoined.
+				this.setRealtimeLive(false);
+				return;
+			}
+			alog.info('reconnected to the internet', { offlineForSec: change.offlineForSec });
+			// The sync client runs a cycle now (library changes made while
+			// this device could not hear them), then says 'reconnected' so the
+			// player asks again for what it is missing.
+			this.wake('network');
 		}, NETWORK_POLL_MS);
 		poll.unref?.();
 		return () => {
@@ -290,6 +309,14 @@ export class CloudAccount {
 			app.off('browser-window-focus', onFocus);
 			clearInterval(poll);
 		};
+	}
+
+	// The sync client's Realtime health (CoreServiceOptions.cloud
+	// .onRealtimeChange). Called with the current state at once.
+	onRealtimeChange(cb: (live: boolean) => void): () => void {
+		this.realtimeListeners.add(cb);
+		try { cb(this.realtimeLive); } catch (err) { alog.warn('realtime listener threw', undefined, err); }
+		return () => { this.realtimeListeners.delete(cb); };
 	}
 
 	async close(): Promise<void> {
@@ -300,6 +327,14 @@ export class CloudAccount {
 	private wake(reason: WakeReason, seq?: number): void {
 		for (const cb of this.wakeListeners) {
 			try { cb(reason, seq); } catch (err) { alog.warn('wake listener threw', undefined, err); }
+		}
+	}
+
+	private setRealtimeLive(live: boolean): void {
+		if (live === this.realtimeLive) return;
+		this.realtimeLive = live;
+		for (const cb of this.realtimeListeners) {
+			try { cb(live); } catch (err) { alog.warn('realtime listener threw', undefined, err); }
 		}
 	}
 
@@ -320,17 +355,23 @@ export class CloudAccount {
 			if (this.channel && this.channelUser === s.user.id) return;
 			await this.dropRealtime();
 			this.channelUser = s.user.id;
-			this.channel = this.supabase
+			const ch = this.supabase
 				.channel(`user:${s.user.id}`, { config: { private: true } })
-				.on('broadcast', { event: 'wake' }, (msg: { payload?: unknown }) => this.wake('realtime', pingSeq(msg.payload)))
-				.subscribe((status, err) => {
-					const userId = s.user.id;
-					if (status === 'SUBSCRIBED') alog.info('realtime wake channel joined', { userId });
-					else if (status === 'CLOSED') alog.info('realtime wake channel closed', { userId });
-					else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') alog.warn('realtime wake channel unavailable — falling back to focus/periodic pulls', { status, userId }, err);
-				});
+				.on('broadcast', { event: 'wake' }, (msg: { payload?: unknown }) => this.wake('realtime', pingSeq(msg.payload)));
+			this.channel = ch;
+			ch.subscribe((status, err) => {
+				const userId = s.user.id;
+				if (status === 'SUBSCRIBED') alog.info('realtime wake channel joined', { userId });
+				else if (status === 'CLOSED') alog.info('realtime wake channel closed', { userId });
+				else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') alog.warn('realtime wake channel unavailable — falling back to focus/periodic pulls', { status, userId }, err);
+				// A status from a channel since replaced (sign-out, a re-join)
+				// says nothing about the current one.
+				const live = realtimeLiveFor(status);
+				if (live !== null && this.channel === ch) this.setRealtimeLive(live);
+			});
 		} catch (err) {
 			alog.warn('realtime setup failed — falling back to focus/periodic pulls', undefined, err);
+			this.setRealtimeLive(false);
 		}
 	}
 
@@ -339,6 +380,7 @@ export class CloudAccount {
 		const userId = this.channelUser;
 		this.channel = null;
 		this.channelUser = null;
+		this.setRealtimeLive(false);
 		if (ch) {
 			alog.debug('leaving realtime wake channel', { userId });
 			await this.supabase.removeChannel(ch).catch(() => { /* already closed */ });

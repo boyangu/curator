@@ -189,6 +189,9 @@ export interface IpcChannels {
 	'analysis:cancel': { args: [trackId: string]; ret: void };
 	'analysis:job': { args: [trackId: string]; ret: AnalysisJob | null };
 	'analysis:get': { args: [trackId: string]; ret: TrackAnalysis | null };
+	// The player found no waveform for a track: fetch it from the account's
+	// catalogue (hi, else lo), then ask curator-peaks:// again. Null = none.
+	'analysis:fetch-peaks': { args: [trackId: string]; ret: 'hi' | 'lo' | null };
 	'analysis:cues': { args: [trackId: string]; ret: Cue[] };
 	// User-facing cue mutations from the pad grid. Backend treats the
 	// (trackId, slot, kind) tuple as the row identity; the renderer drives
@@ -478,6 +481,10 @@ export type EventChannels = {
 	// Cloud sync status snapshots (push/pull state, first-sign-in push
 	// progress, errors; progress coalesced ≤ 4/s) and sign-in changes.
 	'cloud-sync:status': CloudSyncStatusReport;
+	// The first sync cycle that went through after the device came back
+	// online: the player asks again for the playing track's waveform and
+	// analysis, which the outage may have left it without.
+	'cloud-sync:reconnected': { at: number };
 	// Shared analysis status (coalesced ≤ 4/s), and on sign-in changes.
 	'catalogue:status': CatalogueStatus;
 	// A pull or bootstrap changed local rows: the track list patches these
@@ -520,6 +527,7 @@ export const EVENT_CATALOG = {
 	onMcpConfirm: 'mcp:confirm',
 	onMcpNotify: 'mcp:notify',
 	onCloudSyncStatus: 'cloud-sync:status',
+	onCloudSyncReconnected: 'cloud-sync:reconnected',
 	onCatalogueStatus: 'catalogue:status',
 	onSyncApplied: 'sync:applied',
 } as const satisfies Record<string, keyof EventChannels>;
@@ -771,6 +779,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'analysis:cancel': { description: 'Cancel an in-flight or queued analysis job. Mid-run analyses can only be skipped between stages; queued ones are removed immediately.' },
 	'analysis:job': { description: 'Return the current queue state (queued/running/done/error/skipped) of a track\'s analysis, or null if it has never been enqueued.' },
 	'analysis:get': { description: 'Return the persisted analysis result for a track — BPM, beatgrid, key, density, brightness and friends — or null if not yet analyzed.' },
+	'analysis:fetch-peaks': { description: 'Download the waveform peaks of one track from the shared analysis catalogue of the account when this device has none (the hi tier if the account holds it, else lo). Returns the tier now on disk, or null when there is nothing to fetch.' },
 	'analysis:cues': { description: 'List the hot + memory cues stored against a track, ordered by slot. Loops are represented as cues with non-zero length_sec.' },
 	'cue:upsert': { description: 'Create or replace the cue at (trackId, slot, kind). Slot is namespaced per kind (`hot` covers the 16 pad slots; `memory` is reserved for time-ordered ordinals >= 100). `lengthSec` > 0 stores a loop region; null/0 stores a point cue.' },
 	'cue:update': { description: 'Patch a cue\'s name / color / position / length in place. Identified by id. Pass null to clear name or color.' },

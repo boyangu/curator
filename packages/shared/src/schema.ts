@@ -883,6 +883,14 @@ export const trackAnalysis = sqliteTable('track_analysis', {
 	// changes. NULL = provenance unknown: never uploaded, never filled in from
 	// the catalogue. The rb_* slot below is not covered by it.
 	audioHash: text('audio_hash'),
+	// Set when the Curator slot above was written from the account's analysis
+	// (the set-analysis projection, sync-log/track-analysis.ts): the digest of
+	// the payload as this row then read. While the slot still reads that
+	// digest the analysis is the account's — never stated back, replaced when
+	// the account's changes; any local write (an analysis of the file here)
+	// changes the digest and makes it this row's own again. NULL = the slot
+	// is this device's own (or empty).
+	adoptedDigest: text('adopted_digest'),
 
 	// ── Rekordbox slot ───────────────────────────────────────────────────────
 	// Dual-source analysis: the columns above are Curator's own (the analyzer
@@ -1568,6 +1576,20 @@ export const trackAttrsDirty = sqliteTable('track_attrs_dirty', {
 	trackId: text('track_id').primaryKey(),
 });
 export const trackAttrsSeen = sqliteTable('track_attrs_seen', {
+	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
+	recordingId: text('recording_id').notNull(),
+	digest: text('digest').notNull(),
+	seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
+});
+
+// The analyzer's results on the op log (protocol v5 `library_track
+// .set-analysis`, apps/core/src/sync-log/track-analysis.ts): the same pair
+// again, filled by triggers on the Curator slot of track_analysis (never the
+// rb_* slot) and on the local links that make a row's analysis its own.
+export const trackAnalysisDirty = sqliteTable('track_analysis_dirty', {
+	trackId: text('track_id').primaryKey(),
+});
+export const trackAnalysisSeen = sqliteTable('track_analysis_seen', {
 	trackId: text('track_id').primaryKey().references(() => track.id, { onDelete: 'cascade' }),
 	recordingId: text('recording_id').notNull(),
 	digest: text('digest').notNull(),

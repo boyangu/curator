@@ -167,6 +167,12 @@ function evictOver<T>(cache: Map<string, T>, max: number): void {
 }
 const loadingAnalysis = new Set<string>();
 const loadingPeaks = new Set<string>();
+// Tracks whose waveform was asked of the account's catalogue this session
+// (loadPeaks): one ask each, whatever the answer.
+const peaksAsked = new Set<string>();
+// Cached peaks that are the lo tier standing in for a missing hi (main's
+// X-Peaks-Tier): what a reconnect asks the account for again.
+const peaksLo = new Set<string>();
 const analysisListeners = new Set<Listener>();
 const peaksListeners = new Set<Listener>();
 
@@ -340,7 +346,16 @@ async function loadPeaks(trackId: string): Promise<void> {
 		// 'hi' tier — 100 Hz detail, full-res per-track peaks. A 5-min track is
 		// ~90 KB (30k samples × 3 bytes); fine for the renderer's memory budget
 		// and gives one peak per pixel on a 1000-px-wide scrubber.
-		const resp = await fetch(`curator-peaks://${encodeURIComponent(trackId)}/hi`);
+		const url = `curator-peaks://${encodeURIComponent(trackId)}/hi`;
+		let resp = await fetch(url);
+		// No waveform on this device (a track another device analysed): since
+		// protocol v5 the catalogue fetches it only on demand. Asked once per
+		// track per session; main falls back hi → lo, so a lo-only fetch shows.
+		if (!resp.ok && !peaksAsked.has(trackId)) {
+			peaksAsked.add(trackId);
+			const tier = await window.api['analysis:fetch-peaks'](trackId).catch(() => null);
+			if (tier) resp = await fetch(url, { cache: 'no-store' });
+		}
 		if (!resp.ok) {
 			// 404 just means "no peaks for this track yet" (analyzer hasn't
 			// run, no rb_*.cpk file). Silent; listener still fires so the
@@ -357,7 +372,10 @@ async function loadPeaks(trackId: string): Promise<void> {
 		const tier = decodeCpk(buf, source);
 		if (tier) {
 			peaks.set(trackId, { trackId, tier });
+			if (resp.headers.get('X-Peaks-Tier') === 'lo') peaksLo.add(trackId);
+			else peaksLo.delete(trackId);
 			evictOver(peaks, MAX_PEAKS_ENTRIES);
+			for (const id of peaksLo) if (!peaks.has(id)) peaksLo.delete(id);
 		}
 		for (const cb of peaksListeners) cb(trackId);
 	} catch (err) {
@@ -443,6 +461,7 @@ export function invalidate(trackId: string): void {
 	const hadEntry = analyses.delete(trackId);
 	rawAnalyses.delete(trackId);
 	const hadPeaks = peaks.delete(trackId);
+	peaksLo.delete(trackId);
 	if (trackId === currentTrackId) {
 		// Playing track: reload immediately so painters swap to the new data
 		// as soon as it lands (ensureLoaded fires the listeners on completion).
@@ -453,6 +472,31 @@ export function invalidate(trackId: string): void {
 		for (const cb of analysisListeners) cb(trackId);
 		for (const cb of peaksListeners) cb(trackId);
 	}
+}
+
+// The device came back online (cloud-sync:reconnected). The playing track's
+// waveform may have been asked of the account while it could not answer —
+// the once-per-session ask is spent — and its analysis may have arrived
+// since. Asks again when the player shows no waveform or only the lo stand-in,
+// and reloads the analysis either way.
+export async function refreshCurrentAfterReconnect(): Promise<void> {
+	const id = currentTrackId;
+	if (!id) return;
+	peaksAsked.delete(id);
+	if (peaks.has(id) && peaksLo.has(id)) {
+		// loadPeaks would not ask: its hi request is answered (with lo).
+		peaksAsked.add(id);
+		const tier = await window.api['analysis:fetch-peaks'](id).catch(() => null);
+		if (tier === 'hi') {
+			peaks.delete(id);
+			peaksLo.delete(id);
+		}
+		if (id !== currentTrackId) return;
+	}
+	slog.info('reloading the playing track after a reconnect', { trackId: id, peaks: peaks.has(id) ? (peaksLo.has(id) ? 'lo' : 'hi') : 'none' });
+	analyses.delete(id);
+	rawAnalyses.delete(id);
+	ensureLoaded(id);
 }
 
 // Observer registration. Listeners receive the trackId whose load just

@@ -33,7 +33,7 @@
 // for builds that predate this.
 
 import type Database from 'better-sqlite3';
-import { ATTRS_CELL_PREFIX, MASTER_DEVICE_SETTING, META_CELL_PREFIX, masterDeviceOf, type Cell } from '@curator/protocol';
+import { ANALYSIS_CELL_PREFIX, ATTRS_CELL_PREFIX, MASTER_DEVICE_SETTING, META_CELL_PREFIX, masterDeviceOf, type Cell } from '@curator/protocol';
 import { getDeviceId } from './device.js';
 
 type Raw = Database.Database;
@@ -81,19 +81,21 @@ const marks = (n: number): string => Array.from({ length: n }, () => '?').join('
 // created the record (one with no create — a catalogue row the log never
 // carried, or a record this device's own set-meta just started — names no
 // creator, and only the master's cells decide), or the master describes it — a non-null cell of its
-// under either prefix, since the master states set-meta and set-attrs for
-// the same rows and the meta came first (v3; the profile's records held the
-// master's meta on all 34,870 of its recordings while their attrs were still
-// on the way). One read per chunk; json_type is NULL for a missing cell and
-// 'null' for one nulled out. A recording with no record at all is not
-// returned: nothing describes it but this device.
+// under any of the three prefixes, since the master states set-meta,
+// set-attrs and set-analysis (v5) for the same rows and the meta came first
+// (v3; the profile's records held the master's meta on all 34,870 of its
+// recordings while their attrs were still on the way). One read per chunk;
+// json_type is NULL for a missing cell and 'null' for one nulled out. A
+// recording with no record at all is not returned: nothing describes it but
+// this device.
 export function leftToOthers(raw: Raw, role: { self: string; master: string }, recs: readonly string[]): Set<string> {
 	if (recs.length === 0) return new Set();
 	const cell = (prefix: string): string => `$.fields."${prefix}${role.master}".value`;
 	return new Set(raw.prepare(`SELECT key FROM sync_state WHERE map = 'libraryTracks' AND key IN (${marks(recs.length)})
 		AND (coalesce(json_extract(value, '$.created.device'), ?) != ?
-			OR coalesce(json_type(value, ?), 'null') != 'null' OR coalesce(json_type(value, ?), 'null') != 'null')`)
-		.pluck().all(...recs, role.self, role.self, cell(META_CELL_PREFIX), cell(ATTRS_CELL_PREFIX)) as string[]);
+			OR coalesce(json_type(value, ?), 'null') != 'null' OR coalesce(json_type(value, ?), 'null') != 'null'
+			OR coalesce(json_type(value, ?), 'null') != 'null')`)
+		.pluck().all(...recs, role.self, role.self, cell(META_CELL_PREFIX), cell(ATTRS_CELL_PREFIX), cell(ANALYSIS_CELL_PREFIX)) as string[]);
 }
 
 // Whether a secondary states only the user's choices of a playlist or

@@ -1,6 +1,9 @@
 // The cloud sync client's adaptive fallback poll (poll-policy.ts): the
-// cadence while in use / idle, the switch between them, policy changes on a
-// running client, clamping, and the per-device setting behind it.
+// cadence while in use / idle, the switch between them, the Realtime
+// channel's health holding the active cadence while it is down, a regained
+// network (an immediate cycle, the poll re-based, 'reconnected' once it went
+// through), policy changes on a running client, clamping, and the
+// per-device setting behind it.
 //
 // Generated DBs only (CLAUDE.md): mkdtempSync + migrate(). The transport is
 // an in-process stub that counts calls; nothing here touches the network,
@@ -21,22 +24,28 @@ import { createDb } from '../db/client.js';
 import { createCoreService, type CloudActivityWatcher, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import * as mut from '../library/mutators.js';
-import { createSyncClient, type CloudTransport, type SyncClient } from './client.js';
+import { CloudTransportError, createSyncClient, type CloudSyncEvent, type CloudTransport, type SyncClient, type WakeReason } from './client.js';
 import { DEFAULT_SYNC_POLL_POLICY, normalizePollPolicy, readPollSettings, SYNC_POLL_KEY } from './poll-policy.js';
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
-type StubTransport = CloudTransport & { calls: { push: number; pull: number } };
+// `offline`: pulls fail as the HTTP transport's do with no network.
+type StubTransport = CloudTransport & { calls: { push: number; pull: number }; offline: boolean };
 
 function stubTransport(): StubTransport {
 	const calls = { push: 0, pull: 0 };
-	return {
+	const t: StubTransport = {
 		calls,
+		offline: false,
 		session: () => ({ userId: 'user-1', email: null }),
 		signOut: async () => { /* not exercised */ },
 		sync: {
 			push: async (input: PushInput) => { calls.push++; return { accepted: input.ops.length, maxSeq: 0, rejected: [] }; },
-			pull: async (input: PullInput) => { calls.pull++; return { ops: [], nextSeq: input.afterSeq }; },
+			pull: async (input: PullInput) => {
+				calls.pull++;
+				if (t.offline) throw new CloudTransportError('network', 'fetch failed');
+				return { ops: [], nextSeq: input.afterSeq };
+			},
 		},
 		bootstrap: async () => ({ snapshotSeq: 0, baseSeq: 0, records: null }),
 		account: {
@@ -45,6 +54,7 @@ function stubTransport(): StubTransport {
 			revokeDevice: async () => ({ ok: true as const }),
 		},
 	};
+	return t;
 }
 
 type Rec = { level: string; msg: string; data?: Record<string, unknown> };
@@ -97,21 +107,26 @@ const SEC = 1_000;
 // A started client on fake timers whose first (session) cycle has run. The
 // device registration and first-sign-in push run once on real timers first
 // (they yield with setImmediate), so every later cycle is exactly one pull.
-async function startedClient(extra: Partial<Parameters<typeof createSyncClient>[0]> = {}): Promise<{ c: SyncClient; t: StubTransport; raw: Database.Database; recs: Rec[] }> {
+// `live`: the Realtime channel is joined (set before start, so it wakes
+// nothing) — the idle cadence needs it.
+async function startedClient(extra: Partial<Parameters<typeof createSyncClient>[0]> = {}, o: { live?: boolean } = {}): Promise<{ c: SyncClient; t: StubTransport; raw: Database.Database; recs: Rec[]; events: CloudSyncEvent[] }> {
 	const { raw } = freshDb();
 	const t = stubTransport();
 	const { recs, logger } = capture();
-	const c = createSyncClient({ db: raw, transport: t, debounceMs: 1, logger, ...extra });
+	const c = createSyncClient({ db: raw, transport: t, debounceMs: 1, logger, backoffBaseMs: 5_000, backoffCapMs: 5_000, ...extra });
 	clients.push(c);
 	await c.syncNow();
 	vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+	c.setRealtimeLive(o.live ?? true);
 	t.calls.pull = 0;
 	t.calls.push = 0;
 	recs.length = 0;
+	const events: CloudSyncEvent[] = [];
+	c.subscribe((e) => events.push(e));
 	c.start();
 	await vi.advanceTimersByTimeAsync(5);
 	expect(t.calls.pull).toBe(1);
-	return { c, t, raw, recs };
+	return { c, t, raw, recs, events };
 }
 
 // Advance to `ms` after start (the start-time fixture already used 5 ms).
@@ -261,6 +276,127 @@ describe('fallback poll cadence', () => {
 	});
 });
 
+// ── Realtime health ─────────────────────────────────────────────────────────
+
+describe('Realtime channel health', () => {
+	const cycles = (recs: Rec[]): Rec[] => recs.filter((r) => r.msg === 'sync cycle');
+	const channelLines = (recs: Rec[]): Rec[] => recs.filter((r) => r.msg.startsWith('realtime wake channel'));
+
+	it('keeps the 60 s cadence while idle and the channel is down; the idle decay applies once it is joined', async () => {
+		const { c, t } = await startedClient({}, { live: false });
+		const clock = { t: 5 };
+		expect(c.status().poll).toMatchObject({ realtimeLive: false, active: true });
+		c.setActive(false);
+		await advanceTo(clock, 60 * SEC + 5);
+		expect(t.calls.pull).toBe(2);
+		await advanceTo(clock, 120 * SEC + 5);
+		expect(t.calls.pull).toBe(3);
+		// Joined: one catch-up cycle, then the idle period from the last poll.
+		c.setRealtimeLive(true);
+		await advanceTo(clock, 130 * SEC);
+		expect(t.calls.pull).toBe(4);
+		expect(c.status().poll.realtimeLive).toBe(true);
+		await advanceTo(clock, 719 * SEC);
+		expect(t.calls.pull).toBe(4);
+		await advanceTo(clock, 720 * SEC + 10);
+		expect(t.calls.pull).toBe(5);
+	});
+
+	it('idle with the channel joined polls every 600 s', async () => {
+		const { c, t } = await startedClient({}, { live: true });
+		const clock = { t: 5 };
+		c.setActive(false);
+		await advanceTo(clock, 599 * SEC);
+		expect(t.calls.pull).toBe(1);
+		await advanceTo(clock, 600 * SEC + 5);
+		expect(t.calls.pull).toBe(2);
+	});
+
+	it('down → live wakes one catch-up cycle; repeats and live → down wake none; each transition logs once', async () => {
+		const { c, t, recs } = await startedClient({}, { live: false });
+		const clock = { t: 5 };
+		c.setRealtimeLive(true);
+		c.setRealtimeLive(true);
+		await advanceTo(clock, 10 * SEC);
+		expect(t.calls.pull).toBe(2);
+		expect(cycles(recs).at(-1)!.data).toMatchObject({ reason: 'rejoin' });
+		c.setRealtimeLive(false);
+		c.setRealtimeLive(false);
+		await advanceTo(clock, 20 * SEC);
+		expect(t.calls.pull).toBe(2);
+		expect(channelLines(recs).map((r) => [r.level, r.msg])).toEqual([
+			['info', 'realtime wake channel live — polling every 60s'],
+			['info', 'realtime wake channel down — polling every 60s'],
+		]);
+		// While idle the number says what the switch changed.
+		c.setActive(false);
+		c.setRealtimeLive(true);
+		expect(channelLines(recs).at(-1)!.msg).toBe('realtime wake channel live — polling every 600s');
+	});
+
+	it('the channel going down while idle shortens the period at once (a due time already past polls now)', async () => {
+		const { c, t } = await startedClient({}, { live: true });
+		const clock = { t: 5 };
+		c.setActive(false);
+		await advanceTo(clock, 300 * SEC);
+		expect(t.calls.pull).toBe(1);
+		c.setRealtimeLive(false);
+		await advanceTo(clock, 300 * SEC + 5);
+		expect(t.calls.pull).toBe(2);
+		await advanceTo(clock, 359 * SEC);
+		expect(t.calls.pull).toBe(2);
+		await advanceTo(clock, 360 * SEC + 10);
+		expect(t.calls.pull).toBe(3);
+	});
+});
+
+// ── a regained network ──────────────────────────────────────────────────────
+
+describe('a network wake', () => {
+	it('cycles at once, logs it at info, re-bases the poll on it, and says reconnected once', async () => {
+		const { c, t, recs, events } = await startedClient();
+		const clock = { t: 5 };
+		await advanceTo(clock, 45 * SEC);
+		c.wake('network');
+		// The next poll counts from the reconnect, not from start.
+		expect(c.status().poll.nextPollAt).toBe(Date.now() + 60 * SEC);
+		await advanceTo(clock, 45 * SEC + 5);
+		expect(t.calls.pull).toBe(2);
+		const line = recs.filter((r) => r.msg === 'sync cycle').at(-1)!;
+		expect([line.level, line.data?.['reason'], line.data?.['outcome']]).toEqual(['info', 'network', 'ok']);
+		expect(events.filter((e) => e.kind === 'reconnected')).toHaveLength(1);
+		await advanceTo(clock, 104 * SEC);
+		expect(t.calls.pull).toBe(2);
+		await advanceTo(clock, 105 * SEC + 10);
+		expect(t.calls.pull).toBe(3);
+		// Later cycles are ordinary.
+		expect(events.filter((e) => e.kind === 'reconnected')).toHaveLength(1);
+	});
+
+	it('a reconnect whose first cycle fails says reconnected after the one that goes through', async () => {
+		const { c, t, events } = await startedClient();
+		const clock = { t: 5 };
+		t.offline = true;
+		c.wake('network');
+		await advanceTo(clock, 10);
+		expect(t.calls.pull).toBe(2);
+		expect(events.some((e) => e.kind === 'reconnected')).toBe(false);
+		t.offline = false;
+		// The backoff's retry (5 s here) goes through.
+		await advanceTo(clock, 6 * SEC);
+		expect(t.calls.pull).toBe(3);
+		expect(events.filter((e) => e.kind === 'reconnected')).toHaveLength(1);
+	});
+
+	it('other wakes never say reconnected', async () => {
+		const { c, events } = await startedClient();
+		const clock = { t: 5 };
+		for (const r of ['focus', 'realtime', 'manual', 'resume', 'rejoin'] as WakeReason[]) c.wake(r);
+		await advanceTo(clock, 70 * SEC);
+		expect(events.some((e) => e.kind === 'reconnected')).toBe(false);
+	});
+});
+
 // ── the setting ─────────────────────────────────────────────────────────────
 
 describe('sync.poll setting', () => {
@@ -340,5 +476,46 @@ describe('sync.poll setting', () => {
 		svc.close();
 		services.splice(services.indexOf(svc), 1);
 		expect(watcher.stopped).toBe(true);
+	});
+
+	it('threads the host\'s Realtime health and network wakes through: reconnected follows a network wake\'s cycle', async () => {
+		const { path } = freshDb();
+		let onWake: ((reason?: WakeReason, seq?: number) => void) | null = null;
+		let onRealtime: ((live: boolean) => void) | null = null;
+		let realtimeUnsubbed = false;
+		const svc = createCoreService(path, {
+			peaksDir: join(dir, 'peaks'),
+			sourceAdapters: { spotify: throwingAdapter() },
+			cloud: {
+				transport: stubTransport(),
+				device: { name: 'test', platform: 'win32' },
+				subscribeWakeups: (cb) => { onWake = cb; return () => { onWake = null; }; },
+				onRealtimeChange: (cb) => { onRealtime = cb; cb(false); return () => { realtimeUnsubbed = true; }; },
+			},
+		});
+		services.push(svc);
+		const events: CloudSyncEvent[] = [];
+		svc.subscribeCloudSync((e) => events.push(e));
+		svc.startCloudSync();
+		const until = async (cond: () => Promise<boolean>): Promise<void> => {
+			const end = Date.now() + 5_000;
+			while (!(await cond())) {
+				if (Date.now() > end) throw new Error('timed out waiting');
+				await new Promise((r) => setTimeout(r, 10));
+			}
+		};
+		await until(async () => (await svc.getCloudSyncStatus()).lastPullAt !== null && !(await svc.getCloudSyncStatus()).running);
+		expect((await svc.getCloudSyncStatus()).poll.realtimeLive).toBe(false);
+		onRealtime!(true);
+		expect((await svc.getCloudSyncStatus()).poll.realtimeLive).toBe(true);
+		expect(events.some((e) => e.kind === 'reconnected')).toBe(false);
+
+		onWake!('network');
+		await until(async () => events.some((e) => e.kind === 'reconnected'));
+		expect(events.filter((e) => e.kind === 'reconnected')).toHaveLength(1);
+
+		svc.close();
+		services.splice(services.indexOf(svc), 1);
+		expect(realtimeUnsubbed).toBe(true);
 	});
 });

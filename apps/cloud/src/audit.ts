@@ -75,7 +75,7 @@ export const AUDIT_KINDS = [
 	// Storage snapshot ({ snapshotSeq, bytes, parts, pruned, superseded }).
 	'snapshot_published',
 	// sync.push / batchPush accepted source ops (library_track set-meta /
-	// set-attrs, album set-meta) from a device that is not the account's
+	// set-attrs / set-analysis, album set-meta) from a device that is not the account's
 	// master ({ procedure, master, byKind }). Audit only: the ops are kept.
 	'source_from_non_master',
 	// The compaction sweep (src/sync/compact.ts) raised an account's base

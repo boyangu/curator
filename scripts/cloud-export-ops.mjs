@@ -21,7 +21,7 @@
 // input hidden when absent; it is never printed, never in argv (the same
 // handling as scripts/cloud-db-apply.mjs).
 
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -79,6 +79,12 @@ function checkUrl(url) {
 	try { u = new URL(url); } catch { fail('the owner connection string is not a URL (value not shown)'); }
 	if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') fail('the owner connection string must start with postgresql:// (value not shown)');
 	if (!/^postgres([.]|$)/.test(decodeURIComponent(u.username))) fail('expected the owner user postgres.<ref> (value not shown)');
+	// Supabase's pooler names the project in the user (postgres.<ref>); the
+	// dashboard's "Direct connection" string has plain `postgres`, which the
+	// pooler refuses as "Invalid format for user or db_name".
+	if (/pooler\.supabase\.com$/i.test(u.hostname) && !decodeURIComponent(u.username).includes('.')) {
+		fail('the pooler needs the user postgres.<project-ref>: copy the "Session pooler" URI, not "Direct connection" (value not shown)');
+	}
 }
 
 async function loadPostgres() {
@@ -110,18 +116,25 @@ async function main() {
 	try {
 		process.stdout.write(`exporting ops of ${userId.slice(0, 8)}… `);
 		// bigint columns come back as strings from the driver and stay so:
-		// exact, whatever the seq.
-		const cursor = sql
-			.unsafe(
-				`select seq::text as seq, op_id::text as op_id, device_id, client_ts::text as client_ts, schema_version, entity, entity_id, kind, payload, received_at
-				from curator.library_op where user_id = $1 order by seq`,
-				[userId],
-			)
-			.cursor(1000);
-		for await (const rows of cursor) {
+		// exact, whatever the seq. `order by o.seq`, never a bare `seq`: Postgres
+		// resolves that to the text alias above and pages in string order
+		// ('100000' < '99999'), which skipped ~99k ops of the first export
+		// (2026-10-22). Keyset pages, each its own short statement:
+		// one cursor over the whole log ran past Supabase's statement timeout
+		// at ~350k rows (2026-10-22).
+		let after = '0';
+		let reported = 0;
+		for (;;) {
+			const rows = await sql.unsafe(
+				`select o.seq::text as seq, o.op_id::text as op_id, o.device_id, o.client_ts::text as client_ts, o.schema_version, o.entity, o.entity_id, o.kind, o.payload, o.received_at
+				from curator.library_op o where o.user_id = $1 and o.seq > $2::bigint order by o.seq limit 5000`,
+				[userId, after],
+			);
+			if (rows.length === 0) break;
 			for (const r of rows) await write(JSON.stringify({ t: 'op', ...r }));
 			ops += rows.length;
-			if (ops % 50_000 === 0) process.stdout.write(`${ops.toLocaleString('en')}… `);
+			after = rows[rows.length - 1].seq;
+			if (ops - reported >= 50_000) { reported = ops; process.stdout.write(`${ops.toLocaleString('en')}… `); }
 		}
 		const manifests = await sql.unsafe(
 			`select snapshot_seq::text as snapshot_seq, created_at, storage, state_sha256, published_by
@@ -136,6 +149,9 @@ async function main() {
 		console.log(`done\n  ops        ${ops.toLocaleString('en')}\n  snapshots  ${snapshots}\n  bytes      ${bytes.toLocaleString('en')}\n  file       ${outPath}`);
 	} catch (e) {
 		gzip.destroy();
+		// A partial export is worse than none: the next run would refuse to
+		// overwrite it.
+		try { unlinkSync(outPath); } catch { /* never created */ }
 		fail(`${e?.code ? e.code + ' ' : ''}${String(e?.message ?? e).slice(0, 300)}`);
 	} finally {
 		await sql.end({ timeout: 2 });

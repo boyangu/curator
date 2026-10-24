@@ -14,7 +14,7 @@ function status(patch: Partial<CloudSyncStatusReport> = {}): CloudSyncStatusRepo
 		enabled: true, signedIn: true, userId: 'u1', email: 'dj@example.test', deviceId: 'this', pending: 0, rejected: 0,
 		lastPushAt: NOW - 30_000, lastPullAt: NOW - 30_000, lastCheckedAt: NOW - 12_000, lastChangedAt: NOW - 360_000, transferring: false, lastSeq: 10, lastError: null, needsUpdate: false, revoked: false, boundUserId: 'u1',
 		initialPushDone: true, initialPush: null, phase: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null, verifying: false, digest: null }, nextRetryAt: null,
-		poll: { policy: { activeSec: 60, idleSec: 600, idleAfterSec: 600 }, active: true, nextPollAt: null },
+		poll: { policy: { activeSec: 60, idleSec: 600, idleAfterSec: 600 }, active: true, realtimeLive: true, nextPollAt: null },
 		...patch,
 	};
 }

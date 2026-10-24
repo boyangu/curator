@@ -32,8 +32,10 @@
 //                      Beatport/Traxsource match, a Tidal listing) stands; an
 //                      empty one takes the account's. The catalogue hydrate's
 //                      analyzer fill (catalogue/layer.ts) is recorded as
-//                      adopted `from: 'catalogue'`: the account's value
-//                      replaces it, and it stays when the account has none.
+//                      adopted `from: 'catalogue'`, and the account's
+//                      analysis (track-analysis.ts) `from: 'analysis'`: the
+//                      account's value replaces either, and it stays when
+//                      the account has none.
 //                      Overrides are separate fields and still win on read.
 //   explicit, mbid, copyright
 //                      take-if-empty, the same rule (source data).
@@ -85,7 +87,11 @@ export const TRACK_ATTRS_BACKFILL_KEY = 'sync.backfill.track_attrs_v4_at';
 
 export const SCALAR_FIELDS = ['bpm', 'key_camelot', 'explicit', 'mbid', 'copyright', 'play_count'] as const;
 export type ScalarField = (typeof SCALAR_FIELDS)[number];
-type Adopted = Partial<Record<ScalarField, { v: unknown; from: 'account' | 'catalogue' }>>;
+// `from`: the account's attributes (set-attrs), a catalogue hydrate's fill,
+// or the account's analysis (set-analysis, v5, track-analysis.ts). Only
+// 'account' is cleared when its source drops the value; the two fills stay
+// until something better arrives — the attributes' value replaces either.
+export type Adopted = Partial<Record<ScalarField, { v: unknown; from: 'account' | 'catalogue' | 'analysis' }>>;
 
 export function parseAdopted(json: string | null | undefined): Adopted {
 	if (!json) return {};
@@ -97,7 +103,7 @@ export function parseAdopted(json: string | null | undefined): Adopted {
 	}
 }
 
-const adoptedJson = (a: Adopted): string | null => (Object.keys(a).length > 0 ? JSON.stringify(a) : null);
+export const adoptedJson = (a: Adopted): string | null => (Object.keys(a).length > 0 ? JSON.stringify(a) : null);
 
 // A column value in the field's wire form (explicit is stored 0/1; a
 // play_count of 0 is "no plays", stated as nothing).

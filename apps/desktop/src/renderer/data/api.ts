@@ -347,6 +347,7 @@ export const cloudSyncApi = {
 	setPollPolicy: (patch: Parameters<typeof window.api['cloud-sync:set-poll-policy']>[0]) => trpc.cloudSync.setPollPolicy.mutate([patch]),
 	onStatus: (cb: Parameters<typeof window.api.onCloudSyncStatus>[0]) => api().onCloudSyncStatus(cb),
 	onApplied: (cb: Parameters<typeof window.api.onSyncApplied>[0]) => api().onSyncApplied(cb),
+	onReconnected: (cb: Parameters<typeof window.api.onCloudSyncReconnected>[0]) => api().onCloudSyncReconnected(cb),
 };
 
 // Shared analysis catalogue (Settings → Account). Status rides window.api,

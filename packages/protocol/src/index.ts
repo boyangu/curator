@@ -12,6 +12,7 @@
 export * from './ops.js';
 export * from './order-key.js';
 export * from './rb-grid.js';
+export * from './analysis.js';
 export * from './clock.js';
 export * from './state.js';
 export * from './reduce.js';

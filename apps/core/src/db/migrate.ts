@@ -1304,6 +1304,65 @@ const ALTER_MIGRATIONS: string[] = [
 				SELECT t.recording_id FROM track t WHERE t.id = OLD.track_id AND t.derived_from_track_id IS NULL
 					AND EXISTS (SELECT 1 FROM sync_state s WHERE s.recording_id = t.recording_id AND +s.map = 'claims');
 		END`,
+	// ── protocol v5: the analyzer's results on the op log ───────────────────
+	// See trackAnalysis.adoptedDigest, trackAnalysisDirty and
+	// trackAnalysisSeen in schema.ts. The one-time backfill
+	// (sync-log/track-analysis.ts TRACK_ANALYSIS_BACKFILL_KEY) queues every own
+	// analysed row once the server reads v5.
+	`ALTER TABLE track_analysis ADD COLUMN adopted_digest TEXT`,
+	`CREATE TABLE IF NOT EXISTS track_analysis_dirty (track_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS track_analysis_seen (
+		track_id TEXT PRIMARY KEY REFERENCES track(id) ON DELETE CASCADE,
+		recording_id TEXT NOT NULL,
+		digest TEXT NOT NULL,
+		seen_at INTEGER NOT NULL
+	)`,
+	// The Curator slot's columns only: the rekordbox importer's rb_* writes and
+	// the catalogue / projection bookkeeping (adopted_digest, features_json,
+	// which no op carries) state nothing. Gated on a real change, as
+	// track_attrs_dirty_change, and on an own catalogue row (remote rows and
+	// derived WAV copies never state). The upsert clause rather than OR
+	// IGNORE for the reason track_attrs_dirty's gives: persist's write is an
+	// UPSERT. analyzed_at is in the list on purpose: a re-analysis is a new
+	// statement even when it lands on the same values.
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_insert AFTER INSERT ON track_analysis
+		WHEN NEW.analyzer_version != 'rekordbox'
+			AND EXISTS (SELECT 1 FROM track t WHERE t.id = NEW.track_id AND t.remote_only = 0 AND t.derived_from_track_id IS NULL)
+		BEGIN INSERT INTO track_analysis_dirty (track_id) VALUES (NEW.track_id) ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_change AFTER UPDATE OF bpm, beatgrid, downbeats, key_camelot, key_strength, brightness, power,
+		dynamic_complexity, loudness_range_lu, dissonance, density, segments_json, intro_length_sec, outro_length_sec, first_drop_sec, drop_count,
+		breakdown_count, duration, analyzer_version, analyzed_at, audio_hash ON track_analysis
+		WHEN (OLD.bpm IS NOT NEW.bpm OR OLD.beatgrid IS NOT NEW.beatgrid OR OLD.downbeats IS NOT NEW.downbeats OR OLD.key_camelot IS NOT NEW.key_camelot
+				OR OLD.key_strength IS NOT NEW.key_strength OR OLD.brightness IS NOT NEW.brightness OR OLD.power IS NOT NEW.power
+				OR OLD.dynamic_complexity IS NOT NEW.dynamic_complexity OR OLD.loudness_range_lu IS NOT NEW.loudness_range_lu
+				OR OLD.dissonance IS NOT NEW.dissonance OR OLD.density IS NOT NEW.density OR OLD.segments_json IS NOT NEW.segments_json
+				OR OLD.intro_length_sec IS NOT NEW.intro_length_sec OR OLD.outro_length_sec IS NOT NEW.outro_length_sec
+				OR OLD.first_drop_sec IS NOT NEW.first_drop_sec OR OLD.drop_count IS NOT NEW.drop_count OR OLD.breakdown_count IS NOT NEW.breakdown_count
+				OR OLD.duration IS NOT NEW.duration OR OLD.analyzer_version IS NOT NEW.analyzer_version OR OLD.analyzed_at IS NOT NEW.analyzed_at
+				OR OLD.audio_hash IS NOT NEW.audio_hash)
+			AND EXISTS (SELECT 1 FROM track t WHERE t.id = NEW.track_id AND t.remote_only = 0 AND t.derived_from_track_id IS NULL)
+		BEGIN INSERT INTO track_analysis_dirty (track_id) VALUES (NEW.track_id) ON CONFLICT DO NOTHING; END`,
+	// What makes a row's analysis its OWN (track-analysis.ts): a live local
+	// file whose audio hash the slot is stamped with. A link that appears,
+	// goes missing, changes audio or moves to another row changes that.
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_link_insert AFTER INSERT ON source_link
+		WHEN NEW.source = 'local'
+		BEGIN INSERT INTO track_analysis_dirty (track_id) SELECT NEW.track_id WHERE EXISTS (SELECT 1 FROM track_analysis WHERE track_id = NEW.track_id)
+			ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_link_change AFTER UPDATE OF track_id, audio_hash, missing_at ON source_link
+		WHEN NEW.source = 'local' AND (OLD.track_id IS NOT NEW.track_id OR OLD.audio_hash IS NOT NEW.audio_hash OR OLD.missing_at IS NOT NEW.missing_at)
+		BEGIN INSERT INTO track_analysis_dirty (track_id) SELECT track_id FROM track_analysis WHERE track_id IN (OLD.track_id, NEW.track_id)
+			ON CONFLICT DO NOTHING; END`,
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_link_delete AFTER DELETE ON source_link
+		WHEN OLD.source = 'local'
+		BEGIN INSERT INTO track_analysis_dirty (track_id) SELECT OLD.track_id WHERE EXISTS (SELECT 1 FROM track_analysis WHERE track_id = OLD.track_id)
+			ON CONFLICT DO NOTHING; END`,
+	// A row moving to another recording, or a remote row becoming an own one.
+	`CREATE TRIGGER IF NOT EXISTS track_analysis_dirty_rebind AFTER UPDATE OF recording_id, remote_only ON track
+		WHEN NEW.remote_only = 0 AND NEW.derived_from_track_id IS NULL
+			AND (OLD.recording_id IS NOT NEW.recording_id OR OLD.remote_only IS NOT NEW.remote_only)
+		BEGIN INSERT INTO track_analysis_dirty (track_id) SELECT NEW.id WHERE EXISTS (SELECT 1 FROM track_analysis WHERE track_id = NEW.id)
+			ON CONFLICT DO NOTHING; END`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

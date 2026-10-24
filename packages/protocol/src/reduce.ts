@@ -22,6 +22,7 @@ import {
 	type OpOf,
 } from './ops.js';
 import {
+	analysisCellName,
 	attrsCellName,
 	clockOf,
 	compareClock,
@@ -228,6 +229,11 @@ function applyLibraryTrack(state: LibraryState, op: OpOf<'library_track'>, clock
 		// One cell per device, picked like the meta (state.ts resolveTrackAttrs).
 		case 'set-attrs':
 			changed = writeCell(rec.fields, attrsCellName(op.device_id), op.payload, clock);
+			break;
+		// One cell per device, picked whole (state.ts resolveTrackAnalysis);
+		// null withdraws the device's statement.
+		case 'set-analysis':
+			changed = writeCell(rec.fields, analysisCellName(op.device_id), op.payload.analysis, clock);
 			break;
 		case 'set-cues-edited':
 			changed = writeMaxCell(rec.fields, CUES_EDITED_CELL, op.payload.at, clock);
@@ -674,6 +680,10 @@ export function isRestatement(state: LibraryState, op: NewOp): boolean {
 				case 'set-attrs': {
 					const device = (op as { device_id?: string }).device_id;
 					return device !== undefined && cellHolds(rec, attrsCellName(device), op.payload);
+				}
+				case 'set-analysis': {
+					const device = (op as { device_id?: string }).device_id;
+					return device !== undefined && cellHolds(rec, analysisCellName(device), op.payload.analysis);
 				}
 				// A stamp no later than the one held changes nothing visible.
 				case 'set-cues-edited': {

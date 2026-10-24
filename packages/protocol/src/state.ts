@@ -10,7 +10,7 @@
 // the user sees is derived from them by `materialize`, which applies the
 // visibility rules (tombstones, container deletes, add-wins).
 
-import { MASTER_DEVICE_SETTING, type CueKind, type Entity, type Op, type PayloadOf, type SourceLink, type TrackAttrs, type TrackMeta } from './ops.js';
+import { MASTER_DEVICE_SETTING, type CueKind, type Entity, type Op, type PayloadOf, type SourceLink, type TrackAnalysis, type TrackAttrs, type TrackMeta } from './ops.js';
 import { compareKeys } from './order-key.js';
 
 // ── clocks ──────────────────────────────────────────────────────────────────
@@ -236,8 +236,9 @@ export type ResolvedTrackMeta = { device: string; meta: TrackMeta; clock: Clock 
 // The rule over any family of per-device cells `<prefix><device>` whose
 // values carry a `source`: set-meta's and set-attrs' (v4), which must pick
 // the same device for a recording or a remote row would show one device's
-// title beside another's tempo.
-function resolveDeviceCell<T extends { source: string }>(rec: Pick<LwwRecord, 'fields'> | undefined, prefix: string, master: string | null): { device: string; value: T; clock: Clock } | null {
+// title beside another's tempo. A family without a source (set-analysis, v5)
+// ranks every non-master cell alike, so the later write decides.
+function resolveDeviceCell<T extends object>(rec: Pick<LwwRecord, 'fields'> | undefined, prefix: string, master: string | null): { device: string; value: T; clock: Clock } | null {
 	if (!rec) return null;
 	let best: { device: string; value: T; clock: Clock } | null = null;
 	for (const [name, cell] of Object.entries(rec.fields)) {
@@ -245,8 +246,8 @@ function resolveDeviceCell<T extends { source: string }>(rec: Pick<LwwRecord, 'f
 		const cand = { device: name.slice(prefix.length), value: cell.value as T, clock: cell.clock };
 		if (master !== null && cand.device === master) return cand;
 		if (!best) { best = cand; continue; }
-		const rb = META_SOURCE_RANK[best.value.source] ?? 9;
-		const rc = META_SOURCE_RANK[cand.value.source] ?? 9;
+		const rb = META_SOURCE_RANK[(best.value as { source?: string }).source ?? ''] ?? 9;
+		const rc = META_SOURCE_RANK[(cand.value as { source?: string }).source ?? ''] ?? 9;
 		if (rc < rb || (rc === rb && compareClock(cand.clock, best.clock) > 0)) best = cand;
 	}
 	return best;
@@ -303,6 +304,29 @@ export function resolveTrackAttrs(rec: Pick<LwwRecord, 'fields'> | undefined, ma
 	out.provider_refs = cells.find((c) => (c.value.provider_refs?.length ?? 0) > 0)?.value.provider_refs ?? [];
 	out.artist_names = master !== null && lead.device !== master ? [] : lead.value.artist_names ?? [];
 	return { device: lead.device, attrs: out, clock: lead.clock };
+}
+
+// ── analysis (library_track.set-analysis, since v5) ─────────────────────────
+// One cell per device again, and the same "master first" rule as the meta,
+// but WHOLE-cell, never per field: a grid, its tempo and the structure on top
+// of it describe one decode of one file, and mixing one device's grid with
+// another's segments would show neither. A cell carries no source, so among
+// the other devices the later write wins (a secondary states analysis only
+// for recordings it brought that the master does not describe — the desktop's
+// role.ts — so this is the rare case). A null cell is a withdrawn statement
+// and never picked.
+
+export const ANALYSIS_CELL_PREFIX = 'analysis.';
+
+export function analysisCellName(deviceId: string): string {
+	return `${ANALYSIS_CELL_PREFIX}${deviceId}`;
+}
+
+export type ResolvedTrackAnalysis = { device: string; analysis: TrackAnalysis; clock: Clock };
+
+export function resolveTrackAnalysis(rec: Pick<LwwRecord, 'fields'> | undefined, master: string | null): ResolvedTrackAnalysis | null {
+	const r = resolveDeviceCell<TrackAnalysis>(rec, ANALYSIS_CELL_PREFIX, master);
+	return r ? { device: r.device, analysis: r.value, clock: r.clock } : null;
 }
 
 // The account's cue-edit stamp (set-cues-edited), or null.
@@ -393,6 +417,8 @@ export type LibraryTrackView = {
 	cuesEditedAt: number | null;
 	// The curation fields stated (set-curation), a null one as null.
 	curation: Record<string, unknown>;
+	// Since v5: the winning analyzer result (resolveTrackAnalysis).
+	analysis: (TrackAnalysis & { device: string }) | null;
 };
 export type FeedItemView = { key: string; state: string | null; promotedRecordingId: string | null; playedAt: number | null; listened: string[] };
 export type FeedSuppressionView = { key: string; scope: string | null; active: boolean };
@@ -542,6 +568,10 @@ export function materialize(state: LibraryState): LibraryView {
 			})(),
 			cuesEditedAt: field(r, CUES_EDITED_CELL, null),
 			curation,
+			analysis: (() => {
+				const a = resolveTrackAnalysis(r, master);
+				return a ? { ...a.analysis, device: a.device } : null;
+			})(),
 		});
 	}
 

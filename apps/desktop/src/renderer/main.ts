@@ -3406,6 +3406,10 @@ function wireCloudSyncEvents(): void {
 	startAccountLibraryWatch();
 	cloudSyncApi.onApplied((a) => {
 		if (a.tracks.length <= SYNC_PATCH_CAP) for (const id of a.tracks) void patchTrackRow(id);
+		// The playing track's analysis may be what arrived (protocol v5 carries
+		// it with the library): reload its beats, structure and waveform.
+		const playing = analysisStore.getCurrentTrackId();
+		if (playing && a.tracks.includes(playing)) analysisStore.invalidate(playing);
 		if (a.tracks.length > 0 || a.playlists.length > 0) scheduleTracksRefresh(a.tracks.length > SYNC_PATCH_CAP ? 250 : 1500);
 		const containers = a.entities.some((e) => e.entity === 'tag' || e.entity === 'playlist' || e.entity === 'playlist_folder' || e.entity === 'pinned_search');
 		if (containers) {
@@ -3413,6 +3417,9 @@ function wireCloudSyncEvents(): void {
 			syncSidebarHandle = setTimeout(() => { syncSidebarHandle = null; void refreshAll(); }, 1000);
 		}
 	});
+	// Back online and caught up: the playing track may be missing what the
+	// outage kept from it (its waveform, its analysis).
+	cloudSyncApi.onReconnected(() => { void analysisStore.refreshCurrentAfterReconnect(); });
 }
 
 function formatBytesShort(n: number): string {

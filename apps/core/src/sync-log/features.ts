@@ -14,6 +14,12 @@
 //
 // The push loop is the second guard (client.ts): an op stamped above what the
 // server reads stays pending instead of failing the batch.
+//
+// Protocol v5 (2026-10-23, `library_track.set-analysis`) is gated the same
+// way at the push ('analysis_v5'), but needs no device-local copy: its only
+// writer is the sync client's own drain stage (track-analysis.ts), which
+// reads the features directly. The founder's fold states analysis into the
+// records whatever the server reads (records carry no protocol version).
 
 import type Database from 'better-sqlite3';
 import type { SyncFeature } from '@curator/protocol';
@@ -21,6 +27,7 @@ import type { SyncFeature } from '@curator/protocol';
 type Raw = Database.Database;
 
 export const ZERO_LOSS_FEATURE: SyncFeature = 'zero_loss_v4';
+export const ANALYSIS_FEATURE: SyncFeature = 'analysis_v5';
 
 // Device-local (never an account key): '1' while the last answer named the
 // feature. Cleared when an answer stops naming it (a rolled-back server).
@@ -30,11 +37,17 @@ export function featuresReadV4(features: readonly SyncFeature[] | null | undefin
 	return !!features?.includes(ZERO_LOSS_FEATURE);
 }
 
+// v5 only on a server that reads v4 too (every server that reads a version
+// reads the older ones; a list naming v5 without v4 is not one to trust).
+export function featuresReadV5(features: readonly SyncFeature[] | null | undefined): boolean {
+	return featuresReadV4(features) && !!features?.includes(ANALYSIS_FEATURE);
+}
+
 // The highest op version the push loop may send: v4 only once the server
-// said it reads it. v3 ops were always sent ungated (their emitters wait for
-// 'track_meta' themselves), so below v4 nothing changes.
+// said it reads it, v5 likewise. v3 ops were always sent ungated (their
+// emitters wait for 'track_meta' themselves), so below v4 nothing changes.
 export function pushableSchemaVersion(features: readonly SyncFeature[] | null | undefined): number {
-	return featuresReadV4(features) ? 4 : 3;
+	return featuresReadV5(features) ? 5 : featuresReadV4(features) ? 4 : 3;
 }
 
 const STMTS = new WeakMap<Raw, { get: Database.Statement<[string], { value: string }> }>();
