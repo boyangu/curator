@@ -4,14 +4,14 @@
 // override paths keeping the junction + artists_ascii in step.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
 import { syncTrackArtistsByIdRaw } from './artists.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let dbPath: string;
 let sqlite: Database.Database;
@@ -27,15 +27,15 @@ const artistsOf = (id: string): unknown => JSON.parse((sqlite.prepare(`SELECT ar
 const asciiOf = (id: string): string => (sqlite.prepare(`SELECT artists_ascii FROM track WHERE id = ?`).get(id) as { artists_ascii: string }).artists_ascii;
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-artist-svc-'));
+	tmp = tmpDir('curator-artist-svc-');
+	dir = tmp.path;
 	dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
-	svc = createCoreService(dbPath, { peaksDir: join(dir, 'peaks') });
+	sqlite = tmp.track(new Database(dbPath));
+	svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks') }));
 });
-afterEach(() => {
-	sqlite.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* sibling DB handles on Windows */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('listArtists / getArtist / resolveArtistByName', () => {
@@ -175,7 +175,7 @@ describe('listArtistMergeSuggestions', () => {
 			['Kadosh', 'Kadosh (IL)', 'Kadosh (IL)'], // tie → the tagged one
 		]);
 		await svc.dismissArtistMergeSuggestion(s[1]!.b.id, s[1]!.a.id);
-		const again = createCoreService(dbPath, { peaksDir: join(dir, 'peaks') });
+		const again = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks') }));
 		expect((await again.listArtistMergeSuggestions()).map((x) => x.a.name)).toEqual(['Maz']);
 		await svc.mergeArtists(s[0]!.a.id, s[0]!.b.id);
 		expect(await svc.listArtistMergeSuggestions()).toEqual([]);

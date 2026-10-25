@@ -10,7 +10,7 @@
 // the live DB or real files.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -21,6 +21,7 @@ import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
 import { migrate } from '../db/migrate.js';
 import { createDb } from '../db/client.js';
+import { removeDir } from '../test-support/tmp.js';
 import { createCoreService, type CloudActivityWatcher, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import * as mut from '../library/mutators.js';
@@ -86,12 +87,12 @@ const clients: SyncClient[] = [];
 const services: CoreService[] = [];
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'curator-poll-policy-')); });
-afterEach(() => {
+afterEach(async () => {
 	vi.useRealTimers();
 	for (const c of clients.splice(0)) c.stop();
-	for (const s of services.splice(0)) s.close();
+	for (const s of services.splice(0).reverse()) await s.close();
 	for (const h of handles.splice(0)) h.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+	await removeDir(dir);
 });
 
 function freshDb(name = 'lib'): { path: string; raw: Database.Database } {
@@ -431,7 +432,7 @@ describe('sync.poll setting', () => {
 		// Sync disabled: the status still reports the policy in force.
 		expect((await svc.getCloudSyncStatus()).poll).toMatchObject({ policy: { activeSec: 30 }, active: true, nextPollAt: null });
 
-		svc.close();
+		await svc.close();
 		services.splice(services.indexOf(svc), 1);
 		svc = open();
 		expect((await svc.getCloudSyncPollSettings()).policy).toEqual({ activeSec: 30, idleSec: 60, idleAfterSec: 900 });
@@ -473,7 +474,7 @@ describe('sync.poll setting', () => {
 		watcher.onChange!(true);
 		expect((await svc.getCloudSyncStatus()).poll.active).toBe(true);
 
-		svc.close();
+		await svc.close();
 		services.splice(services.indexOf(svc), 1);
 		expect(watcher.stopped).toBe(true);
 	});
@@ -514,7 +515,7 @@ describe('sync.poll setting', () => {
 		await until(async () => events.some((e) => e.kind === 'reconnected'));
 		expect(events.filter((e) => e.kind === 'reconnected')).toHaveLength(1);
 
-		svc.close();
+		await svc.close();
 		services.splice(services.indexOf(svc), 1);
 		expect(realtimeUnsubbed).toBe(true);
 	});

@@ -13,9 +13,9 @@ import { markPreOpLog, TRACKS, TwoDesktopRig, type Desktop } from '../test-suppo
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig('curator-2desk-role-'); });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	expect(upstream).toEqual([]);
 });
 

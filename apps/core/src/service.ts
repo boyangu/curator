@@ -1334,7 +1334,15 @@ export interface CoreService {
 	setCatalogueBackfill(action: CatalogueBackfillAction): Promise<CatalogueStatus>;
 	subscribeCatalogue(cb: (e: CatalogueEvent) => void): () => void;
 
-	close(): void;
+	// Stops every timer, watcher and child the service started and closes its
+	// databases. The synchronous part (cloud sync, schedulers, curator.db) is
+	// done when this returns; what only stops asynchronously — the scanner's
+	// chokidar watchers, the sidecars' graceful exits, the agent workspace and
+	// mir.db (closed after its engine) — is done when the promise settles. It
+	// never rejects. An app quit may fire and forget; anything that removes the
+	// database's directory afterwards (tests) must await it: on Windows an
+	// open handle or watcher keeps the directory from being deleted.
+	close(): Promise<void>;
 }
 
 export function createCoreService(dbPath: string, opts: CoreServiceOptions = {}): CoreService {
@@ -2221,6 +2229,26 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			},
 		})
 		: null;
+	// The Spotify gateway ('spotify_gateway', auth/spotify-gateway.ts): with
+	// the transport's procedures, a signed-in device whose server offers it
+	// takes its Spotify tokens from the cloud. The features ride the sync
+	// client's push/pull answers, so its status events are where the switch
+	// (and the one-time adoption of this device's grant) is noticed.
+	const spotifyProcs = opts.cloud?.transport.spotify;
+	if (cloudClient && spotifyProcs) {
+		const transport = opts.cloud!.transport;
+		auth.attachSpotifyGateway({
+			spotify: spotifyProcs,
+			signedIn: () => transport.session() !== null,
+			features: () => cloudClient.serverFeatures(),
+			deviceId: () => cloudClient.deviceId(),
+		}, {
+			// Connected or disconnected on another device: who "I" am on Spotify
+			// decides the streaming-vs-followed split.
+			onIdentityChange: () => membership.recomputeAll(),
+		});
+		cloudClient.subscribe((e) => { if (e.kind === 'status') auth.spotifyGatewayCheck(); });
+	}
 	let cloudWakeUnsub: (() => void) | null = null;
 	let cloudRealtimeUnsub: (() => void) | null = null;
 	let cloudActivity: CloudActivityWatcher | null = null;
@@ -5694,6 +5722,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 
 		close() {
+			// What only stops asynchronously; awaited together at the end so
+			// the synchronous order below (stop writers, then close the DB) holds.
+			const pending: Array<Promise<unknown> | undefined> = [];
 			// Stop cloud sync before the DB closes: a cycle mid-apply would
 			// otherwise write into a closed handle.
 			cloudWakeUnsub?.();
@@ -5705,10 +5736,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			catalogue?.stop();
 			// Stop the backup scheduler + engine host first: a run mid-upload
 			// must not outlive the DB it snapshotted.
-			backupService.stop();
+			pending.push(backupService.stop());
 			// Stop chokidar watchers before closing the SQLite handle — late
 			// ingestion ticks could otherwise hit a closed DB.
-			libraryScanner.stopAll().catch(() => { /* best-effort */ });
+			pending.push(libraryScanner.stopAll());
 			// Kill converter children (they'd otherwise finish writing a .part
 			// nobody will rename) before the DB they report into closes.
 			wavConverter.cancelActive();
@@ -5718,10 +5749,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// are kept as history. Must run before sqlite.close() below.
 			analysisQueue?.clearPending();
 			// Tear the analyzer sidecar down cleanly so its worker pool isn't
-			// orphaned. shutdown() races against a 2s SIGKILL fallback so we
-			// can fire-and-forget without blocking close().
-			analyzerSidecar?.shutdown().catch(() => { /* best-effort */ });
-			rekordboxSidecar?.shutdown().catch(() => { /* best-effort */ });
+			// orphaned. shutdown() races against a 2s SIGKILL fallback; close()
+			// does not block on it, only its promise does.
+			pending.push(analyzerSidecar?.shutdown(), rekordboxSidecar?.shutdown());
 			// Any pending debounced cutoff recompute is dropped on shutdown —
 			// next boot's staleness check picks up whatever analyses landed since.
 			cutoffStore.cancelPendingRecompute();
@@ -5731,11 +5761,12 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			albumEnricher.stop();
 			feedService.stop(); // stops scheduler + enrichment + closes feed.db
 			knowledgeService.stop(); // stops the expansion queue + closes knowledge.db
-			void researcherSidecar?.shutdown();
-			agentService.stop(); // closes agent.db
-			void agentSidecar?.shutdown();
-			void mirLayer.close(); // engine shutdown (3 s grace) + closes mir.db
+			pending.push(researcherSidecar?.shutdown());
+			pending.push(agentService.stop()); // closes agent.db, then the workspace
+			pending.push(agentSidecar?.shutdown());
+			pending.push(mirLayer.close()); // engine shutdown (3 s grace) + closes mir.db
 			sqlite.close();
+			return Promise.allSettled(pending).then(() => undefined);
 		},
 	};
 	svcRef = service;

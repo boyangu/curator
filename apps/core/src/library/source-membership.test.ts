@@ -8,13 +8,13 @@
 // file resolvers.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let sqlite: Database.Database;
 let svc: CoreService;
@@ -38,11 +38,12 @@ const idsOf = async (filter: Parameters<CoreService['getTracks']>[0]): Promise<s
 	(await svc.getTracks(filter, { column: 'title', dir: 'asc' })).map((t) => t.id);
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-source-membership-'));
+	tmp = tmpDir('curator-source-membership-');
+	dir = tmp.path;
 	const dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
-	svc = createCoreService(dbPath, { peaksDir: join(dir, 'peaks') });
+	sqlite = tmp.track(new Database(dbPath));
+	svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks') }));
 	// a: Spotify only.  b: in rekordbox with its file.  c: a file rekordbox
 	// doesn't have yet.  d: in rekordbox, file pointer pruned (rb only).
 	// e: a deleted local file — hidden from every scope.  f: a file the
@@ -55,9 +56,8 @@ beforeEach(() => {
 	seedTrack('e', { deleted_at: 1 }); link('e', 'local');
 	seedTrack('f'); fileLink('f', 'c:/music/f.flac', Date.now());
 });
-afterEach(() => {
-	sqlite.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* sibling DB handles on Windows */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('hasSource / lacksSource', () => {

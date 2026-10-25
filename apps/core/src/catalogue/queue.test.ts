@@ -22,6 +22,7 @@ import {
 	writeFlac,
 	type TestDevice,
 } from '../test-support/catalogue-fakes.js';
+import { budgetMs } from '../test-support/timing.js';
 import type { CatalogueLayerDeps } from './layer.js';
 
 const USER = '7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d';
@@ -153,7 +154,8 @@ describe('pull-before-compute', () => {
 		(b.queue as unknown as { concurrency: number }).concurrency = 1;
 		await runBackground(b, ['t1', 't2', 't3']);
 		expect(server.calls.lookup).toBe(lookups + 1);
-		expect(Date.now() - t0).toBeLessThan(300 * 2 + 500);
+		// The waits are fixed; only the overhead around them scales with load.
+		expect(Date.now() - t0).toBeLessThan(300 * 2 + budgetMs(500, 'offline overhead'));
 		expect(b.analyzer.calls).toHaveLength(3);
 		expect(b.layer.status().lastError).toMatch(/Offline/);
 	});

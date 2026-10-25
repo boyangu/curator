@@ -52,6 +52,7 @@ import { opSchemaVersion, rebalance, trackTagEntityId, type StoredOp } from '@cu
 import { createDb } from '../db/client.js';
 import { migrate } from '../db/migrate.js';
 import { FakeCloud } from '../test-support/fake-cloud.js';
+import { budgetMs } from '../test-support/timing.js';
 import { createSyncClient } from './client.js';
 import { planIdentityMerges, planIdentityMergesAsync, resolveRecordingIdentitiesAsync } from './identity.js';
 import { initialPush } from './initial-push.js';
@@ -65,12 +66,16 @@ const AUDIO_DUPES = 2_000;
 const SP0 = LOCAL; // first Spotify track
 
 // The target is ~100 ms a slice (a few dropped frames, not a frozen
-// window). The bounds leave CI headroom over the numbers above, wide enough
-// for a loaded machine's spikes (a worst merge chunk of 334 ms was seen
-// under ~95% CPU load), so the structure is asserted too: the plan in
-// several slices, a page in several transactions — a return to one
+// window). The bounds leave CI headroom over the numbers above and are
+// scaled by the machine's measured slowdown (test-support/timing.ts, at most
+// ×4). The p90 of the slices holds the typical slice to the target. The
+// single longest slice and loop gap are where a scheduler stall lands — with
+// other suites running on the machine a pull read p50 198, p90 398 and one
+// 1,111 ms transaction among 400 — so their bound only fails a slice that
+// holds the loop for a second or more. The structure is asserted too: the
+// plan in several slices, a page in several transactions — a return to one
 // transaction per page would pass a loose time bound on a fast machine.
-const SLICE_BOUND_MS = 400;
+const SLICE_BOUND_MS = 1_000;
 const P90_BOUND_MS = 200;
 const PLAN_SLICE_BOUND_MS = 150;
 
@@ -221,9 +226,9 @@ describe('sync slices on a generated 40,000-track library', () => {
 			expect(raw.prepare(`SELECT count(*) FROM recording_alias WHERE winner LIKE 'ffffffff-%' OR loser LIKE 'ffffffff-%'`).pluck().get()).toBe(AUDIO_DUPES);
 			// Several transactions a page, none long.
 			expect(times.length).toBeGreaterThan(r.pages * 3);
-			expect(r.maxSliceMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(gapMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(pct(times, 0.9)).toBeLessThan(P90_BOUND_MS);
+			expect(r.maxSliceMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'pull slice'));
+			expect(gapMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'pull loop gap'));
+			expect(pct(times, 0.9)).toBeLessThan(budgetMs(P90_BOUND_MS, 'pull p90'));
 		} finally {
 			client.stop();
 			raw.close();
@@ -243,15 +248,15 @@ describe('sync slices on a generated 40,000-track library', () => {
 			expect(syncPlan.streamingGroups).toBe(PROFILE_DUPES);
 			expect(syncPlan.merges).toHaveLength(PROFILE_DUPES);
 			expect(asyncPlan.slices).toBeGreaterThan(1);
-			expect(asyncPlan.maxSliceMs).toBeLessThan(PLAN_SLICE_BOUND_MS);
-			expect(planGap).toBeLessThan(PLAN_SLICE_BOUND_MS);
+			expect(asyncPlan.maxSliceMs).toBeLessThan(budgetMs(PLAN_SLICE_BOUND_MS, 'plan slice'));
+			expect(planGap).toBeLessThan(budgetMs(PLAN_SLICE_BOUND_MS, 'plan loop gap'));
 
 			const { result: { result: r, gapMs }, times } = await txTimes(raw, () => worstGap(() => resolveRecordingIdentitiesAsync(raw)));
 			process.stdout.write(`[slices] resolve merged=${r.merged} chunks=${r.chunks} total=${r.ms}ms maxSliceMs=${r.maxSliceMs.toFixed(1)} worstLoopGapMs=${gapMs.toFixed(1)} chunks ${spread(times)}\n`);
 			expect(r.merged).toBe(PROFILE_DUPES);
-			expect(r.maxSliceMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(gapMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(pct(times, 0.9)).toBeLessThan(P90_BOUND_MS);
+			expect(r.maxSliceMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'merge slice'));
+			expect(gapMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'merge loop gap'));
+			expect(pct(times, 0.9)).toBeLessThan(budgetMs(P90_BOUND_MS, 'merge p90'));
 			// Healed: the big playlist holds one row per entry again.
 			expect(raw.prepare(`SELECT count(*) FROM playlist_track WHERE playlist_id = 'pl-big'`).pluck().get()).toBe(BIG);
 			// What every later run costs (each pull and push runs it).

@@ -110,11 +110,14 @@ async function verify(sql) {
 			has_function_privilege('curator_api', 'curator.log_requests(jsonb)', 'execute') as log_grant,
 			exists (select 1 from storage.buckets where id = 'catalogue' and public = false) as bucket,
 			(select count(*)::int from pg_policies where schemaname = 'storage' and tablename = 'objects' and policyname like 'curator_catalogue%') as policies,
-			(select count(*)::int from curator.catalogue_account) as entitled_accounts`;
+			(select count(*)::int from curator.catalogue_account) as entitled_accounts,
+			coalesce((select relrowsecurity from pg_class where oid = to_regclass('curator.spotify_grant')), false) as spotify_rls`;
 	rows.push(['roles.sql grants (API role)', g.gate_grant && g.log_grant]);
 	rows.push(['storage bucket "catalogue", private', g.bucket]);
 	rows.push([`storage policies (${g.policies} of 3)`, g.policies === 3]);
 	rows.push([`catalogue accounts entitled (${g.entitled_accounts})`, g.entitled_accounts > 0]);
+	// 0010: the Spotify grant holds sealed tokens; RLS is its second wall.
+	rows.push(['curator.spotify_grant under RLS', g.spotify_rls]);
 	return rows;
 }
 

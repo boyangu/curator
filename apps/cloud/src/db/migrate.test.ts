@@ -39,6 +39,7 @@ describe('migrations', () => {
 			'library_snapshot',
 			'request_log',
 			'schema_migration',
+			'spotify_grant',
 		]);
 	});
 
@@ -67,6 +68,7 @@ describe('migrations', () => {
 			{ relname: 'library_op_staged', relrowsecurity: true },
 			{ relname: 'library_snapshot', relrowsecurity: true },
 			{ relname: 'request_log', relrowsecurity: true },
+			{ relname: 'spotify_grant', relrowsecurity: true },
 		]);
 	});
 });

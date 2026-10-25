@@ -22,6 +22,7 @@ import {
 	writeFlac,
 	type TestDevice,
 } from '../test-support/catalogue-fakes.js';
+import { budgetMs } from '../test-support/timing.js';
 
 const USER = '0b6e1f3a-2c4d-4e5f-8a9b-1c2d3e4f5a6b';
 const OTHER = 'c3d4e5f6-0718-4293-a4b5-c6d7e8f9a0b1';
@@ -49,6 +50,41 @@ const row = (d: TestDevice, trackId: string) =>
 		{ bpm: number | null; key_camelot: string | null; audio_hash: string | null; analyzer_version: string; brightness: number | null } | undefined;
 const entryStates = (d: TestDevice) =>
 	Object.fromEntries((d.sqlite.prepare(`SELECT unit || ':' || variant AS k, local_state FROM catalogue_entry`).all() as Array<{ k: string; local_state: string }>).map((r) => [r.k, r.local_state]));
+
+// Every top-level write transaction that landed analysis rows while
+// installed: how many, and how long the transaction's own work ran — the
+// COMMIT's write to disk excluded. That write is the disk's, not the
+// layer's: right after another suite deleted a large library it alone read
+// 78-128 ms with the work at ~10 ms, while the un-sliced write it guards
+// against measures 72-92 ms in total. Only the work separates the two.
+type HydrateWrite = { landed: number; workMs: number };
+function recordHydrateWrites(raw: TestDevice['sqlite']): HydrateWrite[] {
+	const writes: HydrateWrite[] = [];
+	const filled = raw.prepare(`SELECT count(*) FROM track_analysis WHERE bpm IS NOT NULL`).pluck();
+	const orig = raw.transaction.bind(raw);
+	let depth = 0;
+	(raw as { transaction: unknown }).transaction = (fn: (...a: unknown[]) => unknown) => {
+		let workMs = 0;
+		const tx = orig((...a: unknown[]) => {
+			const t = performance.now();
+			try { return fn(...a); } finally { workMs = performance.now() - t; }
+		});
+		// drizzle opens its transactions through `.deferred` and friends.
+		const wrap = (run: (...a: unknown[]) => unknown) => (...a: unknown[]) => {
+			const top = depth++ === 0;
+			const before = top ? filled.get() as number : 0;
+			try { return run(...a); } finally {
+				depth--;
+				if (top) {
+					const landed = (filled.get() as number) - before;
+					if (landed > 0) writes.push({ landed, workMs });
+				}
+			}
+		};
+		return Object.assign(wrap(tx), { deferred: wrap(tx.deferred), immediate: wrap(tx.immediate), exclusive: wrap(tx.exclusive) });
+	};
+	return writes;
+}
 
 async function localFile(d: TestDevice, trackId: string, md5: string, durationSec = 30): Promise<string> {
 	const file = join(d.dir, 'lib', `${trackId}.flac`);
@@ -175,13 +211,25 @@ describe('hydrator', () => {
 		b.sqlite.pragma('synchronous = NORMAL');
 		for (let i = 0; i < n; i++) await localFile(b, `t${i}`, pcmMd5(100 + i));
 		const before = server.calls.lookupHashes.length;
+		const writes = recordHydrateWrites(b.sqlite);
 		await b.layer.syncNow();
+		delete (b.sqlite as { transaction?: unknown }).transaction;
 		const batches = server.calls.lookupHashes.slice(before);
 		expect(batches.length).toBe(Math.ceil(n / 50));
 		expect(Math.max(...batches.map((h) => h.length))).toBeLessThanOrEqual(50);
 		expect((b.sqlite.prepare(`SELECT count(*) AS n FROM track_analysis WHERE bpm IS NOT NULL`).get() as { n: number }).n).toBe(n);
-		console.info(`[hydrator] ${n} hashes maxSliceMs=${b.layer.stats().maxSliceMs.toFixed(2)} (${b.layer.stats().maxSliceAt})`);
-		expect(b.layer.stats().maxSliceMs).toBeLessThan(50);
+		const maxWorkMs = Math.max(...writes.map((w) => w.workMs));
+		console.info(`[hydrator] ${n} hashes maxSliceMs=${b.layer.stats().maxSliceMs.toFixed(2)} (${b.layer.stats().maxSliceAt}) writes=${writes.length} maxLanded=${Math.max(...writes.map((w) => w.landed))} maxWorkMs=${maxWorkMs.toFixed(2)}`);
+		// The structure: each batch lands across several time-sliced write
+		// transactions (COMMIT_SLICE_MS of work each, about a ms a track here),
+		// never a whole batch in one.
+		expect(writes.length).toBeGreaterThan(batches.length);
+		expect(Math.max(...writes.map((w) => w.landed))).toBeLessThan(50);
+		// The time: ~10 ms of work a slice at rest.
+		expect(maxWorkMs).toBeLessThan(budgetMs(30, 'hydrate write work'));
+		// The whole slice, commit included: only a stall of a different
+		// order (the loop held for most of a second) is the layer's.
+		expect(b.layer.stats().maxSliceMs).toBeLessThan(budgetMs(250, 'hydrate slice'));
 	}, 60_000);
 
 	it('empties the mirror when another account signs in', async () => {

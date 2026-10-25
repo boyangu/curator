@@ -32,9 +32,9 @@ import { slotDigest, TRACK_ANALYSIS_BACKFILL_KEY } from './track-analysis.js';
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig('curator-2desk-analysis-'); });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	expect(upstream).toEqual([]);
 });
 

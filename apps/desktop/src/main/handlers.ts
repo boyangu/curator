@@ -216,7 +216,8 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 			return svc.auth.getStatus();
 		},
 		'auth:spotify:disconnect': async () => {
-			svc.auth.disconnectSpotify();
+			// Through the cloud this drops the account's grant on every device.
+			await svc.auth.disconnectSpotify();
 			// No account → streaming/followed can't be determined; recompute
 			// collapses them to NULL (local survives).
 			svc.recomputeMembership();

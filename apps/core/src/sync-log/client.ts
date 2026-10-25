@@ -174,6 +174,10 @@ export interface CloudTransport {
 	// checking the parts is the transport's, snapshot-storage.ts), and the
 	// master uploads its own snapshots into it. Without it neither happens.
 	snapshots?: SnapshotBlobStore;
+	// The Spotify gateway's procedures ('spotify_gateway'; auth/spotify-
+	// gateway.ts). Optional: without them Spotify tokens stay this device's
+	// own, refreshed locally, whatever the server offers.
+	spotify?: CloudService['spotify'];
 }
 
 // How a transport reports a failed call. Anything else thrown is treated as
@@ -196,6 +200,10 @@ export type CloudErrorKind =
 	| 'snapshot_ahead'
 	| 'snapshot_part_missing'
 	| 'snapshot_part_invalid'
+	// spotify.* ('spotify_gateway'): the account holds no Spotify grant; or
+	// Spotify refused it (revoked, a scope change, an expired code).
+	| 'spotify_not_connected'
+	| 'spotify_reconnect_required'
 	| 'bad_request'; // any other 4xx: a client bug, not worth hammering
 
 export class CloudTransportError extends Error {

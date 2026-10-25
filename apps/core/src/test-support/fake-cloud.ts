@@ -30,6 +30,13 @@
 // fake's fold at its seq (`publishes[].stateMatches`), as the real server's
 // verifier does.
 //
+// And 'spotify_gateway' (protocol spotify-gateway.ts): the account's Spotify
+// grant in memory with a fake Spotify behind it — vends share one access
+// token until a minute before it expires, a refresh rotates the refresh
+// token and is counted (`spotifyRefreshes`), `spotifyRevoked` holds refresh
+// tokens Spotify refuses, and `revokeSpotifyGrant` is a grant it stopped
+// honouring. Its procedures refuse while the feature is not advertised.
+//
 // Nothing here leaves the process.
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -66,6 +73,12 @@ import {
 	type PullInput,
 	type PullResult,
 	type SnapshotManifest,
+	type SpotifyAdoptInput,
+	type SpotifyConnectInput,
+	type SpotifyGrantStatus,
+	type SpotifyProfile,
+	type SpotifyTokenResult,
+	SPOTIFY_GATEWAY_SCOPES,
 	type PushInput,
 	type PushResult,
 	type RejectReason,
@@ -97,7 +110,7 @@ export class FakeCloud {
 	// Ops the server refuses (as a malformed/unauthorised op would be).
 	readonly rejectIds = new Map<string, RejectReason>();
 	// Failures thrown by the next calls, in order, per procedure.
-	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[]; publish: CloudTransportError[]; upload: Error[] } = { push: [], pull: [], publish: [], upload: [] };
+	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[]; publish: CloudTransportError[]; upload: Error[]; spotify: CloudTransportError[] } = { push: [], pull: [], publish: [], upload: [], spotify: [] };
 	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0, storageBootstraps: 0, batchBegin: 0, batchPush: 0, batchCommit: 0, batchAbort: 0, publish: 0, upload: 0, download: 0 };
 	// The `snapshots` bucket: path → bytes; and the paths clients removed.
 	readonly storage = new Map<string, Uint8Array>();
@@ -134,6 +147,17 @@ export class FakeCloud {
 	// A pull with afterSeq below this gets the snapshot hint (a newest
 	// snapshot must exist for the hint to name).
 	hintBelow = 0;
+
+	// 'spotify_gateway': the account's grant, who it belongs to, the fake
+	// Spotify's token lifetime and refresh count, the refresh tokens it
+	// refuses, and every call by procedure (the refresh tokens adopted too).
+	spotifyGrant: { refreshToken: string; accessToken: string | null; expiresAt: number; profile: SpotifyProfile; connectedAt: number; needsReconnect: boolean } | null = null;
+	spotifyProfile: SpotifyProfile = { id: 'spotify-user', displayName: 'Test DJ', avatarUrl: null };
+	spotifyTokenTtlMs = 3_600_000;
+	spotifyRefreshes = 0;
+	readonly spotifyRevoked = new Set<string>();
+	readonly spotifyCalls = { connect: 0, adopt: 0, status: 0, token: 0, disconnect: 0 };
+	readonly spotifyAdopted: string[] = [];
 
 	// The head: the last op's seq, never below what compaction removed (a seq
 	// is never reused).
@@ -452,6 +476,76 @@ export class FakeCloud {
 		this.baseSeq = Math.max(this.baseSeq, through);
 	}
 
+	// ── 'spotify_gateway' (protocol spotify-gateway.ts) ─────────────────────
+
+	spotifyStatus(): SpotifyGrantStatus {
+		const g = this.spotifyGrant;
+		return g
+			? { connected: true, profile: g.profile, scopes: [...SPOTIFY_GATEWAY_SCOPES], connectedAt: g.connectedAt, needsReconnect: g.needsReconnect }
+			: { connected: false, profile: null, scopes: [], connectedAt: null, needsReconnect: false };
+	}
+
+	// Spotify stops honouring the grant (revoked in the user's account page).
+	revokeSpotifyGrant(): void {
+		if (this.spotifyGrant) this.spotifyRevoked.add(this.spotifyGrant.refreshToken);
+	}
+
+	private spotifyGate(): void {
+		const f = this.fail.spotify.shift();
+		if (f) throw f;
+		if (!this.features.includes('spotify_gateway')) throw new CloudTransportError('bad_request', 'spotify_gateway_off');
+	}
+
+	private spotifyRefresh(refreshToken: string): { refreshToken: string; accessToken: string; expiresAt: number } {
+		if (this.spotifyRevoked.has(refreshToken)) throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		const n = ++this.spotifyRefreshes;
+		// Spotify may rotate the refresh token on every refresh; this one always does.
+		return { refreshToken: `cloud-rt-${n}`, accessToken: `cloud-at-${n}`, expiresAt: Date.now() + this.spotifyTokenTtlMs };
+	}
+
+	spotifyConnect(input: SpotifyConnectInput): SpotifyGrantStatus {
+		this.spotifyCalls.connect++;
+		this.spotifyGate();
+		if (input.code === 'expired-code') throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		this.spotifyGrant = { refreshToken: `cloud-rt-code-${input.code}`, accessToken: `cloud-at-code-${input.code}`, expiresAt: Date.now() + this.spotifyTokenTtlMs, profile: this.spotifyProfile, connectedAt: Date.now(), needsReconnect: false };
+		return this.spotifyStatus();
+	}
+
+	spotifyAdopt(input: SpotifyAdoptInput): SpotifyGrantStatus {
+		this.spotifyCalls.adopt++;
+		this.spotifyGate();
+		// The real gateway proves the token with a refresh before storing it.
+		const r = this.spotifyRefresh(input.refreshToken);
+		this.spotifyAdopted.push(input.refreshToken);
+		this.spotifyGrant = { ...r, profile: this.spotifyProfile, connectedAt: Date.now(), needsReconnect: false };
+		return this.spotifyStatus();
+	}
+
+	spotifyToken(): SpotifyTokenResult {
+		this.spotifyCalls.token++;
+		this.spotifyGate();
+		const g = this.spotifyGrant;
+		if (!g) throw new CloudTransportError('spotify_not_connected', 'spotify_not_connected');
+		if (g.needsReconnect) throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		if (!g.accessToken || g.expiresAt - 60_000 <= Date.now()) {
+			try {
+				Object.assign(g, this.spotifyRefresh(g.refreshToken));
+			} catch (e) {
+				g.needsReconnect = true;
+				g.accessToken = null;
+				throw e;
+			}
+		}
+		return { accessToken: g.accessToken!, expiresAt: g.expiresAt, scopes: [...SPOTIFY_GATEWAY_SCOPES], profile: g.profile };
+	}
+
+	spotifyDisconnect(): SpotifyGrantStatus {
+		this.spotifyCalls.disconnect++;
+		this.spotifyGate();
+		this.spotifyGrant = null;
+		return this.spotifyStatus();
+	}
+
 	// Test-only: an op stored as a newer client would have sent it.
 	appendRaw(op: StoredOp): void { this.log.push(op); }
 
@@ -585,6 +679,13 @@ export class FakeCloud {
 					cloud.revoke(input.deviceId);
 					return { ok: true as const };
 				},
+			},
+			spotify: {
+				connect: async (input: SpotifyConnectInput) => { offline(); return cloud.spotifyConnect(input); },
+				adopt: async (input: SpotifyAdoptInput) => { offline(); return cloud.spotifyAdopt(input); },
+				status: async () => { offline(); cloud.spotifyCalls.status++; cloud.spotifyGate(); return cloud.spotifyStatus(); },
+				token: async () => { offline(); return cloud.spotifyToken(); },
+				disconnect: async () => { offline(); return cloud.spotifyDisconnect(); },
 			},
 		};
 		return t;

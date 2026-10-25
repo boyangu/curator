@@ -50,7 +50,7 @@ export const AUDIT_KINDS = [
 	// `{ ops, via }`: `via` is 'device' (the device named is revoked) or
 	// 'session' (the session acts as a revoked device, whatever it named).
 	'push_from_revoked_device',
-	// sync.pull / sync.bootstrap refused for a revoked device:
+	// sync.pull / sync.bootstrap / spotify.* refused for a revoked device:
 	// `{ procedure, via }` as above.
 	'read_from_revoked_device',
 	'ops_rejected',
@@ -86,6 +86,16 @@ export const AUDIT_KINDS = [
 	// snapshot ({ procedure, baseSeq }): a server invariant violation
 	// (base.ts), answered as an internal error.
 	'base_without_snapshot',
+	// 'spotify_gateway' (src/spotify/gateway.ts): the account's Spotify grant
+	// was stored from a code exchange ({ scopes, replaced }) or moved from a
+	// device ({ scopes, replaced, rotated }), refused by Spotify on a refresh
+	// or an adopt ({ reason }: 'invalid_grant', or 'undecryptable' when no key
+	// on this server opens it), or deleted. Vending a token is no event: its
+	// request_log row is the record.
+	'spotify_connected',
+	'spotify_adopted',
+	'spotify_refresh_failed',
+	'spotify_disconnected',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -127,6 +137,10 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	source_from_non_master: 'info',
 	ops_compacted: 'info',
 	base_without_snapshot: 'warn',
+	spotify_connected: 'info',
+	spotify_adopted: 'info',
+	spotify_refresh_failed: 'warn',
+	spotify_disconnected: 'info',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

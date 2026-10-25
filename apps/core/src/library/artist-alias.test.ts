@@ -6,7 +6,7 @@
 // policy, and a throwing Spotify adapter on the one service built here.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -22,16 +22,18 @@ import { readOutbox } from '../sync-log/outbox.js';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { artistCreditRewritePending, drainArtistCreditRewrites, drainArtistCreditRewritesAsync, loadArtistAliasMap, mapCredits } from './artist-alias.js';
 import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from './artists.js';
+import { budgetMs } from '../test-support/timing.js';
+import { removeDir } from '../test-support/tmp.js';
 
 let dir: string;
 const handles: Database.Database[] = [];
 const services: CoreService[] = [];
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'curator-artist-alias-')); });
-afterEach(() => {
-	for (const s of services.splice(0)) s.close();
-	for (const h of handles.splice(0)) { try { h.close(); } catch { /* */ } }
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+afterEach(async () => {
+	for (const s of services.splice(0).reverse()) await s.close();
+	for (const h of handles.splice(0)) h.close();
+	await removeDir(dir);
 });
 
 function freshDb(name: string): Database.Database {
@@ -238,7 +240,9 @@ describe('a 5,000-track rename on the pulling device', () => {
 		expect(credit(replica)).toEqual(credit(source));
 		// Each slice is bounded by its chunk, not by the size of the rename.
 		expect(drain.chunks).toBeGreaterThanOrEqual(LIBRARY / 1_000);
-		expect(drain.maxSliceMs).toBeLessThan(500);
+		// 33-100 ms a slice at rest, alone; the bound (scaled with the machine's
+		// load, test-support/timing.ts) still fails a 10× slower slice.
+		expect(drain.maxSliceMs).toBeLessThan(budgetMs(250, 'drain slice'));
 	}, 180_000);
 
 	// The size the derivation was sized against: a 5k library where one
@@ -290,8 +294,8 @@ describe('a 5,000-track rename on the pulling device', () => {
 		expect(source.prepare(`SELECT count(*) FROM track WHERE artists LIKE '%Huge Artist%'`).pluck().get()).toBe(0);
 		console.log(`[artist-alias 5k] renamed=${RENAMED} localRename=${localMs.toFixed(0)}ms pulledApply=${applyMs.toFixed(0)}ms pulledDrain=${drain.chunks} chunks maxSlice=${drain.maxSliceMs.toFixed(1)}ms`
 			+ ` contestedApply=${contestApplyMs.toFixed(0)}ms contestedDrain=${contest.chunks} chunks maxSlice=${contest.maxSliceMs.toFixed(1)}ms`);
-		expect(drain.maxSliceMs).toBeLessThan(500);
-		expect(contest.maxSliceMs).toBeLessThan(500);
+		expect(drain.maxSliceMs).toBeLessThan(budgetMs(250, 'drain slice'));
+		expect(contest.maxSliceMs).toBeLessThan(budgetMs(250, 'contested drain slice'));
 	}, 120_000);
 
 	it('an interrupted drain resumes from its cursor', () => {

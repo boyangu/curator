@@ -25,6 +25,7 @@ import { eq } from 'drizzle-orm';
 import { replaceRows } from '../library/playlist-order.js';
 import { reconcileMembership, type DesiredMember } from '../library/mutators.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { loadFactor } from '../test-support/timing.js';
 
 const N = 2000;
 const RUNS = 7;
@@ -99,17 +100,23 @@ describe('reconcileMembership at 2,000 rows', () => {
 			// is ~1 s across a whole-library first import and nothing on a
 			// re-sync (the `unchanged` bound below), so the bound is 2.5× and the
 			// per-row cost is a logged follow-up rather than a failing guard.
-			expect(res.fresh).toBeLessThan(2.5 * base);
+			// Both sides are measured in the same run, but load does not slow
+			// them alike (the JS- and allocation-heavy side more): on a busy
+			// machine the ratio has read 2.5-3.4×. So the line widens with the
+			// measured load, by at most ×1.6 — an O(n²) path is far past it.
+			const ratio = 2.5 * loadFactor(1.6);
+			process.stdout.write(`membership ratio bound ${ratio.toFixed(2)}×\n`);
+			expect(res.fresh).toBeLessThan(ratio * base);
 			// A full upstream reorder rekeys every row and emits ~N moves; it
 			// measures 1.7–1.9× here and is guarded loosely against regression.
-			expect(res.reverse).toBeLessThan(2.5 * base);
+			expect(res.reverse).toBeLessThan(ratio * base);
 			// The common case — a re-sync with nothing changed — writes nothing.
 			expect(res.unchanged).toBeLessThan(base / 2);
 		} finally {
 			sqlite.close();
 			try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows handles */ }
 		}
-	// Retried: when the whole suite runs, the other files' workers compete
-	// for CPU and disk and the ratio drifts from ~1.5× toward the line.
+	// Retried: under load the ratio drifts toward the line. The file runs on
+	// its own after the parallel suite (perf projects, vitest.workspace.ts).
 	}, { timeout: 120_000, retry: 2 });
 });

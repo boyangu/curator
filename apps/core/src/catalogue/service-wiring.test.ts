@@ -4,8 +4,6 @@
 // The layer's own tests inject serverFeatures directly, so they cannot see a
 // break in this hand-off; this is the test that does.
 
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SYNC_FEATURES, type PullInput, type PushInput } from '@curator/protocol';
@@ -13,15 +11,16 @@ import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
 import type { CloudTransport } from '../sync-log/client.js';
 import { FakeBlobStore, FakeCatalogueServer, FakeDevice, waitFor } from '../test-support/catalogue-fakes.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let svc: CoreService | null = null;
 
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'curator-cat-wiring-')); });
-afterEach(() => {
-	svc?.close();
+beforeEach(() => { tmp = tmpDir('curator-cat-wiring-'); dir = tmp.path; });
+afterEach(async () => {
 	svc = null;
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+	await tmp.cleanup();
 });
 
 function cloud(userId: string, catServer: FakeCatalogueServer, offered = { catalogue: true }): { transport: CloudTransport; device: FakeDevice } {
@@ -51,10 +50,10 @@ describe('catalogue wiring in createCoreService', () => {
 		migrate(path);
 		const catServer = new FakeCatalogueServer();
 		const { transport, device } = cloud('user-1', catServer);
-		svc = createCoreService(path, {
+		svc = tmp.track(createCoreService(path, {
 			peaksDir: join(dir, 'peaks'),
 			cloud: { transport, device: { name: 'test', platform: 'win32' }, blobs: new FakeBlobStore(catServer, device) },
-		});
+		}));
 		svc.startCloudSync();
 		await waitFor(() => catServer.calls.inventory > 0, 'the first catalogue inventory call', 15_000);
 		expect(catServer.calls.inventory).toBeGreaterThan(0);
@@ -70,10 +69,10 @@ describe('catalogue wiring in createCoreService', () => {
 		const catServer = new FakeCatalogueServer();
 		const offered = { catalogue: false };
 		const { transport, device } = cloud('user-1', catServer, offered);
-		svc = createCoreService(path, {
+		svc = tmp.track(createCoreService(path, {
 			peaksDir: join(dir, 'peaks'),
 			cloud: { transport, device: { name: 'test', platform: 'win32' }, blobs: new FakeBlobStore(catServer, device) },
-		});
+		}));
 		svc.startCloudSync();
 		await new Promise((r) => setTimeout(r, 1500));
 		expect(catServer.calls.inventory).toBe(0);

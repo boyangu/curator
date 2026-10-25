@@ -2768,11 +2768,13 @@ async function renderTopRight(auth?: AuthStatus): Promise<void> {
 	const displayName = auth[src].displayName ?? (src === 'spotify' ? 'Spotify' : 'Tidal');
 
 	if (!connected) {
+		// A cloud-held grant Spotify refused: same pill, says why.
+		const reconnect = auth[src].needsReconnect;
 		wrap.innerHTML = `
-			<button class="src-btn disconnected" data-src="${src}" data-action="connect">
+			<button class="src-btn disconnected" data-src="${src}" data-action="connect"${reconnect ? ' title="Spotify stopped accepting the sign-in Curator Cloud holds; sign in again"' : ''}>
 				<span class="src-dot"></span>
 				<span class="src-name">${src === 'spotify' ? 'Spotify' : 'Tidal'}</span>
-				<span class="src-meta">CONNECT</span>
+				<span class="src-meta">${reconnect ? 'RECONNECT' : 'CONNECT'}</span>
 			</button>
 		`;
 	} else {
@@ -2811,7 +2813,8 @@ async function renderTopRight(auth?: AuthStatus): Promise<void> {
 			evt.preventDefault();
 			const s = btn.dataset.src as 'spotify' | 'tidal';
 			const label = s === 'spotify' ? 'Spotify' : 'Tidal';
-			if (!window.confirm(`Disconnect ${label}?\n\nYour synced tracks stay; you'll need to reconnect to sync again or play tracks in-app.`)) return;
+			const everywhere = auth?.[s].via === 'cloud' ? `\n\nThis signs every device on your Curator account out of ${label}.` : '';
+			if (!window.confirm(`Disconnect ${label}?\n\nYour synced tracks stay; you'll need to reconnect to sync again or play tracks in-app.${everywhere}`)) return;
 			await window.api[`auth:${s}:disconnect`]();
 			showToast(`${label} disconnected`, { kind: 'info' });
 			await refreshAll();
@@ -2892,7 +2895,8 @@ function showSpotifyTabMenu(evt: MouseEvent): void {
 			iconHtml: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M18.4 5.6 5.6 18.4"/><path d="M9 7 7 5a3 3 0 0 0-4 4l2 2M15 17l2 2a3 3 0 0 0 4-4l-2-2"/></svg>',
 		});
 		handlers.disconnect = async () => {
-			if (!window.confirm('Disconnect Spotify?\n\nYour synced tracks stay; you\'ll need to reconnect to sync again or play tracks in-app.')) return;
+			const everywhere = library.auth()?.spotify.via === 'cloud' ? '\n\nThis signs every device on your Curator account out of Spotify.' : '';
+			if (!window.confirm('Disconnect Spotify?\n\nYour synced tracks stay; you\'ll need to reconnect to sync again or play tracks in-app.' + everywhere)) return;
 			await window.api['auth:spotify:disconnect']();
 			showToast('Spotify disconnected', { kind: 'info' });
 			await refreshAll();

@@ -9,8 +9,7 @@
 // asserted, not avoided.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
@@ -18,7 +17,9 @@ import { migrate } from './db/migrate.js';
 import { memberOrder } from './test-support/playlist-track.js';
 import { createCoreService, type CoreService } from './service.js';
 import type { StreamingSourceAdapter } from './sources/adapter.js';
+import { tmpDir, type TmpDir } from './test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let peaksDir: string;
 let sqlite: Database.Database;
@@ -90,17 +91,18 @@ function seedFull(id: string, rbId: string): void {
 }
 
 function makeService(dbPath: string): CoreService {
-	return createCoreService(dbPath, { peaksDir, sourceAdapters: { spotify: fakeSpotify() }, trashFile: trashFile as unknown as (p: string) => Promise<void> });
+	return tmp.track(createCoreService(dbPath, { peaksDir, sourceAdapters: { spotify: fakeSpotify() }, trashFile: trashFile as unknown as (p: string) => Promise<void> }));
 }
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-remove-sources-'));
+	tmp = tmpDir('curator-remove-sources-');
+	dir = tmp.path;
 	const dbPath = join(dir, 'curator.db');
 	peaksDir = join(dir, 'peaks');
 	mkdirSync(join(peaksDir, 'lo'), { recursive: true });
 	mkdirSync(join(peaksDir, 'hi'), { recursive: true });
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
+	sqlite = tmp.track(new Database(dbPath));
 	trashFile = vi.fn(async () => {});
 	seedPlaylist('owned', 'spotify', null);          // ownerId unknown → treated as modifiable
 	seedPlaylist('followed', 'spotify', 'someone-else');
@@ -108,11 +110,8 @@ beforeEach(() => {
 	svc = makeService(dbPath);
 });
 
-afterEach(() => {
-	sqlite.close();
-	// Sibling DBs (agent.db, workspace) have no dispose hook; on Windows their
-	// handles keep the temp dir busy — swallow the EBUSY, the OS reaps it.
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* handle still open */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('removeTrackSources', () => {

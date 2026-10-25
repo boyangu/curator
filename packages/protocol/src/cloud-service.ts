@@ -12,6 +12,7 @@ import type {
 	CataloguePutResult,
 } from './catalogue.js';
 import type { Op, RejectReason } from './ops.js';
+import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, SpotifyGrantStatus, SpotifyTokenInput, SpotifyTokenResult } from './spotify-gateway.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -89,7 +90,11 @@ export type PushInput = {
 //     `server_outdated` for the whole push) and keeps hydrating analysis
 //     from the catalogue; with it the catalogue moves only waveform peaks,
 //     one track at a time when the player asks.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5'] as const;
+//   - 'spotify_gateway': the `spotify.*` procedures exist and are switched on
+//     (spotify-gateway.ts): the account's Spotify grant lives in the cloud
+//     and devices ask it for access tokens. Like 'catalogue', listed only by
+//     a server configured for it.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -369,6 +374,12 @@ export const CALL_ERROR_REASONS = [
 	// sync.publishSnapshot: a part's path is not snapshotPartPath(caller,
 	// sha256), or the manifest's sizes do not add up.
 	'snapshot_part_invalid',
+	// spotify.token ('spotify_gateway'): the account has no Spotify grant in
+	// the cloud. Connect (or adopt the device's) first.
+	'spotify_not_connected',
+	// spotify.token / connect / adopt: Spotify refused the grant (revoked, a
+	// scope change, an expired code). Sign in to Spotify again.
+	'spotify_reconnect_required',
 ] as const;
 export type CallErrorReason = (typeof CALL_ERROR_REASONS)[number];
 
@@ -413,5 +424,13 @@ export interface CloudService {
 		lookup(input: CatalogueLookupInput): Promise<CatalogueLookupResult>;
 		put(input: CataloguePutInput): Promise<CataloguePutResult>;
 		inventory(input: CatalogueInventoryInput): Promise<CatalogueInventoryResult>;
+	};
+	// 'spotify_gateway' (spotify-gateway.ts).
+	spotify: {
+		connect(input: SpotifyConnectInput): Promise<SpotifyGrantStatus>;
+		adopt(input: SpotifyAdoptInput): Promise<SpotifyGrantStatus>;
+		status(): Promise<SpotifyGrantStatus>;
+		token(input: SpotifyTokenInput): Promise<SpotifyTokenResult>;
+		disconnect(input: SpotifyDisconnectInput): Promise<SpotifyGrantStatus>;
 	};
 }

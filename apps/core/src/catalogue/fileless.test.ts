@@ -25,6 +25,7 @@ import { MASTER_DEVICE_SETTING, opSchemaVersion, type TrackMeta } from '@curator
 import { applyOps } from '../sync-log/apply.js';
 import { remoteTrackId } from '../sync-log/stable-ids.js';
 import { FakeCatalogueServer, POLICY_D_A, makeTestDevice, pcmMd5, seedAnalysed, sha256, type TestDevice } from '../test-support/catalogue-fakes.js';
+import { budgetMs } from '../test-support/timing.js';
 
 const USER = '7a0e5d2c-1b3f-4e6a-9c8d-2f4b6a8c0e1d';
 
@@ -125,6 +126,6 @@ describe('file-less rows take the account\'s analysis through the audio-hash cla
 		b.layer.setBackfill('start');
 		await b.layer.uploadNow();
 		expect(server.calls.put).toBe(puts);
-		expect(b.layer.stats().maxSliceMs).toBeLessThan(100);
+		expect(b.layer.stats().maxSliceMs).toBeLessThan(budgetMs(100, 'fileless slice'));
 	});
 });

@@ -7,13 +7,14 @@
 // (rb sidecar disabled — the cleanup path is pure local DB + fs).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let dbPath: string;
 let sqlite: Database.Database;
@@ -39,20 +40,16 @@ function linkSpotify(id: string): void {
 }
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-missing-'));
+	tmp = tmpDir('curator-missing-');
+	dir = tmp.path;
 	dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
-	svc = createCoreService(dbPath, { peaksDir: join(dir, 'peaks') });
+	sqlite = tmp.track(new Database(dbPath));
+	svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks') }));
 });
 
-afterEach(() => {
-	sqlite.close();
-	// createCoreService opens sibling DB files (agent.db, workspace) with no
-	// dispose hook; on Windows their handles keep the temp dir busy at teardown.
-	// The assertions have already run — swallow the unlink EBUSY so a held
-	// handle doesn't red a green test (the OS reaps the temp dir later).
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* handle still open */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('rekordbox missing-file orphans', () => {

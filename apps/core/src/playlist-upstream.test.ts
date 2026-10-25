@@ -13,8 +13,6 @@
 // adapter injected through CoreServiceOptions.sourceAdapters.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
@@ -22,7 +20,9 @@ import { migrate } from './db/migrate.js';
 import { memberOrder } from './test-support/playlist-track.js';
 import { isProviderTrackId, createCoreService, type CoreService } from './service.js';
 import type { StreamingSourceAdapter, RemoteTrackRef } from './sources/adapter.js';
+import { tmpDir, type TmpDir } from './test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let dbPath: string;
 let sqlite: Database.Database;
@@ -68,20 +68,18 @@ function rows(playlistId: string): Array<{ track_id: string; position: number }>
 }
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-upstream-'));
+	tmp = tmpDir('curator-upstream-');
+	dir = tmp.path;
 	dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
+	sqlite = tmp.track(new Database(dbPath));
 	remote = [];
 	fake = makeFake();
-	svc = createCoreService(dbPath, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: fake } });
+	svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: fake } }));
 });
 
-afterEach(() => {
-	sqlite.close();
-	// Sibling DBs (agent.db, workspace) have no dispose hook; on Windows their
-	// handles keep the temp dir busy — swallow the EBUSY, the OS reaps it.
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* handle still open */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('per-source sync settings persist in core', () => {
@@ -93,7 +91,7 @@ describe('per-source sync settings persist in core', () => {
 
 	it('survives a new service instance on the same DB (the origin-independent store)', async () => {
 		await svc.setSourceSyncSettings('spotify', { readSyncAuto: false, readIntervalMin: 15, writeSyncAuto: true });
-		const again = createCoreService(dbPath, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: makeFake() } });
+		const again = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: makeFake() } }));
 		const all = await again.getSourceSyncSettings();
 		expect(all.spotify).toEqual({ readSyncAuto: false, readIntervalMin: 15, writeSyncAuto: true });
 		expect(all.tidal.writeSyncAuto).toBe(false);

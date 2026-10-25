@@ -33,9 +33,9 @@ import {
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig(); });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	expect(upstream).toEqual([]);
 });
 

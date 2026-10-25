@@ -243,6 +243,40 @@ describe('migration gate before 0009', () => {
 	});
 });
 
+// 0010 adds the Spotify grant: a table the API reads and writes only as the
+// user, with no function for roles.sql to grant. The gate names it, and the
+// table arrives with RLS on and no grant to anon.
+describe('migration gate before 0010', () => {
+	let t: TestDb;
+	beforeAll(async () => {
+		t = await createTestDb({ migrate: false });
+		await migrate(t.db, sqlDirWith(shipped.filter((n) => n < '0010_')));
+		await t.db.exec(rolesSql);
+	});
+	afterAll(() => t.db.close());
+
+	it('refuses an image that ships 0010_spotify_grant.sql, naming it', async () => {
+		expect(shipped).toContain('0010_spotify_grant.sql');
+		const { log, lines } = capture();
+		await expect(asApi(t, (q) => migrationGate(q, log, sqlDir))).resolves.toBe(false);
+		expect(lines).toEqual([expect.objectContaining({ msg: 'schema_behind', reason: 'behind', missing: shipped.filter((n) => n >= '0010_') })]);
+	});
+
+	it('creates the grant table under RLS once the owner runs it', async () => {
+		await migrate(t.db, sqlDir);
+		await t.db.exec(rolesSql);
+		await expect(asApi(t, (q) => checkMigrations(q, sqlDir))).resolves.toEqual({ ok: true, unknown: [] });
+		expect(await t.db.query(`select relrowsecurity as rls from pg_class where oid = 'curator.spotify_grant'::regclass`)).toEqual([{ rls: true }]);
+		const policies = await t.db.query<{ cmd: string }>(`select cmd from pg_policies where schemaname = 'curator' and tablename = 'spotify_grant' order by cmd`);
+		expect(policies.map((p) => p.cmd)).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE']);
+		expect(await t.db.query(`select has_table_privilege('anon', 'curator.spotify_grant', 'select') as anon, has_table_privilege('curator_api', 'curator.spotify_grant', 'select') as api`)).toEqual([
+			{ anon: false, api: false },
+		]);
+		// The API reaches it only by switching to `authenticated`.
+		await expect(asApi(t, (q) => q.query(`select * from curator.spotify_grant`))).rejects.toThrow(/permission denied/);
+	});
+});
+
 // 0005 is index-only, but it ships like any other file: a database without it
 // is behind, and the gate says so by name.
 describe('migration gate before 0005', () => {

@@ -36,9 +36,9 @@ const R = recordingIdForTrack;
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig('curator-2desk-base-'); });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	expect(upstream).toEqual([]);
 });
 

@@ -6,6 +6,7 @@
 import type { CataloguePolicy } from '@curator/protocol';
 import { CataloguePolicyError, parseCataloguePolicy } from './catalogue/policy.js';
 import { assertConnectionString } from './db/db.js';
+import { parseTokenKey, TokenKeyError, type TokenKey, type TokenKeyring } from './spotify/crypto.js';
 
 export type Config = {
 	databaseUrl: string;
@@ -24,6 +25,15 @@ export type Config = {
 	// whose session the server never bound could still use (README
 	// "Revoking a device").
 	requireDeviceId: boolean;
+	// The Spotify gateway (src/spotify/gateway.ts), or null when it is off:
+	// the procedures refuse and 'spotify_gateway' is not advertised. On only
+	// with both values: CURATOR_SPOTIFY_CLIENT_ID (the app's client id; not a
+	// secret, but a Fly secret like the rest so no deployment value lives in
+	// the repo) and CURATOR_TOKEN_KEY (the key that seals the tokens at rest,
+	// 32 bytes of base64), with CURATOR_TOKEN_KEY_PREV during a rotation.
+	spotify: { clientId: string; keys: TokenKeyring } | null;
+	// Which of the two are missing when the gateway is off, for the boot log.
+	spotifyMissing: string[];
 };
 
 export class ConfigError extends Error {
@@ -67,5 +77,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 	const flag = env.CURATOR_REQUIRE_DEVICE_ID?.trim().toLowerCase() ?? '';
 	if (!['', '0', '1', 'false', 'true'].includes(flag)) throw new ConfigError(`CURATOR_REQUIRE_DEVICE_ID must be 0 or 1, not ${env.CURATOR_REQUIRE_DEVICE_ID}`);
 	const requireDeviceId = flag === '1' || flag === 'true';
-	return { databaseUrl, supabaseUrl, port, catalogue, requireDeviceId };
+	const { spotify, spotifyMissing } = loadSpotify(env);
+	return { databaseUrl, supabaseUrl, port, catalogue, requireDeviceId, spotify, spotifyMissing };
+}
+
+// Missing values switch the gateway off (a deployment that has not set the
+// secrets yet keeps serving sync); a value that is set but malformed fails
+// the boot, since that is a mistake, not a choice.
+function loadSpotify(env: NodeJS.ProcessEnv): Pick<Config, 'spotify' | 'spotifyMissing'> {
+	const key = (name: string): TokenKey | null => {
+		const v = env[name]?.trim();
+		if (!v) return null;
+		try {
+			return parseTokenKey(name, v);
+		} catch (e) {
+			if (e instanceof TokenKeyError) throw new ConfigError(e.message);
+			throw e;
+		}
+	};
+	const clientId = env.CURATOR_SPOTIFY_CLIENT_ID?.trim() || null;
+	// Spotify's client ids are 32 hex characters.
+	if (clientId !== null && !/^[0-9a-f]{32}$/i.test(clientId)) throw new ConfigError('CURATOR_SPOTIFY_CLIENT_ID is not a Spotify client id (32 hex characters)');
+	const current = key('CURATOR_TOKEN_KEY');
+	const previous = key('CURATOR_TOKEN_KEY_PREV');
+	if (previous && !current) throw new ConfigError('CURATOR_TOKEN_KEY_PREV is set without CURATOR_TOKEN_KEY');
+	const spotifyMissing = [...(clientId ? [] : ['CURATOR_SPOTIFY_CLIENT_ID']), ...(current ? [] : ['CURATOR_TOKEN_KEY'])];
+	if (!clientId || !current) return { spotify: null, spotifyMissing };
+	return { spotify: { clientId, keys: { current, previous: previous && previous.id !== current.id ? previous : null } }, spotifyMissing: [] };
 }

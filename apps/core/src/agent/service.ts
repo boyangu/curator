@@ -190,7 +190,8 @@ export interface AgentService {
 	externalToolSpecs(): WireToolSpec[];
 	createExternalSession(title: string): AgentSessionSummary;
 	runExternalTool(req: { sessionId: string; name: string; args: unknown }): Promise<unknown>;
-	stop(): void;
+	// Settles once the workspace host has stopped (agent.db closes at once).
+	stop(): Promise<void>;
 }
 
 export function createAgentService(deps: AgentServiceDeps): AgentService {
@@ -482,10 +483,11 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 			return () => { listeners.delete(cb); };
 		},
 
-		stop() {
+		async stop() {
 			externalHits.clear();
-			void deps.workspace?.stop();
+			const workspace = deps.workspace?.stop();
 			store.close();
+			await workspace;
 		},
 	};
 }

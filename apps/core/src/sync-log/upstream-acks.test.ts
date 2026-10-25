@@ -11,7 +11,7 @@
 // temp DBs only.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -19,6 +19,7 @@ import { getSourceCapabilities } from '@curator/shared';
 import { migrate } from '../db/migrate.js';
 import { createDb, type Db } from '../db/client.js';
 import { createCoreService, type CoreService } from '../service.js';
+import { removeDir } from '../test-support/tmp.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import * as mut from '../library/mutators.js';
 import { applyOps } from './apply.js';
@@ -30,10 +31,10 @@ const handles: Database.Database[] = [];
 const services: CoreService[] = [];
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'curator-upstream-')); });
-afterEach(() => {
-	for (const s of services.splice(0)) s.close();
+afterEach(async () => {
+	for (const s of services.splice(0).reverse()) await s.close();
 	for (const h of handles.splice(0)) h.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+	await removeDir(dir);
 });
 
 const TRACKS = Array.from({ length: 8 }, (_, i) => `trk-${i}`);

@@ -9,8 +9,7 @@
 //      row that stores them as one comma-joined string (scorer tokenization).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { migrate } from '../db/migrate.js';
 import { createDb, type Db } from '../db/client.js';
@@ -19,10 +18,12 @@ import { LibraryScanner, normalizePath } from './scanner.js';
 import type { ParseResult } from '../ingest/types.js';
 import { audioHash } from '../ingest/audio-hash.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 import { applyOps } from '../sync-log/apply.js';
 import { opSchemaVersion, type NewOp } from '@curator/protocol';
 import type Database from 'better-sqlite3';
 
+let tmp: TmpDir;
 let dir: string;
 let db: Db;
 let sqlite: Database.Database;
@@ -66,15 +67,15 @@ async function ingest(scanner: LibraryScanner, filePath: string) {
 }
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-scanner-'));
+	tmp = tmpDir('curator-scanner-');
+	dir = tmp.path;
 	migrate(join(dir, 'curator.db'));
 	({ db, sqlite } = createDb(join(dir, 'curator.db')));
+	tmp.track(sqlite);
 });
-afterEach(() => {
-	sqlite.close();
-	// The duplicate-group case opens a CoreService over the same dir; its
-	// sibling DB handles can outlive the test on Windows.
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* see above */ }
+afterEach(async () => {
+	// Also closes the CoreService the duplicate-group case opens over the dir.
+	await tmp.cleanup();
 });
 
 describe('changed file keeps its track binding', () => {
@@ -331,7 +332,7 @@ describe('audio hash identity', () => {
 		expect(linkRow(one)!.track_id).toBe(first.trackId);
 		expect(linkRow(two)!.track_id).toBe(second.trackId);
 
-		const svc = createCoreService(join(dir, 'curator.db'), { peaksDir: join(dir, 'peaks') });
+		const svc = tmp.track(createCoreService(join(dir, 'curator.db'), { peaksDir: join(dir, 'peaks') }));
 		const groups = await svc.getDuplicateAudioGroups();
 		expect(groups).toHaveLength(1);
 		expect(groups[0]!.audioHash).toBe(HASH);
@@ -425,7 +426,7 @@ describe('a deleted track stays deleted', () => {
 		try {
 			await svc.deleteTracks([first.trackId!]);
 		} finally {
-			svc.close();
+			await svc.close();
 		}
 		expect(linkOf(file)).toBeUndefined();
 
@@ -480,7 +481,7 @@ describe('a deleted track stays deleted', () => {
 			expect(await svc.undeleteTracks([first.trackId!])).toEqual({ restored: [first.trackId] });
 			expect(await svc.undeleteTracks([first.trackId!])).toEqual({ restored: [] });
 		} finally {
-			svc.close();
+			await svc.close();
 		}
 		expect(deletedAt(first.trackId!)).toBeNull();
 		expect(linkOf(file)?.track_id).toBe(first.trackId);

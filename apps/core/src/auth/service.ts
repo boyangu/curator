@@ -5,14 +5,16 @@ import {
 	SpotifyClient,
 	exchangeCodeForTokens,
 	refreshTokens,
-	type SpotifyMe,
+	type SpotifyTokens,
 } from '@curator/spotify';
+import type { SpotifyProfile } from '@curator/protocol';
 import {
 	TidalApiClient,
 	exchangeTidalCodeForTokens,
 	refreshTidalTokens,
 	type TidalUser,
 } from '@curator/tidal';
+import { SpotifyGateway, type SpotifyGatewayPort } from './spotify-gateway.js';
 import { TokenStore } from './store.js';
 import type { ExportedTokenRow } from '../backup/types.js';
 import { config } from '../config.js';
@@ -40,6 +42,13 @@ export interface AuthStatusEntry {
 	id: string | null;
 	connectedAt: Date | null;
 	error: string | null;
+	// Where the tokens come from: 'cloud' when the Curator cloud holds the
+	// grant and vends them (Spotify, 'spotify_gateway'), 'device' when this
+	// device holds and refreshes its own; null while disconnected.
+	via: 'cloud' | 'device' | null;
+	// Spotify refused the account's grant (revoked, a scope change): the user
+	// signs in again. `id` / `displayName` still name the account it was.
+	needsReconnect: boolean;
 }
 
 export interface AuthStatus {
@@ -47,39 +56,89 @@ export interface AuthStatus {
 	tidal: AuthStatusEntry;
 }
 
+export type AuthServiceOptions = {
+	// Test seam for the local refresh (the real one reaches Spotify).
+	refreshSpotify?: (refreshToken: string) => Promise<SpotifyTokens>;
+};
+
 export class AuthService {
 	private readonly store: TokenStore;
+	private readonly refreshSpotify: (refreshToken: string) => Promise<SpotifyTokens>;
+	// The cloud's token source (attachSpotifyGateway); null without a cloud
+	// transport that has the procedures.
+	private gateway: SpotifyGateway | null = null;
+	// Single flight for the local refresh: Spotify may rotate the refresh
+	// token on any refresh, so two concurrent ones with the same token leave
+	// the loser holding a dead one (and may strand the grant).
+	private spotifyRefreshing: Promise<string | null> | null = null;
+	// Set once the grant starts moving to the cloud (or a cloud connect
+	// starts): no local refresh after that, for the rest of the session.
+	private localRefreshStopped = false;
 
-	constructor(db: Db) {
+	constructor(private readonly db: Db, opts: AuthServiceOptions = {}) {
 		this.store = new TokenStore(db);
+		this.refreshSpotify = opts.refreshSpotify ?? ((t) => refreshTokens(config.spotify, t));
 	}
 
 	// ─── Spotify ─────────────────────────────────────────────────────────
 
-	async completeSpotifyAuth(code: string, codeVerifier: string): Promise<SpotifyMe> {
+	// Gateway mode (auth/spotify-gateway.ts): while the port says the cloud
+	// is signed in and offers 'spotify_gateway', the cloud is the token
+	// source. Wired once by createCoreService.
+	attachSpotifyGateway(port: SpotifyGatewayPort, opts: { onIdentityChange?: () => void } = {}): void {
+		this.gateway = new SpotifyGateway(port, {
+			store: this.store,
+			db: this.db,
+			stopLocalRefresh: async () => {
+				this.localRefreshStopped = true;
+				await this.spotifyRefreshing?.catch(() => null);
+			},
+			onIdentityChange: opts.onIdentityChange,
+		});
+	}
+
+	// From the sync client's status events (the server's features arrive
+	// with them).
+	spotifyGatewayCheck(): void {
+		this.gateway?.check();
+	}
+
+	async completeSpotifyAuth(code: string, codeVerifier: string): Promise<SpotifyProfile> {
+		if (this.gateway?.active()) return this.gateway.connect(code, codeVerifier, config.spotify.redirectUri);
 		if (!config.spotify.configured) throw new Error(NOT_CONFIGURED.spotify);
 		const tokens = await exchangeCodeForTokens(config.spotify, code, codeVerifier);
 		this.store.put('spotify', 'access', 'user', tokens.accessToken, { expiresAt: tokens.expiresAt });
 		this.store.put('spotify', 'refresh', 'user', tokens.refreshToken);
 		// fetch + persist user info
 		const me = await new SpotifyClient(tokens.accessToken, 'auth:verify').getMe();
-		this.store.put('spotify', 'access', 'user', tokens.accessToken, {
-			expiresAt: tokens.expiresAt,
-			meta: { id: me.id, displayName: me.display_name, avatarUrl: me.images[0]?.url ?? null },
-		});
-		return me;
+		const profile: SpotifyProfile = { id: me.id, displayName: me.display_name, avatarUrl: me.images[0]?.url ?? null };
+		this.store.put('spotify', 'access', 'user', tokens.accessToken, { expiresAt: tokens.expiresAt, meta: profile });
+		this.gateway?.forget();
+		return profile;
 	}
 
 	async getSpotifyAccessToken(): Promise<string | null> {
+		if (this.gateway?.active()) return this.gateway.token();
 		const access = this.store.get('spotify', 'access', 'user');
 		if (!access) return null;
 		const margin = 60_000; // refresh 1 min before expiry
 		if (access.expiresAt && access.expiresAt.getTime() - Date.now() > margin) {
 			return access.value;
 		}
-		// expired or near-expiry — refresh
+		// expired or near-expiry — refresh, once for every caller
+		this.spotifyRefreshing ??= this.refreshSpotifyLocally().finally(() => { this.spotifyRefreshing = null; });
+		return this.spotifyRefreshing;
+	}
+
+	private async refreshSpotifyLocally(): Promise<string | null> {
+		// Read inside the flight: the previous one may have rotated it.
+		const access = this.store.get('spotify', 'access', 'user');
 		const refresh = this.store.get('spotify', 'refresh', 'user');
-		if (!refresh) return null;
+		if (!access || !refresh) return null;
+		if (this.localRefreshStopped) {
+			alog.warn('spotify local refresh skipped: the grant is moving to the cloud');
+			return null;
+		}
 		// A token row can outlive the credentials (restored DB, unconfigured
 		// build): refreshing with an empty client id is a guaranteed 400.
 		if (!config.spotify.configured) {
@@ -87,12 +146,13 @@ export class AuthService {
 			return null;
 		}
 		try {
-			const tokens = await refreshTokens(config.spotify, refresh.value);
+			const tokens = await this.refreshSpotify(refresh.value);
 			this.store.put('spotify', 'access', 'user', tokens.accessToken, {
 				expiresAt: tokens.expiresAt,
 				meta: access.meta,
 			});
 			this.store.put('spotify', 'refresh', 'user', tokens.refreshToken);
+			this.gateway?.forget();
 			return tokens.accessToken;
 		} catch (err) {
 			alog.warn('spotify refresh failed', undefined, err);
@@ -100,8 +160,13 @@ export class AuthService {
 		}
 	}
 
-	disconnectSpotify(): void {
+	// Gateway mode: the cloud drops the account's grant (every device), then
+	// this device's rows go. A failed cloud call throws and keeps them: the
+	// next vend would only bring the token back.
+	async disconnectSpotify(): Promise<void> {
+		if (this.gateway?.active()) return this.gateway.disconnect();
 		this.store.clear('spotify');
+		this.gateway?.forget();
 	}
 
 	// ─── Tidal (OAuth) ───────────────────────────────────────────────────
@@ -229,7 +294,16 @@ export class AuthService {
 		}));
 	}
 
+	// In gateway mode a restored Spotify refresh token is never put back: the
+	// cloud owns the grant, and a stale copy here could be refreshed (or
+	// adopted) against it.
 	importTokenRows(rows: ExportedTokenRow[]): void {
+		if (this.gateway?.offered()) {
+			const kept = rows.filter((r) => !(r.source === 'spotify' && r.kind === 'refresh'));
+			if (kept.length !== rows.length) alog.info('restore: spotify refresh token skipped (the cloud holds the grant)', { skipped: rows.length - kept.length });
+			rows = kept;
+		}
+		this.gateway?.forget();
 		this.store.importRows(rows.map((r) => ({
 			source: r.source, kind: r.kind, scope: r.scope, value: r.value,
 			expiresAt: r.expiresAt != null ? new Date(r.expiresAt) : null, fetchedAt: new Date(r.fetchedAt), meta: r.meta,
@@ -241,6 +315,10 @@ export class AuthService {
 	getStatus(): AuthStatus {
 		const sp = this.store.get('spotify', 'access', 'user');
 		const td = this.store.get('tidal', 'access', 'user');
+		const viaCloud = this.gateway?.active() ?? false;
+		// A grant Spotify refused: no token row, but the account it was (the
+		// membership identity holds until a reconnect or a disconnect).
+		const lost = viaCloud && !sp && this.gateway!.needsReconnect() ? this.gateway!.profile() : null;
 
 		return {
 			spotify: sp
@@ -252,8 +330,22 @@ export class AuthService {
 						id: (sp.meta as Record<string, unknown> | null)?.['id'] as string ?? null,
 						connectedAt: sp.fetchedAt,
 						error: null,
+						via: viaCloud ? 'cloud' : 'device',
+						needsReconnect: false,
 				  }
-				: { configured: config.spotify.configured, connected: false, displayName: null, avatarUrl: null, id: null, connectedAt: null, error: null },
+				: lost
+					? {
+							configured: config.spotify.configured,
+							connected: false,
+							displayName: lost.displayName,
+							avatarUrl: lost.avatarUrl,
+							id: lost.id,
+							connectedAt: null,
+							error: 'Spotify refused the sign-in: reconnect Spotify',
+							via: 'cloud',
+							needsReconnect: true,
+					  }
+					: { configured: config.spotify.configured, connected: false, displayName: null, avatarUrl: null, id: null, connectedAt: null, error: null, via: null, needsReconnect: false },
 			tidal: td
 				? {
 						configured: config.tidal.configured,
@@ -263,8 +355,10 @@ export class AuthService {
 						id: String((td.meta as Record<string, unknown> | null)?.['userId'] ?? ''),
 						connectedAt: td.fetchedAt,
 						error: null,
+						via: 'device',
+						needsReconnect: false,
 				  }
-				: { configured: config.tidal.configured, connected: false, displayName: null, avatarUrl: null, id: null, connectedAt: null, error: null },
+				: { configured: config.tidal.configured, connected: false, displayName: null, avatarUrl: null, id: null, connectedAt: null, error: null, via: null, needsReconnect: false },
 		};
 	}
 }

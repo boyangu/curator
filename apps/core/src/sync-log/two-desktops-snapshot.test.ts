@@ -28,9 +28,9 @@ beforeEach(() => {
 	rig = new TwoDesktopRig('curator-snap-');
 	scratch = mkdtempSync(join(tmpdir(), 'curator-snap-build-'));
 });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	rmSync(scratch, { recursive: true, force: true });
 	expect(upstream).toEqual([]);
 });

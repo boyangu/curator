@@ -4,8 +4,7 @@
 // injected so any accidental upstream write fails the test loudly.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
@@ -15,7 +14,9 @@ import { createDb } from '../db/client.js';
 import { createCoreService, TrackMergeBlockedError, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import { planTrackMerge } from './merge-tracks.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let dbPath: string;
 let peaksDir: string;
@@ -81,17 +82,17 @@ const row = <T = Record<string, unknown>>(sqlText: string, ...args: unknown[]): 
 const all = <T = Record<string, unknown>>(sqlText: string, ...args: unknown[]): T[] => sqlite.prepare(sqlText).all(...args) as T[];
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-merge-'));
+	tmp = tmpDir('curator-merge-');
+	dir = tmp.path;
 	dbPath = join(dir, 'curator.db');
 	peaksDir = join(dir, 'peaks');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
-	svc = createCoreService(dbPath, { peaksDir, sourceAdapters: { spotify: throwingAdapter() } });
+	sqlite = tmp.track(new Database(dbPath));
+	svc = tmp.track(createCoreService(dbPath, { peaksDir, sourceAdapters: { spotify: throwingAdapter() } }));
 });
 
-afterEach(() => {
-	sqlite.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* sibling DB handles on Windows */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('setTrackSourceLinks identity guard', () => {
@@ -132,7 +133,8 @@ describe('previewTrackMerge', () => {
 		const p = await svc.previewTrackMerge('a', 'b');
 		expect(p.plans['a']!.warnings.some((w) => /Durations differ/.test(w))).toBe(true);
 		// Pure planner over a Db handle — same answer, no service.
-		const { db } = createDb(dbPath);
+		const { db, sqlite: handle } = createDb(dbPath);
+		tmp.track(handle);
 		expect(planTrackMerge(db, 'b', 'a').warnings).toEqual(p.plans['b']!.warnings);
 	});
 });

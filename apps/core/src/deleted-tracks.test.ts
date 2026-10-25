@@ -7,14 +7,14 @@
 // Real CoreService over a generated DB; no remote-write policy (CLAUDE.md).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from './db/migrate.js';
 import { memberOrder } from './test-support/playlist-track.js';
 import { createCoreService, type CoreService } from './service.js';
+import { tmpDir, type TmpDir } from './test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let sqlite: Database.Database;
 let svc: CoreService;
@@ -45,10 +45,11 @@ const count = (sql: string, ...args: unknown[]): number => (sqlite.prepare(sql).
 const purgedAt = (id: string): number | null => (sqlite.prepare(`SELECT purged_at FROM track WHERE id = ?`).get(id) as { purged_at: number | null }).purged_at;
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-deleted-tracks-'));
+	tmp = tmpDir('curator-deleted-tracks-');
+	dir = tmp.path;
 	const dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
+	sqlite = tmp.track(new Database(dbPath));
 	seedPlaylist('own', 'spotify', null);             // ownerId unknown → modifiable
 	seedPlaylist('followed', 'spotify', 'someone-else');
 	seedPlaylist('local', 'local', null);
@@ -71,12 +72,11 @@ beforeEach(() => {
 	seedRow('local', 'gone', 0);
 	// a deleted Convert-to-WAV copy.
 	seedTrack('wav', { deleted: true, derivedFrom: 'live' });
-	svc = createCoreService(dbPath);
+	svc = tmp.track(createCoreService(dbPath));
 });
 
-afterEach(() => {
-	sqlite.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* sibling DB handle still open */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 describe('deleted tracks are not counted or listed', () => {

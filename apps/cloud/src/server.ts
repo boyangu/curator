@@ -1,6 +1,6 @@
 // Production entry: config from env, Postgres pool, JWKS-backed verifier,
-// HTTP server, the access-log writer, and the maintenance sweeps on timers:
-// batch upkeep (expire idle batches, finish stalled commits) every 15 min,
+// the Spotify gateway when its secrets are set, HTTP server, the access-log
+// writer, and the maintenance sweeps on timers: batch upkeep (expire idle batches, finish stalled commits) every 15 min,
 // the access log's prune and the log compaction (src/sync/compact.ts) daily.
 // Nothing starts until the migration gate has confirmed the database holds
 // every migration this image ships (src/db/migration-gate.ts).
@@ -17,6 +17,8 @@ import { createLogger } from './log.js';
 import { defaultRateLimits } from './rate-limit.js';
 import { DEFAULT_BATCH_OPTIONS, tendBatches } from './sync/batch.js';
 import { compactDueUsers } from './sync/compact.js';
+import { TokenCrypto } from './spotify/crypto.js';
+import { SPOTIFY_TIMEOUT_MS } from './spotify/gateway.js';
 import { DEFAULT_PULL_OPTIONS } from './sync/pull.js';
 
 // Often enough that an idle batch expires within 15 min of its day; cheap
@@ -57,8 +59,15 @@ const handler = createFetchHandler({
 	catalogue: config.catalogue,
 	requireDeviceId: config.requireDeviceId,
 	batch: DEFAULT_BATCH_OPTIONS,
+	spotify: config.spotify
+		? { clientId: config.spotify.clientId, crypto: new TokenCrypto(config.spotify.keys), fetch: (url, init) => fetch(url, init), timeoutMs: SPOTIFY_TIMEOUT_MS }
+		: null,
 });
 log.info('device_reads', { requireDeviceId: config.requireDeviceId });
+// Key ids only (fingerprints, src/spotify/crypto.ts), never a key.
+log.info('spotify_gateway', config.spotify
+	? { enabled: true, keyId: config.spotify.keys.current.id, previousKeyId: config.spotify.keys.previous?.id ?? null }
+	: { enabled: false, missing: config.spotifyMissing });
 log.info('catalogue_policy', { allow: config.catalogue?.allow.map((a) => (a.variants ? `${a.unit}:${a.variants.join('|')}` : a.unit)) ?? 'off' });
 
 const server = createServer(toNodeListener(handler, { log, audit }));

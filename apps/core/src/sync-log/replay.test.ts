@@ -11,7 +11,7 @@
 // Spotify adapter guards against any upstream write.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -19,6 +19,7 @@ import { applyOps as reduceOps, createLibraryState, materialize, type Op } from 
 import { getSourceCapabilities } from '@curator/shared';
 import { migrate } from '../db/migrate.js';
 import { createDb } from '../db/client.js';
+import { removeDir } from '../test-support/tmp.js';
 import { createCoreService, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
 import * as mut from '../library/mutators.js';
@@ -108,7 +109,8 @@ beforeAll(async () => {
 	// creates, exactly as D10's initial push does on a real library.
 	initialPush(source);
 	svc = createCoreService(p, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: throwingAdapter() } });
-	const { db } = createDb(p);
+	const { db, sqlite: dbHandle } = createDb(p);
+	handles.push(dbHandle);
 
 	const [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11] = TRACKS as [string, string, string, string, string, string, string, string, string, string, string, string];
 
@@ -202,9 +204,10 @@ beforeAll(async () => {
 	wantArtists = artistDump(source);
 }, 120_000);
 
-afterAll(() => {
-	for (const h of handles.splice(0)) { try { h.close(); } catch { /* */ } }
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+afterAll(async () => {
+	await svc?.close();
+	for (const h of handles.splice(0)) h.close();
+	await removeDir(dir);
 });
 
 describe('outbox replay', () => {

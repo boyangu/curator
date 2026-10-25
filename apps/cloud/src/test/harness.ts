@@ -36,7 +36,9 @@ import type { AppRouter } from '../router.js';
 import { CATALOGUE_POLICY_D_A, parseCataloguePolicy } from '../catalogue/policy.js';
 import { DEFAULT_BATCH_OPTIONS, type BatchOptions } from '../sync/batch.js';
 import { DEFAULT_PULL_OPTIONS, type PullOptions } from '../sync/pull.js';
+import { TokenCrypto, type TokenKeyring } from '../spotify/crypto.js';
 import type { AppDeps } from '../trpc.js';
+import { FakeSpotify, randomTokenKey } from './fake-spotify.js';
 import { SUPABASE_SHIM_SQL } from './supabase-shim.js';
 
 export const SUPABASE_URL = 'https://test-project.supabase.co';
@@ -219,6 +221,8 @@ export async function createKeys(kid = 'test-key'): Promise<TestKeys> {
 export type TestApp = TestDb &
 	TestKeys & {
 		deps: AppDeps;
+		// The Spotify the gateway reaches, or null when the gateway is off.
+		spotify: FakeSpotify | null;
 		// Its timer is off: tests `await app.audit.flush()` before reading
 		// curator.request_log / audit_event.
 		audit: AuditWriter;
@@ -231,7 +235,8 @@ export type TestApp = TestDb &
 
 export async function createTestApp(
 	opts: {
-		limits?: RateLimits;
+		// Buckets not given are unbounded.
+		limits?: Partial<RateLimits>;
 		pull?: PullOptions;
 		auditDb?: Queryable;
 		auditOptions?: { maxBuffered?: number; flushAt?: number };
@@ -242,6 +247,9 @@ export async function createTestApp(
 		// Default: production's, except that batchCommit waits for its commit
 		// to finish (a minute), so a test reads `committed` from one call.
 		batch?: Partial<BatchOptions>;
+		// Default: on, against a fresh FakeSpotify, with a fresh key. `null` =
+		// gateway off (no client id or key).
+		spotify?: { fake?: FakeSpotify; keys?: TokenKeyring } | null;
 	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
@@ -249,18 +257,22 @@ export async function createTestApp(
 	const logs: TestApp['logs'] = [];
 	const log: Logger = createLogger((line) => logs.push(JSON.parse(line) as TestApp['logs'][number]));
 	const audit = new AuditWriter({ db: opts.auditDb ?? tdb.db, log, ...opts.auditOptions });
+	const spotify = opts.spotify === null ? null : (opts.spotify?.fake ?? new FakeSpotify());
 	const deps: AppDeps = {
 		db: tdb.db,
 		log,
 		auth: createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: keys.keys }),
 		// Generous by default so suites that are not about rate limits never
 		// trip them; the rate-limit test injects its own clock and buckets.
-		limits: opts.limits ?? defaultRateLimitsUnbounded(),
+		limits: { ...defaultRateLimitsUnbounded(), ...opts.limits },
 		pull: opts.pull ?? DEFAULT_PULL_OPTIONS,
 		audit,
 		catalogue: opts.catalogue === undefined ? parseCataloguePolicy(CATALOGUE_POLICY_D_A) : opts.catalogue,
 		requireDeviceId: opts.requireDeviceId ?? false,
 		batch: { ...DEFAULT_BATCH_OPTIONS, commitWaitMs: 60_000, ...opts.batch },
+		spotify: spotify
+			? { clientId: spotify.clientId, fetch: spotify.fetch, timeoutMs: 5_000, crypto: new TokenCrypto(opts.spotify?.keys ?? { current: randomTokenKey(), previous: null }) }
+			: null,
 	};
 	const handler = createFetchHandler(deps);
 	const client = (token?: string) =>
@@ -277,6 +289,7 @@ export async function createTestApp(
 		...tdb,
 		...keys,
 		deps,
+		spotify,
 		audit,
 		handler,
 		logs,
@@ -292,7 +305,8 @@ export async function createTestApp(
 }
 
 function defaultRateLimitsUnbounded(): RateLimits {
-	return { push: new TokenBucketLimiter(1e9, 1e9), pull: new TokenBucketLimiter(1e9, 1e9), catalogue: new TokenBucketLimiter(1e9, 1e9) };
+	const unbounded = () => new TokenBucketLimiter(1e9, 1e9);
+	return { push: unbounded(), pull: unbounded(), catalogue: unbounded(), spotifyToken: unbounded(), spotifyConnect: unbounded() };
 }
 
 // The `reason` the server put in the error's data, for `expect(...).rejects`.

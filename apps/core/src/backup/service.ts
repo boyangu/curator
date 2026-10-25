@@ -68,7 +68,8 @@ export interface BackupService {
 	restore(req: BackupRestoreRequest): Promise<{ runId: string; relaunchRequired: boolean }>;
 	startScheduler(): void;
 	subscribe(cb: (e: BackupEvent) => void): () => void;
-	stop(): void;
+	// Settles once the engine host has stopped; never rejects.
+	stop(): Promise<void>;
 }
 
 export function createBackupService(deps: BackupServiceDeps): BackupService {
@@ -372,10 +373,10 @@ export function createBackupService(deps: BackupServiceDeps): BackupService {
 			return () => { subscribers.delete(cb); };
 		},
 
-		stop() {
+		async stop() {
 			if (firstTimer) { clearTimeout(firstTimer); firstTimer = null; }
 			if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
-			void hostRef?.stop().catch(() => { /* best effort */ });
+			await hostRef?.stop().catch(() => { /* best effort */ });
 		},
 	};
 }

@@ -1,16 +1,16 @@
 // Spotify PKCE flow inside an Electron BrowserWindow.
 // We listen for the redirect to our loopback URI via webRequest, extract
-// the auth code without ever needing a real local HTTP server.
+// the auth code without ever needing a real local HTTP server. Who exchanges
+// the code is core's call (AuthService.completeSpotifyAuth): the Curator
+// cloud when it holds the account's grant ('spotify_gateway'; it needs the
+// same client id this window authorizes with), else this device.
 
 import { BrowserWindow, session } from 'electron';
-import {
-	buildAuthorizeUrl,
-	generatePkce,
-	type SpotifyMe,
-} from '@curator/spotify';
+import { buildAuthorizeUrl, generatePkce } from '@curator/spotify';
+import type { SpotifyProfile } from '@curator/protocol';
 import { config, NOT_CONFIGURED, type AuthService } from '@curator/core';
 
-export async function runSpotifyAuthFlow(authService: AuthService): Promise<SpotifyMe> {
+export async function runSpotifyAuthFlow(authService: AuthService): Promise<SpotifyProfile> {
 	// Refuse before a window opens: Spotify would only show an error page
 	// for an empty client_id.
 	if (!config.spotify.configured) throw new Error(NOT_CONFIGURED.spotify);
@@ -21,7 +21,7 @@ export async function runSpotifyAuthFlow(authService: AuthService): Promise<Spot
 	// Use a dedicated session so cookies don't leak into other Electron windows
 	const authSession = session.fromPartition('persist:curator-spotify-auth');
 
-	return new Promise<SpotifyMe>((resolve, reject) => {
+	return new Promise<SpotifyProfile>((resolve, reject) => {
 		const win = new BrowserWindow({
 			width: 520,
 			height: 720,

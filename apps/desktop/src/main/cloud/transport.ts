@@ -53,6 +53,12 @@ import {
 	type PushInput,
 	type PushResult,
 	type RegisterDeviceInput,
+	type SpotifyAdoptInput,
+	type SpotifyConnectInput,
+	type SpotifyDisconnectInput,
+	type SpotifyGrantStatus,
+	type SpotifyTokenInput,
+	type SpotifyTokenResult,
 } from '@curator/protocol';
 import { mainLog } from '../log.js';
 import { createSnapshotBlobStore } from './blobs.js';
@@ -85,6 +91,14 @@ const PROCS = {
 	catalogueLookup: { path: 'catalogue.lookup', type: 'mutation' },
 	cataloguePut: { path: 'catalogue.put', type: 'mutation' },
 	catalogueInventory: { path: 'catalogue.inventory', type: 'query' },
+	// 'spotify_gateway' (core auth/spotify-gateway.ts). `token` is a mutation:
+	// it may refresh on the server, and an answer carrying an access token
+	// must never be a cacheable GET. Adopt's refresh token rides in the body.
+	spotifyConnect: { path: 'spotify.connect', type: 'mutation' },
+	spotifyAdopt: { path: 'spotify.adopt', type: 'mutation' },
+	spotifyStatus: { path: 'spotify.status', type: 'query' },
+	spotifyToken: { path: 'spotify.token', type: 'mutation' },
+	spotifyDisconnect: { path: 'spotify.disconnect', type: 'mutation' },
 } as const;
 
 // A snapshot of a 40k-track library inflates to tens of MB; cap what a
@@ -143,6 +157,7 @@ function mapError(err: unknown): CloudTransportError {
 		if (reason === 'batch_gone') return new CloudTransportError('batch_gone', reason);
 		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
 		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
+		if (reason === 'spotify_not_connected' || reason === 'spotify_reconnect_required') return new CloudTransportError(reason, reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
 		if (status >= 500) return new CloudTransportError('server', `HTTP ${status}`);
 		if (status >= 400) return new CloudTransportError('bad_request', reason ?? `HTTP ${status}`);
@@ -331,6 +346,13 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			lookup: (input: CatalogueLookupInput) => call<CatalogueLookupResult>(PROCS.catalogueLookup, input),
 			put: (input: CataloguePutInput) => call<CataloguePutResult>(PROCS.cataloguePut, input),
 			inventory: (input: CatalogueInventoryInput) => call<CatalogueInventoryResult>(PROCS.catalogueInventory, input),
+		},
+		spotify: {
+			connect: (input: SpotifyConnectInput) => call<SpotifyGrantStatus>(PROCS.spotifyConnect, input),
+			adopt: (input: SpotifyAdoptInput) => call<SpotifyGrantStatus>(PROCS.spotifyAdopt, input),
+			status: () => call<SpotifyGrantStatus>(PROCS.spotifyStatus),
+			token: (input: SpotifyTokenInput) => call<SpotifyTokenResult>(PROCS.spotifyToken, input),
+			disconnect: (input: SpotifyDisconnectInput) => call<SpotifyGrantStatus>(PROCS.spotifyDisconnect, input),
 		},
 	};
 }

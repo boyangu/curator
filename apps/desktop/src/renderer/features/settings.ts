@@ -160,6 +160,20 @@ export async function renderSettingsConnections(): Promise<void> {
 				</div>
 			`;
 		}
+		// The Curator cloud holds the account's grant and Spotify refused it
+		// (revoked, a scope change): one sign-in fixes it for every device.
+		if (!a.connected && a.needsReconnect) {
+			return `
+				<div class="settings-connection" data-src="${src}">
+					<div class="settings-row">
+						<span class="settings-row__label">${escapeHtml(label)}</span>
+						<span class="settings-row__state settings-row__state--off">Reconnect needed · ${escapeHtml(name)}</span>
+						<button class="btn-primary" data-action="connect" data-src="${src}">Reconnect</button>
+						<span class="settings-toggle__hint">${escapeHtml(label)} stopped accepting the sign-in Curator Cloud holds for your account. Sign in again to restore it on every device.</span>
+					</div>
+				</div>
+			`;
+		}
 		if (!a.connected) {
 			return `
 				<div class="settings-connection" data-src="${src}">
@@ -188,7 +202,7 @@ export async function renderSettingsConnections(): Promise<void> {
 			<div class="settings-connection" data-src="${src}">
 				<div class="settings-row">
 					<span class="settings-row__label">${escapeHtml(label)}</span>
-					<span class="settings-row__state settings-row__state--on">Connected · ${escapeHtml(name)}</span>
+					<span class="settings-row__state settings-row__state--on"${a.via === 'cloud' ? ` title="Curator Cloud holds this sign-in and hands this device short-lived tokens"` : ''}>${a.via === 'cloud' ? 'Connected through Curator Cloud' : 'Connected'} · ${escapeHtml(name)}</span>
 					${syncBtns}
 					<button class="btn-secondary" data-action="disconnect" data-src="${src}">Disconnect</button>
 				</div>
@@ -209,7 +223,9 @@ export async function renderSettingsConnections(): Promise<void> {
 					await (src === 'spotify' ? authApi.spotifyStart() : authApi.tidalStart());
 				} else if (action === 'disconnect') {
 					const label = src === 'spotify' ? 'Spotify' : 'Tidal';
-					if (!window.confirm(`Disconnect ${label}?\n\nYour synced tracks stay; you'll need to reconnect to sync again or play tracks in-app.`)) return;
+					// Through the cloud the grant is the account's, not this device's.
+					const everywhere = auth[src].via === 'cloud' ? `\n\nThis signs every device on your Curator account out of ${label}.` : '';
+					if (!window.confirm(`Disconnect ${label}?\n\nYour synced tracks stay; you'll need to reconnect to sync again or play tracks in-app.${everywhere}`)) return;
 					await (src === 'spotify' ? authApi.spotifyDisconnect() : authApi.tidalDisconnect());
 					showToast(`${label} disconnected`, { kind: 'info' });
 				} else if (action === 'sync') {

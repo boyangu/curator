@@ -3,13 +3,14 @@
 // is a supported state — seed similarity still answers from stored vectors).
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
 import { SqliteMirStore } from './store.js';
+import { removeDir } from '../test-support/tmp.js';
 
 const M = 'mert-v2-fullsong@1';
 const vec = (xs: number[]): Buffer => Buffer.from(new Float32Array(xs).buffer);
@@ -39,10 +40,11 @@ beforeEach(() => {
 	mir.putResult('d', M, 'local', null, vec([0, 1]), []);
 	svc = createCoreService(dbPath);
 });
-afterEach(() => {
-	svc.close();
+afterEach(async () => {
+	// Awaited: the service's own mir.db handle closes after close() returns.
+	await svc.close();
 	mir.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* handle still open on Windows */ }
+	await removeDir(dir);
 });
 
 describe('similarTo through getTracksPage', () => {

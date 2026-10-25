@@ -1,5 +1,6 @@
 // Per-device token buckets (design: "Limits": 10 pushes/s, 100 pulls/min;
-// catalogue plan: 20 burst, 5/s per user + device for catalogue.*).
+// catalogue plan: 20 burst, 5/s per user + device for catalogue.*; the
+// Spotify gateway: 30 token calls/min per device, 5 sign-ins/min per account).
 // In memory on purpose: the limit protects this process and the database
 // behind it from a runaway client loop, not a billing quota, so a bucket
 // that resets on deploy or differs per machine is fine and costs no round
@@ -51,7 +52,13 @@ export class TokenBucketLimiter {
 	}
 }
 
-export type RateLimits = { push: TokenBucketLimiter; pull: TokenBucketLimiter; catalogue: TokenBucketLimiter };
+export type RateLimits = {
+	push: TokenBucketLimiter;
+	pull: TokenBucketLimiter;
+	catalogue: TokenBucketLimiter;
+	spotifyToken: TokenBucketLimiter;
+	spotifyConnect: TokenBucketLimiter;
+};
 
 export function defaultRateLimits(now: () => number = Date.now): RateLimits {
 	return {
@@ -61,5 +68,11 @@ export function defaultRateLimits(now: () => number = Date.now): RateLimits {
 		// 100 items per call: 5 calls/s is ~250 tracks/s, far past what the
 		// desktop's own 2 MB/s blob budget lets it use.
 		catalogue: new TokenBucketLimiter(20, 5, now),
+		// spotify.token, per device: a device asks once per token (an hour)
+		// plus once per launch; 30/min is a client loop, not a user.
+		spotifyToken: new TokenBucketLimiter(30, 30 / 60, now),
+		// spotify.connect / adopt / disconnect, per account: each one is a
+		// sign-in or a sign-out, and connect / adopt each call Spotify twice.
+		spotifyConnect: new TokenBucketLimiter(5, 5 / 60, now),
 	};
 }

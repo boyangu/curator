@@ -29,6 +29,7 @@ import { initialPush } from './initial-push.js';
 import { readOutbox } from './outbox.js';
 import { healStreamingDuplicates, planStreamingDedupe, streamingDedupeSwept, sweepStreamingDuplicatesAsync } from './playlist-dedupe.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { budgetMs } from '../test-support/timing.js';
 import { isStreamingMemberId, memberIdAllocator, nextStreamingPlaylistId, streamingMemberId, streamingPlaylistId, uuidv5 } from './stable-ids.js';
 
 const R = recordingIdForTrack;
@@ -440,7 +441,9 @@ describe('identity: the streaming tier', () => {
 		console.log(`[streaming identity] merges=${r.merged} dedupeRemoved=${r.dedupeRemoved} chunks=${r.chunks} plan=${planMs.toFixed(1)}ms total=${r.ms}ms maxSlice=${r.maxSliceMs.toFixed(1)}ms worstTimerGap=${worstGap.toFixed(1)}ms`);
 		expect(r.merged).toBe(N);
 		expect(r.dedupeRemoved).toBe(N);
-		expect(r.maxSliceMs).toBeLessThan(2_000);
+		// ~110-135 ms a slice alone, up to 365 ms under the parallel suite;
+		// scaled with the load (test-support/timing.ts).
+		expect(r.maxSliceMs).toBeLessThan(budgetMs(2_000, 'merge slice'));
 		// The library as it was: every row here moved onto the smaller id,
 		// the playlist still N rows in upstream order, none doubled.
 		expect(raw.prepare(`SELECT count(*) FROM track WHERE id LIKE 'big-%' AND recording_id LIKE '00000000-%' AND deleted_at IS NULL`).pluck().get()).toBe(N);

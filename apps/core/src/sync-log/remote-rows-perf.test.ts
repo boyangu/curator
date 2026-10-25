@@ -11,8 +11,12 @@
 // the rest queued) 87-91 ms; pending drain (20 rows a slice, each projected
 // with its tags and its row in a 2,000-row playlist) median 24, p95 73, max
 // 101 ms. Under the parallel suite a slice has been seen at ~400 ms (GC and
-// the other suites' load), so the bound only catches a regression in kind —
-// a slice that scales with the library — not a few ms.
+// the other suites' load), so this file runs on its own after it (the perf
+// projects, vitest.workspace.ts) and the bound scales with the machine's
+// measured slowdown (test-support/timing.ts): it fails a regression in kind
+// — a slice that scales with the library — not a few ms. A max is where a
+// scheduler stall lands: run beside another full suite, a 47-101 ms drain
+// read 457 ms at ×1.7 load.
 
 import { describe, it, expect } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -28,6 +32,7 @@ import { recordingIdForTrack } from './recording-id.js';
 import { drainTrackDerivationsAsync, remotePendingCount, remoteRowCount } from './remote-rows.js';
 import { drainRemotePendingAsync } from './remote-sweep.js';
 import { drainTrackMetaAsync, queueTrackMetaBackfillAsync } from './track-meta.js';
+import { budgetMs } from '../test-support/timing.js';
 
 const N = 10_000;
 const SLICE_BOUND_MS = 600;
@@ -84,10 +89,10 @@ describe('protocol v3 drains on a generated 10,000-track library', () => {
 			b.close();
 
 			console.log(JSON.stringify({ metaDrainMaxSliceMs: Math.round(meta.maxSliceMs), metaChunks: meta.chunks, pullPageMaxMs: Math.round(worstPage), pendingMaxSliceMs: Math.round(pending.maxSliceMs), pendingChunks: pending.chunks, deriveMaxSliceMs: Math.round(derive.maxSliceMs) }));
-			expect(meta.maxSliceMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(worstPage).toBeLessThan(SLICE_BOUND_MS);
-			expect(pending.maxSliceMs).toBeLessThan(SLICE_BOUND_MS);
-			expect(derive.maxSliceMs).toBeLessThan(SLICE_BOUND_MS);
+			expect(meta.maxSliceMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'meta drain slice'));
+			expect(worstPage).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'pull page'));
+			expect(pending.maxSliceMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'pending drain slice'));
+			expect(derive.maxSliceMs).toBeLessThan(budgetMs(SLICE_BOUND_MS, 'derive slice'));
 		} finally {
 			try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
 		}

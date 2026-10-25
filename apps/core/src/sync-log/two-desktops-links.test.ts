@@ -24,9 +24,9 @@ import { remoteTrackId } from './stable-ids.js';
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig('curator-2desk-links-'); });
-afterEach(() => {
+afterEach(async () => {
 	const upstream = rig.upstreamCalls();
-	rig.close();
+	await rig.close();
 	expect(upstream).toEqual([]);
 });
 

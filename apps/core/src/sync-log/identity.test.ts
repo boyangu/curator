@@ -16,6 +16,7 @@ import { planIdentityMerges, resolveRecordingIdentitiesAsync } from './identity.
 import { CLAIMS_BACKFILL_KEY, claimsBackfillAsync, claimsBackfillPending, initialPush } from './initial-push.js';
 import { readOutbox } from './outbox.js';
 import { recordingIdForTrack } from './recording-id.js';
+import { budgetMs } from '../test-support/timing.js';
 
 const R = recordingIdForTrack;
 
@@ -167,7 +168,9 @@ describe('cost on a generated 5,000-track library', () => {
 		// A create plus three claims per row (the generated row's fingerprint
 		// is not replayed; initial-push.ts).
 		expect(r.ops).toBe(5_000 * 4);
-		expect(r.maxSliceMs).toBeLessThan(2_000);
+		// ~170 ms a slice alone, up to 559 ms under the parallel suite (×1.6
+		// load); scaled with the load (test-support/timing.ts).
+		expect(r.maxSliceMs).toBeLessThan(budgetMs(2_000, 'claims backfill slice'));
 	}, 120_000);
 
 	it('the resolver merges 5,000 rows another desktop already holds, in short slices', async () => {
@@ -199,7 +202,8 @@ describe('cost on a generated 5,000-track library', () => {
 		expect(r.merged).toBe(5_000);
 		expect(raw.prepare(`SELECT count(*) FROM track WHERE id LIKE 'big-%' AND recording_id LIKE '00000000-%'`).pluck().get()).toBe(5_000);
 		expect(readOutbox(raw).filter((o) => o.entity === 'recording')).toHaveLength(5_000);
-		expect(r.maxSliceMs).toBeLessThan(2_000);
+		// ~90-100 ms a slice alone, up to 633 ms under the parallel suite.
+		expect(r.maxSliceMs).toBeLessThan(budgetMs(2_000, 'resolver slice'));
 		// Nothing left: the next run is a plan over an empty index range.
 		const again = performance.now();
 		expect(planIdentityMerges(raw)).toMatchObject({ groups: 0, merges: [] });

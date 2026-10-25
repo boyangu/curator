@@ -14,8 +14,7 @@
 // denied remote writes and rekordbox write batches too). No rekordbox spec is
 // passed, so the rekordbox sidecar is off on every device.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { it } from 'vitest';
@@ -33,6 +32,7 @@ import { readCursor } from '../sync-log/client.js';
 import { canonicalOverrides, compareDumps, dumpLibrary, type LibraryDump, type TableReport } from '../sync-log/dump.js';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { FakeCloud, type FakeTransport } from './fake-cloud.js';
+import { TmpDir } from './tmp.js';
 
 type Raw = Database.Database;
 
@@ -173,9 +173,8 @@ export class Desktop {
 	}
 
 	async restart(): Promise<CoreService> {
-		this.svc.close();
-		// The scanner's watchers stop asynchronously on close.
-		await tick(50);
+		// Awaited: the scanner's watchers and mir.db close after close() returns.
+		await this.svc.close();
 		return this.open();
 	}
 
@@ -209,9 +208,12 @@ export class Desktop {
 	one<T = unknown>(sql: string, ...params: unknown[]): T { return this.raw.prepare(sql).pluck().get(...params) as T; }
 	all<T = unknown>(sql: string, ...params: unknown[]): T[] { return this.raw.prepare(sql).all(...params) as T[]; }
 
-	close(): void {
-		for (const s of this.svcs.splice(0)) { try { s.close(); } catch { /* already closed */ } }
-		try { this.raw.close(); } catch { /* */ }
+	// Every service this desktop opened (restarts included), newest first,
+	// each awaited, then the raw handle: nothing may hold a file in the dir
+	// when the rig removes it.
+	async close(): Promise<void> {
+		for (const s of this.svcs.splice(0).reverse()) await s.close();
+		this.raw.close();
 	}
 }
 
@@ -221,9 +223,11 @@ export class TwoDesktopRig {
 	readonly dir: string;
 	readonly cloud = new FakeCloud();
 	readonly desktops: Desktop[] = [];
+	private readonly tmp: TmpDir;
 
 	constructor(prefix = 'curator-2desk-') {
-		this.dir = mkdtempSync(join(tmpdir(), prefix));
+		this.tmp = new TmpDir(prefix);
+		this.dir = this.tmp.path;
 	}
 
 	async desktop(name: string, opts: DesktopOpts = {}): Promise<Desktop> {
@@ -284,10 +288,12 @@ export class TwoDesktopRig {
 		return this.cloud.publishes.filter((p) => p.stateMatches === false).map(({ deviceId, seq }) => ({ deviceId, seq }));
 	}
 
-	close(): void {
+	// Must be awaited (afterEach(() => rig.close())): the directory can only
+	// go once every desktop's services have finished closing.
+	async close(): Promise<void> {
 		const mismatches = this.snapshotMismatches();
-		for (const d of this.desktops.splice(0)) d.close();
-		try { rmSync(this.dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+		for (const d of this.desktops.splice(0).reverse()) await d.close();
+		await this.tmp.cleanup();
 		if (mismatches.length > 0) throw new Error(`published snapshots differ from the server fold: ${JSON.stringify(mismatches)}`);
 	}
 }

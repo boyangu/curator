@@ -12,6 +12,7 @@
     "cloud:rotate-db-password": "node scripts/rotate-cloud-db-password.mjs",
     "cloud:db-apply": "node scripts/cloud-db-apply.mjs",
     "cloud:export-ops": "node scripts/cloud-export-ops.mjs",
+    "cloud:set-token-key": "node scripts/cloud-set-token-key.mjs",
     "build": "pnpm -r --filter='./packages/**' build && pnpm --filter @curator/mcp build && pnpm --filter @curator/desktop build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",

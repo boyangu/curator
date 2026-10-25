@@ -4,33 +4,33 @@
 // only the rows that moved.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { rebalance } from '@curator/protocol';
 import { migrate } from '../db/migrate.js';
 import { createCoreService, type CoreService } from '../service.js';
 import { planReorderKeys, recomputePositions } from './playlist-order.js';
+import { tmpDir, type TmpDir } from '../test-support/tmp.js';
 
+let tmp: TmpDir;
 let dir: string;
 let dbPath: string;
 let sqlite: Database.Database;
 let svc: CoreService;
 
 beforeEach(() => {
-	dir = mkdtempSync(join(tmpdir(), 'curator-playlist-order-'));
+	tmp = tmpDir('curator-playlist-order-');
+	dir = tmp.path;
 	dbPath = join(dir, 'curator.db');
 	migrate(dbPath);
-	sqlite = new Database(dbPath);
+	sqlite = tmp.track(new Database(dbPath));
 	const ins = sqlite.prepare(`INSERT INTO track (id, title, artists, state) VALUES (?, ?, '[]', 'unsorted')`);
 	for (let i = 0; i < 8; i++) ins.run(`t${i}`, `T${i}`);
-	svc = createCoreService(dbPath, { peaksDir: join(dir, 'peaks') });
+	svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks') }));
 });
 
-afterEach(() => {
-	sqlite.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* sibling DB handles on Windows */ }
+afterEach(async () => {
+	await tmp.cleanup();
 });
 
 type Row = { id: string; track_id: string; order_key: string; position: number };

@@ -11,7 +11,7 @@
 // here ever leaves the process.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
@@ -33,6 +33,8 @@ import { inlineSnapshotBuilder } from './snapshot-build.js';
 import { recordingIdForTrack } from './recording-id.js';
 import { remintDeviceIdentity } from './remint.js';
 import { FakeCloud } from '../test-support/fake-cloud.js';
+import { removeDir } from '../test-support/tmp.js';
+import { budgetMs } from '../test-support/timing.js';
 import * as mut from '../library/mutators.js';
 import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '../library/artists.js';
 
@@ -63,11 +65,11 @@ const services: CoreService[] = [];
 const clients: SyncClient[] = [];
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'curator-cloud-client-')); });
-afterEach(() => {
+afterEach(async () => {
 	for (const c of clients.splice(0)) c.stop();
-	for (const s of services.splice(0)) s.close();
+	for (const s of services.splice(0).reverse()) await s.close();
 	for (const h of handles.splice(0)) h.close();
-	try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); } catch { /* Windows handles */ }
+	await removeDir(dir);
 });
 
 // Catalogue rows as a write site leaves them: with their artist junction
@@ -926,11 +928,13 @@ describe('stating the library', () => {
 		const timer = setInterval(() => { const now = performance.now(); worstGap = Math.max(worstGap, now - last); last = now; }, 1);
 		const r = await foldLibraryAsync(raw, { chunk: 500 });
 		clearInterval(timer);
-		// Reported, not asserted tight: machines differ. A 500-op slice should
-		// stay far under the 18 s single-shot run B measured.
+		// A 500-op slice should stay far under the 18 s single-shot run B
+		// measured: ~90-100 ms here alone, up to 773 ms under the parallel suite
+		// (×1.9 load). The bound is for a regression in kind, scaled with the
+		// load (test-support/timing.ts).
 		console.log(`[founder-fold stall] rows=${rows} ops=${r.ops} meta=${r.meta} attrs=${r.attrs} chunks=${r.chunks} total=${r.ms}ms maxSlice=${r.maxSliceMs.toFixed(1)}ms worstTimerGap=${worstGap.toFixed(1)}ms`);
 		expect(r.ops).toBeGreaterThan(40_000);
-		expect(r.maxSliceMs).toBeLessThan(2_000);
+		expect(r.maxSliceMs).toBeLessThan(budgetMs(2_000, 'fold slice'));
 		expect(raw.prepare(`SELECT count(*) FROM sync_outbox`).pluck().get()).toBe(0);
 		// The joiner form of the same library, for the record.
 		const j = freshDb('join', false);

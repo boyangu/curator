@@ -17,6 +17,10 @@ import {
 	ZDeviceId,
 	ZPublishSnapshotInput,
 	ZPullInput,
+	ZSpotifyAdoptInput,
+	ZSpotifyConnectInput,
+	ZSpotifyDisconnectInput,
+	ZSpotifyTokenInput,
 	type BatchAbortResult,
 	type BatchBeginResult,
 	type BatchCommitResult,
@@ -29,8 +33,11 @@ import {
 	type PublishSnapshotResult,
 	type PullResult,
 	type PushResult,
+	type SpotifyGrantStatus,
+	type SpotifyTokenResult,
 	type SyncFeature,
 } from '@curator/protocol';
+import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
@@ -42,18 +49,21 @@ import { bootstrap } from './sync/bootstrap.js';
 import { publishSnapshot } from './sync/publish-snapshot.js';
 import { pull } from './sync/pull.js';
 import { push } from './sync/push.js';
-import { authedProcedure, publicProcedure, rateLimit, router, type AppContext } from './trpc.js';
+import { SpotifyRateLimitedError, SpotifyUnavailableError } from './spotify/accounts.js';
+import { adopt as spotifyAdopt, connect as spotifyConnect, disconnect as spotifyDisconnect, status as spotifyStatus, token as spotifyToken, type GatewayDeps } from './spotify/gateway.js';
+import { authedProcedure, publicProcedure, rateLimit, router, type AppContext, type AppDeps } from './trpc.js';
 import type { BootstrapResult, HealthResult } from './wire.js';
 
 // What this server offers: every protocol feature it implements, minus the
-// catalogue when it runs without a catalogue policy. Health, push and pull
-// all answer with this one list, so a client never sees them disagree.
-export function serverFeatures(catalogue: CataloguePolicy | null): SyncFeature[] {
-	return SYNC_FEATURES.filter((f) => f !== 'catalogue' || catalogue !== null);
+// catalogue when it runs without a catalogue policy and the Spotify gateway
+// when it runs without its client id or key. Health, push and pull all
+// answer with this one list, so a client never sees them disagree.
+export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify'>): SyncFeature[] {
+	return SYNC_FEATURES.filter((f) => (f !== 'catalogue' || deps.catalogue !== null) && (f !== 'spotify_gateway' || deps.spotify !== null));
 }
 
 const withFeatures = <T extends { features?: SyncFeature[] }>(ctx: AppContext, r: T): T =>
-	r.features ? { ...r, features: serverFeatures(ctx.deps.catalogue) } : r;
+	r.features ? { ...r, features: serverFeatures(ctx.deps) } : r;
 
 // The catalogue procedures refuse outright on a server configured without
 // one; a client that read `features` never gets here.
@@ -114,6 +124,36 @@ async function auditedWrite<T>(ctx: AppContext, ops: number, fn: () => Promise<T
 	}
 }
 
+// The Spotify gateway's procedures on a server without it answer the one
+// refusal a client already handles ("connect Spotify"); a client that read
+// `features` never gets here. The line says why, for whoever reads the logs.
+function gatewayDeps(ctx: AppContext): GatewayDeps {
+	if (!ctx.deps.spotify) {
+		ctx.deps.log.warn('spotify_gateway_disabled', { requestId: ctx.call.requestId, procedure: ctx.call.procedure });
+		throw new CloudError('FORBIDDEN', 'spotify_not_connected');
+	}
+	return { db: ctx.deps.db, log: ctx.deps.log, audit: ctx.call.audit, gateway: ctx.deps.spotify };
+}
+
+// Spotify's own failures, made the API's: its rate limit is ours (with its
+// Retry-After), anything else (down, a timeout, a refusal that is not the
+// user's grant) is a 503 the client retries later, with the stage and
+// Spotify's status on the log line. A revoked device is audited like a read
+// from one: a token is the Spotify library's key.
+async function spotifyCall<T>(ctx: AppContext, procedure: string, fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (e) {
+		if (e instanceof DeviceRevokedError) ctx.call.audit('read_from_revoked_device', { procedure, via: e.via });
+		if (e instanceof SpotifyRateLimitedError) throw new CloudError('TOO_MANY_REQUESTS', 'rate_limited', e.retryAfterSec);
+		if (e instanceof SpotifyUnavailableError) {
+			ctx.deps.log.warn('spotify_unavailable', { requestId: ctx.call.requestId, procedure, stage: e.stage, status: e.status, spotifyError: e.spotifyError });
+			throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'spotify_unavailable' });
+		}
+		throw e;
+	}
+}
+
 const batchDeps = (ctx: AppContext): BatchDeps => ({ db: ctx.deps.db, log: ctx.deps.log, audit: ctx.deps.audit, options: ctx.deps.batch });
 
 const ZRegisterDeviceInput = z
@@ -134,7 +174,7 @@ export const appRouter = router({
 		ok: true,
 		schemaVersion: SCHEMA_VERSION,
 		minSupportedSchemaVersion: MIN_SUPPORTED_SCHEMA_VERSION,
-		features: serverFeatures(ctx.deps.catalogue),
+		features: serverFeatures(ctx.deps),
 		...(ctx.deps.catalogue ? { catalogue: { policy: ctx.deps.catalogue } } : {}),
 		// Baked into the image by the deploy workflow (Dockerfile ARG GIT_SHA);
 		// the workflow polls this until it shows the commit it deployed. `||`
@@ -258,6 +298,47 @@ export const appRouter = router({
 			const r = await inventory(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), policy, input);
 			ctx.call.opsOut = r.entries.length;
 			return r;
+		}),
+	}),
+
+	// 'spotify_gateway', stage 1 (src/spotify/gateway.ts). Mutations but for
+	// status: connect, adopt and disconnect write the grant, and token may
+	// refresh it and carries a credential, which never belongs in a query
+	// string. Vending is not audited; its request_log row is the record.
+	spotify: router({
+		connect: authedProcedure.input(ZSpotifyConnectInput).mutation(async ({ ctx, input }): Promise<SpotifyGrantStatus> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'spotifyConnect', ctx.user.id);
+			const deps = gatewayDeps(ctx);
+			return spotifyCall(ctx, 'spotify.connect', () => spotifyConnect(deps, ctx.user.id, callerOf(ctx), input));
+		}),
+		adopt: authedProcedure.input(ZSpotifyAdoptInput).mutation(async ({ ctx, input }): Promise<SpotifyGrantStatus> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'spotifyConnect', ctx.user.id);
+			const deps = gatewayDeps(ctx);
+			return spotifyCall(ctx, 'spotify.adopt', () => spotifyAdopt(deps, ctx.user.id, callerOf(ctx), input));
+		}),
+		// Shares the pull bucket: a cheap read a device makes on launch.
+		status: authedProcedure.query(async ({ ctx }): Promise<SpotifyGrantStatus> => {
+			rateLimit(ctx, 'pull', pullKey(ctx.user));
+			const deps = gatewayDeps(ctx);
+			return spotifyCall(ctx, 'spotify.status', () => spotifyStatus(deps, ctx.user.id, callerOf(ctx)));
+		}),
+		token: authedProcedure.input(ZSpotifyTokenInput).mutation(async ({ ctx, input }): Promise<SpotifyTokenResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'spotifyToken', `${ctx.user.id}:${input.deviceId}`);
+			const deps = gatewayDeps(ctx);
+			const { result, refreshed } = await spotifyCall(ctx, 'spotify.token', () => spotifyToken(deps, ctx.user.id, callerOf(ctx), input.deviceId));
+			// request_log has no column for it: ops_out = 1 when this call
+			// refreshed (asked Spotify), 0 when it handed out the shared token.
+			ctx.call.opsOut = refreshed ? 1 : 0;
+			return result;
+		}),
+		disconnect: authedProcedure.input(ZSpotifyDisconnectInput).mutation(async ({ ctx, input }): Promise<SpotifyGrantStatus> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'spotifyConnect', ctx.user.id);
+			const deps = gatewayDeps(ctx);
+			return spotifyCall(ctx, 'spotify.disconnect', () => spotifyDisconnect(deps, ctx.user.id, callerOf(ctx), input.deviceId));
 		}),
 	}),
 });

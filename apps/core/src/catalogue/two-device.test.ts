@@ -29,6 +29,7 @@ import {
 	writeFlac,
 	type TestDevice,
 } from '../test-support/catalogue-fakes.js';
+import { budgetMs } from '../test-support/timing.js';
 
 const USER = '4f1c2a9e-6b1d-4c55-9a51-0d3c2f7e8a10';
 const PCM_MD5 = '0123456789abcdef0123456789abcdef';
@@ -133,7 +134,7 @@ describe('two devices, one account (stage D-a exit)', () => {
 		const maxSliceMs = b.layer.stats().maxSliceMs;
 		// Reported by the caller of this suite; the bound is the plan's.
 		console.info(`[two-device] B hydrate maxSliceMs=${maxSliceMs.toFixed(2)}`);
-		expect(maxSliceMs).toBeLessThan(50);
+		expect(maxSliceMs).toBeLessThan(budgetMs(50, 'B hydrate slice'));
 		// B re-uploads nothing it took from A.
 		const puts = server.calls.put;
 		await b.layer.uploadNow();

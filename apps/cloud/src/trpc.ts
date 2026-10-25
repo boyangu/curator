@@ -16,6 +16,7 @@ import type { Db } from './db/db.js';
 import { CloudError } from './errors.js';
 import type { Logger } from './log.js';
 import type { RateLimits, TokenBucketLimiter } from './rate-limit.js';
+import type { SpotifyGateway } from './spotify/gateway.js';
 import type { BatchOptions } from './sync/batch.js';
 import type { PullOptions } from './sync/pull.js';
 
@@ -34,6 +35,10 @@ export type AppDeps = {
 	requireDeviceId: boolean;
 	// 'batches' (src/sync/batch.ts): commit chunking, leases, expiry.
 	batch: BatchOptions;
+	// 'spotify_gateway' (src/spotify/gateway.ts): the client id, the token
+	// sealer and the fetch that reaches Spotify; null when the gateway is off
+	// (config.ts), which refuses its procedures and drops the feature.
+	spotify: SpotifyGateway | null;
 };
 
 export type AppContext = {
