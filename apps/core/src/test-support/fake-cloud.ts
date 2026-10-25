@@ -567,7 +567,11 @@ export class FakeCloud {
 					// Revocation is final (apps/cloud account/devices.ts), and a
 					// session that acted as a revoked device cannot mint another.
 					if (revokedSession() || cloud.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
-					cloud.devices.set(input.deviceId, { ...input, registeredAt: Date.now(), lastSeenAt: null, revokedAt: null });
+					// A re-register keeps the device's place in registration order
+					// (the real upsert never touches created_at): who founds an
+					// empty account is read off that order (client.ts founderOf).
+					const prev = cloud.devices.get(input.deviceId);
+					cloud.devices.set(input.deviceId, { ...input, registeredAt: prev?.registeredAt ?? Date.now(), lastSeenAt: prev?.lastSeenAt ?? null, revokedAt: null });
 					actsAs = input.deviceId;
 					return { ok: true as const };
 				},

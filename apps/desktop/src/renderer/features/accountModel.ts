@@ -39,16 +39,27 @@ export function syncLine(a: AccountStatus, s: CloudSyncStatusReport | null, now 
 	if (!a.syncAvailable || !s?.enabled) return { text: 'Library sync is not configured in this build (CURATOR_CLOUD_API_URL) — your account is ready for when it is.', tone: 'warn' };
 	if (s.revoked) return { text: REVOKED_LINE, tone: 'error' };
 	if (s.needsUpdate) return { text: 'Update Curator to keep syncing. Your changes are kept and will sync after the update.', tone: 'error' };
-	if (s.initialPush) return { text: `Uploading your library… ${s.initialPush.done.toLocaleString()} of about ${s.initialPush.estimate.toLocaleString()} changes`, tone: 'ok' };
+	// The founder's fold and a joiner's bind sweep are work on this computer
+	// that sends nothing (core client.ts `stage`); only ops bound for the
+	// account are an upload. No numbers before the first chunk reports them.
+	if (s.initialPush) {
+		const verb = s.initialPush.stage === 'preparing' ? 'Preparing' : 'Uploading';
+		const count = s.initialPush.estimate > 0 ? ` ${s.initialPush.done.toLocaleString()} of about ${s.initialPush.estimate.toLocaleString()} changes` : '';
+		return { text: `${verb} your library…${count}`, tone: 'ok' };
+	}
 	if (s.bootstrap) return { text: `Downloading your library… ${s.bootstrap.done.toLocaleString()} of ${s.bootstrap.total.toLocaleString()}`, tone: 'ok' };
 	// A backlog going up as one server batch: staged first, then published
 	// at once (other devices see none of it until the commit is done).
 	if (s.batch?.phase === 'uploading') return { text: `Uploading your library (batch)… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
 	if (s.batch?.phase === 'committing') return { text: `Publishing your library upload… ${s.batch.done.toLocaleString()} of ${s.batch.total.toLocaleString()} changes`, tone: 'ok' };
-	// The account has changes but its master has not published the library
-	// snapshot a new computer joins from yet (core client.ts): asked again
-	// every sync, nothing of this library is sent meanwhile.
-	if (s.phase === 'waiting_for_snapshot') return { text: 'Waiting for your main computer to publish the library — this computer joins as soon as it has.', tone: 'ok' };
+	// No library snapshot to join from yet: the account's master (or, on a
+	// new account, the computer that signed in first) has not published it
+	// (core client.ts): asked again every sync, nothing of this library is
+	// sent meanwhile. Named when the account's device list names it.
+	if (s.phase === 'waiting_for_snapshot') {
+		const who = s.waitingFor?.name ? `“${s.waitingFor.name}”` : 'your main computer';
+		return { text: `Waiting for ${who} to publish the library — this computer joins as soon as it has.`, tone: 'ok' };
+	}
 	if (s.lastError) return { text: `${s.lastError}${s.pending > 0 ? ` · ${s.pending.toLocaleString()} changes waiting` : ''}`, tone: 'error' };
 	// "Syncing…" only while changes actually move; a routine check (every
 	// minute or on focus) moves nothing and must not flip the label.

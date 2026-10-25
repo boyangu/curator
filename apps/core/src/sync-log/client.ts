@@ -44,12 +44,16 @@
 //     asks for the base (establishBase): with a snapshot it is a JOINER — it
 //     loads the snapshot, binds its rows to the account's recordings
 //     (join-bind.ts) and sends only what it alone holds (initial-push.ts
-//     joinPushAsync); on an account with no snapshot and no ops it is the
-//     FOUNDER — it folds its library into its own records without sending
-//     an op (foldLibraryAsync), states itself master, and the publish stage
-//     puts the base up; on an account with ops but no snapshot (a founder
-//     still publishing, a legacy account whose master has not published
-//     yet) it WAITS, asking again each cycle (status `phase`). A server
+//     joinPushAsync); on an account with no snapshot and no ops the one
+//     device that founds it (founderOf: the master the user chose here,
+//     else the earliest-registered active device — the same answer on every
+//     device, so two signing in at once never both fold) is the FOUNDER —
+//     it folds its library into its own records without sending an op
+//     (foldLibraryAsync), states itself master, and the publish stage puts
+//     the base up; any other device there, and any device on an account with
+//     ops but no snapshot (a founder still publishing, a legacy account
+//     whose master has not published yet), WAITS for that base, asking
+//     again each cycle (status `phase`, `waitingFor`). A server
 //     without 'snapshot_storage' has no base to give: the library goes up
 //     as ops, as it did before.
 //   - A secondary whose cursor sits exactly at the master's newest published
@@ -230,13 +234,19 @@ export type CloudSyncStatus = {
 	// first sign-in syncs it). Unlink keeps it: see `unlink`.
 	boundUserId: string | null;
 	initialPushDone: boolean;
-	// Set while the first sign-in states the library: the founder's fold or
-	// a joiner's bind sweep and push (initial-push.ts).
-	initialPush: InitialPushProgress | null;
-	// 'waiting_for_snapshot': this library has not stated itself and the
-	// account has ops but no published snapshot to join from (the header);
-	// the client asks again each cycle.
+	// Set while the first sign-in states the library (initial-push.ts), and
+	// while a stated library's one-time backfills go out. `stage`: whether
+	// the work is local — the founder's fold, a joiner's bind sweep, nothing
+	// sent ('preparing') — or ops bound for the account ('uploading').
+	initialPush: (InitialPushProgress & { stage: 'preparing' | 'uploading' }) | null;
+	// 'waiting_for_snapshot': this library has not stated itself and there
+	// is no published snapshot to join from yet — the account has ops but no
+	// base, or it is empty and another device founds it (the header); the
+	// client asks again each cycle. `waitingFor`: the device expected to
+	// publish it (the stated master, else the earliest-registered), with its
+	// name from the account's device list when it is there.
 	phase: 'waiting_for_snapshot' | null;
+	waitingFor: { deviceId: string; name: string | null } | null;
 	// Set while a snapshot is being loaded.
 	bootstrap: { done: number; total: number } | null;
 	// Set while a backlog goes up as a server batch ('batches'): staging
@@ -625,11 +635,13 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// pending). Reads "update required", as do held newer-version ops
 	// (heldCount, read per status).
 	let pushRefused = false;
-	let initialPushProgress: InitialPushProgress | null = null;
+	let initialPushProgress: CloudSyncStatus['initialPush'] = null;
 	let bootstrapProgress: { done: number; total: number } | null = null;
-	// The header's waiting state, and whether it was logged this session.
+	// The header's waiting state, the device it waits for, and which one was
+	// last logged this session (null: none yet).
 	let waitingForSnapshot = false;
-	let waitingLogged = false;
+	let waitingFor: CloudSyncStatus['waitingFor'] = null;
+	let waitingLogged: string | null = null;
 	let batchProgress: CloudSyncStatus['batch'] = null;
 	let running = false;
 	// True only while changes are actually moving in this cycle (a push with
@@ -724,6 +736,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			initialPushDone: libraryStated(raw),
 			initialPush: initialPushProgress,
 			phase: waitingForSnapshot ? 'waiting_for_snapshot' : null,
+			waitingFor: waitingForSnapshot ? waitingFor : null,
 			bootstrap: bootstrapProgress,
 			batch: batchProgress,
 			running,
@@ -1391,26 +1404,62 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	// One pull of the head, for what the bootstrap does not say: whether the
 	// account has any op at all, and the server's features when this session
-	// has not heard them yet.
-	const probeHead = async (): Promise<{ empty: boolean }> => {
+	// has not heard them yet. `master`: the device the account's first op
+	// states as master, when it is that op (a founder's, still publishing) —
+	// whom a waiting device names, without reading the log.
+	const probeHead = async (): Promise<{ empty: boolean; master: string | null }> => {
 		const res = await transport.sync.pull({ afterSeq: 0, limit: 1, ...(serverDeviceReads ? { deviceId } : {}) });
 		learnFeatures(res.features);
-		return { empty: res.ops.length === 0 && res.snapshotSeq === undefined };
+		const first = res.ops[0];
+		const value = first?.entity === 'setting' && first.entity_id === MASTER_DEVICE_SETTING ? (first.payload as { value?: unknown }).value : null;
+		return { empty: res.ops.length === 0 && res.snapshotSeq === undefined, master: typeof value === 'string' && value.length > 0 ? value : null };
+	};
+
+	// Who founds an EMPTY account (the header): the master this device's
+	// records already name — the user chose one here (service
+	// setMasterDevice) while it waited — if that device is still on the
+	// account, else the earliest-registered active device
+	// (defaultMasterDevice, the same rule ensureMaster states). Registration
+	// order is the server's, ties by device id, so every device asking names
+	// the same one: two new desktops signing in at once no longer both fold
+	// (the loser's library then lived only in its own records — the master
+	// published the other's). No device listed (a test client never
+	// registered): this one.
+	type Devices = Awaited<ReturnType<CloudTransport['account']['devices']>>;
+	const founderOf = (devices: Devices): { deviceId: string; chosen: boolean } => {
+		const stated = masterDevice(raw);
+		if (stated !== null && devices.some((d) => d.deviceId === stated && d.revokedAt === null)) return { deviceId: stated, chosen: true };
+		return { deviceId: defaultMasterDevice(devices) ?? deviceId, chosen: false };
+	};
+	const wait = (id: string | null, devices: Devices): 'waiting' => {
+		waitingFor = id === null ? null : { deviceId: id, name: devices.find((d) => d.deviceId === id)?.name ?? null };
+		return 'waiting';
 	};
 
 	type BaseOutcome = 'stated' | 'founded' | 'joined' | 'waiting' | 'pushed';
 	let baseRun: Promise<BaseOutcome> | null = null;
 	type Driver = (r: Raw, o: { chunk?: number; onProgress?: (p: InitialPushProgress) => void }) => Promise<InitialPushAsyncResult>;
-	const progress = (p: InitialPushProgress): void => { initialPushProgress = p; emitStatus({ progress: true }); };
+	// The status shows a stage as soon as it starts (counting from zero until
+	// its driver reports), never before this cycle knows which one it is: a
+	// waiting device's probe, or a stated one's quiet check, is neither.
+	let pushStage: 'preparing' | 'uploading' = 'uploading';
+	const enterStage = (stage: 'preparing' | 'uploading'): void => {
+		pushStage = stage;
+		initialPushProgress = { done: 0, estimate: 0, stage };
+		emitStatus();
+	};
+	const progress = (p: InitialPushProgress): void => { initialPushProgress = { ...p, stage: pushStage }; emitStatus({ progress: true }); };
 
-	// A joiner's statement: the bind sweep (once), then the join push as the
-	// 'initial-push' batch.
+	// A joiner's statement: the bind sweep (once; local), then the join push
+	// as the 'initial-push' batch.
 	const joinAccount = async (): Promise<void> => {
 		if (!joinBindDone(raw)) {
+			enterStage('preparing');
 			const b = await joinBindAsync(raw);
 			slog.info('join: own rows bound to the account\'s recordings', { rows: b.rows, bound: b.bound, boundDeleted: b.boundDeleted, known: b.known, unbound: b.unbound, held: b.held, chunks: b.chunks, maxSliceMs: Math.round(b.maxSliceMs) });
 			emitApplied(b.tracksTouched, b.playlistsTouched, []);
 		}
+		enterStage('uploading');
 		const r = await joinPushAsync(raw, { chunk: opts.initialPushChunk, onProgress: progress });
 		slog.info('join push: done', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
 	};
@@ -1423,6 +1472,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		// No base to be had: the library goes up as ops (the path before the
 		// account had a base at all; a server without 'snapshot_storage').
 		if (!features?.includes('snapshot_storage')) {
+			enterStage('uploading');
 			const r = await joinPushAsync(raw, { chunk: opts.initialPushChunk, onProgress: progress });
 			slog.info('initial push: done (the server holds no base)', { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
 			return 'pushed';
@@ -1434,26 +1484,43 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			rememberBase(b.baseSeq);
 			if (b.records !== null) {
 				await loadRecords(b.records, b.snapshotSeq);
-			} else if (b.baseSeq === 0 && (probed ?? await probeHead()).empty) {
-				// The founder. The account is empty, so this device has seen all
-				// of it (FIRST_PULL_KEY: the drains' role gate opens on it), and
-				// the fold states everything into the records alone.
-				// snapshot_seq 0: this device holds the base itself (the pull's
-				// never-loaded-a-base rule below does not apply to it).
-				raw.transaction(() => { markFirstPull(raw); writeCursor(raw, readCursor(raw).lastSeq, 0); })();
-				const r = await foldLibraryAsync(raw, {
-					chunk: opts.initialPushChunk,
-					onProgress: progress,
-					...(opts.feed ? { feed: { backfill: (o: { local: true }) => opts.feed!.backfill(o) } } : {}),
-				});
-				slog.info('founder: library folded into the records as the account base; nothing sent', { ops: r.ops, meta: r.meta, attrs: r.attrs, analysis: r.analysis, playlistAttrs: r.playlistAttrs, v4: r.v4, claims: r.claims, albums: r.albums, feed: r.feed, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
-				return 'founded';
-			} else if (masterDevice(raw) === deviceId) {
-				// The records already name this device the master (nothing to
-				// join from): it publishes the base itself.
-				markFirstPull(raw);
 			} else {
-				return 'waiting';
+				const head = b.baseSeq === 0 ? (probed ?? await probeHead()) : null;
+				const devices = await transport.account.devices();
+				if (head?.empty) {
+					// A server that reads no master (pre-v3) has no device to
+					// publish a base: every device founds its own, as before.
+					const founder = serverReadsTrackMeta(features) ? founderOf(devices) : { deviceId, chosen: false };
+					if (founder.deviceId !== deviceId) return wait(founder.deviceId, devices);
+					// Chosen here while waiting: the choice goes up before the fold,
+					// so the device registration order would have picked finds the
+					// account taken (its probe no longer empty) for the whole fold,
+					// not only once it is done.
+					if (founder.chosen && (await pushAll()) === 'device_revoked') throw new CloudTransportError('device_revoked', 'device_revoked');
+					// The founder. The account is empty, so this device has seen all
+					// of it (FIRST_PULL_KEY: the drains' role gate opens on it), and
+					// the fold states everything into the records alone.
+					// snapshot_seq 0: this device holds the base itself (the pull's
+					// never-loaded-a-base rule below does not apply to it).
+					raw.transaction(() => { markFirstPull(raw); writeCursor(raw, readCursor(raw).lastSeq, 0); })();
+					enterStage('preparing');
+					const r = await foldLibraryAsync(raw, {
+						chunk: opts.initialPushChunk,
+						onProgress: progress,
+						...(opts.feed ? { feed: { backfill: (o: { local: true }) => opts.feed!.backfill(o) } } : {}),
+					});
+					slog.info('founder: library folded into the records as the account base; nothing sent', { chosen: founder.chosen, ops: r.ops, meta: r.meta, attrs: r.attrs, analysis: r.analysis, playlistAttrs: r.playlistAttrs, v4: r.v4, claims: r.claims, albums: r.albums, feed: r.feed, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
+					return 'founded';
+				}
+				if (masterDevice(raw) === deviceId) {
+					// The records already name this device the master (nothing to
+					// join from): it publishes the base itself.
+					markFirstPull(raw);
+				} else {
+					// Ops but no base: a founder still publishing (its master op is
+					// the account's first), or a master that has not published yet.
+					return wait(head?.master ?? masterDevice(raw) ?? defaultMasterDevice(devices), devices);
+				}
 			}
 		}
 		await joinAccount();
@@ -1467,8 +1534,6 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const runInitialPush = (): Promise<BaseOutcome> => {
 		if (baseRun) return baseRun;
 		baseRun = (async (): Promise<BaseOutcome> => {
-			initialPushProgress = { done: 0, estimate: 0 };
-			emitStatus();
 			try {
 				const outcome = await establishBase();
 				if (outcome === 'waiting') return outcome;
@@ -1477,6 +1542,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 					...(claimsBackfillPending(raw) ? [['recording claims backfill: done', claimsBackfillAsync] as [string, Driver]] : []),
 				];
 				for (const [done, drive] of runs) {
+					enterStage('uploading');
 					const r = await drive(raw, { chunk: opts.initialPushChunk, onProgress: progress });
 					slog.info(done, { ops: r.ops, chunks: r.chunks, ms: r.ms, maxSliceMs: Math.round(r.maxSliceMs) });
 				}
@@ -2050,9 +2116,11 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			await ensureRegistered(session);
 			if ((await runInitialPush()) === 'waiting') {
 				waitingForSnapshot = true;
-				if (!waitingLogged) {
-					waitingLogged = true;
-					slog.info('waiting for the account\'s snapshot: the account has ops but no published base yet; asking again each cycle');
+				// Said once per device waited for, not per cycle.
+				const awaited = waitingFor?.deviceId ?? '';
+				if (waitingLogged !== awaited) {
+					waitingLogged = awaited;
+					slog.info('waiting for the account\'s snapshot: no published base to join yet; asking again each cycle', { waitingFor: waitingFor?.deviceId ?? null, name: waitingFor?.name ?? null });
 				}
 				outcome = 'waiting';
 				return;

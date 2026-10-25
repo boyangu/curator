@@ -2,7 +2,9 @@
 // library into its own records and publishes them as the snapshot, sending
 // no op for them; a joining device bootstraps from that snapshot, binds its
 // rows to the account's recordings (join-bind.ts) and sends only what it
-// alone holds; a device on an account with ops but no snapshot waits; a
+// alone holds; a device on an account with ops but no snapshot waits, as
+// does a new device on an empty account another (earlier-registered, or
+// chosen as master) device founds; a
 // cursor below the server's base bootstraps; a secondary at the master's
 // newest snapshot checks its records' digest and reloads on a mismatch; acked
 // outbox rows go after a week without the clock or the own-op skip noticing;
@@ -22,7 +24,7 @@ import { createDb } from '../db/client.js';
 import { migrate } from '../db/migrate.js';
 import * as mut from '../library/mutators.js';
 import { FakeCloud } from '../test-support/fake-cloud.js';
-import { markPreOpLog, replicaDiff, seedCatalogue, TRACKS, TwoDesktopRig, type Desktop, type DesktopOpts } from '../test-support/two-desktops.js';
+import { markPreOpLog, replicaDiff, seedCatalogue, tick, TRACKS, TwoDesktopRig, type Desktop, type DesktopOpts } from '../test-support/two-desktops.js';
 import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY, recordsComplete } from './apply.js';
 import { createSyncClient, readCursor, type SyncClient } from './client.js';
 import { inlineSnapshotBuilder, type SnapshotBuilder } from './snapshot-build.js';
@@ -188,7 +190,8 @@ describe('a joiner', () => {
 		const pulls = rig.cloud.calls.pull;
 		await b.sync();
 		await b.sync();
-		expect(await b.svc.getCloudSyncStatus()).toMatchObject({ phase: 'waiting_for_snapshot', initialPushDone: false, lastError: null, pending: 0 });
+		// Named by the account's first op, the founder's master statement.
+		expect(await b.svc.getCloudSyncStatus()).toMatchObject({ phase: 'waiting_for_snapshot', waitingFor: { deviceId: await a.deviceId(), name: 'a' }, initialPushDone: false, lastError: null, pending: 0 });
 		expect(await opsOf(b)).toEqual([]);
 		// One probe of the head per cycle; never a pull of the log.
 		expect(rig.cloud.calls.pull - pulls).toBe(2);
@@ -200,6 +203,118 @@ describe('a joiner', () => {
 		await rig.settle([b, a]);
 		expect(await b.svc.getCloudSyncStatus()).toMatchObject({ phase: null, initialPushDone: true });
 		expect(recOf(b, 'b-1')).toBe(R('a-1'));
+	});
+});
+
+describe('two new desktops on one empty account', () => {
+	// B's library, disjoint from A's: a file, a Spotify track, its own tag
+	// and a rating.
+	const other = (): Promise<Desktop> => rig.desktop('b', {
+		catalogue: ['b-1', 'b-2'],
+		seed: (raw) => {
+			holdFile(raw, 'b-1', hash(7));
+			holdSpotify(raw, 'b-2', 'sp8');
+			tagRow(raw, 'b-1', 'deep');
+			raw.prepare(`UPDATE track SET rating = 5 WHERE id = 'b-2'`).run();
+			markPreOpLog(raw);
+		},
+	});
+	// Both sign in before either cycles: registered in this order, a few ms
+	// apart so registration order alone decides (a tie breaks by device id).
+	// The clients register again on their first cycle, keeping their place.
+	const register = async (...ds: Desktop[]): Promise<string[]> => {
+		const ids: string[] = [];
+		for (const d of ds) {
+			const id = await d.deviceId();
+			await d.transport.account.registerDevice({ deviceId: id, name: d.name, platform: 'win32' });
+			ids.push(id);
+			await tick(5);
+		}
+		return ids;
+	};
+	const folded = (d: Desktop): number => d.one(`SELECT count(*) FROM sync_state WHERE map = 'libraryTracks'`);
+	const creates = async (d: Desktop): Promise<string[]> => (await opsOf(d)).filter((o) => o.entity === 'library_track' && o.kind === 'create').map((o) => o.entity_id).sort();
+	const tagged = (d: Desktop, recordingId: string, tagId: string): number =>
+		d.one(`SELECT count(*) FROM track_tag tt JOIN track t ON t.id = tt.track_id WHERE t.recording_id = ? AND tt.tag_id = ?`, recordingId, tagId);
+
+	// Each library reached the other device: the joiner's rows (create,
+	// claims, meta, curation) on the founder, the founder's on the joiner.
+	const bothLibraries = (founder: Desktop, joiner: Desktop, joinerRows: { file: string; fileHash: string; rated: string; rating: number; tag: string }, founderRows: typeof joinerRows): void => {
+		for (const [d, rows] of [[founder, joinerRows], [joiner, founderRows]] as const) {
+			const rec = R(rows.file);
+			expect(d.one(`SELECT title FROM track WHERE recording_id = ?`, rec), `${d.name}: ${rows.file}`).toBe(`Title ${rows.file}`);
+			expect(d.one(`SELECT count(*) FROM sync_state WHERE map = 'claims' AND key = ?`, `${rec}:audio_hash:${rows.fileHash}`), `${d.name}: claim`).toBe(1);
+			expect(tagged(d, rec, rows.tag), `${d.name}: tag`).toBe(1);
+			expect(d.one(`SELECT rating FROM track WHERE recording_id = ?`, R(rows.rated)), `${d.name}: rating`).toBe(rows.rating);
+		}
+	};
+	const aRows = { file: 'a-1', fileHash: hash(1), rated: 'a-2', rating: 4, tag: 'warm' };
+	const bRows = { file: 'b-1', fileHash: hash(7), rated: 'b-2', rating: 5, tag: 'deep' };
+
+	it('only the earliest-registered folds and publishes; the other waits for it by name, then joins, and both libraries reach the account', async () => {
+		const a = await master();
+		const b = await other();
+		const [bId] = await register(b, a);
+		// What the status line reads off each: the founder's fold is local
+		// work, the joiner's push an upload; a waiting device shows neither.
+		const stages = new Map<Desktop, Set<string>>([[a, new Set()], [b, new Set()]]);
+		for (const d of [a, b]) d.svc.subscribeCloudSync((e) => { if (e.kind === 'status' && e.status.initialPush) stages.get(d)!.add(e.status.initialPush.stage); });
+		// A cycles first, more than once: B is merely slow, and A never founds.
+		await a.sync();
+		await a.sync();
+		expect(await a.svc.getCloudSyncStatus()).toMatchObject({ phase: 'waiting_for_snapshot', waitingFor: { deviceId: bId, name: 'b' }, initialPushDone: false, initialPush: null, pending: 0, lastError: null });
+		expect(folded(a)).toBe(0);
+		expect(rig.cloud.log).toEqual([]);
+		expect(rig.cloud.published).toEqual([]);
+		expect([...stages.get(a)!]).toEqual([]);
+		// B founds and publishes in one sync; A then joins from its base.
+		await b.sync();
+		expect(rig.cloud.published.map((p) => p.deviceId)).toEqual([bId]);
+		expect([...stages.get(b)!]).toEqual(['preparing']);
+		await rig.settle([a, b]);
+		expect([...stages.get(a)!].sort()).toEqual(['preparing', 'uploading']);
+		expect(rig.cloud.publishes.every((p) => p.deviceId === bId)).toBe(true);
+		for (const d of [a, b]) {
+			expect(await d.svc.getCloudSyncStatus(), d.name).toMatchObject({ phase: null, waitingFor: null, initialPushDone: true, lastError: null });
+			expect((await d.svc.getAccountLibraryInfo()).masterDeviceId, d.name).toBe(bId);
+		}
+		// B's library is the base (no op for it); A's went up as ops.
+		expect(await creates(b)).toEqual([]);
+		expect(await creates(a)).toEqual([R('a-1'), R('a-2'), R('a-3')].sort());
+		bothLibraries(b, a, aRows, bRows);
+		expect(rig.cloud.calls.storageBootstraps).toBeGreaterThanOrEqual(1);
+	});
+
+	it('the user making the waiting device the master founds it on the next cycle; the earliest one then joins', async () => {
+		const a = await master();
+		const b = await other();
+		const [bId, aId] = await register(b, a);
+		await a.sync();
+		expect(await a.svc.getCloudSyncStatus()).toMatchObject({ phase: 'waiting_for_snapshot', waitingFor: { deviceId: bId } });
+		await a.svc.setMasterDevice(aId!);
+		await a.sync();
+		expect(await a.svc.getCloudSyncStatus()).toMatchObject({ phase: null, initialPushDone: true, pending: 0, lastError: null });
+		// The choice went up first, then the base it publishes.
+		expect(rig.cloud.log.map((o) => [o.seq, o.entity, o.entity_id, o.device_id])).toEqual([[1, 'setting', 'library.master_device', aId]]);
+		expect(rig.cloud.published.map((p) => [p.seq, p.deviceId])).toEqual([[1, aId]]);
+		// B, the earliest, finds a base and joins it rather than founding.
+		await rig.settle([b, a]);
+		expect(rig.cloud.publishes.every((p) => p.deviceId === aId)).toBe(true);
+		for (const d of [a, b]) expect((await d.svc.getAccountLibraryInfo()).masterDeviceId, d.name).toBe(aId);
+		expect(await creates(a)).toEqual([]);
+		expect(await creates(b)).toEqual([R('b-1'), R('b-2')].sort());
+		bothLibraries(a, b, bRows, aRows);
+	});
+
+	it('an earliest device that was revoked does not hold the account: the next one founds', async () => {
+		const a = await master();
+		const b = await other();
+		const [aId, bId] = await register(a, b);
+		rig.cloud.revoke(aId!);
+		await b.sync();
+		expect(await b.svc.getCloudSyncStatus()).toMatchObject({ phase: null, initialPushDone: true, lastError: null });
+		expect(rig.cloud.published.map((p) => p.deviceId)).toEqual([bId]);
+		expect(await creates(b)).toEqual([]);
 	});
 });
 

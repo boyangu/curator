@@ -2316,7 +2316,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		: {
 			enabled: false, signedIn: false, userId: null, email: null, deviceId: '', pending: 0, rejected: 0,
 			lastPushAt: null, lastPullAt: null, lastCheckedAt: null, lastChangedAt: null, transferring: false, lastSeq: 0, lastError: null, needsUpdate: false, revoked: false, boundUserId: null, initialPushDone: false,
-			initialPush: null, phase: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null, verifying: false, digest: null }, nextRetryAt: null,
+			initialPush: null, phase: null, waitingFor: null, bootstrap: null, batch: null, running: false, snapshot: { publishing: false, lastSeq: null, lastAt: null, verifying: false, digest: null }, nextRetryAt: null,
 			poll: { policy: readPollPolicy(sqlite), active: true, realtimeLive: false, nextPollAt: null },
 		};
 
