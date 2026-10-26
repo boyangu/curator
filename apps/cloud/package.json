@@ -22,17 +22,17 @@
 	},
 	"dependencies": {
 		"@trpc/server": "^11",
-		"jose": "^6.2.12",
+		"jose": "^6.2.13",
 		"postgres": "^3.4.9",
 		"zod": "^3.23.8"
 	},
 	"devDependencies": {
 		"@curator/protocol": "workspace:*",
-		"@electric-sql/pglite": "^0.5.10",
+		"@electric-sql/pglite": "^0.5.11",
 		"@trpc/client": "^11",
 		"@types/node": "^22.10.0",
 		"esbuild": "^0.28.2",
-		"tsx": "^4.19.2",
+		"tsx": "^4.23.15",
 		"typescript": "^5.6.3",
 		"vitest": "^2.1.6"
 	}
