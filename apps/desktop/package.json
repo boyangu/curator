@@ -30,25 +30,25 @@
     "@curator/spotify": "workspace:*",
     "@curator/tidal": "workspace:*",
     "@supabase/supabase-js": "^2.118.0",
-    "@tanstack/virtual-core": "^3.17.0",
+    "@tanstack/virtual-core": "^3.19.7",
     "@tidal-music/common": "^0.2.1",
-    "@tidal-music/player": "^0.18.1",
+    "@tidal-music/player": "^0.20.1",
     "@trpc/client": "^11",
     "@trpc/server": "^11",
     "better-sqlite3": "^12.10.0",
-    "drizzle-orm": "^0.36.4",
-    "electron-updater": "^6.3.9",
-    "solid-js": "^1.9.13"
+    "drizzle-orm": "^0.45.4",
+    "electron-updater": "^6.8.11",
+    "solid-js": "^1.9.17"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.1",
     "@types/node": "^22.10.0",
     "electron": "https://github.com/castlabs/electron-releases#v38.8.6+wvcus",
-    "electron-builder": "^26.8.1",
+    "electron-builder": "^26.18.0",
     "electron-vite": "^2.3.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
-    "vite-plugin-solid": "^2.11.12",
+    "vite-plugin-solid": "^2.11.14",
     "vitest": "^2.1.6"
   }
 }
