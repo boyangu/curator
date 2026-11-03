@@ -19,6 +19,9 @@ def load_embedder(spec: ModelSpec, device: str) -> Embedder:
     if spec.key == "clap":
         from .clap import Clap
         return Clap(spec, device)
+    if spec.key == "audiobox-aesthetics":
+        from .audiobox import Audiobox
+        return Audiobox(spec, device)
     if spec.key == "stub":
         from .stub import Stub
         return Stub(spec, device)

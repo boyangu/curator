@@ -22,11 +22,18 @@ export interface MirSettings {
 // Default models = the Phase 0 bake-off winner (research/mir/FINDINGS.md):
 // MERT-v2 + MuQ-MuLan blended beat every single model on the user's own tags
 // and DJ-set adjacency; MuQ-MuLan also brings text search.
+// Audiobox Aesthetics rides along: a 4-score model (its PQ axis is the
+// production-quality prior, apps/core/src/production/), cheap next to the
+// embedders and excluded from similarity by its registry flag.
 export const DEFAULT_MIR_SETTINGS: MirSettings = {
 	enabled: false,
 	executor: 'local',
-	models: ['mert-v2-fullsong', 'muq-mulan-large'],
+	models: ['mert-v2-fullsong', 'muq-mulan-large', 'audiobox-aesthetics'],
 };
+
+export const AUDIOBOX_MODEL_KEY = 'audiobox-aesthetics';
+// Row layout of the stored Audiobox vector.
+export const AUDIOBOX_AXES = ['CE', 'CU', 'PC', 'PQ'] as const;
 
 export interface MirModelInfo {
 	key: string;
@@ -34,6 +41,9 @@ export interface MirModelInfo {
 	dim: number;
 	sampleRate: number;
 	text: boolean; // text prompts embed into the same space (text search)
+	// False for score models (Audiobox Aesthetics: the "vector" is four 0-10
+	// ratings): stored and pooled like any vector, never ranked or blended.
+	similarity: boolean;
 	license: string;
 	repo: string;
 	summary: string;

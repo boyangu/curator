@@ -52,6 +52,9 @@ export interface MirLayer {
 	provision(): Promise<MirStatus>;
 	rank(q: RankQuery): Promise<SimilarResult>;
 	trackVector(trackId: string, model?: string): number[] | null;
+	// Every stored track-level vector of a model, by track id — the
+	// production profile reads Audiobox scores for a whole cohort this way.
+	trackVectors(model: string): Map<string, Float32Array>;
 	subscribe(cb: (e: MirEvent) => void): () => void;
 	// True while a track is being embedded — the backup scheduler yields to
 	// it. Cheaper than status(), which runs a coverage query.
@@ -89,8 +92,14 @@ export function createMirLayer(deps: MirLayerDeps): MirLayer {
 		return known.length ? known[known.length - 1]!.modelId : null;
 	};
 	const modelInfos = (): MirModelInfo[] => caps
-		? caps.models.map((m) => ({ ...m }))
-		: store.knownModels().map((m) => ({ key: m.key, modelId: m.modelId, dim: m.dim, sampleRate: 0, text: m.text, license: '', repo: '', summary: '' }));
+		? caps.models.map((m) => ({ ...m, similarity: m.similarity !== false }))
+		: store.knownModels().map((m) => ({ key: m.key, modelId: m.modelId, dim: m.dim, sampleRate: 0, text: m.text, similarity: m.similarity, license: '', repo: '', summary: '' }));
+	// Enabled models that live in a similarity space (score models such as
+	// Audiobox are stored and pooled like vectors but never ranked).
+	const rankable = (): string[] => {
+		const infos = modelInfos();
+		return settings.models.filter((key) => infos.find((i) => i.key === key)?.similarity !== false);
+	};
 
 	let statusTimer: NodeJS.Timeout | null = null;
 	let closed = false;
@@ -111,7 +120,7 @@ export function createMirLayer(deps: MirLayerDeps): MirLayer {
 			sidecar.capabilities()
 				.then((c) => {
 					caps = c;
-					for (const m of c.models) store.upsertModel(m);
+					for (const m of c.models) store.upsertModel({ ...m, similarity: m.similarity !== false });
 					mlog.info('engine ready', { device: c.device, torch: c.torch, cloud: c.cloudConfigured });
 					scheduler!.invalidate();
 					scheduler!.kick();
@@ -196,15 +205,16 @@ export function createMirLayer(deps: MirLayerDeps): MirLayer {
 		// Seed-only queries with no explicit model blend every enabled model
 		// that has vectors: in the Phase 0 bake-off MERT-v2 + MuQ-MuLan
 		// together beat either alone on the user's tags and DJ-set adjacency.
+		const models = rankable();
 		if (!q.model && !text) {
-			const mids = settings.models.map(withVectors).filter((m): m is string => m !== null);
+			const mids = models.map(withVectors).filter((m): m is string => m !== null);
 			if (mids.length > 1) return blend(mids, seeds, k, q.allow ?? null, exclude);
 		}
 		// Single model: the requested one; for text the first enabled model
 		// with a text tower (text and audio share its raw space).
 		const key = q.model ?? (text
-			? settings.models.find((m) => infos.find((i) => i.key === m)?.text) ?? infos.find((i) => i.text)?.key
-			: settings.models.find((m) => withVectors(m)) ?? settings.models[0]);
+			? models.find((m) => infos.find((i) => i.key === m)?.text) ?? infos.find((i) => i.text && i.similarity)?.key
+			: models.find((m) => withVectors(m)) ?? models[0]);
 		const mid = key ? modelId(key) : null;
 		if (!key || !mid) return { model: null, items: [], missingSeeds: seeds };
 		const index = indexFor(mid);
@@ -294,6 +304,14 @@ export function createMirLayer(deps: MirLayerDeps): MirLayer {
 			const mid = modelId(model ?? settings.models[0]!);
 			const v = mid ? store.trackVector(trackId, mid) : null;
 			return v ? Array.from(v) : null;
+		},
+		trackVectors(model) {
+			const out = new Map<string, Float32Array>();
+			const mid = modelId(model);
+			if (!mid) return out;
+			const m = store.loadTrackMatrix(mid);
+			for (let i = 0; i < m.ids.length; i++) out.set(m.ids[i]!, m.data.subarray(i * m.dim, (i + 1) * m.dim));
+			return out;
 		},
 		subscribe(cb) {
 			listeners.add(cb);

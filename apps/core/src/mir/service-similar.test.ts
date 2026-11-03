@@ -32,7 +32,7 @@ beforeEach(() => {
 	}
 	raw.close();
 	mir = new SqliteMirStore(join(dir, 'mir.db'));
-	mir.upsertModel({ key: 'mert-v2-fullsong', modelId: M, dim: 2, sampleRate: 24000, text: false, license: '', repo: '', summary: '' });
+	mir.upsertModel({ key: 'mert-v2-fullsong', modelId: M, dim: 2, sampleRate: 24000, text: false, similarity: true, license: '', repo: '', summary: '' });
 	// Angles from a: b closest, then c, then d; e has no vector.
 	mir.putResult('a', M, 'local', null, vec([1, 0]), []);
 	mir.putResult('b', M, 'local', null, vec([0.95, 0.31]), []);
@@ -83,7 +83,7 @@ describe('similarTo through getTracksPage', () => {
 
 	it('seed queries blend every enabled model; an explicit model ranks alone', async () => {
 		const Q = 'muq-mulan-large@1';
-		mir.upsertModel({ key: 'muq-mulan-large', modelId: Q, dim: 2, sampleRate: 24000, text: true, license: '', repo: '', summary: '' });
+		mir.upsertModel({ key: 'muq-mulan-large', modelId: Q, dim: 2, sampleRate: 24000, text: true, similarity: true, license: '', repo: '', summary: '' });
 		// The second model hears it differently: d is a's closest relative.
 		mir.putResult('a', Q, 'local', null, vec([1, 0]), []);
 		mir.putResult('b', Q, 'local', null, vec([0, 1]), []);

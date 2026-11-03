@@ -11,7 +11,10 @@ audio file:
   4. Key     → KeyExtractor (Krumhansl/Temperley/EDMA — we use EDMA for the
                electronic-music tilt)
   5. Feat    → MusicExtractor (scalar danceability/energy/etc.)
-  6. Peaks   → 3-band biquad + decimate → .cpk file on disk
+  6. Struct  → novelty-curve segmentation (intro/build/drop/…)
+  7. Prod    → production measurements on the stereo decode (production.py;
+               opt-in via options.production)
+  8. Peaks   → 3-band biquad + decimate → .cpk file on disk
 
 Each pipeline stage can call `emit(stage, pct)` to push a progress event
 back to the master process. Stages also emit `partial` records as soon as
@@ -58,6 +61,14 @@ class AnalyzeRequest:
     #       default for scanner-driven auto-analyses).
     #   - 'skip_beatgrid' / 'skip_key' / 'skip_segments' / 'skip_peaks' /
     #       'skip_fingerprint': bool; leave that stage out of this pass.
+    #   - 'production': bool; run the production-measurement stage
+    #       (production.py) on the stereo decode.
+    #   - 'prior_segments': list of {startSec, endSec, label} — the track's
+    #       existing segments, injected by the queue alongside skip_segments
+    #       so the production stage can still report per-section rows.
+    #   - 'production_beats': beat times (s) for the production stage's kick
+    #       measures when no grid is computed or injected this pass (the
+    #       queue sends the Rekordbox grid). Never returned as the beatgrid.
     # Future-proof shape: unrecognised keys are ignored, so the renderer
     # can ship new override knobs ahead of worker support landing.
     options: dict[str, Any] = field(default_factory=dict)
@@ -121,6 +132,12 @@ class AnalyzeResult:
     # when a fingerprint was actually produced.
     fingerprint: Optional[str] = None
     fingerprint_duration_sec: Optional[int] = None
+    # Stage 7 — production measurements (production.py): loudness, true peak,
+    # clipping, tonal balance, stereo, transcode cliff, onset-gated kick
+    # measures, plus per-section rows. None when the stage was not requested
+    # (options.production) or failed; the TS side writes the row only when
+    # it is present.
+    production: Optional[dict[str, Any]] = None
     features: dict[str, Any] = field(default_factory=dict)
     peaks_lo_path: str = ""
     peaks_hi_path: str = ""
@@ -662,23 +679,16 @@ def analyze(req: AnalyzeRequest, emit: Callable[[str, str, Optional[float]], Non
             sys.stderr.write(f"[analyzer] structure stage failed: {exc}\n")
             # Keep going — peaks + the rest still ship.
 
-    emit("progress", "peaks", 0.75)
-    # Skip-peaks gate: when the track already has .cpk files and the user
-    # hasn't ticked the Waveform override, the queue passes skip_peaks=true so
-    # we leave the existing waveform untouched (saves the decode + band pass).
-    # The existing files at out_peaks_*_path stay valid, so the result still
-    # reports their paths below.
-    if bool(req.options.get("skip_peaks")):
-        emit("partial", "peaks", {"source": "skipped"})
-    else:
-        # Stereo peaks: the band pipeline runs per channel so the big-wave
-        # painter can draw top=left / bottom=right. We load the file a second
-        # time as stereo (the analysis stages above all run on the resampled
-        # mono `audio` and must keep doing so). AudioLoader doesn't resample,
-        # so we Resample each channel to `sr` to match the mono pipeline's
-        # grid. Any failure — mono source, decoder hiccup — falls back to the
-        # mono `audio` we already have, which renders the classic mirror.
-        bundle = None
+    # Stereo decode, shared by the peaks and production stages. Loaded lazily
+    # and at most once: AudioLoader doesn't resample, so each channel is
+    # Resampled to `sr` to sit on the mono pipeline's grid. The analysis
+    # stages above all run on the resampled mono `audio` and must keep doing
+    # so; only these two stages read the channels. A mono source or a decoder
+    # hiccup yields None and each stage falls back to `audio`.
+    skip_peaks = bool(req.options.get("skip_peaks"))
+    run_production = bool(req.options.get("production"))
+    stereo_lr: Optional[tuple[np.ndarray, np.ndarray]] = None
+    if not skip_peaks or run_production:
         try:
             from essentia.standard import AudioLoader, Resample
             stereo, in_sr, n_ch, _md5, _br, _codec = AudioLoader(filename=req.path)()
@@ -690,9 +700,54 @@ def analyze(req: AnalyzeRequest, emit: Callable[[str, str, Optional[float]], Non
                     rs_r = Resample(inputSampleRate=int(in_sr), outputSampleRate=sr)
                     left = rs_l(left)
                     right = rs_r(right)
-                bundle = compute_peaks_stereo(left, right, sr)
+                stereo_lr = (left, right)
+            del stereo
         except Exception as exc:  # noqa: BLE001
-            sys.stderr.write(f"[analyzer] stereo peaks load failed, using mono: {exc}\n")
+            sys.stderr.write(f"[analyzer] stereo load failed, using mono: {exc}\n")
+
+    # Stage 7 — production measurements (production.py). Opt-in like the
+    # advanced bundle: it costs a stereo decode plus a few seconds of DSP, so
+    # the scanner-driven auto path leaves it off by default. Best-effort — a
+    # failure leaves `production` None and the rest of the result ships.
+    # Sections come from this pass's segments, or from the prior segments the
+    # queue injects when the structure stage was skipped, so section rows
+    # follow whatever labelling the track actually carries.
+    production: Optional[dict[str, Any]] = None
+    if run_production:
+        emit("progress", "production", 0.70)
+        try:
+            from .production import compute_production
+            if stereo_lr is not None:
+                left, right = stereo_lr
+                stereo_source = True
+            else:
+                left = right = np.asarray(audio, dtype=np.float32)
+                stereo_source = False
+            section_src = segments if segments else (req.options.get("prior_segments") or [])
+            beat_src = beats_list or [float(b) for b in (req.options.get("production_beats") or [])]
+            production = compute_production(left, right, sr, beats=beat_src or None,
+                                            segments=list(section_src), stereo_source=stereo_source)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[analyzer] production stage failed: {exc}\n")
+
+    emit("progress", "peaks", 0.75)
+    # Skip-peaks gate: when the track already has .cpk files and the user
+    # hasn't ticked the Waveform override, the queue passes skip_peaks=true so
+    # we leave the existing waveform untouched (saves the band pass). The
+    # existing files at out_peaks_*_path stay valid, so the result still
+    # reports their paths below.
+    if skip_peaks:
+        emit("partial", "peaks", {"source": "skipped"})
+    else:
+        # Stereo peaks: the band pipeline runs per channel so the big-wave
+        # painter can draw top=left / bottom=right; a mono decode renders the
+        # classic mirror.
+        bundle = None
+        if stereo_lr is not None:
+            try:
+                bundle = compute_peaks_stereo(stereo_lr[0], stereo_lr[1], sr)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[analyzer] stereo peaks failed, using mono: {exc}\n")
         if bundle is None:
             bundle = compute_peaks(np.asarray(audio, dtype=np.float32), sr)
         # The two peaks files live in sibling directories (peaks/lo/, peaks/hi/);
@@ -724,6 +779,7 @@ def analyze(req: AnalyzeRequest, emit: Callable[[str, str, Optional[float]], Non
         breakdown_count=seg_scalars.get("breakdown_count"),
         fingerprint=fingerprint,
         fingerprint_duration_sec=fingerprint_duration_sec,
+        production=production,
         features=features,
         peaks_lo_path=req.out_peaks_lo_path,
         peaks_hi_path=req.out_peaks_hi_path,

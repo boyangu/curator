@@ -20,6 +20,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { isWellFormedString } from '@curator/shared';
+import type { ProductionMeasurements } from '@curator/shared/schema';
 import { log } from '../log.js';
 
 const alog = log.for('analyzer');
@@ -175,6 +176,17 @@ export interface AnalyzeOptions {
 	// decode every pass already pays for (~0.1 s) and the queue writes the
 	// print onto the local source_link only when one was produced.
 	skipFingerprint?: boolean;
+	// Production measurements (stage 7): opt-in like the advanced bundle —
+	// a stereo decode plus a few seconds of DSP per track.
+	production?: boolean;
+	// The track's existing segments, injected by buildEffectiveOptions next
+	// to skipSegments so the production stage can still report per-section
+	// rows when the structure stage doesn't run this pass.
+	priorSegments?: readonly { startSec: number; endSec: number; label?: string | null }[];
+	// Beat times for the production stage's kick measures when this pass has
+	// no Curator grid (skipped or never computed): the Rekordbox grid. Not a
+	// prior — the worker never returns it as the track's beatgrid.
+	productionBeats?: readonly number[];
 }
 
 export interface AnalyzeParams {
@@ -227,6 +239,10 @@ export interface AnalyzeResult {
 	// AcoustID lookups take with it. Both null when skipped or failed.
 	fingerprint: string | null;
 	fingerprint_duration_sec: number | null;
+	// Stage 7 — production measurements. Null when the stage was not
+	// requested (options.production) or failed; persist.ts writes the group
+	// only when present. Optional: a pre-2.5.0 sidecar omits the key.
+	production?: ProductionMeasurements | null;
 	features: Record<string, unknown>;
 	peaks_lo_path: string;
 	peaks_hi_path: string;
@@ -634,6 +650,15 @@ export class AnalyzerSidecar extends EventEmitter {
 						: {}),
 					...(params.options.skipFingerprint
 						? { skip_fingerprint: true }
+						: {}),
+					...(params.options.production
+						? { production: true }
+						: {}),
+					...(params.options.production && params.options.productionBeats?.length
+						? { production_beats: [...params.options.productionBeats] }
+						: {}),
+					...(params.options.production && params.options.priorSegments?.length
+						? { prior_segments: params.options.priorSegments.map((s) => ({ startSec: s.startSec, endSec: s.endSec, label: s.label ?? null })) }
 						: {}),
 				}
 				: undefined;

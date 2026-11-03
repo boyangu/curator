@@ -18,6 +18,9 @@ dependencies = [
     # muq declares its deps only in setup.py's install_requires (its PyPI
     # metadata is empty), so they're listed here explicitly.
     "muq ==0.1.0",
+    # Meta Audiobox Aesthetics: the learned production-quality prior (models/audiobox.py).
+    # Pulls torch + torchaudio only; its submitit/rich extras are inert here.
+    "audiobox_aesthetics ==0.0.4",
     "einops", "librosa", "nnAudio", "tqdm", "easydict", "x-clip",
 ]
 

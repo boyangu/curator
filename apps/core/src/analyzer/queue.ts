@@ -77,7 +77,7 @@ export function splitFileless(db: Db, trackIds: readonly string[]): { own: strin
 // The analyzer version this Node code is paired with — what a fresh result is
 // stamped with. Bump in lockstep with
 // `apps/analyzer/src/curator_analyzer/__init__.py`.
-export const EXPECTED_ANALYZER_VERSION = '2.4.0';
+export const EXPECTED_ANALYZER_VERSION = '2.5.0';
 
 // Rows stamped below this version are re-queued for a FULL re-analysis on
 // boot (Path A backfill in design.md). Deliberately decoupled from
@@ -1017,6 +1017,7 @@ export class AnalysisQueue extends EventEmitter {
 				keyCamelot: trackAnalysis.keyCamelot,
 				keyStrength: trackAnalysis.keyStrength,
 				segmentsJson: trackAnalysis.segmentsJson,
+				rbBeatgrid: trackAnalysis.rbBeatgrid,
 			})
 			.from(trackAnalysis)
 			.where(eq(trackAnalysis.trackId, trackId))
@@ -1042,9 +1043,24 @@ export class AnalysisQueue extends EventEmitter {
 			if (prior.keyStrength != null) injected.priorKeyStrength = prior.keyStrength;
 			anyInjection = true;
 		}
+		// The production stage's kick measures are onset-gated on a beatgrid.
+		// A track with only a Rekordbox grid (never grid-analysed here) gets it
+		// for that purpose alone — never as a prior for the Curator slot.
+		if (opts?.production && !injected.priorBeatgrid && !opts.overrideBeatgrid && prior.rbBeatgrid) {
+			injected.productionBeats = unpack(prior.rbBeatgrid);
+			anyInjection = true;
+		}
 		if (!opts?.overrideSegments && prior.segmentsJson != null) {
 			injected.skipSegments = true;
 			anyInjection = true;
+			// The production stage reports per-section rows over whatever
+			// segments the track carries; hand it the ones we're telling the
+			// worker not to recompute.
+			if (opts?.production && Array.isArray(prior.segmentsJson) && prior.segmentsJson.length > 0) {
+				injected.priorSegments = prior.segmentsJson
+					.filter((s) => Number.isFinite(s.startSec) && Number.isFinite(s.endSec) && s.endSec > s.startSec)
+					.map((s) => ({ startSec: s.startSec, endSec: s.endSec, label: s.label ?? null }));
+			}
 		}
 
 		return anyInjection ? injected : opts;

@@ -41,6 +41,11 @@ export interface AnalysisFlags {
 	// ─── Advanced features (MusicExtractor — slow, +5-15s/track) ───
 	// One toggle for the whole learned/Essentia bundle (all 7 scalars).
 	advanced: boolean;
+	// ─── Production measurements (stereo decode + DSP, +2-7s/track) ───
+	// Loudness, true peak, clipping, tonal balance, stereo, transcode cliff,
+	// kick measures, per-section rows. Feeds the Production profile and the
+	// integrity flags.
+	production: boolean;
 }
 
 // Auto-analyze of newly-ingested files: a light touch applied to every new
@@ -53,6 +58,7 @@ export const DEFAULT_AUTO_FLAGS: AnalysisFlags = {
 	peaks: true,
 	fingerprint: true,
 	advanced: false,
+	production: false,
 };
 
 // Manual Analyze modal: the opt-in surface for the expensive scalars. The
@@ -67,6 +73,7 @@ export const DEFAULT_MANUAL_FLAGS: AnalysisFlags = {
 	peaks: false,
 	fingerprint: true,
 	advanced: true,
+	production: true,
 };
 
 // The persisted auto-analyze settings object. `enabled` is the master gate
@@ -121,6 +128,8 @@ export function analysisFlagsToOptions(f: AnalysisFlags): AnalyzeOptions {
 	else opts.overridePeaks = true;
 
 	if (!f.fingerprint) opts.skipFingerprint = true;
+
+	if (f.production) opts.production = true;
 
 	return opts;
 }

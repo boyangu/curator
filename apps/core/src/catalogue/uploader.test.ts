@@ -106,7 +106,7 @@ describe('uploader', () => {
 		const first = [...server.objects.keys()];
 		// Two newer analyses with other waveforms: the server keeps two
 		// versions, so the first one's blob is no longer named.
-		for (const [v, seed] of [['2.5.0', 50], ['2.6.0', 60]] as const) {
+		for (const [v, seed] of [['9.0.0', 50], ['9.1.0', 60]] as const) {
 			a.sqlite.prepare(`UPDATE track_analysis SET analyzer_version = ? WHERE track_id = 't'`).run(v);
 			writeFileSync(lo, fixedCpk('lo', seed));
 			a.layer.queueHook.persisted('t');

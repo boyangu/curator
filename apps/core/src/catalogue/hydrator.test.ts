@@ -8,7 +8,7 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FINGERPRINT_ONLY_OPTIONS } from '../analyzer/queue.js';
+import { EXPECTED_ANALYZER_VERSION, FINGERPRINT_ONLY_OPTIONS } from '../analyzer/queue.js';
 import {
 	FakeCatalogueServer,
 	POLICY_D_A,
@@ -107,7 +107,7 @@ describe('hydrator', () => {
 
 		await b.layer.syncNow();
 
-		expect(row(b, 'fresh')).toMatchObject({ bpm: 124.5, key_camelot: '8A', audio_hash: hash, analyzer_version: '2.4.0', brightness: 0.42 });
+		expect(row(b, 'fresh')).toMatchObject({ bpm: 124.5, key_camelot: '8A', audio_hash: hash, analyzer_version: EXPECTED_ANALYZER_VERSION, brightness: 0.42 });
 		// Never overwrite local: the duplicate keeps its own key, gets the rest.
 		expect(row(b, 'dup')).toMatchObject({ bpm: 124.5, key_camelot: '3B', audio_hash: hash });
 		for (const t of ['fresh', 'dup']) expect(existsSync(join(b.peaksDir, 'lo', `${t}.cpk`))).toBe(true);

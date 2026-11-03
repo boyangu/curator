@@ -22,6 +22,10 @@ class ModelSpec:
     license: str         # weights licence (all fine for a personal library)
     window_secs: float   # longest audio span fed to the model in one pass
     summary: str
+    # False for models whose "vector" is a row of named scores rather than a
+    # point in a similarity space: stored and pooled like any vector, never
+    # ranked, blended or offered for similar:/sounds: queries.
+    similarity: bool = True
 
     @property
     def model_id(self) -> str:
@@ -49,6 +53,13 @@ MODELS: dict[str, ModelSpec] = {s.key: s for s in [
                 "published alignment with human timbre words. Mean of L2-normalised 10 s window "
                 "embeddings. (laion/larger_clap_music is broken under transformers: its text and "
                 "audio towers don't align — Phase 0 finding.)",
+    ),
+    ModelSpec(
+        key="audiobox-aesthetics", version=1, repo="facebook/audiobox-aesthetics",
+        sample_rate=16000, dim=4, text=False, license="CC-BY-4.0", window_secs=10.0, similarity=False,
+        summary="Meta's learned aesthetic ratings, 0-10 per axis: [CE content enjoyment, CU content "
+                "usefulness, PC production complexity, PQ production quality]. Length-weighted mean "
+                "of 10 s windows, like the official predictor; the per-window scores pool per section.",
     ),
 ]}
 

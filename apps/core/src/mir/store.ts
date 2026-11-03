@@ -17,7 +17,7 @@
 import Database from 'better-sqlite3';
 import type { MirModelCoverage, MirModelInfo } from './types.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS mir_meta (
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS mir_model (
 	dim INTEGER NOT NULL,
 	sample_rate INTEGER,
 	text INTEGER NOT NULL DEFAULT 0,
+	similarity INTEGER NOT NULL DEFAULT 1,
 	license TEXT,
 	repo TEXT,
 	first_seen_at INTEGER NOT NULL
@@ -96,6 +97,10 @@ export class SqliteMirStore {
 		this.db = new Database(dbPath);
 		this.db.pragma('journal_mode = WAL');
 		this.db.exec(DDL);
+		// Schema 1 → 2: score models (Audiobox) are stored like any vector but
+		// must never be ranked; the flag survives the engine being down.
+		try { this.db.exec(`ALTER TABLE mir_model ADD COLUMN similarity INTEGER NOT NULL DEFAULT 1`); }
+		catch (err) { if (!/duplicate column/i.test(String(err))) throw err; }
 		this.db
 			.prepare(`INSERT OR REPLACE INTO mir_meta (key, value) VALUES ('schema_version', ?)`)
 			.run(String(SCHEMA_VERSION));
@@ -118,19 +123,19 @@ export class SqliteMirStore {
 
 	upsertModel(m: MirModelInfo): void {
 		this.db.prepare(`
-			INSERT INTO mir_model (id, key, dim, sample_rate, text, license, repo, first_seen_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO mir_model (id, key, dim, sample_rate, text, similarity, license, repo, first_seen_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET dim = excluded.dim, sample_rate = excluded.sample_rate,
-				text = excluded.text, license = excluded.license, repo = excluded.repo
-		`).run(m.modelId, m.key, m.dim, m.sampleRate, m.text ? 1 : 0, m.license, m.repo, Date.now());
+				text = excluded.text, similarity = excluded.similarity, license = excluded.license, repo = excluded.repo
+		`).run(m.modelId, m.key, m.dim, m.sampleRate, m.text ? 1 : 0, m.similarity ? 1 : 0, m.license, m.repo, Date.now());
 	}
 
 	// Models seen in earlier runs — lets seed-based similarity work from stored
 	// vectors even while the engine is down or not yet started.
-	knownModels(): { modelId: string; key: string; dim: number; text: boolean }[] {
-		return (this.db.prepare(`SELECT id, key, dim, text FROM mir_model ORDER BY first_seen_at`).all() as
-			{ id: string; key: string; dim: number; text: number }[])
-			.map((r) => ({ modelId: r.id, key: r.key, dim: r.dim, text: r.text === 1 }));
+	knownModels(): { modelId: string; key: string; dim: number; text: boolean; similarity: boolean }[] {
+		return (this.db.prepare(`SELECT id, key, dim, text, similarity FROM mir_model ORDER BY first_seen_at`).all() as
+			{ id: string; key: string; dim: number; text: number; similarity: number }[])
+			.map((r) => ({ modelId: r.id, key: r.key, dim: r.dim, text: r.text === 1, similarity: r.similarity !== 0 }));
 	}
 
 	// Replace every vector of (track, model) with this run's output and mark

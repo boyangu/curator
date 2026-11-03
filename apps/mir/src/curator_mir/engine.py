@@ -64,7 +64,8 @@ class Engine:
             "loaded": list(self._loaded),
             "models": [
                 {"key": s.key, "modelId": s.model_id, "dim": s.dim, "sampleRate": s.sample_rate,
-                 "text": s.text, "license": s.license, "repo": s.repo, "summary": s.summary}
+                 "text": s.text, "similarity": s.similarity, "license": s.license, "repo": s.repo,
+                 "summary": s.summary}
                 for s in MODELS.values()
             ],
         }

@@ -32,6 +32,7 @@ export const DEFAULT_AUTO_FLAGS: AnalysisFlags = {
 	peaks: true,
 	fingerprint: true,
 	advanced: false,
+	production: false,
 };
 
 // Manual Analyze modal: basics OFF (leave existing Curator grid/key/segments
@@ -44,6 +45,7 @@ export const DEFAULT_MANUAL_FLAGS: AnalysisFlags = {
 	peaks: false,
 	fingerprint: true,
 	advanced: true,
+	production: true,
 };
 
 // Auto key stays v2 to preserve the user's `enabled` opt-in across the shape

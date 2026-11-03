@@ -47,7 +47,7 @@ export interface MirCapabilities {
 	cloudConfigured: boolean;
 	loaded: string[];
 	models: { key: string; modelId: string; dim: number; sampleRate: number; text: boolean;
-		license: string; repo: string; summary: string }[];
+		similarity?: boolean; license: string; repo: string; summary: string }[];
 }
 
 export interface MirSegmentIn { startSec: number; endSec: number; label?: string | null }

@@ -38,7 +38,7 @@ describe('track context menu', () => {
 			'--',
 			'Enhance with BPM, Key, Label, Genre', 'Enhance with Tidal',
 			'--',
-			'Find Similar', 'Navigate to > Solee',
+			'Find Similar', 'Production Profile…', 'Navigate to > Solee',
 			'--',
 			'Open in **Spotify**', 'Copy **Spotify** URL', 'Search in **Tidal**', 'Search in **Beatport**', 'Open File Location',
 			'--',

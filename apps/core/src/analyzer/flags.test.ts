@@ -15,10 +15,10 @@ describe('analysisFlagsToOptions', () => {
 	});
 
 	it('translates each basic flag to its skip/override pair', () => {
-		const everythingOff = analysisFlagsToOptions({ beatgrid: false, key: false, segments: false, peaks: false, fingerprint: false, advanced: false });
+		const everythingOff = analysisFlagsToOptions({ beatgrid: false, key: false, segments: false, peaks: false, fingerprint: false, advanced: false, production: false });
 		expect(everythingOff).toEqual({ features: [], skipBeatgrid: true, skipKey: true, skipSegments: true, skipPeaks: true, skipFingerprint: true });
 
-		const everythingOn = analysisFlagsToOptions({ beatgrid: true, key: true, segments: true, peaks: true, fingerprint: true, advanced: true });
+		const everythingOn = analysisFlagsToOptions({ beatgrid: true, key: true, segments: true, peaks: true, fingerprint: true, advanced: true, production: true });
 		expect(everythingOn.features).toHaveLength(6);
 		expect(everythingOn).toMatchObject({ overrideBeatgrid: true, overrideBpm: true, overrideKey: true, overrideSegments: true, overridePeaks: true });
 		expect(everythingOn.skipFingerprint).toBeUndefined();

@@ -125,7 +125,34 @@ export function persistAnalysisResult(db: Db, result: AnalyzeResult, filePath: s
 		}
 	}
 
+	// Production stage: an atomic group like the segments — the six scalars
+	// and the JSON move together, and only when the stage produced them.
+	const prod = result.production ?? null;
+	if (prod) {
+		advancedSet.prodLufs = prod.lufs_i;
+		advancedSet.prodTruePeak = prod.true_peak_dbtp;
+		advancedSet.prodPlr = prod.plr;
+		advancedSet.prodCutoffHz = prod.cutoff_hz;
+		advancedSet.prodSubCorr = prod.sub_corr;
+		advancedSet.prodClipPct = prod.clip_pct;
+		advancedSet.productionJson = prod;
+		row.prodLufs = prod.lufs_i;
+		row.prodTruePeak = prod.true_peak_dbtp;
+		row.prodPlr = prod.plr;
+		row.prodCutoffHz = prod.cutoff_hz;
+		row.prodSubCorr = prod.sub_corr;
+		row.prodClipPct = prod.clip_pct;
+		row.productionJson = prod;
+	}
+
 	const trackAdvancedSet: Record<string, number | null | SQL> = {};
+	if (prod) {
+		trackAdvancedSet.prodLufs = prod.lufs_i;
+		trackAdvancedSet.prodPlr = prod.plr;
+		trackAdvancedSet.prodCutoffHz = prod.cutoff_hz;
+		trackAdvancedSet.prodSubCorr = prod.sub_corr;
+		trackAdvancedSet.prodClipPct = prod.clip_pct;
+	}
 	if (result.brightness !== null) trackAdvancedSet.brightness = result.brightness;
 	if (result.power !== null) trackAdvancedSet.power = result.power;
 	if (result.dynamic_complexity !== null) trackAdvancedSet.dynamicComplexity = result.dynamic_complexity;

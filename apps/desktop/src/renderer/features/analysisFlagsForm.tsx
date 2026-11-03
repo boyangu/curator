@@ -33,7 +33,15 @@ export const BASIC_FLAGS: FlagDef[] = [
 const ADVANCED_FLAG: FlagDef = {
 	key: 'advanced',
 	label: 'Advanced features',
-	hint: 'MusicExtractor pass — slow, +5-15 s/track. Computes all seven together: Brightness, Power, Dynamic range, Punch, Dissonance, Density, Hypnosis.',
+	hint: 'MusicExtractor pass — slow, +5-15 s/track. Computes all together: Brightness, Power, Dynamic range, Punch, Dissonance, Density.',
+};
+
+// Production measurements: a stereo decode plus DSP; the whole set lands
+// together, so one toggle.
+export const PRODUCTION_FLAG: FlagDef = {
+	key: 'production',
+	label: 'Production quality',
+	hint: 'Loudness, true peak, clipping, tonal balance, stereo image, lossy-source check, kick punch, per-section rows (+2-7 s/track). Feeds the Production profile and its flags.',
 };
 
 export function AnalysisFlagsForm(props: {
@@ -65,6 +73,7 @@ export function AnalysisFlagsForm(props: {
 			</div>
 			<div class="analysis-flags__group analysis-flags__group--advanced">
 				{row(ADVANCED_FLAG)}
+				{row(PRODUCTION_FLAG)}
 			</div>
 		</div>
 	);

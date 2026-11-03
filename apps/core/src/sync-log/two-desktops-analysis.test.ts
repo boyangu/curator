@@ -22,6 +22,7 @@ import type { StoredOp, TrackAnalysis } from '@curator/protocol';
 import { consoleSink, createLogger, type LogRecord } from '@curator/shared/log';
 import { setCoreLogger } from '../log.js';
 import { persistAnalysisResult } from '../analyzer/persist.js';
+import { EXPECTED_ANALYZER_VERSION } from '../analyzer/queue.js';
 import type { AnalyzeParams, AnalyzeResult } from '../analyzer/sidecar.js';
 import { decodeFloat32, float32Buffer } from '../rekordbox/rb-slot.js';
 import { fullResult } from '../test-support/catalogue-fakes.js';
@@ -82,7 +83,7 @@ describe('the master\'s analysis reaches a secondary through the log', () => {
 
 		const remote = remoteTrackId(R('trk-0'));
 		const s = slotOf(b, remote)!;
-		expect([s.bpm, s.key_camelot, s.brightness, s.power, s.analyzer_version, s.audio_hash]).toEqual([124.5, '8A', 0.42, 0.66, '2.4.0', 'pcm-md5:aaaa']);
+		expect([s.bpm, s.key_camelot, s.brightness, s.power, s.analyzer_version, s.audio_hash]).toEqual([124.5, '8A', 0.42, 0.66, EXPECTED_ANALYZER_VERSION, 'pcm-md5:aaaa']);
 		// The slot reads back as exactly what was sent: a re-projection is a
 		// digest compare, not a rewrite.
 		expect(s.adopted_digest).toBe(slotDigest(sent as unknown as TrackAnalysis));

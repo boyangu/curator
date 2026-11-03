@@ -96,3 +96,34 @@ describe('persistAnalysisResult', () => {
 		expect(analysis('t')!.audio_hash).toBeNull();
 	});
 });
+
+// Stage 7 (production measurements): an atomic group written only when the
+// stage ran, mirrored onto track, and left alone by a pass without it.
+describe('persistAnalysisResult — production stage', () => {
+	const measurements = {
+		version: 1, stereo_source: true, duration_sec: 30,
+		lufs_i: -8.2, lra: 3.1, lufs_m_max: -5, true_peak_dbtp: -0.4, plr: 7.8, clip_pct: 0.02, dc_offset: 0,
+		crest_db: 11, crest_st_p50: 9.5, noise_floor_db: -72,
+		bands_db: { sub: -6, bass: -5, lowmid: -12, mid: -8, himid: -16, high: -20 },
+		centroid_hz: 900, tilt_db_oct: -5, cutoff_hz: 19600, cutoff_depth_db: 22,
+		phase_corr: 0.9, sub_corr: 0.97, width_db: { low: -30, mid: -12, high: -8 },
+		kick_punch_db: 12, sub_under_kick_db: 8, sections: [],
+	};
+	const PROD_COLS = ['prod_lufs', 'prod_true_peak', 'prod_plr', 'prod_cutoff_hz', 'prod_sub_corr', 'prod_clip_pct'];
+
+	it('writes the group + the track mirror when present and keeps it when absent', () => {
+		const pa = seed('a', HASH_A);
+		const base = fullResult({ trackId: 'a', path: pa, outPeaksLoPath: '', outPeaksHiPath: '' }, { advanced: false });
+		persistAnalysisResult(db, { ...base, production: measurements }, pa);
+		expect(pick(analysis('a')!, PROD_COLS)).toEqual({ prod_lufs: -8.2, prod_true_peak: -0.4, prod_plr: 7.8, prod_cutoff_hz: 19600, prod_sub_corr: 0.97, prod_clip_pct: 0.02 });
+		expect(JSON.parse(analysis('a')!.production_json as string)).toEqual(measurements);
+		expect(pick(trackRow('a'), ['prod_lufs', 'prod_plr', 'prod_cutoff_hz', 'prod_sub_corr', 'prod_clip_pct']))
+			.toEqual({ prod_lufs: -8.2, prod_plr: 7.8, prod_cutoff_hz: 19600, prod_sub_corr: 0.97, prod_clip_pct: 0.02 });
+
+		persistAnalysisResult(db, { ...base, production: null }, pa);
+		expect(pick(analysis('a')!, PROD_COLS).prod_plr).toBe(7.8);
+		expect(trackRow('a').prod_plr).toBe(7.8);
+		persistAnalysisResult(db, base, pa); // a pre-2.5.0 result omits the key entirely
+		expect(trackRow('a').prod_lufs).toBe(-8.2);
+	});
+});

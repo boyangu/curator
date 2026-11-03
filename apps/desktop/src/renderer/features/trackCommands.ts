@@ -17,6 +17,7 @@
 // contextMenus.ts) wired in boot().
 
 import type { Playlist, Track } from '@curator/shared';
+import { artistNames } from '@curator/shared';
 import type { RemovableTrackSource } from '@curator/core';
 import type { ActiveView, JitPlaylist, SourceTab } from '../viewmodel/shell.js';
 import type { ContextMenusFeatureDeps } from './contextMenus.js';
@@ -447,6 +448,19 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		},
 		label: (c) => (single(c) ? 'Add to Similarity Match' : `Add ${c.tracks.length} to Similarity Match`),
 		run: (c) => { void addToSimilarityMatch(c); },
+	},
+	{
+		// Mastering/mix read of one track: integrity flags, cohort-relative
+		// deviations, sections, Audiobox PQ, learned score. The dialog offers
+		// to run the (opt-in) production stage when the track lacks it.
+		// Below the similarity pair, which stays together.
+		id: 'production-profile', group: 'navigate', isAvailable: single, iconHtml: ICON_ANALYZE,
+		label: () => 'Production Profile…',
+		run: (c) => {
+			const t = c.tracks[0]!;
+			const who = artistNames(t.artists).join(', ');
+			deps.openProductionProfile(t.id, who ? `${who} — ${t.title}` : t.title);
+		},
 	},
 	{
 		// Embark on a discovery journey seeded with this track — Discover's

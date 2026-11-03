@@ -6,4 +6,7 @@
 # analysis scalars and grid are unchanged, so the queue's full-re-analysis
 # floor (MIN_FULL_REANALYSIS_VERSION in apps/core/src/analyzer/queue.ts)
 # stays at 2.3.0 — missing prints are backfilled by a decode-only pass.
-ANALYZER_VERSION = "2.4.0"
+# 2.5.0: adds the opt-in production-measurement stage (production.py,
+# options.production). Every existing stage is unchanged, so the
+# full-re-analysis floor stays at 2.3.0.
+ANALYZER_VERSION = "2.5.0"

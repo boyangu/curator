@@ -58,6 +58,7 @@ export interface AnalyzeModalHandle {
 const ASPECT_KEYS: (keyof AnalysisFlags)[] = [
 	...BASIC_FLAGS.map((f) => f.key),
 	'advanced',
+	'production',
 ];
 
 export function mountAnalyzeModal(host: HTMLElement, props: AnalyzeModalProps): AnalyzeModalHandle {
