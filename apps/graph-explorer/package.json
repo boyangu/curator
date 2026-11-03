@@ -11,7 +11,7 @@
 		"preview": "vite preview"
 	},
 	"dependencies": {
-		"graphology": "^0.25.4",
+		"graphology": "^0.26.0",
 		"graphology-layout-forceatlas2": "^0.10.1",
 		"sigma": "^3.0.0"
 	},
