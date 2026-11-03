@@ -96,6 +96,15 @@ export const AUDIT_KINDS = [
 	'spotify_adopted',
 	'spotify_refresh_failed',
 	'spotify_disconnected',
+	// 'global_catalog' (src/catalog): a device's claims ingested ({ reason,
+	// claims, rejected, created, attached }), a watch set ({ kind, added,
+	// source }), follows imported ({ claims, created, watched, rejected }), a
+	// refresh asked for ({ accepted }: false inside the hour since the last).
+	'catalog_ingested',
+	'catalog_watch_set',
+	'catalog_import',
+	'catalog_enrich_requested',
+	'catalog_refresh_requested',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -141,6 +150,11 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	spotify_adopted: 'info',
 	spotify_refresh_failed: 'warn',
 	spotify_disconnected: 'info',
+	catalog_ingested: 'info',
+	catalog_watch_set: 'info',
+	catalog_import: 'info',
+	catalog_enrich_requested: 'info',
+	catalog_refresh_requested: 'info',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

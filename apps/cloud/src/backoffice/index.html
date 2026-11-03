@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Catalogue Back Office</title>
+<style>
+:root {
+	--bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e4e4df; --hover: #f0f0ec;
+	--accent: #2f5bd3; --accent-soft: #e8eefc; --warn: #a3520b; --chip: #efefea;
+	--mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) {
+		--bg: #141413; --panel: #1c1c1a; --text: #ecece8; --muted: #9a9a93; --line: #2c2c29; --hover: #242422;
+		--accent: #8aa8ff; --accent-soft: #1f2a48; --warn: #e5a15d; --chip: #2a2a27;
+	}
+}
+:root[data-theme="dark"] {
+	--bg: #141413; --panel: #1c1c1a; --text: #ecece8; --muted: #9a9a93; --line: #2c2c29; --hover: #242422;
+	--accent: #8aa8ff; --accent-soft: #1f2a48; --warn: #e5a15d; --chip: #2a2a27;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1280px; margin: 0 auto; padding: 10px 16px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.brand { font-weight: 650; letter-spacing: -0.01em; white-space: nowrap; }
+.brand small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+nav { display: flex; gap: 4px; }
+nav a { padding: 6px 10px; border-radius: 6px; color: var(--text); }
+nav a:hover { background: var(--hover); text-decoration: none; }
+nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+nav a .n { color: var(--muted); font-size: 12px; margin-left: 4px; font-variant-numeric: tabular-nums; }
+nav a.on .n { color: inherit; opacity: .75; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+.tools { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.lib { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+input[type=search], select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+input[type=search] { flex: 1 1 260px; min-width: 0; }
+input[type=search]:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
+.pager { display: flex; gap: 8px; align-items: center; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--panel); white-space: nowrap; }
+th a.sort { color: inherit; }
+th a.sort.on { color: var(--accent); }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr.link { cursor: pointer; }
+tbody tr.link:hover { background: var(--hover); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.dim { color: var(--muted); }
+td.nowrap { white-space: nowrap; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.chip { display: inline-block; font-size: 11.5px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); white-space: nowrap; }
+a.chip { color: var(--text); }
+a.chip:hover { text-decoration: none; background: var(--accent-soft); color: var(--accent); }
+.watch { color: var(--accent); font-weight: 600; }
+.empty { padding: 32px; text-align: center; color: var(--muted); }
+.err { padding: 12px 16px; border: 1px solid var(--warn); color: var(--warn); border-radius: 8px; background: var(--panel); }
+h1 { font-size: 22px; margin: 0; letter-spacing: -0.015em; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 24px 0 8px; font-weight: 600; }
+h2 .n { font-weight: 400; margin-left: 4px; }
+.head { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 4px; }
+.head img { width: 96px; height: 96px; border-radius: 6px; object-fit: cover; background: var(--chip); flex: none; }
+.kind { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.meta { color: var(--muted); margin-top: 6px; display: flex; gap: 14px; flex-wrap: wrap; }
+.redirect { margin-bottom: 12px; color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0 24px; }
+.refs { display: flex; flex-wrap: wrap; gap: 6px; }
+.refs a { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; color: var(--text); }
+.refs a:hover { border-color: var(--accent); text-decoration: none; }
+.refs a .n { color: var(--muted); font-size: 12px; margin-left: 4px; }
+details { margin-top: 24px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+pre { font-family: var(--mono); font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; }
+.more { color: var(--muted); font-size: 12px; padding: 8px 12px; }
+.loading { color: var(--muted); padding: 24px 0; }
+/* inbox */
+.filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.filters a { padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--text); background: var(--panel); }
+.filters a:hover { text-decoration: none; background: var(--hover); }
+.filters a.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
+.filters a .n { color: var(--muted); margin-left: 5px; font-variant-numeric: tabular-nums; }
+.filters a.on .n { color: inherit; opacity: .75; }
+.item { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.item.resolved { opacity: .75; }
+.item .top { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; position: relative; top: -1px; }
+.dot.approval { background: var(--warn); }
+.dot.notice { background: var(--accent); }
+.dot.audit { background: var(--line); border: 1px solid var(--muted); }
+.item .title { font-weight: 600; flex: 1 1 320px; }
+.item .who { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.item .about { margin-top: 4px; color: var(--muted); font-size: 13px; }
+.item .about a { margin-right: 8px; }
+.ev { margin-top: 8px; font-size: 13px; color: var(--text); }
+.ev .l { color: var(--muted); }
+.insights > div { padding: 4px 0; }
+.ev table { margin-top: 4px; }
+.ev td, .ev th { padding: 4px 8px; font-size: 12.5px; }
+.ev label { display: block; padding: 2px 0; cursor: pointer; }
+.ev input[type=radio] { margin-right: 6px; }
+.act { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.act input[type=text] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; flex: 1 1 220px; min-width: 0; }
+.act select { padding: 5px 8px; }
+button.ok { border-color: var(--accent); color: var(--accent); }
+button.no { border-color: var(--warn); color: var(--warn); }
+.item .state { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
+.item .state .err { display: inline; padding: 2px 6px; }
+nav a .badge { background: var(--warn); color: #fff; border-radius: 999px; padding: 0 6px; font-size: 11px; margin-left: 6px; font-weight: 600; }
+@media (max-width: 640px) { .hide-sm { display: none; } .head img { width: 64px; height: 64px; } }
+</style>
+</head>
+<body>
+<header>
+	<div class="bar">
+		<div class="brand">Curator catalogue<small>back office · read-only</small></div>
+		<nav id="nav"></nav>
+	</div>
+</header>
+<main id="app"><div class="loading">Loading…</div></main>
+<script type="module">
+const KINDS = [
+	{ kind: 'label', path: 'labels', title: 'Labels' },
+	{ kind: 'artist', path: 'artists', title: 'Artists' },
+	{ kind: 'recording', path: 'tracks', title: 'Tracks' },
+];
+const PAGE_SIZE = 50;
+const app = document.getElementById('app');
+const nav = document.getElementById('nav');
+let stats = {};
+// The owner's library filter (local catalogue only: stats.library is null
+// elsewhere). On by default; turning it off is remembered in this browser.
+const libraryOn = () => {
+	if (!stats.library) return false;
+	try { return localStorage.getItem('libraryFilter') !== 'off'; } catch { return true; }
+};
+const setLibrary = (on) => { try { localStorage.setItem('libraryFilter', on ? 'on' : 'off'); } catch {} };
+// What waits for the operator (inbox.ts): the nav badge is the notification.
+let inboxCounts = null;
+// The page's one write path: the host's loopback /admin (cli/local.ts serves
+// every op; cli/backoffice.ts the inbox ones). Absent, the inbox is read-only.
+let writable = null;
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const fmtN = (n) => (n ?? 0).toLocaleString();
+const fmtDate = (ms) => (ms ? new Date(ms).toISOString().slice(0, 10) : '');
+const fmtDur = (s) => (s == null ? '' : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`);
+const objLink = (r) => `<a href="#/o/${r.id}">${esc(r.name)}</a>`;
+const refLinks = (list) => (list ?? []).map(objLink).join(', ');
+const chips = (list) => `<span class="chips">${(list ?? []).map((p) => `<span class="chip">${esc(p)}</span>`).join('')}</span>`;
+const scanned = (ms) => (ms ? `<span title="${esc(new Date(ms).toISOString().slice(0, 16).replace('T', ' '))} UTC">${fmtDate(ms)}</span>` : '<span class="dim">never</span>');
+const watchers = (n) => (n ? `<span class="watch">${fmtN(n)}</span>` : '<span class="dim">0</span>');
+
+async function api(path) {
+	const res = await fetch(`/backoffice/api/${path}`);
+	const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+	if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+	return body;
+}
+
+function parseHash() {
+	const raw = location.hash.replace(/^#\/?/, '');
+	const [path, qs] = raw.split('?');
+	return { parts: path.split('/').filter(Boolean), params: new URLSearchParams(qs ?? '') };
+}
+
+function renderNav(active) {
+	const waiting = inboxCounts ? inboxCounts.approval + inboxCounts.notice : null;
+	nav.innerHTML = `<a href="#/inbox" class="${active === 'inbox' ? 'on' : ''}">Inbox${waiting ? `<span class="badge">${fmtN(waiting)}</span>` : ''}</a>`
+		+ KINDS.map((k) => {
+			const n = libraryOn() ? stats.library.objects[k.kind] : stats[k.kind];
+			return `<a href="#/${k.path}" class="${k.kind === active ? 'on' : ''}">${k.title}<span class="n">${n != null ? fmtN(n) : ''}</span></a>`;
+		}).join('');
+}
+
+async function admin(op, args) {
+	const res = await fetch('/admin', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op, args }) });
+	const body = await res.json().catch(() => ({ ok: false, error: res.status === 404 ? 'this back office is read-only (no /admin here)' : `HTTP ${res.status}` }));
+	if (!res.ok || !body.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+	return body.result;
+}
+async function refreshCounts() {
+	try {
+		inboxCounts = await api('inbox/counts');
+	} catch {
+		inboxCounts = null;
+	}
+}
+
+// ---- lists ----
+
+const COLUMNS = {
+	label: [
+		['Name', (r) => objLink(r)],
+		['Releases', (r) => fmtN(r.releases), 'num'],
+		['Tracks', (r) => fmtN(r.tracks), 'num', ['tracks', 'fewest_tracks']],
+		['Roster', (r) => fmtN(r.roster), 'num hide-sm'],
+		['Watchers', (r) => watchers(r.watchers), 'num'],
+		['Sources', (r) => chips(r.providers), 'hide-sm'],
+		['Last scanned', (r) => scanned(r.scannedAt), 'nowrap', ['scanned', 'stale']],
+		['Discovered', (r) => fmtDate(r.discoveredAt), 'dim nowrap hide-sm'],
+	],
+	artist: [
+		['Name', (r) => objLink(r)],
+		['Releases', (r) => fmtN(r.releases), 'num'],
+		['Tracks', (r) => fmtN(r.tracks), 'num hide-sm'],
+		['Watchers', (r) => watchers(r.watchers), 'num'],
+		['Sources', (r) => chips(r.providers), 'hide-sm'],
+		['Last scanned', (r) => scanned(r.scannedAt), 'nowrap hide-sm', ['scanned', 'stale']],
+		['Discovered', (r) => fmtDate(r.discoveredAt), 'dim nowrap hide-sm'],
+	],
+	recording: [
+		['Title', (r) => objLink(r)],
+		['Artists', (r) => esc((r.artists ?? []).join(', '))],
+		['Release', (r) => esc(r.release ?? ''), 'hide-sm'],
+		['Label', (r) => esc(r.label ?? ''), 'hide-sm'],
+		['Date', (r) => esc(r.date ?? ''), 'dim nowrap'],
+		['Length', (r) => fmtDur(r.durationSec), 'num dim hide-sm'],
+		['ISRC', (r) => `<span class="mono">${esc(r.isrc ?? '')}</span>`, 'hide-sm'],
+		['Sources', (r) => chips(r.providers), 'hide-sm'],
+	],
+};
+
+// Labels and artists have listings a crawler reads; tracks do not.
+const SORTS = [
+	['name', 'Name'],
+	['recent', 'Recently discovered'],
+	['watched', 'Most watched'],
+	['scanned', 'Recently scanned', (k) => k !== 'recording'],
+	['stale', 'Longest unscanned', (k) => k !== 'recording'],
+	['tracks', 'Most tracks', (k) => k === 'label'],
+	['fewest_tracks', 'Fewest tracks', (k) => k === 'label'],
+];
+
+let listSeq = 0;
+async function renderList(kindDef, params) {
+	const q = params.get('q') ?? '';
+	const sort = params.get('sort') ?? 'name';
+	const page = Math.max(Number(params.get('page') ?? 0) || 0, 0);
+	renderNav(kindDef.kind);
+	if (!app.querySelector(`[data-list="${kindDef.kind}"]`)) {
+		app.innerHTML = `<div data-list="${kindDef.kind}">
+			<div class="tools">
+				<input type="search" id="q" placeholder="Search ${kindDef.title.toLowerCase()}…" autocomplete="off">
+				<select id="sort" aria-label="Sort">
+					${SORTS.filter(([, , on]) => !on || on(kindDef.kind)).map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}
+				</select>
+				${stats.library ? `<label class="lib" title="Only what your ${fmtN(stats.library.tracks)} tracks with local files are, and the releases, labels and artists they touch (curator.db, loaded ${fmtDate(stats.library.loadedAt)})"><input type="checkbox" id="lib"> My library</label>` : ''}
+				<div class="pager" id="pager"></div>
+			</div>
+			<div class="card scroll" id="rows"><div class="empty">Loading…</div></div>
+		</div>`;
+		const input = app.querySelector('#q');
+		let t;
+		input.addEventListener('input', () => {
+			clearTimeout(t);
+			t = setTimeout(() => go(kindDef, { q: input.value, sort: app.querySelector('#sort').value, page: 0 }, true), 200);
+		});
+		app.querySelector('#sort').addEventListener('change', (e) => go(kindDef, { q: input.value, sort: e.target.value, page: 0 }));
+		app.querySelector('#lib')?.addEventListener('change', (e) => {
+			setLibrary(e.target.checked);
+			renderNav(kindDef.kind);
+			go(kindDef, { q: input.value, sort: app.querySelector('#sort').value, page: 0 }, true);
+		});
+		input.value = q;
+		input.focus();
+	}
+	const input = app.querySelector('#q');
+	// Not while typing: the debounce would put back what was just deleted.
+	if (document.activeElement !== input) input.value = q;
+	app.querySelector('#sort').value = sort;
+	const lib = app.querySelector('#lib');
+	if (lib) lib.checked = libraryOn();
+	const seq = ++listSeq;
+	let data;
+	try {
+		data = await api(`list?kind=${kindDef.kind}&q=${encodeURIComponent(q)}&sort=${sort}&offset=${page * PAGE_SIZE}&limit=${PAGE_SIZE}${libraryOn() ? '&library=1' : ''}`);
+	} catch (e) {
+		app.querySelector('#rows').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+		return;
+	}
+	if (seq !== listSeq) return;
+	const cols = COLUMNS[kindDef.kind];
+	const from = data.total ? page * PAGE_SIZE + 1 : 0;
+	const to = Math.min((page + 1) * PAGE_SIZE, data.total);
+	app.querySelector('#pager').innerHTML = `<span>${fmtN(from)}–${fmtN(to)} of ${fmtN(data.total)}</span>
+		<button id="prev" ${page === 0 ? 'disabled' : ''} aria-label="Previous page">‹</button>
+		<button id="next" ${to >= data.total ? 'disabled' : ''} aria-label="Next page">›</button>`;
+	app.querySelector('#prev').onclick = () => go(kindDef, { q, sort, page: page - 1 });
+	app.querySelector('#next').onclick = () => go(kindDef, { q, sort, page: page + 1 });
+	app.querySelector('#rows').innerHTML = data.rows.length
+		? `<table><thead><tr>${cols.map(([h, , c, sorts]) => `<th class="${c ?? ''}">${sorts ? sortHeader(kindDef, h, sorts, q, sort) : h}</th>`).join('')}</tr></thead>
+			<tbody>${data.rows.map((r) => `<tr class="link" data-id="${r.id}">${cols.map(([, f, c]) => `<td class="${c ?? ''}">${f(r)}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+		: `<div class="empty">No ${kindDef.title.toLowerCase()}${q ? ` matching “${esc(q)}”` : ''}${libraryOn() ? ' in your library' : ''}.</div>`;
+	for (const tr of app.querySelectorAll('tr.link')) {
+		tr.addEventListener('click', (e) => {
+			if (e.target.closest('a')) return;
+			location.hash = `#/o/${tr.dataset.id}`;
+		});
+	}
+}
+
+// A sortable header: a click sorts by it, a second flips the direction.
+function sortHeader(kindDef, title, [first, second], q, sort) {
+	const next = sort === first ? second : first;
+	const arrow = sort === first ? ' ↓' : sort === second ? ' ↑' : '';
+	const p = new URLSearchParams();
+	if (q) p.set('q', q);
+	p.set('sort', next);
+	return `<a class="sort ${arrow ? 'on' : ''}" href="#/${kindDef.path}?${p}" title="Sort by ${esc(title.toLowerCase())}">${esc(title)}${arrow}</a>`;
+}
+
+function go(kindDef, { q, sort, page }, replace = false) {
+	const p = new URLSearchParams();
+	if (q) p.set('q', q);
+	if (sort && sort !== 'name') p.set('sort', sort);
+	if (page) p.set('page', String(page));
+	const hash = `#/${kindDef.path}${p.toString() ? `?${p}` : ''}`;
+	if (replace) history.replaceState(null, '', hash), route();
+	else location.hash = hash;
+}
+
+// ---- detail ----
+
+function table(cols, rows, more) {
+	if (!rows?.length) return '<div class="card"><div class="empty">None.</div></div>';
+	return `<div class="card scroll"><table><thead><tr>${cols.map(([h, , c]) => `<th class="${c ?? ''}">${h}</th>`).join('')}</tr></thead>
+		<tbody>${rows.map((r) => `<tr>${cols.map(([, f, c]) => `<td class="${c ?? ''}">${f(r)}</td>`).join('')}</tr>`).join('')}</tbody></table>
+		${more && more > rows.length ? `<div class="more">Showing ${fmtN(rows.length)} of ${fmtN(more)}</div>` : ''}</div>`;
+}
+
+const RELEASE_COLS_ALL = [
+	['Date', (r) => esc(r.date ?? ''), 'dim nowrap'],
+	['Title', (r) => `${objLink({ id: r.id, name: r.title })}${r.edition ? ` <span class="chip" title="edition (an insight)">${esc(r.edition)}</span>` : ''}`],
+	['Artists', (r) => refLinks(r.artists)],
+	['Label', (r) => (r.labels.length ? refLinks(r.labels) : esc(r.labelText ?? '')), 'hide-sm'],
+	['Type', (r) => esc(r.type ?? ''), 'dim hide-sm'],
+	['Tracks', (r) => fmtN(r.tracks), 'num'],
+	['Sources', (r) => chips(r.providers), 'hide-sm'],
+];
+const RELEASE_COLS = (withLabel = true) => RELEASE_COLS_ALL.filter(([h]) => withLabel || h !== 'Label');
+const TRACK_COLS = (withPos) => [
+	...(withPos ? [['#', (r) => esc(r.position ?? ''), 'num dim']] : []),
+	['Title', (r) => objLink({ id: r.id, name: r.title })],
+	['Artists', (r) => refLinks(r.artists)],
+	['Length', (r) => fmtDur(r.durationSec), 'num dim'],
+	['ISRC', (r) => `<span class="mono">${esc(r.isrc ?? '')}</span>`, 'hide-sm'],
+	['Sources', (r) => chips(r.providers), 'hide-sm'],
+];
+const refBlock = (list, withCount) =>
+	list?.length ? `<div class="refs">${list.map((r) => `<a href="#/o/${r.id}">${esc(r.name)}${withCount && r.releases != null ? `<span class="n">${fmtN(r.releases)}</span>` : ''}${r.role && r.role !== 'main' ? `<span class="n">${esc(r.role)}</span>` : ''}</a>`).join('')}</div>` : '<div class="dim">None.</div>';
+const section = (title, body, n) => `<h2>${title}${n != null ? `<span class="n">${fmtN(n)}</span>` : ''}</h2>${body}`;
+
+async function renderObject(id) {
+	app.innerHTML = '<div class="loading">Loading…</div>';
+	let o;
+	try {
+		o = await api(`object/${encodeURIComponent(id)}${libraryOn() ? '?library=1' : ''}`);
+	} catch (e) {
+		app.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+		return;
+	}
+	const listKind = o.kind === 'release' ? null : o.kind;
+	renderNav(listKind);
+	document.title = `${o.name} · Catalogue`;
+	const a = o.attrs ?? {};
+	const meta = [
+		o.release?.date && `Released ${esc(o.release.date)}`,
+		o.release?.type && esc(o.release.type),
+		o.durationSec != null && fmtDur(o.durationSec),
+		a.bpm && `${esc(a.bpm)} BPM`,
+		a.key && `Key ${esc(a.key)}`,
+		a.catalogNumber && `Cat# ${esc(a.catalogNumber)}`,
+		a.country && esc(a.country),
+		`${o.watchers ? `<span class="watch">${fmtN(o.watchers)}</span>` : '0'} watching`,
+		(o.kind === 'label' || o.kind === 'artist') && (o.scannedAt ? `Last scanned ${fmtDate(o.scannedAt)}` : 'Never scanned'),
+		`Discovered ${fmtDate(o.discoveredAt)} via ${esc(o.discoveredVia.replace('_', ' '))}`,
+	].filter(Boolean);
+	const sourceLinks = o.sources.map((s) => (s.url ? `<a class="chip" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.providerId)}">${esc(s.provider)} ↗</a>` : `<span class="chip" title="${esc(s.providerId)}">${esc(s.provider)}</span>`)).join('');
+	let html = `${o.redirectedFrom ? `<div class="redirect">Merged object <span class="mono">${esc(o.redirectedFrom)}</span> → showing the survivor.</div>` : ''}
+		<div class="head">
+			${a.coverUrl ? `<img src="${esc(a.coverUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ''}
+			<div>
+				<div class="kind">${esc(o.kind === 'recording' ? 'track' : o.kind)}</div>
+				<h1>${esc(o.name)}</h1>
+				${o.artists?.length && (o.kind === 'recording' || o.kind === 'release') ? `<div>${refLinks(o.artists)}</div>` : ''}
+				<div class="meta">${meta.map((m) => `<span>${m}</span>`).join('')}</div>
+				<div class="chips" style="margin-top:8px">${sourceLinks}</div>
+				${stats.library && (o.kind === 'label' || o.kind === 'artist') ? `<label class="lib" style="margin-top:8px" title="Releases, tracks, artists and their counts only as far as your tracks with local files reach"><input type="checkbox" id="lib-o" ${libraryOn() ? 'checked' : ''}> My library</label>` : ''}
+			</div>
+		</div>`;
+	// What the operator or the agent concluded about it (insights.ts).
+	if (o.insights?.length) {
+		html += section('Insights', `<div class="insights">${o.insights.map((i) => `<div><span class="chip">${esc(i.topic)}</span> ${esc(i.body)} <span class="dim">— ${esc(i.actor)}, ${fmtDate(i.createdAt)} · #${i.id}</span></div>`).join('')}</div>`, o.insights.length);
+	}
+
+	if (o.kind === 'label') {
+		html += section('Releases', table(RELEASE_COLS(false), o.releases, o.releaseCount), o.releaseCount);
+		html += `<div class="grid2"><div>${section('Artists releasing here', refBlock(o.artists, true), o.artists.length)}</div>
+			<div>${section('Roster (from label pages)', refBlock(o.roster), o.roster.length)}</div></div>`;
+		if (o.playlists?.length) html += section('Label playlists', refBlock(o.playlists), o.playlists.length);
+	} else if (o.kind === 'artist') {
+		html += section('Releases', table(RELEASE_COLS(), o.releases, o.releaseCount), o.releaseCount);
+		html += section('Tracks', table(TRACK_COLS(false), o.tracks, o.trackCount), o.trackCount);
+		html += `<div class="grid2"><div>${section('Labels', refBlock(o.labels, true), o.labels.length)}</div>
+			<div>${section('On label rosters', refBlock(o.roster), o.roster.length)}</div></div>`;
+		if (o.similar?.length) html += section('Similar artists', refBlock(o.similar), o.similar.length);
+	} else if (o.kind === 'release') {
+		html += `<div class="grid2"><div>${section('Label', o.labels.length ? refBlock(o.labels) : `<div class="${o.release.labelText ? '' : 'dim'}">${esc(o.release.labelText ?? 'None.')}${o.release.labelText ? ' <span class="chip">text only</span>' : ''}</div>`)}</div>
+			<div>${section('Genres', refBlock(o.genres))}</div></div>`;
+		html += section('Tracklist', table(TRACK_COLS(true), o.tracks), o.tracks.length);
+	} else if (o.kind === 'recording') {
+		html += section('Appears on', table(RELEASE_COLS(), o.releases), o.releases.length);
+		html += `<div class="grid2"><div>${section('Genres', refBlock(o.genres))}</div><div>${section('In playlists', refBlock(o.playlists), o.playlists.length)}</div></div>`;
+		if (o.charts?.length) {
+			html += section('Charts', table([
+				['Chart', (c) => objLink(c.genre)],
+				['Provider', (c) => esc(c.provider), 'dim'],
+				['Rank', (c) => fmtN(c.rank), 'num'],
+				['Best', (c) => fmtN(c.bestRank), 'num'],
+				['Last seen', (c) => fmtDate(c.lastSeenAt), 'dim nowrap'],
+			], o.charts), o.charts.length);
+		}
+	}
+
+	html += section('Identifiers', o.identifiers.length ? table([['Namespace', (i) => esc(i.namespace), 'dim'], ['Value', (i) => `<span class="mono">${esc(i.value)}</span>`]], o.identifiers) : '<div class="dim">None.</div>');
+	html += section('Sources', table([
+		['Provider', (s) => esc(s.provider)],
+		['Id', (s) => (s.url ? `<a class="mono" href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.providerId)}</a>` : `<span class="mono">${esc(s.providerId)}</span>`)],
+		['First seen', (s) => fmtDate(s.firstSeenAt), 'dim nowrap'],
+		['Last seen', (s) => fmtDate(s.lastSeenAt), 'dim nowrap hide-sm'],
+	], o.sources), o.sources.length);
+	if (o.merged.length) html += section('Merged into this', refBlock(o.merged), o.merged.length);
+	html += `<details><summary>Raw: attributes and facts (${fmtN(o.facts.length)})</summary>
+		<pre>${esc(JSON.stringify({ id: o.id, attrs: o.attrs }, null, 2))}</pre>
+		${o.facts.length ? table([['Field', (f) => esc(f.field)], ['Source', (f) => esc(f.source), 'dim'], ['Value', (f) => `<span class="mono">${esc(JSON.stringify(f.value))}</span>`], ['Method', (f) => esc(f.method), 'dim hide-sm']], o.facts) : ''}
+	</details>`;
+	app.innerHTML = html;
+	app.querySelector('#lib-o')?.addEventListener('change', (e) => {
+		setLibrary(e.target.checked);
+		renderNav(listKind);
+		void renderObject(id);
+	});
+	window.scrollTo(0, 0);
+}
+
+// ---- inbox ----
+
+const FILTERS = [
+	{ f: 'needs', title: 'Needs you', q: 'status=open&severity=approval', count: (c) => c?.approval },
+	{ f: 'notices', title: 'Notices', q: 'status=open&severity=notice', count: (c) => c?.notice },
+	{ f: 'snoozed', title: 'Snoozed', q: 'status=snoozed', count: (c) => c?.snoozed },
+	{ f: 'all', title: 'All activity', q: 'status=all', count: () => null },
+];
+const ago = (ms) => {
+	const s = Math.max(0, (Date.now() - ms) / 1000);
+	return s < 90 ? 'just now' : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`;
+};
+const kindWords = (k) => k.replace('.', ' · ').replace('_', ' ');
+const pct = (x) => `${Math.round((x ?? 0) * 100)}%`;
+
+// What the item rests on, by kind; the lines the CLI prints for the same evidence.
+function evidenceHtml(it) {
+	const e = it.evidence ?? {};
+	const parts = [];
+	const related = (r) => {
+		const s = r.sides ?? [];
+		parts.push(`<div><span class="l">name</span> ${esc(r.name ?? 'unrelated')} · <span class="l">shared releases</span> ${fmtN(r.sharedReleases)} · <span class="l">shared artists</span> ${fmtN(r.sharedArtists)} (${pct(r.rosterShare?.[0])} of keep, ${pct(r.rosterShare?.[1])} of candidate)</div>`);
+		for (const [i, x] of s.entries()) parts.push(`<div><span class="l">${i === 0 ? 'keep' : 'cand'}</span> “${esc(x.name)}” · ${fmtN(x.releases)} releases ${esc(x.span?.[0] ?? '?')}…${esc(x.span?.[1] ?? '?')} · roster ${fmtN(x.roster)} · watchers ${fmtN(x.watchers)}${x.fromLibrary ? ' · in library' : ''} · pages ${esc((x.pages ?? []).join(', ') || '—')}</div>`);
+		if (r.sharedReleaseExamples?.length) parts.push(`<div><span class="l">both hold</span> ${esc(r.sharedReleaseExamples.join(' | '))}</div>`);
+		if (r.sharedArtistExamples?.length) parts.push(`<div><span class="l">both put out</span> ${esc(r.sharedArtistExamples.join(', '))}</div>`);
+	};
+	if (e.candidate?.evidence?.kind === 'related_label') related(e.candidate.evidence);
+	if (it.kind === 'review.escalated' && Array.isArray(e.candidates)) {
+		for (const [i, c] of e.candidates.entries()) {
+			const where = c.objectId ? objLink({ id: c.objectId, name: c.name }) : `${esc(c.name)} <span class="mono">${esc(c.provider)}:${esc(c.providerId)}</span>${c.url ? ` <a href="${esc(c.url)}" target="_blank" rel="noopener">↗</a>` : ''}`;
+			parts.push(`<label><input type="radio" name="cand-${it.id}" value="${i}" ${i === 0 ? 'checked' : ''}>[${i}] ${where}${c.releases?.length ? `<div class="l" style="margin-left:22px">lists: ${esc(c.releases.slice(0, 10).join(' | '))}</div>` : ''}</label>`);
+			if (c.evidence?.kind === 'related_label') related(c.evidence);
+		}
+		if (e.reviewEvidence?.releases?.length) parts.push(`<div><span class="l">catalogue holds</span> ${esc(e.reviewEvidence.releases.slice(0, 10).join(' | '))}</div>`);
+	}
+	if (Array.isArray(e.pairs)) {
+		const side = (r) => `${objLink({ id: r.id, name: r.title })}${r.artists?.length ? ` — ${esc(r.artists.join(', '))}` : ''}<span class="l"> ${esc(r.date ?? '')} [${esc((r.providers ?? []).join(','))}] ${fmtN(r.tracks)} tr</span>`;
+		// Open: a box per pair, ticked = merge; an unticked pair is ruled not twins (`except`).
+		const pick = it.status === 'open' && (it.kind === 'release.twins' || it.kind === 'artist.twins');
+		parts.push(`<table><thead><tr>${pick ? '<th title="Merge this pair">Merge</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th></tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><input type="checkbox" data-pair="${i}" checked aria-label="Merge pair ${i}"></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td></tr>`).join('')}</tbody></table>`);
+	}
+	if (it.kind === 'page.mismatch') parts.push(`<div><span class="l">only on this page (${fmtN(e.onlyHere)})</span> ${esc(e.sampleHere ?? '')}</div><div><span class="l">only elsewhere (${fmtN(e.onlyElsewhere)})</span> ${esc(e.sampleElsewhere ?? '')}</div>`);
+	if (it.kind === 'page.dead' || it.kind === 'tracker.failing') parts.push(`<div><span class="l">${esc(e.provider)}</span> failed ${fmtN(e.failCount)}× · last run ${e.lastRunAt ? fmtDate(e.lastRunAt) : '—'} · <span class="mono">${esc(e.lastError ?? '')}</span>${(e.handles ?? []).map((h) => h.url ? ` <a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.id)} ↗</a>` : ` ${esc(h.id)}`).join('')}</div>`);
+	if (e.url && !['page.dead', 'tracker.failing'].includes(it.kind)) parts.push(`<div><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)} ↗</a></div>`);
+	if (e.note) parts.push(`<div><span class="l">agent's note</span> ${esc(e.note)}</div>`);
+	const rest = Object.fromEntries(Object.entries(e).filter(([k, v]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'url', 'note', 'handles', 'sampleHere', 'sampleElsewhere', 'lastError', 'from', 'into'].includes(k) && v !== null && typeof v !== 'object'));
+	if (Object.keys(rest).length) parts.push(`<div class="l mono">${esc(Object.entries(rest).map(([k, v]) => `${k}: ${v}`).join(' · '))}</div>`);
+	return parts.length ? `<div class="ev">${parts.join('')}</div>` : '';
+}
+
+// The buttons word what approve / reject do for this item.
+function actionWords(it) {
+	if (it.apply) {
+		if (it.kind === 'review.escalated') return ['Decide', 'Leave it'];
+		if (it.kind === 'release.twins' || it.kind === 'artist.twins') return ['Merge ticked', 'None are twins'];
+		if (it.kind.startsWith('page.')) return ['Unlink', 'Keep the page'];
+		return ['Approve', 'Reject'];
+	}
+	return it.undo ? ['OK', 'Undo'] : ['Dismiss', null];
+}
+
+function itemHtml(it) {
+	const open = it.status === 'open';
+	const snoozed = open && it.snoozedUntil && it.snoozedUntil > Date.now();
+	const state = !open
+		? `${esc(it.status)}${it.resolution ? ` (${esc(it.resolution)})` : ''}${it.resolvedBy ? ` by ${esc(it.resolvedBy)}` : ''}${it.resolvedAt ? ` · ${ago(it.resolvedAt)}` : ''}${it.note ? ` — ${esc(it.note)}` : ''}`
+		: snoozed ? `snoozed until ${fmtDate(it.snoozedUntil)}` : '';
+	const [yes, no] = actionWords(it);
+	const actions = open && writable !== false
+		? `<div class="act">
+			<input type="text" placeholder="note (why)" data-note>
+			${it.kind === 'review.escalated' ? '<select data-choice aria-label="Decision for the chosen candidate"><option value="merge">merge</option><option value="attach">attach</option><option value="not_same">not the same</option></select>' : ''}
+			<button class="ok" data-do="approve" ${writable === null ? 'disabled' : ''}>${yes}</button>
+			${no ? `<button class="no" data-do="reject" ${writable === null ? 'disabled' : ''}>${no}</button>` : ''}
+			<select data-snooze aria-label="Snooze"><option value="">Snooze…</option><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option>${snoozed ? '<option value="0">Unsnooze</option>' : ''}</select>
+		</div>`
+		: open ? '<div class="state">read-only here: resolve it from the local catalogue\'s back office or the catalog CLI</div>' : '';
+	return `<div class="item ${open ? '' : 'resolved'}" data-id="${it.id}">
+		<div class="top"><span class="dot ${esc(it.severity)}" title="${esc(it.severity)}"></span><span class="chip">${esc(kindWords(it.kind))}</span><span class="title">${esc(it.title)}</span><span class="who">${esc(it.actor)} · ${ago(it.raisedAt)}${it.approvedBy ? ` · approved in chat by ${esc(it.approvedBy)}` : ''}${it.reviewId != null ? ` · review #${it.reviewId}` : ''} · #${it.id}</span></div>
+		${it.subjectNames?.length ? `<div class="about">${it.subjectNames.map(objLink).join('')}</div>` : ''}
+		${evidenceHtml(it)}
+		${actions}
+		${state || it.lastError ? `<div class="state">${state}${it.lastError ? ` <span class="err">last attempt failed: ${esc(it.lastError)}</span>` : ''}</div>` : ''}
+	</div>`;
+}
+
+function wireItem(card) {
+	const id = Number(card.dataset.id);
+	const refresh = async () => {
+		const it = await api(`inbox/${id}`);
+		const fresh = document.createElement('div');
+		fresh.innerHTML = itemHtml(it);
+		card.replaceWith(fresh.firstElementChild);
+		wireItem(document.querySelector(`.item[data-id="${id}"]`));
+		await refreshCounts();
+		renderNav('inbox');
+		document.querySelector('#inbox-filters')?.replaceWith(filtersHtml(parseHash().params.get('f') ?? 'needs'));
+	};
+	const fail = (e) => {
+		let s = card.querySelector('.state');
+		if (!s) { s = document.createElement('div'); s.className = 'state'; card.appendChild(s); }
+		s.innerHTML = `<span class="err">${esc(e.message)}</span>`;
+		for (const b of card.querySelectorAll('button')) b.disabled = false;
+	};
+	for (const b of card.querySelectorAll('button[data-do]')) {
+		b.addEventListener('click', async () => {
+			for (const x of card.querySelectorAll('button')) x.disabled = true;
+			const note = card.querySelector('[data-note]')?.value || null;
+			const chosen = card.querySelector(`input[name="cand-${id}"]:checked`);
+			let choice;
+			if (b.dataset.do === 'approve' && chosen) choice = { action: card.querySelector('[data-choice]')?.value ?? 'merge', candidate: Number(chosen.value) };
+			const unticked = [...card.querySelectorAll('input[data-pair]')].filter((x) => !x.checked).map((x) => Number(x.dataset.pair));
+			const except = b.dataset.do === 'approve' && unticked.length ? unticked : undefined;
+			try {
+				await admin('inboxDecide', { id, action: b.dataset.do, choice, except, note, by: 'guy' });
+				await refresh();
+			} catch (e) {
+				fail(e);
+			}
+		});
+	}
+	card.querySelector('[data-snooze]')?.addEventListener('change', async (e) => {
+		if (e.target.value === '') return;
+		try {
+			await admin('inboxSnooze', { id, days: Number(e.target.value) });
+			await refresh();
+		} catch (err) {
+			fail(err);
+		}
+	});
+}
+
+function filtersHtml(active) {
+	const el = document.createElement('div');
+	el.className = 'filters';
+	el.id = 'inbox-filters';
+	el.innerHTML = FILTERS.map((f) => { const n = f.count(inboxCounts); return `<a href="#/inbox?f=${f.f}" class="${f.f === active ? 'on' : ''}">${f.title}${n != null ? `<span class="n">${fmtN(n)}</span>` : ''}</a>`; }).join('');
+	return el;
+}
+
+let inboxSeq = 0;
+async function renderInbox(params) {
+	const f = FILTERS.find((x) => x.f === params.get('f')) ?? FILTERS[0];
+	const page = Math.max(Number(params.get('page') ?? 0) || 0, 0);
+	renderNav('inbox');
+	document.title = `Inbox${inboxCounts?.approval ? ` (${inboxCounts.approval})` : ''} · Catalogue`;
+	if (writable === null) {
+		// Probe once: a read-only host answers /admin with 404.
+		try {
+			await admin('inboxCounts', {});
+			writable = true;
+		} catch (e) {
+			writable = !/read-only|HTTP 404/.test(e.message);
+		}
+	}
+	await refreshCounts();
+	renderNav('inbox');
+	app.innerHTML = '';
+	app.appendChild(filtersHtml(f.f));
+	const list = document.createElement('div');
+	list.innerHTML = '<div class="loading">Loading…</div>';
+	app.appendChild(list);
+	const seq = ++inboxSeq;
+	let data;
+	try {
+		data = await api(`inbox?${f.q}&offset=${page * PAGE_SIZE}&limit=${PAGE_SIZE}`);
+	} catch (e) {
+		list.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+		return;
+	}
+	if (seq !== inboxSeq) return;
+	const to = Math.min((page + 1) * PAGE_SIZE, data.total);
+	list.innerHTML = (data.rows.length ? data.rows.map(itemHtml).join('') : `<div class="card"><div class="empty">${f.f === 'needs' ? 'Nothing waits for you.' : 'Nothing here.'}</div></div>`)
+		+ (data.total > PAGE_SIZE ? `<div class="tools"><div class="pager">${fmtN(page * PAGE_SIZE + 1)}–${fmtN(to)} of ${fmtN(data.total)}
+			<button id="prev" ${page === 0 ? 'disabled' : ''}>‹</button><button id="next" ${to >= data.total ? 'disabled' : ''}>›</button></div></div>` : '');
+	for (const card of list.querySelectorAll('.item')) wireItem(card);
+	list.querySelector('#prev')?.addEventListener('click', () => { location.hash = `#/inbox?f=${f.f}&page=${page - 1}`; });
+	list.querySelector('#next')?.addEventListener('click', () => { location.hash = `#/inbox?f=${f.f}&page=${page + 1}`; });
+}
+
+// ---- routing ----
+
+function route() {
+	const { parts, params } = parseHash();
+	if (parts[0] === 'o' && parts[1]) return void renderObject(parts[1]);
+	if (parts[0] === 'inbox') return void renderInbox(params);
+	const kindDef = KINDS.find((k) => k.path === parts[0]);
+	if (!kindDef) return void (location.hash = '#/inbox');
+	document.title = `${kindDef.title} · Catalogue`;
+	void renderList(kindDef, params);
+}
+
+window.addEventListener('hashchange', route);
+// Stats first: whether the library filter exists decides the first list's query.
+Promise.all([api('stats').then((s) => { stats = s; }).catch(() => {}), refreshCounts()]).then(() => { route(); });
+</script>
+</body>
+</html>

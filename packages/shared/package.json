@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./schema": "./src/schema.ts",
+    "./artist-credit": "./src/artist-credit.ts",
     "./enums": "./src/enums.ts",
     "./sync": "./src/sync.ts",
     "./log": "./src/log.ts",

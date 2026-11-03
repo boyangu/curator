@@ -16,6 +16,9 @@
 		"start": "node dist/server.js",
 		"db:migrate": "tsx src/cli/migrate.ts",
 		"snapshot": "tsx src/cli/snapshot.ts",
+		"local": "tsx --env-file-if-exists=../../.env src/cli/local.ts",
+		"catalog": "tsx --env-file-if-exists=../../.env src/cli/catalog.ts",
+		"backoffice": "tsx --env-file-if-exists=../../.env src/cli/backoffice.ts",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"typecheck": "tsc --noEmit && node ../../scripts/check-package-boundaries.mjs cloud"
@@ -27,7 +30,9 @@
 		"zod": "^3.23.8"
 	},
 	"devDependencies": {
+		"@curator/library-logic": "workspace:*",
 		"@curator/protocol": "workspace:*",
+		"@curator/shared": "workspace:*",
 		"@electric-sql/pglite": "^0.5.10",
 		"@trpc/client": "^11",
 		"@types/node": "^22.10.0",

@@ -1,4 +1,4 @@
-// Bundles the server and the two CLIs into dist/ for the image.
+// Bundles the server, the catalogue worker and the two CLIs into dist/ for the image.
 //
 // Workspace packages (`@curator/protocol`) export TypeScript source, which
 // plain Node will not load from node_modules, so they are bundled in; npm
@@ -15,6 +15,7 @@ const external = Object.keys(pkg.dependencies ?? {}).flatMap((name) => [name, `$
 await build({
 	entryPoints: {
 		server: 'src/server.ts',
+		worker: 'src/worker/main.ts',
 		migrate: 'src/cli/migrate.ts',
 		snapshot: 'src/cli/snapshot.ts',
 	},

@@ -31,6 +31,7 @@ const repoRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 //   allowNode  — node:* builtins in non-test source too
 //   testDirs   — files under these repo-relative dirs count as test code
 //   deny       — patterns refused even where another rule would allow them
+//   denyExempt — file → the exact denied specifiers it alone may import
 const RULES = {
 	protocol: { dir: 'packages/protocol/src', allow: ['zod'] },
 	'library-logic': {
@@ -52,16 +53,26 @@ const RULES = {
 	// so one import of it (or of a SQLite driver or dialect) would put the
 	// desktop's storage stack inside the server. It is a Node service, so
 	// node:* is fine in source, and its test harness under src/test/ counts as
-	// test code (PGlite, jose key generation and the tRPC client are devDeps).
+	// test code (PGlite, jose key generation and the tRPC client are devDeps),
+	// as does the dev-only local server (src/cli/local.ts, PGlite; not an
+	// entry of scripts/build.mjs, so never in the image).
 	cloud: {
 		dir: 'apps/cloud/src',
 		allow: ['@curator/protocol', '@curator/library-logic'],
-		allowExact: ['@curator/shared/enums', '@curator/shared/sync'],
+		// artist-credit is the one credit splitter desktop and catalogue readers
+		// must agree on; like enums and sync it loads nothing at runtime (a
+		// pure fold helper and a type).
+		allowExact: ['@curator/shared/enums', '@curator/shared/sync', '@curator/shared/artist-credit'],
 		typeOnly: ['@curator/shared'],
 		ownDeps: 'apps/cloud/package.json',
 		allowNode: true,
-		testDirs: ['apps/cloud/src/test/'],
+		testDirs: ['apps/cloud/src/test/', 'apps/cloud/src/cli/local.ts', 'apps/cloud/src/cli/catalog.ts'],
 		deny: [/^@curator\/(core|desktop|mcp|agent)(\/|$)/, /sqlite/i],
+		// The dev-only local server reads the desktop's library read-only
+		// through Node's built-in SQLite. Only src/cli/local.ts loads it (the
+		// back office imports its type), so it never reaches an entry of
+		// scripts/build.mjs or the image.
+		denyExempt: { 'apps/cloud/src/catalog/local-library.ts': ['node:sqlite'], 'apps/cloud/src/catalog/local-library.test.ts': ['node:sqlite'] },
 	},
 };
 
@@ -102,7 +113,7 @@ for (const file of walk(srcRoot)) {
 		if (spec.startsWith('./') || spec.startsWith('../')) continue;
 		const line = text.slice(0, m.index).split('\n').length;
 		const denied = (rule.deny ?? []).find((re) => re.test(spec));
-		if (denied) {
+		if (denied && !rule.denyExempt?.[rel]?.includes(spec)) {
 			failures.push(`${rel}:${line} imports "${spec}"; ${name} must never import anything matching ${denied}`);
 			continue;
 		}

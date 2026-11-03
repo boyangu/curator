@@ -54,9 +54,15 @@ importers:
         specifier: ^3.23.8
         version: 3.25.76
     devDependencies:
+      '@curator/library-logic':
+        specifier: workspace:*
+        version: link:../../packages/library-logic
       '@curator/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      '@curator/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       '@electric-sql/pglite':
         specifier: ^0.5.10
         version: 0.5.10
@@ -157,6 +163,9 @@ importers:
       '@curator/google-drive':
         specifier: workspace:*
         version: link:../../packages/providers/google-drive
+      '@curator/library-logic':
+        specifier: workspace:*
+        version: link:../../packages/library-logic
       '@curator/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

@@ -11,6 +11,34 @@ import type {
 	CataloguePutInput,
 	CataloguePutResult,
 } from './catalogue.js';
+import type {
+	CatalogGetInput,
+	CatalogBrowseInput,
+	CatalogBrowseResult,
+	CatalogImportInput,
+	CatalogImportResult,
+	CatalogIngestInput,
+	CatalogIngestResult,
+	CatalogListWatchesInput,
+	CatalogMuteInput,
+	CatalogObjectDetail,
+	CatalogEnrichInput,
+	CatalogEnrichResult,
+	CatalogRefreshInput,
+	CatalogRefreshResult,
+	CatalogResolveInput,
+	CatalogResolveResult,
+	CatalogSearchInput,
+	CatalogSearchResult,
+	CatalogUnwatchInput,
+	CatalogWatch,
+	CatalogWatchInput,
+	CatalogWatchResult,
+	FeedEventsInput,
+	FeedEventsResult,
+	FeedRecentInput,
+	FeedRecentResult,
+} from './catalog-service.js';
 import type { Op, RejectReason } from './ops.js';
 import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, SpotifyGrantStatus, SpotifyTokenInput, SpotifyTokenResult } from './spotify-gateway.js';
 
@@ -94,7 +122,11 @@ export type PushInput = {
 //     (spotify-gateway.ts): the account's Spotify grant lives in the cloud
 //     and devices ask it for access tokens. Like 'catalogue', listed only by
 //     a server configured for it.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway'] as const;
+//   - 'global_catalog': the `catalog.*` and `feed.events` procedures exist
+//     (catalog-service.ts): the shared catalogue of artists, labels,
+//     releases and recordings, watches, and the event stream devices feed
+//     their Discover from. Listed only by a server configured for it.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -334,6 +366,9 @@ export const CALL_ERROR_REASONS = [
 	'missing_token',
 	'token_expired',
 	'invalid_token',
+	// The server could not reach the signing keys to check the token (a 500,
+	// not a 401): the token is fine, retry.
+	'auth_unavailable',
 	// Push or pull from a device id the account has not registered: register,
 	// then retry the same call.
 	'device_not_registered',
@@ -380,6 +415,17 @@ export const CALL_ERROR_REASONS = [
 	// spotify.token / connect / adopt: Spotify refused the grant (revoked, a
 	// scope change, an expired code). Sign in to Spotify again.
 	'spotify_reconnect_required',
+	// catalog.* / feed.events ('global_catalog'): this server runs without the
+	// catalogue. Stop calling until `features` lists it.
+	'catalog_disabled',
+	// catalog.get / watch / unwatch / mute / refreshNow: no such object.
+	'catalog_not_found',
+	// catalog.watch / import: the account already watches CATALOG_MAX_WATCHES
+	// objects.
+	'catalog_watch_limit',
+	// catalog.watch / ingest: the claim is malformed or names nothing the
+	// catalogue can hold (detail in the result where there is one).
+	'catalog_claim_invalid',
 ] as const;
 export type CallErrorReason = (typeof CALL_ERROR_REASONS)[number];
 
@@ -424,6 +470,25 @@ export interface CloudService {
 		lookup(input: CatalogueLookupInput): Promise<CatalogueLookupResult>;
 		put(input: CataloguePutInput): Promise<CataloguePutResult>;
 		inventory(input: CatalogueInventoryInput): Promise<CatalogueInventoryResult>;
+	};
+	// 'global_catalog' (catalog-service.ts).
+	catalog: {
+		ingest(input: CatalogIngestInput): Promise<CatalogIngestResult>;
+		resolve(input: CatalogResolveInput): Promise<CatalogResolveResult>;
+		search(input: CatalogSearchInput): Promise<CatalogSearchResult>;
+		get(input: CatalogGetInput): Promise<CatalogObjectDetail>;
+		browse(input: CatalogBrowseInput): Promise<CatalogBrowseResult>;
+		watch(input: CatalogWatchInput): Promise<CatalogWatchResult>;
+		unwatch(input: CatalogUnwatchInput): Promise<{ ok: true }>;
+		mute(input: CatalogMuteInput): Promise<{ ok: true }>;
+		listWatches(input: CatalogListWatchesInput): Promise<CatalogWatch[]>;
+		import(input: CatalogImportInput): Promise<CatalogImportResult>;
+		refreshNow(input: CatalogRefreshInput): Promise<CatalogRefreshResult>;
+		enrich(input: CatalogEnrichInput): Promise<CatalogEnrichResult>;
+	};
+	feed: {
+		events(input: FeedEventsInput): Promise<FeedEventsResult>;
+		recent(input: FeedRecentInput): Promise<FeedRecentResult>;
 	};
 	// 'spotify_gateway' (spotify-gateway.ts).
 	spotify: {

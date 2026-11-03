@@ -9,8 +9,10 @@
 // enforces the import list in this package's typecheck.
 
 export * from './isrc.js';
+export * from './name-fold.js';
 export * from './recording-key.js';
 export * from './version.js';
 export * from './merge.js';
 export * from './overrides.js';
 export * from './reorder-moves.js';
+export * from './production-flags.js';

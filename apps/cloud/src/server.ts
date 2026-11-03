@@ -62,7 +62,9 @@ const handler = createFetchHandler({
 	spotify: config.spotify
 		? { clientId: config.spotify.clientId, crypto: new TokenCrypto(config.spotify.keys), fetch: (url, init) => fetch(url, init), timeoutMs: SPOTIFY_TIMEOUT_MS }
 		: null,
+	catalog: config.catalog,
 });
+log.info('global_catalog', { enabled: config.catalog });
 log.info('device_reads', { requireDeviceId: config.requireDeviceId });
 // Key ids only (fingerprints, src/spotify/crypto.ts), never a key.
 log.info('spotify_gateway', config.spotify

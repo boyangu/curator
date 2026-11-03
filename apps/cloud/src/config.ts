@@ -34,6 +34,10 @@ export type Config = {
 	spotify: { clientId: string; keys: TokenKeyring } | null;
 	// Which of the two are missing when the gateway is off, for the boot log.
 	spotifyMissing: string[];
+	// CURATOR_GLOBAL_CATALOG=1: the Global Catalog's procedures are served
+	// ('global_catalog'). Not a secret; fly.toml [env]. Off until the
+	// migrations (0011, 0012) and roles.sql have run.
+	catalog: boolean;
 };
 
 export class ConfigError extends Error {
@@ -74,17 +78,41 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 		if (e instanceof CataloguePolicyError) throw new ConfigError(e.message);
 		throw e;
 	}
-	const flag = env.CURATOR_REQUIRE_DEVICE_ID?.trim().toLowerCase() ?? '';
-	if (!['', '0', '1', 'false', 'true'].includes(flag)) throw new ConfigError(`CURATOR_REQUIRE_DEVICE_ID must be 0 or 1, not ${env.CURATOR_REQUIRE_DEVICE_ID}`);
-	const requireDeviceId = flag === '1' || flag === 'true';
+	const requireDeviceId = flagOf(env, 'CURATOR_REQUIRE_DEVICE_ID');
 	const { spotify, spotifyMissing } = loadSpotify(env);
-	return { databaseUrl, supabaseUrl, port, catalogue, requireDeviceId, spotify, spotifyMissing };
+	const catalog = flagOf(env, 'CURATOR_GLOBAL_CATALOG');
+	return { databaseUrl, supabaseUrl, port, catalogue, requireDeviceId, spotify, spotifyMissing, catalog };
+}
+
+// A 0/1 switch; anything else is a mistake and fails the boot.
+export function flagOf(env: NodeJS.ProcessEnv, name: string): boolean {
+	const flag = env[name]?.trim().toLowerCase() ?? '';
+	if (!['', '0', '1', 'false', 'true'].includes(flag)) throw new ConfigError(`${name} must be 0 or 1, not ${env[name]}`);
+	return flag === '1' || flag === 'true';
+}
+
+// SoundCloud's app credentials for the worker's label tracker; both or
+// neither. Either spelling of the id (Guy's .env writes CLIENTID).
+export function soundcloudCredentials(env: NodeJS.ProcessEnv): { clientId: string; clientSecret: string } | null {
+	const clientId = (env.CURATOR_SOUNDCLOUD_CLIENT_ID ?? env.CURATOR_SOUNDCLOUD_CLIENTID)?.trim() || null;
+	const clientSecret = (env.CURATOR_SOUNDCLOUD_CLIENT_SECRET ?? env.CURATOR_SOUNDCLOUD_CLIENTSECRET)?.trim() || null;
+	if ((clientId === null) !== (clientSecret === null)) throw new ConfigError('set both CURATOR_SOUNDCLOUD_CLIENT_ID and CURATOR_SOUNDCLOUD_CLIENT_SECRET, or neither');
+	return clientId && clientSecret ? { clientId, clientSecret } : null;
+}
+
+// Tidal through the app's own credentials (catalog/trackers/tidal-app.ts):
+// the store linker's lookups by UPC and ISRC. Unset switches that store off.
+export function tidalCredentials(env: NodeJS.ProcessEnv): { clientId: string; clientSecret: string } | null {
+	const clientId = env.CURATOR_TIDAL_CLIENT_ID?.trim() || null;
+	const clientSecret = env.CURATOR_TIDAL_CLIENT_SECRET?.trim() || null;
+	if ((clientId === null) !== (clientSecret === null)) throw new ConfigError('set both CURATOR_TIDAL_CLIENT_ID and CURATOR_TIDAL_CLIENT_SECRET, or neither');
+	return clientId && clientSecret ? { clientId, clientSecret } : null;
 }
 
 // Missing values switch the gateway off (a deployment that has not set the
 // secrets yet keeps serving sync); a value that is set but malformed fails
 // the boot, since that is a mistake, not a choice.
-function loadSpotify(env: NodeJS.ProcessEnv): Pick<Config, 'spotify' | 'spotifyMissing'> {
+export function loadSpotify(env: NodeJS.ProcessEnv): Pick<Config, 'spotify' | 'spotifyMissing'> {
 	const key = (name: string): TokenKey | null => {
 		const v = env[name]?.trim();
 		if (!v) return null;

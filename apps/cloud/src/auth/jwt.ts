@@ -17,7 +17,7 @@ export type AuthUser = {
 	sessionId: string | null;
 };
 
-export type AuthFailure = 'missing_token' | 'token_expired' | 'invalid_token';
+export type AuthFailure = 'missing_token' | 'token_expired' | 'invalid_token' | 'auth_unavailable';
 
 export class AuthError extends Error {
 	override readonly name = 'AuthError';
@@ -39,7 +39,10 @@ export function jwksUrl(supabaseUrl: string): URL {
 }
 
 export function remoteKeys(supabaseUrl: string): JWTVerifyGetKey {
-	return createRemoteJWKSet(jwksUrl(supabaseUrl));
+	// jose's default fetch timeout is five seconds; a cold fetch of the key
+	// set from a fresh process has taken longer. A key set is cached ten
+	// minutes, and an unknown `kid` refetches it at most every minute.
+	return createRemoteJWKSet(jwksUrl(supabaseUrl), { timeoutDuration: 15_000, cooldownDuration: 60_000, cacheMaxAge: 600_000 });
 }
 
 export function createTokenVerifier(opts: { supabaseUrl: string; keys: JWTVerifyGetKey; clockToleranceSec?: number }): TokenVerifier {
@@ -59,8 +62,15 @@ export function createTokenVerifier(opts: { supabaseUrl: string; keys: JWTVerify
 				}));
 			} catch (e) {
 				// The client refreshes on `token_expired` and signs in again on
-				// anything else; the jose detail stays in the server log only.
-				throw new AuthError(e instanceof errors.JWTExpired ? 'token_expired' : 'invalid_token');
+				// `invalid_token`; the jose detail stays in the server log only.
+				// A token that could not be checked at all — the key set did not
+				// answer (jose's fetch timed out, or the network failed) — is not
+				// a bad token: `auth_unavailable`, which the client retries.
+				// Telling the two apart matters: a cold key fetch past jose's
+				// timeout read as "invalid token" (2026-10-27).
+				if (e instanceof errors.JWTExpired) throw new AuthError('token_expired');
+				if (e instanceof errors.JWKSTimeout || !(e instanceof errors.JOSEError)) throw new AuthError('auth_unavailable');
+				throw new AuthError('invalid_token');
 			}
 			// `auth.uid()` casts `sub` to uuid; anything else would surface as a
 			// 500 deep inside a query instead of a 401 here.

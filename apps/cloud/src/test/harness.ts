@@ -250,6 +250,8 @@ export async function createTestApp(
 		// Default: on, against a fresh FakeSpotify, with a fresh key. `null` =
 		// gateway off (no client id or key).
 		spotify?: { fake?: FakeSpotify; keys?: TokenKeyring } | null;
+		// Default on. `false` = the Global Catalog switched off.
+		catalog?: boolean;
 	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
@@ -273,6 +275,7 @@ export async function createTestApp(
 		spotify: spotify
 			? { clientId: spotify.clientId, fetch: spotify.fetch, timeoutMs: 5_000, crypto: new TokenCrypto(opts.spotify?.keys ?? { current: randomTokenKey(), previous: null }) }
 			: null,
+		catalog: opts.catalog ?? true,
 	};
 	const handler = createFetchHandler(deps);
 	const client = (token?: string) =>
@@ -306,7 +309,15 @@ export async function createTestApp(
 
 function defaultRateLimitsUnbounded(): RateLimits {
 	const unbounded = () => new TokenBucketLimiter(1e9, 1e9);
-	return { push: unbounded(), pull: unbounded(), catalogue: unbounded(), spotifyToken: unbounded(), spotifyConnect: unbounded() };
+	return {
+		push: unbounded(),
+		pull: unbounded(),
+		catalogue: unbounded(),
+		spotifyToken: unbounded(),
+		spotifyConnect: unbounded(),
+		catalogRead: unbounded(),
+		catalogWrite: unbounded(),
+	};
 }
 
 // The `reason` the server put in the error's data, for `expect(...).rejects`.

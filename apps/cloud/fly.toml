@@ -17,8 +17,23 @@ kill_timeout = "15s"
   # quota raise: "rhythm,key,structure,advanced,fingerprint,peaks:lo,peaks:hi,vectors".
   # "off" (or removing the line) switches the catalogue off.
   CURATOR_CATALOGUE = "rhythm,key,structure,advanced,fingerprint,peaks:lo"
+  # The Global Catalog's procedures (src/catalog). "1" only after migrations 0011 + 0012 and
+  # roles.sql have run on the database.
+  CURATOR_GLOBAL_CATALOG = "0"
+  # Deezer's key-less catalogue for the worker's trackers (terms: non-commercial; registration
+  # closed, so it runs behind this switch and nothing requires it).
+  CURATOR_FEED_DEEZER = "0"
+
+# Two process groups from the one image: `app` serves the API, `worker` runs the Global
+# Catalog's trackers and identity planner (src/worker/main.ts) and serves nothing. The worker's
+# provider credentials are Fly secrets like the rest (CURATOR_SPOTIFY_APP_CLIENT_ID / _SECRET);
+# CURATOR_FEED_DEEZER below switches the key-less Deezer adapters on.
+[processes]
+  app = "node --enable-source-maps dist/server.js"
+  worker = "node --enable-source-maps dist/worker.js"
 
 [http_service]
+  processes = ["app"]
   internal_port = 8080
   force_https = true
   auto_start_machines = true
@@ -40,10 +55,18 @@ kill_timeout = "15s"
     timeout = "5s"
 
 [[vm]]
+  processes = ["app"]
   size = "shared-cpu-1x"
   # Nothing here holds a library in memory any more (the master publishes
   # the snapshot; the server never folds). The image caps the V8 heap at
   # 384 MB (Dockerfile NODE_OPTIONS); raising this, raise that too in [env],
   # e.g. for 1gb:
   #   NODE_OPTIONS = "--max-old-space-size=768"
+  memory = "512mb"
+
+# The worker: one small machine, always on (it runs on a timer, not on requests). 512 MB because
+# the image caps the heap at 384 MB for both processes (Dockerfile NODE_OPTIONS).
+[[vm]]
+  processes = ["worker"]
+  size = "shared-cpu-1x"
   memory = "512mb"

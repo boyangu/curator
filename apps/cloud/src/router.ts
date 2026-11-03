@@ -12,6 +12,20 @@ import {
 	ZBatchCommitInput,
 	ZBatchPushInput,
 	ZBootstrapInput,
+	ZCatalogGetInput,
+	ZCatalogBrowseInput,
+	ZCatalogImportInput,
+	ZCatalogIngestInput,
+	ZCatalogListWatchesInput,
+	ZCatalogMuteInput,
+	ZCatalogEnrichInput,
+	ZCatalogRefreshInput,
+	ZCatalogResolveInput,
+	ZCatalogSearchInput,
+	ZCatalogUnwatchInput,
+	ZCatalogWatchInput,
+	ZFeedEventsInput,
+	ZFeedRecentInput,
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
@@ -25,6 +39,18 @@ import {
 	type BatchBeginResult,
 	type BatchCommitResult,
 	type BatchPushResult,
+	type CatalogImportResult,
+	type CatalogIngestResult,
+	type CatalogObjectDetail,
+	type CatalogBrowseResult,
+	type CatalogEnrichResult,
+	type CatalogRefreshResult,
+	type CatalogResolveResult,
+	type CatalogSearchResult,
+	type CatalogWatch,
+	type CatalogWatchResult,
+	type FeedEventsResult,
+	type FeedRecentResult,
 	type CatalogueInventoryResult,
 	type CatalogueLookupResult,
 	type CataloguePolicy,
@@ -41,6 +67,7 @@ import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
+import * as catalog from './catalog/catalog.js';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
 import { BaseInvariantError } from './sync/base.js';
@@ -58,8 +85,10 @@ import type { BootstrapResult, HealthResult } from './wire.js';
 // catalogue when it runs without a catalogue policy and the Spotify gateway
 // when it runs without its client id or key. Health, push and pull all
 // answer with this one list, so a client never sees them disagree.
-export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify'>): SyncFeature[] {
-	return SYNC_FEATURES.filter((f) => (f !== 'catalogue' || deps.catalogue !== null) && (f !== 'spotify_gateway' || deps.spotify !== null));
+export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'catalog'>): SyncFeature[] {
+	return SYNC_FEATURES.filter(
+		(f) => (f !== 'catalogue' || deps.catalogue !== null) && (f !== 'spotify_gateway' || deps.spotify !== null) && (f !== 'global_catalog' || deps.catalog),
+	);
 }
 
 const withFeatures = <T extends { features?: SyncFeature[] }>(ctx: AppContext, r: T): T =>
@@ -150,6 +179,21 @@ async function spotifyCall<T>(ctx: AppContext, procedure: string, fn: () => Prom
 			ctx.deps.log.warn('spotify_unavailable', { requestId: ctx.call.requestId, procedure, stage: e.stage, status: e.status, spotifyError: e.spotifyError });
 			throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'spotify_unavailable' });
 		}
+		throw e;
+	}
+}
+
+// 'global_catalog' (src/catalog/catalog.ts): refused on a server without it;
+// a client that read `features` never gets here. A revoked device is audited
+// like a read from one.
+async function catalogCall<T>(ctx: AppContext & { user: { id: string } }, deviceId: string, bucket: 'catalogRead' | 'catalogWrite', fn: (deps: catalog.CatalogDeps) => Promise<T>): Promise<T> {
+	ctx.call.deviceId = deviceId;
+	if (!ctx.deps.catalog) throw new CloudError('PRECONDITION_FAILED', 'catalog_disabled');
+	rateLimit(ctx, bucket, ctx.user.id);
+	try {
+		return await fn({ db: ctx.deps.db, audit: ctx.call.audit });
+	} catch (e) {
+		if (e instanceof DeviceRevokedError) ctx.call.audit('read_from_revoked_device', { procedure: ctx.call.procedure ?? 'catalog', via: e.via });
 		throw e;
 	}
 }
@@ -297,6 +341,72 @@ export const appRouter = router({
 			rateLimit(ctx, 'catalogue', `${ctx.user.id}:${input.deviceId}`);
 			const r = await inventory(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), policy, input);
 			ctx.call.opsOut = r.entries.length;
+			return r;
+		}),
+	}),
+
+	// 'global_catalog' (src/catalog). Mutations for everything that writes,
+	// and for search / resolve so their inputs ride in the body. request_log:
+	// ops_in = claims sent, ops_out = events returned.
+	catalog: router({
+		ingest: authedProcedure.input(ZCatalogIngestInput).mutation(({ ctx, input }): Promise<CatalogIngestResult> => {
+			ctx.call.opsIn = input.claims.length;
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.ingest(d, ctx.user.id, callerOf(ctx), input));
+		}),
+		resolve: authedProcedure.input(ZCatalogResolveInput).mutation(({ ctx, input }): Promise<CatalogResolveResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.resolve(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		search: authedProcedure.input(ZCatalogSearchInput).mutation(({ ctx, input }): Promise<CatalogSearchResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.searchObjects(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		get: authedProcedure.input(ZCatalogGetInput).query(({ ctx, input }): Promise<CatalogObjectDetail> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.get(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		browse: authedProcedure.input(ZCatalogBrowseInput).query(({ ctx, input }): Promise<CatalogBrowseResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.browse(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		watch: authedProcedure.input(ZCatalogWatchInput).mutation(({ ctx, input }): Promise<CatalogWatchResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.watch(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		unwatch: authedProcedure.input(ZCatalogUnwatchInput).mutation(({ ctx, input }): Promise<{ ok: true }> =>
+			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.unwatch(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		mute: authedProcedure.input(ZCatalogMuteInput).mutation(({ ctx, input }): Promise<{ ok: true }> =>
+			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.mute(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		listWatches: authedProcedure.input(ZCatalogListWatchesInput).query(({ ctx, input }): Promise<CatalogWatch[]> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.watches(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		import: authedProcedure.input(ZCatalogImportInput).mutation(({ ctx, input }): Promise<CatalogImportResult> => {
+			ctx.call.opsIn = input.claims.length;
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.importWatches(d, ctx.user.id, callerOf(ctx), input));
+		}),
+		enrich: authedProcedure.input(ZCatalogEnrichInput).mutation(({ ctx, input }): Promise<CatalogEnrichResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.enrich(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		refreshNow: authedProcedure.input(ZCatalogRefreshInput).mutation(({ ctx, input }): Promise<CatalogRefreshResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.refresh(d, ctx.user.id, callerOf(ctx), input)),
+		),
+	}),
+
+	// The event stream devices feed their Discover from. The pull bucket: a
+	// device reads it on a timer, like sync.pull.
+	feed: router({
+		events: authedProcedure.input(ZFeedEventsInput).query(async ({ ctx, input }): Promise<FeedEventsResult> => {
+			ctx.call.deviceId = input.deviceId;
+			if (!ctx.deps.catalog) throw new CloudError('PRECONDITION_FAILED', 'catalog_disabled');
+			rateLimit(ctx, 'pull', pullKey(ctx.user));
+			const r = await catalog.events({ db: ctx.deps.db, audit: ctx.call.audit }, ctx.user.id, callerOf(ctx), input);
+			ctx.call.opsOut = r.events.length;
+			return r;
+		}),
+		// "Load more" on a device: a window of its watches' events, any seq.
+		recent: authedProcedure.input(ZFeedRecentInput).query(async ({ ctx, input }): Promise<FeedRecentResult> => {
+			ctx.call.deviceId = input.deviceId;
+			if (!ctx.deps.catalog) throw new CloudError('PRECONDITION_FAILED', 'catalog_disabled');
+			rateLimit(ctx, 'pull', pullKey(ctx.user));
+			const r = await catalog.recent({ db: ctx.deps.db, audit: ctx.call.audit }, ctx.user.id, callerOf(ctx), input);
+			ctx.call.opsOut = r.events.length;
 			return r;
 		}),
 	}),

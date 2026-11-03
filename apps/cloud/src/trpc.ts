@@ -39,6 +39,9 @@ export type AppDeps = {
 	// sealer and the fetch that reaches Spotify; null when the gateway is off
 	// (config.ts), which refuses its procedures and drops the feature.
 	spotify: SpotifyGateway | null;
+	// 'global_catalog' (src/catalog): on or off (config.ts CURATOR_GLOBAL_CATALOG).
+	// Off refuses the catalog.* and feed.* procedures and drops the feature.
+	catalog: boolean;
 };
 
 export type AppContext = {
@@ -86,7 +89,9 @@ export const authedProcedure = publicProcedure.use(async ({ ctx, next }) => {
 		if (e instanceof AuthError) {
 			// No user on the event: nothing about the caller is verified yet.
 			ctx.call.audit('auth_failed', { reason: e.reason });
-			throw new CloudError('UNAUTHORIZED', e.reason);
+			// A token the server could not check is the server's problem, not
+			// the token's: a 500 the client retries, never a 401 it signs out on.
+			throw new CloudError(e.reason === 'auth_unavailable' ? 'INTERNAL_SERVER_ERROR' : 'UNAUTHORIZED', e.reason);
 		}
 		throw e;
 	}

@@ -73,6 +73,39 @@ begin
 end
 $$;
 
+-- The Global Catalog (sql/0011_catalog.sql): shared across accounts, so no `authenticated` grant at
+-- all; the API and the worker read and write it as this role, outside any user transaction, and
+-- what a user may see leaves through the tRPC procedures only (src/catalog). The deliberate
+-- exception to "no privileges of its own": these rows belong to no user, so RLS has nothing to
+-- judge. catalog_watch is the per-user table among them: written as the user (RLS), read here by
+-- the fan-out and the sweeps. Conditional, like the functions above.
+do $$
+declare
+	t text;
+begin
+	foreach t in array array[
+		'catalog_object', 'catalog_source_object', 'catalog_identifier', 'catalog_fact', 'catalog_edge',
+		'catalog_edge_evidence', 'catalog_playlist_item', 'catalog_genre', 'genre_alias', 'catalog_not_same',
+		'catalog_merge_log', 'catalog_signal', 'catalog_audio', 'catalog_ingest_batch', 'catalog_enrich_task',
+		'catalog_event', 'catalog_event_subject', 'tracker', 'catalog_cursor', 'provider_budget', 'tracker_run',
+		'catalog_chart_entry', 'catalog_review', 'catalog_inbox', 'catalog_insight'
+	] loop
+		if to_regclass('curator.' || t) is not null then
+			execute format('grant select, insert, update, delete on curator.%I to curator_api', t);
+		end if;
+	end loop;
+	if to_regclass('curator.catalog_watch') is not null then
+		grant select on curator.catalog_watch to curator_api;
+	end if;
+	if to_regclass('curator.admin_user') is not null then
+		grant select on curator.admin_user to curator_api;
+	end if;
+	if to_regprocedure('curator.catalog_reserve_calls(text, integer, integer)') is not null then
+		grant execute on function curator.catalog_reserve_calls(text, integer, integer) to curator_api;
+	end if;
+end
+$$;
+
 -- The access log and audit trail (sql/0002_audit.sql): write-only for the API through these
 -- definer functions. No table grant at all, so it can neither read rows back nor update or
 -- delete them; only the owner can.

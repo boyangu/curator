@@ -58,6 +58,8 @@ export type RateLimits = {
 	catalogue: TokenBucketLimiter;
 	spotifyToken: TokenBucketLimiter;
 	spotifyConnect: TokenBucketLimiter;
+	catalogRead: TokenBucketLimiter;
+	catalogWrite: TokenBucketLimiter;
 };
 
 export function defaultRateLimits(now: () => number = Date.now): RateLimits {
@@ -74,5 +76,11 @@ export function defaultRateLimits(now: () => number = Date.now): RateLimits {
 		// spotify.connect / adopt / disconnect, per account: each one is a
 		// sign-in or a sign-out, and connect / adopt each call Spotify twice.
 		spotifyConnect: new TokenBucketLimiter(5, 5 / 60, now),
+		// catalog.search / get / resolve / listWatches, per account: typing in
+		// the Following panel's search box, a page of results at a time.
+		catalogRead: new TokenBucketLimiter(20, 5, now),
+		// catalog.ingest / watch / unwatch / mute / import / refreshNow, per
+		// account: each is a user's action, or one 200-claim batch of an import.
+		catalogWrite: new TokenBucketLimiter(30, 30 / 60, now),
 	};
 }

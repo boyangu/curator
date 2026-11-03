@@ -199,73 +199,92 @@ function cachedToken(gw: SpotifyGateway, userId: string, row: GrantRow): Spotify
 // written down (needs_reconnect) and committed before the call fails, so
 // every device sees it and none asks Spotify again with a dead token.
 export async function token(deps: GatewayDeps, userId: string, caller: Caller, deviceId: string): Promise<{ result: SpotifyTokenResult; refreshed: boolean }> {
-	const { gateway: gw } = deps;
 	const outcome = await withUserTx(deps.db, userId, async (tx): Promise<VendOutcome> => {
 		await gateDevice(tx, caller, deviceId);
-		const markReconnect = async (reason: 'invalid_grant' | 'undecryptable'): Promise<VendOutcome> => {
-			await tx.query(`update curator.spotify_grant set needs_reconnect = true, access_ct = null, access_expires_at = null, updated_at = now() where user_id = (select auth.uid())`);
-			return { ok: false, reason };
-		};
-		const check = (row: GrantRow | undefined): GrantRow => {
-			if (!row) throw new CloudError('FORBIDDEN', 'spotify_not_connected');
-			if (row.needs_reconnect) throw new CloudError('FORBIDDEN', 'spotify_reconnect_required');
-			return row;
-		};
-		// The common case, no lock: the shared token is still good.
-		const first = cachedToken(gw, userId, check(await readGrant(tx)));
-		if (first) return { ok: true, result: first, refreshed: false };
-		await tx.query(GRANT_LOCK);
-		// Whoever held the lock may have refreshed (or a connect replaced the
-		// grant, or a refusal flagged it) while this call waited.
-		const row = check(await readGrant(tx));
-		const again = cachedToken(gw, userId, row);
-		if (again) return { ok: true, result: again, refreshed: false };
-		let refreshToken: string;
-		try {
-			refreshToken = gw.crypto.open(userId, 'refresh', row.key_id, Buffer.from(row.refresh_ct, 'base64'));
-		} catch (e) {
-			if (!(e instanceof TokenOpenError)) throw e;
-			deps.log.error('spotify_grant_unopenable', { userId, keyId: row.key_id, current: gw.crypto.keyId });
-			return markReconnect('undecryptable');
-		}
-		let grant: SpotifyTokenGrant;
-		try {
-			grant = await refreshGrant(gw, refreshToken);
-		} catch (e) {
-			if (e instanceof SpotifyGrantRefusedError) return markReconnect('invalid_grant');
-			// Rate limit, outage: the grant is untouched (rolled back: nothing
-			// was written), the caller retries.
-			throw e;
-		}
-		const scopes = grant.scopes ?? (JSON.parse(row.scopes) as string[]);
-		// Both columns re-sealed under the current key, so a grant moves off a
-		// rotated key on its next refresh.
-		const [written] = await tx.query<{ expires_ms: unknown }>(
-			`update curator.spotify_grant set
-				refresh_ct = decode($1, 'base64'), access_ct = decode($2, 'base64'),
-				access_expires_at = clock_timestamp() + make_interval(secs => $3::float8),
-				scopes = array(select jsonb_array_elements_text($4::text::jsonb)), key_id = $5, updated_at = now()
-			where user_id = (select auth.uid())
-			returning floor(extract(epoch from access_expires_at) * 1000)::float8 as expires_ms`,
-			[
-				b64(gw.crypto.seal(userId, 'refresh', grant.refreshToken ?? refreshToken)),
-				b64(gw.crypto.seal(userId, 'access', grant.accessToken)),
-				String(grant.expiresInSec),
-				JSON.stringify(scopes),
-				gw.crypto.keyId,
-			],
-		);
-		return {
-			ok: true,
-			refreshed: true,
-			result: { accessToken: grant.accessToken, expiresAt: num(written!.expires_ms), scopes, profile: JSON.parse(row.profile) as SpotifyProfile },
-		};
+		return vend(deps, tx, userId);
 	});
 	if (!outcome.ok) {
 		deps.audit('spotify_refresh_failed', { reason: outcome.reason }, { deviceId });
 		throw new CloudError('FORBIDDEN', 'spotify_reconnect_required');
 	}
 	return { result: outcome.result, refreshed: outcome.refreshed };
+}
+
+// The account's access token for the catalogue worker (a tracker reading a
+// watched playlist as one of its watchers): the same cached-or-refreshed token
+// a device gets, under the same lock, minus the device gate (no device asks).
+// A refusal is written down exactly as for a device and thrown.
+export async function tokenForUser(deps: Pick<GatewayDeps, 'db' | 'log' | 'gateway'>, userId: string): Promise<SpotifyTokenResult> {
+	const outcome = await withUserTx(deps.db, userId, (tx) => vend(deps, tx, userId));
+	if (!outcome.ok) {
+		deps.log.warn('spotify_refresh_failed', { userId, reason: outcome.reason, by: 'worker' });
+		throw new CloudError('FORBIDDEN', 'spotify_reconnect_required');
+	}
+	return outcome.result;
+}
+
+// Inside the user's transaction: the cached token, or a refresh under the
+// account's lock.
+async function vend(deps: Pick<GatewayDeps, 'log' | 'gateway'>, tx: Queryable, userId: string): Promise<VendOutcome> {
+	const { gateway: gw } = deps;
+	const markReconnect = async (reason: 'invalid_grant' | 'undecryptable'): Promise<VendOutcome> => {
+		await tx.query(`update curator.spotify_grant set needs_reconnect = true, access_ct = null, access_expires_at = null, updated_at = now() where user_id = (select auth.uid())`);
+		return { ok: false, reason };
+	};
+	const check = (row: GrantRow | undefined): GrantRow => {
+		if (!row) throw new CloudError('FORBIDDEN', 'spotify_not_connected');
+		if (row.needs_reconnect) throw new CloudError('FORBIDDEN', 'spotify_reconnect_required');
+		return row;
+	};
+	// The common case, no lock: the shared token is still good.
+	const first = cachedToken(gw, userId, check(await readGrant(tx)));
+	if (first) return { ok: true, result: first, refreshed: false };
+	await tx.query(GRANT_LOCK);
+	// Whoever held the lock may have refreshed (or a connect replaced the
+	// grant, or a refusal flagged it) while this call waited.
+	const row = check(await readGrant(tx));
+	const again = cachedToken(gw, userId, row);
+	if (again) return { ok: true, result: again, refreshed: false };
+	let refreshToken: string;
+	try {
+		refreshToken = gw.crypto.open(userId, 'refresh', row.key_id, Buffer.from(row.refresh_ct, 'base64'));
+	} catch (e) {
+		if (!(e instanceof TokenOpenError)) throw e;
+		deps.log.error('spotify_grant_unopenable', { userId, keyId: row.key_id, current: gw.crypto.keyId });
+		return markReconnect('undecryptable');
+	}
+	let grant: SpotifyTokenGrant;
+	try {
+		grant = await refreshGrant(gw, refreshToken);
+	} catch (e) {
+		if (e instanceof SpotifyGrantRefusedError) return markReconnect('invalid_grant');
+		// Rate limit, outage: the grant is untouched (rolled back: nothing
+		// was written), the caller retries.
+		throw e;
+	}
+	const scopes = grant.scopes ?? (JSON.parse(row.scopes) as string[]);
+	// Both columns re-sealed under the current key, so a grant moves off a
+	// rotated key on its next refresh.
+	const [written] = await tx.query<{ expires_ms: unknown }>(
+		`update curator.spotify_grant set
+			refresh_ct = decode($1, 'base64'), access_ct = decode($2, 'base64'),
+			access_expires_at = clock_timestamp() + make_interval(secs => $3::float8),
+			scopes = array(select jsonb_array_elements_text($4::text::jsonb)), key_id = $5, updated_at = now()
+		where user_id = (select auth.uid())
+		returning floor(extract(epoch from access_expires_at) * 1000)::float8 as expires_ms`,
+		[
+			b64(gw.crypto.seal(userId, 'refresh', grant.refreshToken ?? refreshToken)),
+			b64(gw.crypto.seal(userId, 'access', grant.accessToken)),
+			String(grant.expiresInSec),
+			JSON.stringify(scopes),
+			gw.crypto.keyId,
+		],
+	);
+	return {
+		ok: true,
+		refreshed: true,
+		result: { accessToken: grant.accessToken, expiresAt: num(written!.expires_ms), scopes, profile: JSON.parse(row.profile) as SpotifyProfile },
+	};
 }
 
 // spotify.disconnect: the grant is deleted here. Spotify has no endpoint to

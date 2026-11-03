@@ -1,5 +1,5 @@
 import { MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION } from '@curator/protocol';
-import { SignJWT, UnsecuredJWT } from 'jose';
+import { errors, SignJWT, UnsecuredJWT } from 'jose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createKeys, createTestApp, errorReason, ISSUER, SUPABASE_URL, type TestApp } from '../test/harness.js';
 import { AuthError, createTokenVerifier, jwksUrl } from './jwt.js';
@@ -26,6 +26,17 @@ describe('token verification', () => {
 		const verifier = createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: app.keys });
 		await expect(verifier.verify('Basic abc')).rejects.toEqual(new AuthError('missing_token'));
 		await expect(verifier.verify('Bearer')).rejects.toEqual(new AuthError('missing_token'));
+	});
+
+	it('a key set that does not answer is auth_unavailable, not a bad token', async () => {
+		const token = await app.sign(await app.createUser());
+		const timedOut = createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: async () => { throw new errors.JWKSTimeout(); } });
+		await expect(timedOut.verify(`Bearer ${token}`)).rejects.toEqual(new AuthError('auth_unavailable'));
+		const offline = createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: async () => { throw new TypeError('fetch failed'); } });
+		await expect(offline.verify(`Bearer ${token}`)).rejects.toEqual(new AuthError('auth_unavailable'));
+		// A key set that answers but holds no key for the token is a bad token.
+		const noKey = createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: async () => { throw new errors.JWKSNoMatchingKey(); } });
+		await expect(noKey.verify(`Bearer ${token}`)).rejects.toEqual(new AuthError('invalid_token'));
 	});
 
 	it('rejects an expired token as token_expired so the client refreshes', async () => {

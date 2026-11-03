@@ -4,6 +4,54 @@ import { findSqlDir, listMigrations, migrate, MigrationDriftError } from './migr
 
 const sqlDir = findSqlDir();
 
+// Tables holding a user's rows: RLS on, every policy keyed on auth.uid().
+const USER_TABLES = [
+	'audit_event',
+	'catalogue_account',
+	'catalogue_item',
+	'device',
+	'device_session',
+	'library_base',
+	'library_op',
+	'library_op_batch',
+	'library_op_fence',
+	'library_op_staged',
+	'library_snapshot',
+	'request_log',
+	'spotify_grant',
+	'catalog_watch',
+];
+
+// The Global Catalog (sql/0011): shared across accounts, reachable only as curator_api.
+const SHARED_TABLES = [
+	'admin_user',
+	'catalog_audio',
+	'catalog_chart_entry',
+	'catalog_cursor',
+	'catalog_edge',
+	'catalog_edge_evidence',
+	'catalog_enrich_task',
+	'catalog_event',
+	'catalog_event_subject',
+	'catalog_fact',
+	'catalog_genre',
+	'catalog_identifier',
+	'catalog_inbox',
+	'catalog_ingest_batch',
+	'catalog_insight',
+	'catalog_merge_log',
+	'catalog_not_same',
+	'catalog_object',
+	'catalog_playlist_item',
+	'catalog_review',
+	'catalog_signal',
+	'catalog_source_object',
+	'genre_alias',
+	'provider_budget',
+	'tracker',
+	'tracker_run',
+];
+
 describe('migrations', () => {
 	let t: TestDb;
 	beforeAll(async () => {
@@ -25,22 +73,7 @@ describe('migrations', () => {
 		const tables = await t.db.query<{ table_name: string }>(
 			`select table_name from information_schema.tables where table_schema = 'curator' order by table_name`,
 		);
-		expect(tables.map((r) => r.table_name)).toEqual([
-			'audit_event',
-			'catalogue_account',
-			'catalogue_item',
-			'device',
-			'device_session',
-			'library_base',
-			'library_op',
-			'library_op_batch',
-			'library_op_fence',
-			'library_op_staged',
-			'library_snapshot',
-			'request_log',
-			'schema_migration',
-			'spotify_grant',
-		]);
+		expect(tables.map((r) => r.table_name)).toEqual([...USER_TABLES, ...SHARED_TABLES, 'schema_migration'].sort());
 	});
 
 	it('refuses to run when an applied file changed', async () => {
@@ -53,23 +86,22 @@ describe('migrations', () => {
 	it('enables RLS on every curator table that holds user data', async () => {
 		const rows = await t.db.query<{ relname: string; relrowsecurity: boolean }>(
 			`select c.relname, c.relrowsecurity from pg_class c join pg_namespace n on n.oid = c.relnamespace
-			where n.nspname = 'curator' and c.relkind = 'r' and c.relname <> 'schema_migration' order by c.relname`,
+			where n.nspname = 'curator' and c.relkind = 'r' and c.relname = any($1::text[]) order by c.relname`,
+			[`{${USER_TABLES.join(',')}}`],
 		);
-		expect(rows).toEqual([
-			{ relname: 'audit_event', relrowsecurity: true },
-			{ relname: 'catalogue_account', relrowsecurity: true },
-			{ relname: 'catalogue_item', relrowsecurity: true },
-			{ relname: 'device', relrowsecurity: true },
-			{ relname: 'device_session', relrowsecurity: true },
-			{ relname: 'library_base', relrowsecurity: true },
-			{ relname: 'library_op', relrowsecurity: true },
-			{ relname: 'library_op_batch', relrowsecurity: true },
-			{ relname: 'library_op_fence', relrowsecurity: true },
-			{ relname: 'library_op_staged', relrowsecurity: true },
-			{ relname: 'library_snapshot', relrowsecurity: true },
-			{ relname: 'request_log', relrowsecurity: true },
-			{ relname: 'spotify_grant', relrowsecurity: true },
-		]);
+		expect(rows).toEqual([...USER_TABLES].sort().map((relname) => ({ relname, relrowsecurity: true })));
+	});
+
+	// The Global Catalog's shared tables belong to no user: no RLS to judge
+	// them, so `authenticated` and `anon` hold no privilege on them at all
+	// (curator_api's grants come from roles.sql).
+	it('grants the shared catalogue tables to no client role', async () => {
+		const rows = await t.db.query<{ table_name: string; grantee: string }>(
+			`select table_name, grantee from information_schema.role_table_grants
+			where table_schema = 'curator' and table_name = any($1::text[]) and grantee in ('authenticated', 'anon', 'public')`,
+			[`{${SHARED_TABLES.join(',')}}`],
+		);
+		expect(rows).toEqual([]);
 	});
 });
 
