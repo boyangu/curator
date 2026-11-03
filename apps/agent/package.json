@@ -15,7 +15,7 @@
 		"@ai-sdk/deepseek": "^1.0.0",
 		"@ai-sdk/openai": "^2.0.0",
 		"@ai-sdk/openai-compatible": "^1.0.0",
-		"ai": "^5.0.0",
+		"ai": "^7.0.142",
 		"zod": "^4.0.0"
 	},
 	"devDependencies": {
