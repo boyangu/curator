@@ -6,7 +6,7 @@ import { classifyTail, createAgentService, describeViewContext, type AgentEvent,
 import { SqliteAgentStore } from './store.js';
 import type { AgentTool } from './tools.js';
 import type { ResultRefPorts } from './result-set.js';
-import type { WireMessage } from './protocol.js';
+import type { WireMessage } from '@curator/agent-core';
 
 describe('classifyTail', () => {
 	const history: WireMessage[] = [

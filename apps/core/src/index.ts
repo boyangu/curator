@@ -38,7 +38,7 @@ export type { CatalogWatch, CatalogClaim, CatalogHandle, CatalogKind } from '@cu
 export type { FeedStore } from './feed/store.js';
 export * from './knowledge/types.js';
 export type { KnowledgeStore } from './knowledge/store.js';
-export type { AgentConfig, AgentProvider, RunUsage as AgentRunUsage, WireToolSpec } from './agent/protocol.js';
+export type { AgentConfig, AgentProvider, RunUsage as AgentRunUsage, WireToolSpec } from '@curator/agent-core';
 export type { AgentResultSet, AgentResultItem } from './agent/result-set.js';
 export type { AgentStore, AgentSessionSummary, AgentSessionDetail } from './agent/store.js';
 export type { AgentEvent, AgentStatus, AgentViewCommand, AgentViewContext } from './agent/service.js';

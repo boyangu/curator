@@ -15,7 +15,7 @@
 import type { StreamingSource, TrackOverrides, ZTrackSortT } from '@curator/shared';
 import { splitArtistCredit, type TrackArtist } from '@curator/shared';
 import type { CoreService } from '../service.js';
-import type { WireToolSpec } from '../agent/protocol.js';
+import type { WireToolSpec } from '@curator/agent-core';
 import { keyToCamelot } from '../enrich/keys.js';
 
 export interface McpConfirmRequest {

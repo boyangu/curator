@@ -15,7 +15,7 @@ import type { SpotifyClient } from '@curator/spotify';
 import type { BeatportClient } from '@curator/beatport';
 import type { CoreService } from '../service.js';
 import type { KbAspect, KbEntity, KbEntityDetail, KbExpansion } from '../knowledge/types.js';
-import type { WireToolSpec } from './protocol.js';
+import type { WireToolSpec } from '@curator/agent-core';
 import { draftsFromWorkspaceRows, ProviderHitCache, type AgentResultItemDraft } from './result-set.js';
 import type { SessionWorkspace, WorkspaceLoadSummary, RowProvenance } from './workspace/manager.js';
 import { validTableName, type WorkspaceColumn } from './workspace/engine.js';

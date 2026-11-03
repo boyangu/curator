@@ -9,8 +9,8 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createDeepSeek } from '@ai-sdk/deepseek';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import type { AgentConfig, WireMessage, WireToolSpec } from '../protocol.js';
-import type { ModelAdapter, ModelDelta, ModelRequest, ModelStep } from './types.js';
+import type { AgentConfig, WireMessage, WireToolSpec } from '@curator/agent-core';
+import type { ModelAdapter, ModelDelta, ModelRequest, ModelStep } from '@curator/agent-core';
 
 function makeModel(cfg: AgentConfig, modelId: string): LanguageModel {
 	switch (cfg.provider) {

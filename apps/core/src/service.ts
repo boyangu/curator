@@ -213,7 +213,7 @@ import { SqliteAgentStore, type AgentSessionDetail, type AgentSessionSummary } f
 import { AgentSidecarManager, type AgentSidecarSpec } from './agent/sidecar.js';
 import { buildAgentTools } from './agent/tools.js';
 import { createAgentService, type AgentEvent, type AgentStatus, type AgentViewContext } from './agent/service.js';
-import type { AgentConfig, WireToolSpec } from './agent/protocol.js';
+import type { AgentConfig, WireToolSpec } from '@curator/agent-core';
 import type { AgentResultSet, ResultRefPorts } from './agent/result-set.js';
 import { createWorkspaceManager } from './agent/workspace/manager.js';
 import { createInlineWorkspaceHost, type WorkspaceHost } from './agent/workspace/host.js';

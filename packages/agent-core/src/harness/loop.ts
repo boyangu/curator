@@ -1,13 +1,16 @@
 // Default agent loop — while the model keeps calling tools and the step
 // budget lasts: stream one model step, forward client tool calls to the
-// host (or run sidecar-local tools), append results, re-stream. The AI SDK
-// never executes tools here; the loop owns execution so the host stays the
-// single authority on what a tool does.
+// host (or run loop-local tools), append results, re-stream. The model
+// adapter never executes tools here; the loop owns execution so the host
+// stays the single authority on what a tool does.
 
 import type { AgentDelta, RunParams, RunResult, RunUsage, WireMessage, WireToolResultPart } from '../protocol.js';
 import type { AgentLoop, LoopDeps, ModelDelta } from './types.js';
 
 const ARGS_SUMMARY_MAX = 120;
+
+// Byte length without node:Buffer — this package also runs where there is none.
+const utf8 = new TextEncoder();
 
 function summarize(value: unknown, max = ARGS_SUMMARY_MAX): string {
 	let s: string;
@@ -29,7 +32,7 @@ export function capToolResult(value: unknown, maxBytes: number): WireToolResultP
 	} catch (err) {
 		return { type: 'error-text', value: `tool result not serializable: ${err instanceof Error ? err.message : String(err)}` };
 	}
-	if (Buffer.byteLength(json, 'utf8') <= maxBytes) return { type: 'json', value };
+	if (utf8.encode(json).byteLength <= maxBytes) return { type: 'json', value };
 	return {
 		type: 'json',
 		value: {

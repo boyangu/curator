@@ -16,7 +16,7 @@ import type { AgentTool, AgentToolCtx } from './tools.js';
 import { toolSpecs } from './tools.js';
 import { CompositeProviderHits, ProviderHitCache, validateResultItems, type AgentResultSet, type ResultRefPorts } from './result-set.js';
 import type { WorkspaceManager } from './workspace/manager.js';
-import type { AgentConfig, AgentProvider, RunUsage, WireMessage, WireToolSpec } from './protocol.js';
+import { assemblePrompt, type AgentConfig, type AgentProvider, type DecisionToolCall, type RunUsage, type WireMessage, type WireToolSpec } from '@curator/agent-core';
 
 const alog = log.for('agent');
 
@@ -197,6 +197,10 @@ export interface AgentService {
 export function createAgentService(deps: AgentServiceDeps): AgentService {
 	const { store, sidecar, tools, refs } = deps;
 	const specs = toolSpecs(tools);
+	// The prompt version every turn is logged under: the frozen system prompt
+	// plus the tool list in its fixed order — exactly the provider's cached
+	// prefix (agent-core prompts/assemble.ts).
+	const promptHash = assemblePrompt({ core: SYSTEM_PROMPT, tools: specs }).hash;
 	const toolsByName = new Map(tools.map((t) => [t.name, t]));
 	const listeners = new Set<(e: AgentEvent) => void>();
 	// Current model config, mirrored from configure() for status display.
@@ -271,10 +275,36 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 
 	const runTurn = async (sessionId: string, turnId: string): Promise<void> => {
 		const ctx = buildToolCtx(sessionId, turnId, new ProviderHitCache());
+		const startedAt = Date.now();
+		const toolCalls: DecisionToolCall[] = [];
+		let model = '';
+		let mode: 'quick' | 'research' = 'research';
+		// The turn on the decision log, whatever ended it. Logging must never
+		// fail a turn that already ran.
+		const record = (stopReason: 'done' | 'cancelled' | 'max-steps' | 'error', usage: RunUsage, text: string): void => {
+			try {
+				store.record({
+					id: turnId,
+					surface: 'assistant',
+					task: mode,
+					promptHash,
+					model,
+					subject: sessionId,
+					startedAt,
+					endedAt: Date.now(),
+					stopReason,
+					usage,
+					costUsd: null,
+					toolCalls,
+					verdict: text.trim() ? text.trim().split('\n')[0]!.slice(0, 200) : null,
+				});
+			} catch (err) {
+				alog.warn('decision log write failed', { turnId }, err);
+			}
+		};
 
 		try {
 			const history = store.getMessages(sessionId);
-			let mode: 'quick' | 'research' = 'research';
 			try {
 				mode = (await sidecar!.classify(classifyTail(history))).mode;
 			} catch (err) {
@@ -282,7 +312,7 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 				// cost, not a wrong answer.
 				alog.warn('classify failed — defaulting to research', undefined, err);
 			}
-			const model = mode === 'research' ? config!.researchModel : config!.routerModel;
+			model = mode === 'research' ? config!.researchModel : config!.routerModel;
 			emit({ kind: 'turn-started', sessionId, turnId, mode, model });
 
 			const wallClock = setTimeout(() => {
@@ -317,6 +347,7 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 								case 'tool-end':
 									// Sidecar-executed tools (local web_fetch, provider
 									// web tools) — host tools emit their finish below.
+									toolCalls.push({ tool: delta.tool, ok: delta.ok });
 									emit({ kind: 'tool-finished', sessionId, turnId, callId: delta.callId, tool: delta.tool, ok: delta.ok, summary: delta.summary });
 									break;
 								case 'source':
@@ -332,12 +363,15 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 						onToolCall: async (callId, toolName, args) => {
 							const tool = toolsByName.get(toolName);
 							if (!tool) throw new Error(`unknown tool: ${toolName}`);
+							const t0 = Date.now();
 							try {
 								const result = await tool.execute(args, ctx);
+								toolCalls.push({ tool: toolName, ok: true, ms: Date.now() - t0 });
 								emit({ kind: 'tool-finished', sessionId, turnId, callId, tool: toolName, ok: true, summary: summarizeResult(result) });
 								return result;
 							} catch (err) {
 								const message = err instanceof Error ? err.message : String(err);
+								toolCalls.push({ tool: toolName, ok: false, ms: Date.now() - t0 });
 								emit({ kind: 'tool-finished', sessionId, turnId, callId, tool: toolName, ok: false, summary: message });
 								throw err;
 							}
@@ -349,6 +383,7 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 				if (result.stopReason === 'error') {
 					emit({ kind: 'error', sessionId, turnId, message: result.errorMessage ?? 'turn failed' });
 				}
+				record(result.stopReason, result.usage, result.text);
 				emit({ kind: 'turn-finished', sessionId, turnId, stopReason: result.stopReason, usage: result.usage, costUsd: null });
 			} finally {
 				clearTimeout(wallClock);
@@ -357,14 +392,9 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 			const message = err instanceof Error ? err.message : String(err);
 			alog.error('turn failed', err instanceof Error ? err : undefined, { turnId });
 			emit({ kind: 'error', sessionId, turnId, message });
-			emit({
-				kind: 'turn-finished',
-				sessionId,
-				turnId,
-				stopReason: 'error',
-				usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, steps: 0 },
-				costUsd: null,
-			});
+			const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, steps: 0 };
+			record('error', usage, '');
+			emit({ kind: 'turn-finished', sessionId, turnId, stopReason: 'error', usage, costUsd: null });
 		} finally {
 			activeTurn = null;
 		}

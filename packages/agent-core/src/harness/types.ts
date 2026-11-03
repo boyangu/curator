@@ -1,9 +1,10 @@
 // Harness seams — deepseek-harness-inspired: the model adapter, tool
 // execution port, session log, and the loop itself are each replaceable
 // interfaces with one default implementation. No plugin machinery — the
-// seams exist so tests can script a model, a hosted v2 can swap the tool
-// port for a service call, and an AI SDK major bump stays confined to
-// model-aisdk.ts.
+// seams exist so tests can script a model, a hosted runtime can swap the
+// tool port for a service call, and a provider SDK major bump stays
+// confined to that adapter (apps/agent/src/harness/model-aisdk.ts for the
+// AI SDK; the cloud's Anthropic adapter).
 
 import type { AgentConfig, AgentDelta, RunParams, RunResult, WireMessage, WireToolSpec } from '../protocol.js';
 
@@ -55,13 +56,14 @@ export interface ModelAdapter {
 	complete(config: AgentConfig, model: string, system: string, messages: WireMessage[]): Promise<string>;
 }
 
-// Seam 2 — where host tools actually run. The default implementation posts
+// Seam 2 — where host tools actually run. The sidecar's implementation posts
 // a tool-call frame and awaits the host's tool-result; tests execute inline.
 export interface ToolPort {
 	execute(callId: string, tool: string, args: unknown): Promise<unknown>;
 }
 
-// Sidecar-local tools (web_fetch floor). Executed in-process by the loop.
+// Loop-local tools (the sidecar's web_fetch floor). Executed in-process by
+// the loop.
 export type LocalTool = {
 	spec: WireToolSpec;
 	execute(args: unknown, abort: AbortSignal): Promise<unknown>;

@@ -17,7 +17,7 @@ import {
 	type RunParams,
 	type RunResult,
 	type WireMessage,
-} from './protocol.js';
+} from '@curator/agent-core';
 
 const alog = log.for('agent');
 

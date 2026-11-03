@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AgentSidecarManager } from './sidecar.js';
-import type { AgentDelta, RunParams } from './protocol.js';
+import type { AgentDelta, RunParams } from '@curator/agent-core';
 
 // Scripted fake sidecar child (plain Node, CJS via -e): speaks the protocol
 // well enough to exercise handshake, configure, classify, and the
@@ -120,7 +120,11 @@ describe('AgentSidecarManager', () => {
 	it('disables itself on a handshake mismatch', async () => {
 		const mgr = makeManager(FAKE_SIDECAR.replace("name: 'curator-agent'", "name: 'imposter'"));
 		mgr.start();
-		await new Promise((r) => setTimeout(r, 500));
+		// A spawned Node child takes a load-dependent while to print its hello
+		// (a fixed half-second failed under the full suite): wait for the
+		// manager to settle, with a generous ceiling.
+		const deadline = Date.now() + 10_000;
+		while (mgr.available && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
 		expect(mgr.available).toBe(false);
 		await expect(mgr.configure(CONFIG)).rejects.toThrow();
 		await mgr.shutdown();

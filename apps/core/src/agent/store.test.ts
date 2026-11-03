@@ -87,6 +87,19 @@ describe('SqliteAgentStore', () => {
 		expect(store.getResultSet('rs1')).toBeNull();
 	});
 
+	it('keeps the decision log: one record per turn, outcomes attached, newest first per session', () => {
+		const s = store.createSession('x');
+		const base = { surface: 'assistant' as const, task: 'quick', promptHash: 'abc', model: 'm', subject: s.id, stopReason: 'done' as const, costUsd: null };
+		store.record({ ...base, id: 'd1', startedAt: 1, endedAt: 2, usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, steps: 1 }, toolCalls: [{ tool: 'query_library', ok: true, ms: 12 }], verdict: 'first line' });
+		store.record({ ...base, id: 'd2', startedAt: 3, endedAt: 4, usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, steps: 1 }, toolCalls: [], verdict: null });
+		store.record({ ...base, id: 'd3', subject: 'other', startedAt: 5, endedAt: 6, usage: { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, steps: 1 }, toolCalls: [], verdict: null });
+		store.outcome({ decisionId: 'd1', at: 7, by: 'guy', kind: 'corrected', correction: { want: 'other' }, note: 'wrong list' });
+		const mine = store.listDecisions({ subject: s.id });
+		expect(mine.map((d) => d.id)).toEqual(['d2', 'd1']);
+		expect(mine[1]).toMatchObject({ promptHash: 'abc', toolCalls: [{ tool: 'query_library', ok: true, ms: 12 }], verdict: 'first line', usage: { inputTokens: 1 } });
+		expect(store.listDecisions().map((d) => d.id)).toEqual(['d3', 'd2', 'd1']);
+	});
+
 	it('lists sessions most recently touched first', () => {
 		const a = store.createSession('a');
 		const b = store.createSession('b');

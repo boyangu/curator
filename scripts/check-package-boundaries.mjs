@@ -34,6 +34,10 @@ const repoRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 //   denyExempt — file → the exact denied specifiers it alone may import
 const RULES = {
 	protocol: { dir: 'packages/protocol/src', allow: ['zod'] },
+	// The agent foundation: loaded by the Node sidecar, the Electron main
+	// process, the cloud worker and later a React Native app — relative
+	// imports only (no node:*, no schema library; tests may use vitest).
+	'agent-core': { dir: 'packages/agent-core/src', allow: [] },
 	'library-logic': {
 		dir: 'packages/library-logic/src',
 		// matcher is pure string scoring with no dependencies of its own;
@@ -58,7 +62,7 @@ const RULES = {
 	// entry of scripts/build.mjs, so never in the image).
 	cloud: {
 		dir: 'apps/cloud/src',
-		allow: ['@curator/protocol', '@curator/library-logic'],
+		allow: ['@curator/protocol', '@curator/library-logic', '@curator/agent-core'],
 		// artist-credit is the one credit splitter desktop and catalogue readers
 		// must agree on; like enums and sync it loads nothing at runtime (a
 		// pure fold helper and a type).

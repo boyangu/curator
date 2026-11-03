@@ -19,6 +19,7 @@
     "catalog:import": "tsx --env-file-if-exists=../../.env src/cli/catalog-import.ts"
   },
   "dependencies": {
+    "@curator/agent-core": "workspace:*",
     "@curator/beatport": "workspace:*",
     "@curator/google-drive": "workspace:*",
     "@curator/library-logic": "workspace:*",

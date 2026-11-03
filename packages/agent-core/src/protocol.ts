@@ -1,7 +1,6 @@
-// curator-agent protocol — newline-framed JSON over stdio, bidirectional.
-//
-// Host side: apps/core/src/agent/sidecar.ts — keep the two in sync (same
-// copy-with-comment convention as apps/researcher).
+// The agent wire protocol — one copy, shared by both ends of the stdio
+// boundary (apps/agent/src/main.ts and apps/core/src/agent/sidecar.ts), so
+// the two can never drift.
 //
 // Unlike the researcher's one-shot request/response, this protocol is
 // bidirectional: the agent loop runs in the sidecar, but tools execute
@@ -15,15 +14,14 @@
 // turn. `configure` can be re-sent at any time (key rotation without
 // respawn); the sidecar boots unconfigured and rejects `run` until armed.
 
-export const PROTOCOL = 1;
-export const SIDECAR_NAME = 'curator-agent';
+export const AGENT_PROTOCOL = 1;
+export const AGENT_SIDECAR_NAME = 'curator-agent';
 
 export type AgentProvider = 'anthropic' | 'openai' | 'deepseek' | 'openai-compatible';
 
 // BYOK model config. Two model roles, one loop: the router model handles
 // classification + quick turns; the research model runs multi-step research
-// turns. Provider-generic — the sidecar's model adapter maps this onto the
-// AI SDK provider packages.
+// turns. Provider-generic — a model adapter maps this onto its SDK.
 export interface AgentConfig {
 	provider: AgentProvider;
 	// openai-compatible only: the endpoint base URL.
@@ -33,6 +31,17 @@ export interface AgentConfig {
 	researchModel: string;
 }
 
+// What a tool does to the world, as MCP's tool annotations say it
+// (readOnlyHint, destructiveHint, idempotentHint, openWorldHint). Hints a
+// host feeds its confirm gate — never the authority on what runs: the host's
+// registry decides that by construction.
+export interface ToolAnnotations {
+	readOnly?: boolean;
+	destructive?: boolean;
+	idempotent?: boolean;
+	openWorld?: boolean;
+}
+
 // Tool schemas cross the wire as plain JSON Schema — deliberately NOT zod:
 // core (zod 3) and the sidecar (zod 4, AI SDK requirement) must not share a
 // schema library across the process boundary.
@@ -40,6 +49,7 @@ export interface WireToolSpec {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	annotations?: ToolAnnotations;
 }
 
 // Conversation messages — a structural subset of the AI SDK's ModelMessage
@@ -128,6 +138,10 @@ export interface RunResult {
 	errorMessage?: string;
 }
 
+export interface ClassifyResult {
+	mode: 'quick' | 'research';
+}
+
 // ─── Frames ──────────────────────────────────────────────────────────────
 
 // Sidecar → host.
@@ -147,7 +161,3 @@ export type AgentHostFrame =
 	| { method: 'tool-error'; callId: string; message: string }
 	| { method: 'cancel'; params: { turnId: string } }
 	| { method: 'shutdown' };
-
-export interface ClassifyResult {
-	mode: 'quick' | 'research';
-}

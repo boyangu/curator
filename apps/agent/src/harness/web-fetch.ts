@@ -6,7 +6,7 @@
 // Deliberately minimal: GET, 15s timeout, 100KB of extracted text, crude
 // HTML→text. Not a crawler — one page per call, the model pages itself.
 
-import type { LocalTool } from './types.js';
+import type { LocalTool } from '@curator/agent-core';
 
 const FETCH_TIMEOUT_MS = 15_000;
 const MAX_TEXT_BYTES = 100_000;

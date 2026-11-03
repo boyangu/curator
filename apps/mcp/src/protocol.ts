@@ -21,11 +21,9 @@ export interface BridgeDiscovery {
 	startedAt: number;
 }
 
-export interface WireToolSpec {
-	name: string;
-	description: string;
-	parameters: Record<string, unknown>;
-}
+// The tool shape is the agent foundation's; the bridge carries it unchanged.
+export type { WireToolSpec } from '@curator/agent-core';
+import type { WireToolSpec } from '@curator/agent-core';
 
 export type BridgeMethod = 'initialize' | 'tools/call' | 'ping';
 

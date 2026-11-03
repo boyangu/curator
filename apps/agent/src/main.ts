@@ -1,5 +1,6 @@
-// curator-agent — the in-app agent sidecar. Protocol contract lives in
-// ./protocol.ts (host side: apps/core/src/agent/sidecar.ts — keep in sync).
+// curator-agent — the in-app agent sidecar. The protocol and the loop come
+// from @curator/agent-core, shared with the host (apps/core/src/agent/
+// sidecar.ts); this program is the AI SDK adapter plus the stdio framing.
 //
 // The process is stateless across turns: `configure` arms it with BYOK
 // provider config (re-send = key rotation, no respawn), `classify` runs the
@@ -15,19 +16,21 @@ console.log = console.info = console.warn = console.error = (...args: unknown[])
 
 import { createInterface } from 'node:readline';
 import {
-	PROTOCOL,
-	SIDECAR_NAME,
+	AGENT_PROTOCOL,
+	AGENT_SIDECAR_NAME,
+	defaultLoop,
+	noopLog,
 	type AgentConfig,
 	type AgentDelta,
 	type AgentHostFrame,
 	type ClassifyResult,
+	type LocalTool,
 	type RunParams,
+	type ToolPort,
 	type WireMessage,
-} from './protocol.js';
-import { defaultLoop } from './harness/loop.js';
+} from '@curator/agent-core';
 import { aiSdkAdapter } from './harness/model-aisdk.js';
 import { webFetchTool } from './harness/web-fetch.js';
-import { noopLog, type LocalTool, type ToolPort } from './harness/types.js';
 
 const VERSION = '0.1.0';
 
@@ -100,7 +103,7 @@ async function run(params: RunParams): Promise<unknown> {
 }
 
 async function main(): Promise<void> {
-	send({ event: 'hello', name: SIDECAR_NAME, version: VERSION, protocol: PROTOCOL });
+	send({ event: 'hello', name: AGENT_SIDECAR_NAME, version: VERSION, protocol: AGENT_PROTOCOL });
 	const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 	for await (const line of rl) {
 		if (!line.trim()) continue;
