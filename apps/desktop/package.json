@@ -25,6 +25,7 @@
   "dependencies": {
     "@curator/core": "workspace:*",
     "@curator/google-drive": "workspace:*",
+    "@curator/library-logic": "workspace:*",
     "@curator/protocol": "workspace:*",
     "@curator/shared": "workspace:*",
     "@curator/spotify": "workspace:*",

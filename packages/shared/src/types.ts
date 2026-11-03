@@ -79,6 +79,7 @@ export const ZTrackFilter = z.object({
 			'loudnessRangeLu', 'dissonance', 'density',
 			'brightness', 'power', 'dynamicComplexity',
 			'introLengthSec', 'outroLengthSec', 'firstDropSec',
+			'prodLufs', 'prodPlr', 'prodCutoffHz', 'prodSubCorr', 'prodClipPct', 'prodScore', 'audioboxPq',
 		]),
 		min: z.number().optional(),
 		max: z.number().optional(),
@@ -130,7 +131,7 @@ export type ScalarBoundField = NonNullable<ZTrackFilterT['scalarBounds']>[number
 
 export const ZTrackSort = z.object({
 	// 'match' orders a similarTo scope by similarity score (best first on desc).
-	column: z.enum(['match', 'index', 'title', 'artist', 'album', 'releaseDate', 'label', 'genre', 'bpm', 'keyCamelot', 'duration', 'createdAt', 'rating', 'loudnessRangeLu', 'dissonance', 'density', 'brightness', 'power', 'dynamicComplexity', 'introLengthSec', 'outroLengthSec', 'firstDropSec']),
+	column: z.enum(['match', 'index', 'title', 'artist', 'album', 'releaseDate', 'label', 'genre', 'bpm', 'keyCamelot', 'duration', 'createdAt', 'rating', 'loudnessRangeLu', 'dissonance', 'density', 'brightness', 'power', 'dynamicComplexity', 'introLengthSec', 'outroLengthSec', 'firstDropSec', 'prodLufs', 'prodPlr', 'prodCutoffHz', 'prodScore', 'audioboxPq']),
 	dir: z.enum(['asc', 'desc']),
 });
 export type ZTrackSortT = z.infer<typeof ZTrackSort>;

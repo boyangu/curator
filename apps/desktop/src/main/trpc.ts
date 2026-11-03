@@ -161,6 +161,10 @@ export function buildAppRouter(h: Handlers) {
 			analyzeNow: proc('mir:analyze-now'),
 			provision: proc('mir:provision'),
 		}),
+		production: t.router({
+			judge: proc('production:judge'),
+			fit: proc('production:fit'),
+		}),
 		backup: t.router({
 			getSettings: proc('backup:get-settings'),
 			setSettings: proc('backup:set-settings'),

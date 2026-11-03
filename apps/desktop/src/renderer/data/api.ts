@@ -220,6 +220,21 @@ export const journeyApi = {
 	deleteBranch: (journeyId: string, nodeId: string) => api()['journey:delete-branch'](journeyId, nodeId),
 };
 
+// Following — the artists and labels the cloud tracks for Discover.
+export const catalogApi = {
+	status: () => api()['catalog:status'](),
+	watches: () => api()['catalog:watches'](),
+	search: (q: string) => api()['catalog:search'](q),
+	follow: (...args: Parameters<typeof window.api['catalog:follow']>) => api()['catalog:follow'](...args),
+	unfollow: (objectId: string) => api()['catalog:unfollow'](objectId),
+	mute: (objectId: string, muted: boolean) => api()['catalog:mute'](objectId, muted),
+	refresh: (objectId: string) => api()['catalog:refresh'](objectId),
+	importSpotify: () => api()['catalog:import-spotify'](),
+	enrichLabels: () => api()['catalog:enrich-labels'](),
+	candidates: (...args: Parameters<typeof window.api['catalog:candidates']>) => api()['catalog:candidates'](...args),
+	followMany: (...args: Parameters<typeof window.api['catalog:follow-many']>) => api()['catalog:follow-many'](...args),
+};
+
 export const kbApi = {
 	entity: (entityId: string) => api()['kb:entity'](entityId),
 	expand: (...args: Parameters<typeof window.api['kb:expand']>) => api()['kb:expand'](...args),
@@ -300,6 +315,19 @@ export const mirApi = {
 	analyzeNow: (trackIds: string[]) => trpc.mir.analyzeNow.mutate([trackIds]),
 	provision: () => trpc.mir.provision.mutate([]),
 	onEvent: (cb: Parameters<typeof window.api.onMirEvent>[0]) => api().onMirEvent(cb),
+};
+
+// Production quality: profile / pair draws / stats are queries; recording a
+// judgment and fitting the probe are mutations on tRPC.
+export const productionApi = {
+	profile: (trackId: string) => api()['production:profile'](trackId),
+	// Track rows for a pair (the compare dialog plays through player.play,
+	// which wants the full Track).
+	tracksByIds: (ids: string[]) => api()['tracks:list']({ ids }, undefined, ids.length),
+	nextPair: (opts?: { genre?: string | null; playlistId?: string | null }) => api()['production:next-pair'](opts),
+	stats: () => api()['production:stats'](),
+	judge: (a: string, b: string, winner: Parameters<typeof window.api['production:judge']>[2]) => trpc.production.judge.mutate([a, b, winner]),
+	fit: () => trpc.production.fit.mutate([]),
 };
 
 // Backup & restore. Status + listings are one-way queries on window.api;

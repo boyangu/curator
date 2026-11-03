@@ -31,10 +31,10 @@ import { SpotifySidecarHost } from './spotify-sidecar.js';
 import { LoadRecovery } from './load-recovery.js';
 import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
-import { createHttpCloudTransport } from './cloud/transport.js';
+import { createHttpCloudTransport, withLocalCatalog } from './cloud/transport.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
 import { createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
-import { cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
+import { catalogApiUrl, cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import { PROFILE_NAME_RE, decideRails, parseProfileEnv, profileAppUserModelId, profileDeviceName, profileRailsSummary, profileTitleSuffix, profileUserDataDir } from './profile.js';
 import type { CloudTransport } from '@curator/core';
 
@@ -1196,6 +1196,15 @@ app.whenReady().then(async () => {
 	}
 	const apiUrl = cloudApiUrl();
 	cloudTransport = cloudAccount && apiUrl ? createHttpCloudTransport(apiUrl, cloudAccount) : null;
+	// Development: the Global Catalog from a local server, sync unchanged.
+	const localCatalogUrl = app.isPackaged ? '' : catalogApiUrl();
+	if (cloudTransport && cloudAccount && localCatalogUrl) {
+		cloudTransport = withLocalCatalog(cloudTransport, createHttpCloudTransport(localCatalogUrl, cloudAccount), localCatalogUrl, {
+			name: profileDeviceName(hostname(), PROFILE),
+			platform: process.platform === 'darwin' ? 'darwin' : process.platform === 'linux' ? 'linux' : 'win32',
+		});
+		bootLog.info('global catalog from a local server', { url: localCatalogUrl });
+	}
 	bootLog.info('cloud sync', { account: !!cloudAccount, api: apiUrl || null, enabled: !!cloudTransport });
 	const accountForCore = cloudAccount;
 	core = createCoreService(dbPath, {

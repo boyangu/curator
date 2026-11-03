@@ -44,6 +44,7 @@ import type {
 } from './types.js';
 import { resolveFeedMembership } from './types.js';
 import { log } from '../log.js';
+import { CLOUD_FEED_PRODUCER_ID, CloudFeedProducer, type CatalogFeedPort } from './cloud-producer.js';
 
 const flog = log.for('feed');
 
@@ -105,6 +106,33 @@ export interface FeedServiceDeps {
 	// after feed.db holds it, and it says whether this device collects the
 	// feed. Absent ⇒ a standalone device: collects, states nothing.
 	decisions?: FeedDecisionPort;
+	// The Global Catalog's event stream (feed/cloud-producer.ts). Present on a
+	// device with a cloud transport; it reports itself unavailable until the
+	// server lists 'global_catalog'. Every device polls it, collector or not:
+	// the cloud collects, devices only read.
+	catalogFeed?: CatalogFeedPort;
+	// The account's watches, once the Spotify follows are carried into the
+	// catalogue (catalog-client/follows-sync.ts): follows live there from
+	// then on, so unfollow and mute act on the watch, not on Spotify.
+	catalogFollows?: CatalogFollowsPort;
+}
+
+export interface CatalogFollowsPort {
+	// The catalogue is reachable and the Spotify follows were carried over:
+	// the local Spotify producers defer to it.
+	active(): boolean;
+	// The catalogue is reachable: a follow that is a watch there is unfollowed
+	// and muted there, never on Spotify.
+	reachable(): boolean;
+	// The watch on this Spotify artist / playlist, or null.
+	watchFor(kind: 'artist' | 'playlist', spotifyId: string): Promise<string | null>;
+	// Spotify ids of every watched artist / playlist.
+	watchedSpotifyIds(kind: 'artist' | 'playlist'): Promise<Set<string>>;
+	// Spotify ids of watched playlists the cloud is not (yet) reading: this
+	// device's playlist producer keeps reading those.
+	deviceTrackedPlaylists(): Promise<Set<string>>;
+	unwatch(objectId: string): Promise<void>;
+	mute(objectId: string, muted: boolean): Promise<void>;
 }
 
 export interface FeedService {
@@ -127,11 +155,11 @@ export interface FeedService {
 	// producer stops seeing it), then hard-remove every feed item it
 	// produced. No suppression rule is written — a later re-follow should
 	// repopulate cleanly.
-	unfollowPlaylist(playlistId: string): Promise<FeedActionResult>;
+	unfollowPlaylist(playlistId: string, catalogId?: string): Promise<FeedActionResult>;
 	// Unfollow a source artist: drop them at the source (so the new-releases
 	// producer stops scanning them), then hard-remove every feed item they
 	// produced — release-origin items and any track/album they appear on.
-	unfollowArtist(artistId: string): Promise<FeedActionResult>;
+	unfollowArtist(artistId: string, catalogId?: string): Promise<FeedActionResult>;
 	refresh(): Promise<FeedRefreshResult>;
 	// Manual Refresh of one producer by id (see FEED_PRODUCER_IDS) — drives the
 	// temporary per-source Refresh buttons. Unknown id is a clean no-op.
@@ -213,13 +241,40 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 		new AlbumExpanderStage(() => spotifyClient('feed:album-expander')),
 	];
 	const scheduler = new FeedScheduler(store, () => enrichment.kick(), stages);
-	scheduler.register(new SpotifyPlaylistDeltaProducer(auth), THIRTY_MIN_MS, AUTO_POLL);
+	const catalogFeed = deps.catalogFeed ?? null;
+	const follows = deps.catalogFollows ?? null;
+	const followsActive = (): boolean => follows?.active() ?? false;
+	const followsReachable = (): boolean => follows?.reachable() ?? false;
+	// Cheap (one call per page of events), so it runs on a timer.
+	if (catalogFeed) scheduler.register(new CloudFeedProducer(catalogFeed), THIRTY_MIN_MS, true);
+	scheduler.register(
+		new SpotifyPlaylistDeltaProducer(auth, async () => (followsActive() ? follows!.deviceTrackedPlaylists() : null)),
+		THIRTY_MIN_MS,
+		AUTO_POLL,
+	);
 	// Pass the muted-artist lookup so the release walk skips silenced artists
 	// before spending a per-artist albums call (the ArtistDismissFilter still
 	// backstops at the pipeline).
-	scheduler.register(new SpotifyNewReleasesProducer(auth, () => store.suppressedKeys('artist')), ONE_DAY_MS, AUTO_POLL);
+	scheduler.register(new SpotifyNewReleasesProducer(auth, () => store.suppressedKeys('artist'), followsActive), ONE_DAY_MS, AUTO_POLL);
 	if (!AUTO_POLL)
 		flog.warn('Spotify producers are manual-only — no background polling; ingest runs on Refresh / Load More only');
+
+	// Unfollow through the catalogue when the follow is a watch there: the
+	// watch goes, and the items it produced go unless another watched artist /
+	// playlist also credits them. Null when there is no such watch.
+	const unfollowWatch = async (kind: 'artist' | 'playlist', spotifyId: string, catalogId?: string): Promise<FeedActionResult | null> => {
+		if (!followsReachable()) return null;
+		const objectId = catalogId ?? (await follows!.watchFor(kind, spotifyId));
+		if (!objectId) return null;
+		try {
+			await follows!.unwatch(objectId);
+		} catch (err) {
+			return { ok: false, error: `unfollow failed: ${err instanceof Error ? err.message : String(err)}` };
+		}
+		const still = await follows!.watchedSpotifyIds(kind).catch(() => new Set<string>());
+		still.delete(spotifyId);
+		return { ok: true, removed: await store.removeOriginItems(kind, spotifyId, still) };
+	};
 
 	// Per-page decoration of TRACK items (one batched deleted-probe + one
 	// membership probe). Two jobs:
@@ -419,6 +474,12 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 				for (const s of action.scopes) {
 					await store.addSuppression(s.scope, s.key);
 					decisions?.suppression(s.key, s.scope, true);
+					// A followed artist's watch is muted too, so the cloud's stream
+					// (and every device) stops bringing its releases.
+					if (s.scope === 'artist' && followsReachable() && s.key.startsWith('artist:')) {
+						const objectId = await follows!.watchFor('artist', s.key.slice('artist:'.length)).catch(() => null);
+						if (objectId) await follows!.mute(objectId, true).catch((e: unknown) => flog.warn('watch mute failed', undefined, e));
+					}
 				}
 				if (action.dismissItemId) {
 					const it = await store.getItem(action.dismissItemId);
@@ -567,7 +628,11 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 				}
 			}
 		},
-		async unfollowPlaylist(playlistId): Promise<FeedActionResult> {
+		async unfollowPlaylist(playlistId, catalogId): Promise<FeedActionResult> {
+			// Followed in the catalogue: unwatch there; Spotify is left alone (the
+			// playlist producer reads watched playlists only).
+			const viaCatalog = await unfollowWatch('playlist', playlistId, catalogId);
+			if (viaCatalog) return viaCatalog;
 			// Remote write — gated. Off-product code (no policy) throws here before
 			// touching the live account.
 			remoteWriteGate({ source: 'spotify', op: 'unfollowPlaylist', remoteId: playlistId });
@@ -589,7 +654,9 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			const removed = await store.removeOriginItems('playlist', playlistId, new Set(playlists.map((p) => p.id)));
 			return { ok: true, removed };
 		},
-		async unfollowArtist(artistId): Promise<FeedActionResult> {
+		async unfollowArtist(artistId, catalogId): Promise<FeedActionResult> {
+			const viaCatalog = await unfollowWatch('artist', artistId, catalogId);
+			if (viaCatalog) return viaCatalog;
 			// Remote write — gated (see unfollowPlaylist).
 			remoteWriteGate({ source: 'spotify', op: 'unfollowArtist', remoteId: artistId });
 			// Source first, fail-closed — same contract as unfollowPlaylist.
@@ -610,6 +677,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			return { ok: true, removed };
 		},
 		async refresh() {
+			// A follower collects nothing itself, but it does read the cloud's stream.
+			if (followerSkip() && catalogFeed?.available()) return scheduler.refreshProducer(CLOUD_FEED_PRODUCER_ID);
 			return followerSkip() ?? scheduler.runAll();
 		},
 		async refreshProducer(producerId) {
@@ -630,7 +699,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			// no-op (both Spotify producers are manual-only; see AUTO_POLL). Ingest
 			// runs on Refresh / Refresh-producer / Load More instead.
 			// A follower runs no producer, timers included (feed/sync.ts).
-			if (role().role === 'collector') scheduler.start();
+			// The cloud producer is the only auto-poll one, and every device runs it.
+			if (role().role === 'collector' || catalogFeed) scheduler.start();
 			// Drain any pre-existing backlog (items fetched before the enricher
 			// existed). Enrichment is Beatport-only, no Spotify quota, so it runs
 			// regardless of producer state.

@@ -19,12 +19,14 @@ export interface SpotifyTokens {
 	scope: string;
 }
 
+// email / country / product are gone from GET /me under the February 2026
+// Development Mode rules (see SPOTIFY_2026 below).
 export interface SpotifyMe {
 	id: string;
 	display_name: string | null;
-	email: string | null;
-	country: string;
-	product: string;
+	email?: string | null;
+	country?: string;
+	product?: string;
 	images: { url: string }[];
 	external_urls: { spotify: string };
 }
@@ -34,7 +36,8 @@ export interface SpotifyTrack {
 	name: string;
 	duration_ms: number;
 	explicit: boolean;
-	external_ids: { isrc?: string };
+	// Absent under the 2026 rules — the ISRC then has to come from elsewhere.
+	external_ids?: { isrc?: string };
 	artists: { id: string; name: string }[];
 	album: {
 		id: string;
@@ -97,11 +100,75 @@ export interface SpotifyPlaylist {
 	description: string | null;
 	owner: { id: string; display_name: string | null };
 	images: { url: string }[];
+	// Spotify now calls this `items`; normalizePlaylist maps it back.
 	tracks: { total: number };
+	// Spotify withheld the playlist's items (2026 rules: only owners and
+	// collaborators see them). Its tracks can't be read — not "it's empty".
+	itemsWithheld?: boolean;
 	collaborative: boolean;
 	public: boolean | null;
 	snapshot_id: string;
 	external_urls: { spotify: string };
+}
+
+// ─── Spotify's 2026 API (SPOTIFY_2026) ─────────────────────────────────────
+// The February 2026 Development Mode rules (moved onto existing apps in March,
+// with a postponement some older apps — ours, as of 2026-10-26 — still enjoy):
+// batch GET /tracks|/albums|/artists?ids= removed; /playlists/{id}/tracks
+// renamed /items, with each entry's `track` now `item` and the playlist's
+// `tracks` now `items`; a playlist's items served only to its owner and
+// collaborators; POST /users/{id}/playlists → POST /me/playlists; follow /
+// unfollow → /me/library with URIs; search capped at 10 results; ISRC, UPC and
+// label dropped from track and album objects.
+//
+// The client speaks both: each call tries its preferred form and falls back to
+// the other when Spotify says that form doesn't exist here (FORM_GONE), and
+// remembers which one answered, so the switch-over needs no release. Batch reads
+// prefer the batch (one call instead of 50) and drop to single lookups only once
+// Spotify refuses the batch. A write is only re-sent in the other form after a
+// rejection, which Spotify returns before doing anything.
+
+export class SpotifyHttpError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+	) {
+		super(message);
+		this.name = 'SpotifyHttpError';
+	}
+}
+
+// Spotify withheld a playlist's items. Callers must leave what they hold for
+// that playlist untouched — reading this as "the playlist is now empty" would
+// remove every row locally (and from rekordbox on the next push).
+export class SpotifyPlaylistItemsWithheldError extends Error {
+	constructor(readonly playlistId: string, detail: string) {
+		super(`Spotify no longer shares this playlist's tracks with Curator (${detail})`);
+		this.name = 'SpotifyPlaylistItemsWithheldError';
+	}
+}
+
+// Statuses that mean "this form of the request isn't served here" rather than
+// a failure of the request itself. 400 counts for writes and filtered reads: a
+// body or `fields` shape the other API version doesn't know.
+const FORM_GONE = new Set([400, 403, 404, 410]);
+const formChoice = new Map<string, number>();
+
+function normalizePlaylist(raw: SpotifyPlaylist & { items?: { total?: number } }): SpotifyPlaylist {
+	const count = raw.tracks ?? raw.items;
+	const { items: _items, ...rest } = raw;
+	return {
+		...rest,
+		tracks: { total: count?.total ?? 0 },
+		...(count ? {} : { itemsWithheld: true }),
+	};
+}
+
+type RawPlaylistEntry = Omit<SpotifyPlaylistTrack, 'track'> & { track?: SpotifyTrack | null; item?: SpotifyTrack | null };
+
+function normalizeEntry(raw: RawPlaylistEntry): SpotifyPlaylistTrack {
+	const { item, track, ...rest } = raw;
+	return { ...rest, track: track ?? item ?? null };
 }
 
 // ─── PKCE helpers ──────────────────────────────────────────────────────────
@@ -468,11 +535,76 @@ export class SpotifyClient {
 			}
 			if (!res.ok) {
 				const body = await res.text().catch(() => '');
-				throw new Error(`Spotify ${res.status} ${path}: ${body}`);
+				throw new SpotifyHttpError(res.status, `Spotify ${res.status} ${path}: ${body}`);
 			}
 			return res.json() as Promise<T>;
 		}
 		throw lastErr;
+	}
+
+	// One logical call in its alternative forms (SPOTIFY_2026), the last answer
+	// that worked tried first. `gone` is the set of statuses that move on to the
+	// next form; anything else is the call's real outcome and is thrown as is.
+	private async inForms<T>(key: string, forms: Array<() => Promise<T>>, gone: Set<number> = FORM_GONE): Promise<T> {
+		const first = formChoice.get(key) ?? 0;
+		const order = [first, ...forms.map((_, i) => i).filter((i) => i !== first)];
+		let lastErr: unknown;
+		for (const i of order) {
+			try {
+				const out = await forms[i]!();
+				if (i !== first) {
+					formChoice.set(key, i);
+					console.log(`[spotify] ${key}: switched to form ${i + 1} of ${forms.length}`);
+				}
+				return out;
+			} catch (err) {
+				if (!(err instanceof SpotifyHttpError) || !gone.has(err.status)) throw err;
+				lastErr = err;
+			}
+		}
+		throw lastErr;
+	}
+
+	// Batch lookup with single-id fallback. A batch the API no longer serves
+	// is only written off once a single lookup succeeds — a 403 that both
+	// forms share is a real refusal (bad token), not the endpoint going away.
+	private async lookupMany<T extends { id: string }>(
+		key: string,
+		ids: string[],
+		chunk: number,
+		batch: (ids: string[]) => Promise<(T | null)[]>,
+		single: (id: string) => Promise<T>,
+	): Promise<T[]> {
+		const out: T[] = [];
+		const singles = async (part: string[]): Promise<void> => {
+			for (const id of part) {
+				try {
+					out.push(await single(id));
+				} catch (err) {
+					// A batch answers null for an unknown id; keep that contract.
+					if (err instanceof SpotifyHttpError && (err.status === 404 || err.status === 400)) continue;
+					throw err;
+				}
+			}
+		};
+		for (const part of chunkArray(ids, chunk)) {
+			if (formChoice.get(key) === 1) {
+				await singles(part);
+				continue;
+			}
+			try {
+				for (const x of await batch(part)) if (x) out.push(x);
+			} catch (err) {
+				if (!(err instanceof SpotifyHttpError) || !FORM_GONE.has(err.status)) throw err;
+				const before = out.length;
+				await singles(part);
+				if (out.length > before) {
+					formChoice.set(key, 1);
+					console.log(`[spotify] ${key}: batch refused (${err.status}), using single lookups`);
+				}
+			}
+		}
+		return out;
 	}
 
 	// Generic write — POST / PUT / DELETE. Spotify's write endpoints either
@@ -506,7 +638,7 @@ export class SpotifyClient {
 		if (!res.ok) {
 			if (res.status === 429) noteRateLimit(Number(res.headers.get('retry-after') ?? '1'));
 			const txt = await res.text().catch(() => '');
-			throw new Error(`Spotify ${res.status} ${method} ${path}: ${txt}`);
+			throw new SpotifyHttpError(res.status, `Spotify ${res.status} ${method} ${path}: ${txt}`);
 		}
 		if (res.status === 204) return null;
 		const len = res.headers.get('content-length');
@@ -520,10 +652,15 @@ export class SpotifyClient {
 
 	// Fetch metadata for one playlist — used to compare snapshot_id before
 	// committing to a full /tracks refetch in the lazy-sync path.
-	getPlaylist(id: string): Promise<SpotifyPlaylist> {
-		return this.request<SpotifyPlaylist>(
-			`/playlists/${encodeURIComponent(id)}?fields=id,name,description,owner(id,display_name),images,tracks(total),collaborative,public,snapshot_id,external_urls`
-		);
+	// Both names of the count go into the filter (SPOTIFY_2026); an API that
+	// rejects the filter gets the unfiltered object.
+	async getPlaylist(id: string): Promise<SpotifyPlaylist> {
+		const base = `/playlists/${encodeURIComponent(id)}`;
+		const raw = await this.inForms('playlist-meta', [
+			() => this.request<SpotifyPlaylist>(`${base}?fields=id,name,description,owner(id,display_name),images,tracks(total),items(total),collaborative,public,snapshot_id,external_urls`),
+			() => this.request<SpotifyPlaylist>(base),
+		], new Set([400]));
+		return normalizePlaylist(raw);
 	}
 
 	// Paginate /me/playlists. Returns all of the user's playlists (including ones
@@ -536,7 +673,7 @@ export class SpotifyClient {
 		while (next) {
 			page++;
 			const body: SpotifyPaginated<SpotifyPlaylist> = await this.request(next);
-			out.push(...body.items);
+			out.push(...body.items.map(normalizePlaylist));
 			// URL-parse to extract pathname+search regardless of host/protocol —
 			// the old simple replace(API_BASE, '') was brittle to any host quirk
 			// (e.g. Spotify occasionally returning trailing slashes).
@@ -556,25 +693,54 @@ export class SpotifyClient {
 		return out;
 	}
 
-	// Paginate /playlists/{id}/tracks. Yields each PlaylistTrack item (which
+	// Paginate a playlist's items. Yields each PlaylistTrack item (which
 	// wraps Track plus per-item metadata like added_at). null `track` happens
 	// when a track is removed from Spotify catalog but still in the playlist —
 	// filtered out by the caller.
+	//
+	// Never returns a short list in place of the real one: callers replace
+	// their rows with what this returns, so a withheld or truncated answer
+	// throws (SpotifyPlaylistItemsWithheldError / Error) instead.
 	async getPlaylistTracks(playlistId: string): Promise<SpotifyPlaylistTrack[]> {
+		// track_number / disc_number + the album's artists / type / size feed
+		// the album seam (apps/core/src/library/albums.ts) so a newly synced
+		// track lands on a fully described release.
+		const trackFields = '(id,name,duration_ms,explicit,external_ids,external_urls,track_number,disc_number,artists(id,name),album(id,name,release_date,images,album_type,total_tracks,artists(id,name)))';
+		const base = `/playlists/${encodeURIComponent(playlistId)}`;
+		const itemsFields = `next,total,items(added_at,added_by.id,is_local,item${trackFields},track${trackFields})`;
+		const tracksFields = `next,total,items(added_at,added_by.id,is_local,track${trackFields})`;
+		let itemsStatus: number | null = null;
+		type Page = SpotifyPaginated<RawPlaylistEntry>;
+		let first: Page;
+		try {
+			first = await this.inForms<Page>('playlist-items', [
+				() => this.request<Page>(`${base}/items?limit=100&offset=0&fields=${encodeURIComponent(itemsFields)}`).catch((err) => {
+					if (err instanceof SpotifyHttpError) itemsStatus = err.status;
+					throw err;
+				}),
+				() => this.request<Page>(`${base}/tracks?limit=100&offset=0&fields=${encodeURIComponent(tracksFields)}`),
+				() => this.request<Page>(`${base}/items?limit=100&offset=0`),
+			]);
+		} catch (err) {
+			// Only the owner/collaborator rule answers 403 on /items; a missing
+			// playlist is a 404 and stays a plain error.
+			if (itemsStatus === 403 && err instanceof SpotifyHttpError) {
+				throw new SpotifyPlaylistItemsWithheldError(playlistId, `items ${itemsStatus}, last form ${err.status}`);
+			}
+			throw err;
+		}
 		const out: SpotifyPlaylistTrack[] = [];
-		let next: string | null =
-			`/playlists/${encodeURIComponent(playlistId)}/tracks?limit=100&offset=0` +
-			'&fields=' +
-			encodeURIComponent(
-				// track_number / disc_number + the album's artists / type / size
-				// feed the album seam (apps/core/src/library/albums.ts) so a
-				// newly synced track lands on a fully described release.
-				'next,items(added_at,added_by.id,is_local,track(id,name,duration_ms,explicit,external_ids,external_urls,track_number,disc_number,artists(id,name),album(id,name,release_date,images,album_type,total_tracks,artists(id,name))))'
-			);
-		while (next) {
-			const page: SpotifyPaginated<SpotifyPlaylistTrack> = await this.request(next);
-			out.push(...page.items);
-			next = page.next ? page.next.replace(API_BASE, '') : null;
+		let page: Page = first;
+		for (;;) {
+			if (!Array.isArray(page.items)) throw new SpotifyPlaylistItemsWithheldError(playlistId, 'no items in the answer');
+			// The /me/playlists quirk (right total, empty items) seen on a
+			// playlist would read as "emptied" — refuse it.
+			if (page.items.length === 0 && out.length < (page.total ?? 0)) {
+				throw new Error(`Spotify returned ${out.length} of ${page.total} items for playlist ${playlistId}; not trusting a short list`);
+			}
+			out.push(...page.items.map(normalizeEntry));
+			if (!page.next) break;
+			page = await this.request<Page>(page.next.replace(API_BASE, ''));
 		}
 		return out;
 	}
@@ -640,28 +806,26 @@ export class SpotifyClient {
 
 	// Full track objects by id (50 per request — chunked). Used at feed
 	// promotion time to get ISRC + album art for ingest.
-	async getTracksByIds(ids: string[]): Promise<SpotifyTrack[]> {
-		const out: SpotifyTrack[] = [];
-		for (const chunk of chunkArray(ids, 50)) {
-			const body: { tracks: (SpotifyTrack | null)[] } = await this.request(
-				`/tracks?ids=${chunk.map(encodeURIComponent).join(',')}`,
-			);
-			for (const t of body.tracks) if (t) out.push(t);
-		}
-		return out;
+	getTracksByIds(ids: string[]): Promise<SpotifyTrack[]> {
+		return this.lookupMany<SpotifyTrack>(
+			'tracks-batch',
+			ids,
+			50,
+			async (part) => (await this.request<{ tracks: (SpotifyTrack | null)[] }>(`/tracks?ids=${part.map(encodeURIComponent).join(',')}`)).tracks,
+			(id) => this.request<SpotifyTrack>(`/tracks/${encodeURIComponent(id)}`),
+		);
 	}
 
 	// Full artist objects by id (50 per request — chunked). Powers the KB
 	// artist `detail` aspect (images + genre strings).
-	async getArtists(ids: string[]): Promise<SpotifyArtist[]> {
-		const out: SpotifyArtist[] = [];
-		for (const chunk of chunkArray(ids, 50)) {
-			const body: { artists: (SpotifyArtist | null)[] } = await this.request(
-				`/artists?ids=${chunk.map(encodeURIComponent).join(',')}`,
-			);
-			for (const a of body.artists) if (a) out.push(a);
-		}
-		return out;
+	getArtists(ids: string[]): Promise<SpotifyArtist[]> {
+		return this.lookupMany<SpotifyArtist>(
+			'artists-batch',
+			ids,
+			50,
+			async (part) => (await this.request<{ artists: (SpotifyArtist | null)[] }>(`/artists?ids=${part.map(encodeURIComponent).join(',')}`)).artists,
+			(id) => this.request<SpotifyArtist>(`/artists/${encodeURIComponent(id)}`),
+		);
 	}
 
 	// One page of an artist's releases with pagination surfaced — the KB
@@ -681,32 +845,36 @@ export class SpotifyClient {
 
 	// Artist search — journey seeding and agent-stub → catalog unification.
 	async searchArtists(query: string, limit = 10): Promise<SpotifyArtist[]> {
-		const body: { artists?: SpotifyPaginated<SpotifyArtist> } = await this.request(
-			`/search?type=artist&q=${encodeURIComponent(query)}&limit=${Math.min(Math.max(limit, 1), 50)}`,
-		);
+		const body = await this.search<{ artists?: SpotifyPaginated<SpotifyArtist> }>('artist', query, limit);
 		return body.artists?.items ?? [];
 	}
 
 	// Track search — the in-app agent's catalog lookup. Full track objects
 	// (ISRC + album) so hits can seed KB entities / result sets directly.
 	async searchTracks(query: string, limit = 10): Promise<SpotifyTrack[]> {
-		const body: { tracks?: SpotifyPaginated<SpotifyTrack> } = await this.request(
-			`/search?type=track&q=${encodeURIComponent(query)}&limit=${Math.min(Math.max(limit, 1), 50)}`,
-		);
+		const body = await this.search<{ tracks?: SpotifyPaginated<SpotifyTrack> }>('track', query, limit);
 		return body.tracks?.items ?? [];
+	}
+
+	// The 2026 rules cap `limit` at 10 (SPOTIFY_2026): a larger ask that comes
+	// back 400 is re-asked at 10, and later searches stay at 10.
+	private search<T>(type: 'artist' | 'track', query: string, limit: number): Promise<T> {
+		const at = (n: number) => () =>
+			this.request<T>(`/search?type=${type}&q=${encodeURIComponent(query)}&limit=${Math.min(Math.max(limit, 1), n)}`);
+		if (limit <= 10) return at(10)();
+		return this.inForms('search-limit', [at(50), at(10)], new Set([400]));
 	}
 
 	// Full album objects by id (20 per request — the documented /albums
 	// ceiling). The full object is the only carrier of `label`.
-	async getAlbums(ids: string[]): Promise<SpotifyFullAlbum[]> {
-		const out: SpotifyFullAlbum[] = [];
-		for (const chunk of chunkArray(ids, 20)) {
-			const body: { albums: (SpotifyFullAlbum | null)[] } = await this.request(
-				`/albums?ids=${chunk.map(encodeURIComponent).join(',')}`,
-			);
-			for (const a of body.albums) if (a) out.push(a);
-		}
-		return out;
+	getAlbums(ids: string[]): Promise<SpotifyFullAlbum[]> {
+		return this.lookupMany<SpotifyFullAlbum>(
+			'albums-batch',
+			ids,
+			20,
+			async (part) => (await this.request<{ albums: (SpotifyFullAlbum | null)[] }>(`/albums?ids=${part.map(encodeURIComponent).join(',')}`)).albums,
+			(id) => this.request<SpotifyFullAlbum>(`/albums/${encodeURIComponent(id)}`),
+		);
 	}
 
 	// ─── Writes ─────────────────────────────────────────────────────────
@@ -720,13 +888,27 @@ export class SpotifyClient {
 			description: opts.description ?? '',
 			public: opts.isPublic ?? false,
 		};
-		const created = await this.write<SpotifyPlaylist>(
-			'POST',
-			`/users/${encodeURIComponent(userId)}/playlists`,
-			body,
-		);
+		const created = await this.inForms('create-playlist', [
+			() => this.write<SpotifyPlaylist>('POST', '/me/playlists', body),
+			() => this.write<SpotifyPlaylist>('POST', `/users/${encodeURIComponent(userId)}/playlists`, body),
+		]);
 		if (!created) throw new Error('Spotify createPlaylist returned empty body');
-		return created;
+		return normalizePlaylist(created);
+	}
+
+	// Track-list writes on /items with /tracks as the older form (SPOTIFY_2026).
+	// The 2026 DELETE body names its list `items`, the older one `tracks`.
+	private playlistItemsWrite<T>(
+		method: 'POST' | 'PUT' | 'DELETE',
+		playlistId: string,
+		body: Record<string, unknown>,
+		olderBody: Record<string, unknown> = body,
+	): Promise<T | null> {
+		const base = `/playlists/${encodeURIComponent(playlistId)}`;
+		return this.inForms(`playlist-items-${method}`, [
+			() => this.write<T>(method, `${base}/items`, body),
+			() => this.write<T>(method, `${base}/tracks`, olderBody),
+		]);
 	}
 
 	// Spotify has no "delete playlist". The equivalent on a playlist you
@@ -740,7 +922,10 @@ export class SpotifyClient {
 	// them from the new-releases producer's scan on the next poll. Mirrors the
 	// /me/following reader used to build the followed-artist list.
 	async unfollowArtist(artistId: string): Promise<void> {
-		await this.write<void>('DELETE', `/me/following?type=artist&ids=${encodeURIComponent(artistId)}`);
+		await this.inForms('unfollow-artist', [
+			() => this.write<void>('DELETE', '/me/library', { uris: [`spotify:artist:${artistId}`] }),
+			() => this.write<void>('DELETE', `/me/following?type=artist&ids=${encodeURIComponent(artistId)}`),
+		]);
 	}
 
 	// PUT /playlists/{id}  — change name / description / public flag.
@@ -768,11 +953,7 @@ export class SpotifyClient {
 		let snapshot = '';
 		for (const chunk of chunkArray(trackIds, 100)) {
 			const uris = chunk.map(toTrackUri);
-			const res = await this.write<{ snapshot_id: string }>(
-				'POST',
-				`/playlists/${encodeURIComponent(playlistId)}/tracks`,
-				{ uris },
-			);
+			const res = await this.playlistItemsWrite<{ snapshot_id: string }>('POST', playlistId, { uris });
 			if (res?.snapshot_id) snapshot = res.snapshot_id;
 		}
 		return { snapshot_id: snapshot };
@@ -787,12 +968,8 @@ export class SpotifyClient {
 		if (trackIds.length === 0) return { snapshot_id: '' };
 		let snapshot = '';
 		for (const chunk of chunkArray(trackIds, 100)) {
-			const tracks = chunk.map((id) => ({ uri: toTrackUri(id) }));
-			const res = await this.write<{ snapshot_id: string }>(
-				'DELETE',
-				`/playlists/${encodeURIComponent(playlistId)}/tracks`,
-				{ tracks },
-			);
+			const entries = chunk.map((id) => ({ uri: toTrackUri(id) }));
+			const res = await this.playlistItemsWrite<{ snapshot_id: string }>('DELETE', playlistId, { items: entries }, { tracks: entries });
 			if (res?.snapshot_id) snapshot = res.snapshot_id;
 		}
 		return { snapshot_id: snapshot };
@@ -818,11 +995,7 @@ export class SpotifyClient {
 				range_length: m.range_length ?? 1,
 			};
 			if (snapshot) body['snapshot_id'] = snapshot;
-			const res = await this.write<{ snapshot_id: string }>(
-				'PUT',
-				`/playlists/${encodeURIComponent(playlistId)}/tracks`,
-				body,
-			);
+			const res = await this.playlistItemsWrite<{ snapshot_id: string }>('PUT', playlistId, body);
 			if (res?.snapshot_id) snapshot = res.snapshot_id;
 		}
 		return { snapshot_id: snapshot };
@@ -840,18 +1013,10 @@ export class SpotifyClient {
 		// First chunk replaces; if zero tracks, an explicit empty replace
 		// clears the playlist.
 		const first = chunks[0] ?? [];
-		const firstRes = await this.write<{ snapshot_id: string }>(
-			'PUT',
-			`/playlists/${encodeURIComponent(playlistId)}/tracks`,
-			{ uris: first.map(toTrackUri) },
-		);
+		const firstRes = await this.playlistItemsWrite<{ snapshot_id: string }>('PUT', playlistId, { uris: first.map(toTrackUri) });
 		if (firstRes?.snapshot_id) snapshot = firstRes.snapshot_id;
 		for (let i = 1; i < chunks.length; i++) {
-			const res = await this.write<{ snapshot_id: string }>(
-				'POST',
-				`/playlists/${encodeURIComponent(playlistId)}/tracks`,
-				{ uris: chunks[i]!.map(toTrackUri) },
-			);
+			const res = await this.playlistItemsWrite<{ snapshot_id: string }>('POST', playlistId, { uris: chunks[i]!.map(toTrackUri) });
 			if (res?.snapshot_id) snapshot = res.snapshot_id;
 		}
 		return { snapshot_id: snapshot };

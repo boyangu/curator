@@ -50,6 +50,11 @@ function seedLegacy(): void {
 	ins.run('rmx1', 'Drown (Massano Remix)', JSON.stringify([{ name: 'Lane 8' }, { name: 'Massano' }]), null);
 	ins.run('rmx2', 'Breezeblocks - Nils Extended Mix', JSON.stringify([{ name: 'alt-J' }]), null);
 	ins.run('rmx3', 'Radian - Cercle Version', JSON.stringify([{ name: 'Someone' }]), null);
+	// A known multi-word artist whose first word is also an artist: the remix
+	// is the full name's, not the one-word prefix's.
+	ins.run('rmx4own', 'Glass Rivers', JSON.stringify([{ name: 'Marten Vohl' }]), null);
+	ins.run('rmx4singer', 'Harbour Song', JSON.stringify([{ name: 'Marten' }]), null);
+	ins.run('rmx4', 'Lanterns (Marten Vohl Remix)', JSON.stringify([{ name: 'Ilka Rane' }]), null);
 	// Spelling variants collapse to one artist named by the most-credited spelling.
 	ins.run('sp1', 'S1', JSON.stringify([{ name: 'Pig&Dan' }]), null);
 	ins.run('sp2', 'S2', JSON.stringify([{ name: 'Pig & Dan' }]), null);
@@ -85,6 +90,7 @@ describe('artist backfill', () => {
 		expect(artistsOf(db, 'rmx1')).toEqual([{ name: 'Lane 8' }, { name: 'Massano', role: 'remixer' }]);
 		expect(artistsOf(db, 'rmx2')).toEqual([{ name: 'alt-J' }, { name: 'Nils', role: 'remixer' }]);
 		expect(artistsOf(db, 'rmx3')).toEqual([{ name: 'Someone' }]);
+		expect(artistsOf(db, 'rmx4')).toEqual([{ name: 'Ilka Rane' }, { name: 'Marten Vohl', role: 'remixer' }]);
 		expect((db.prepare(`SELECT title FROM track WHERE id = 'rmx1'`).get() as { title: string }).title).toBe('Drown (Massano Remix)');
 		expect(db.prepare(`SELECT role FROM track_artist ta JOIN artist a ON a.id = ta.artist_id WHERE ta.track_id = 'rmx1' AND a.name = 'Massano'`).get()).toEqual({ role: 'remixer' });
 		const ov = JSON.parse((db.prepare(`SELECT overrides FROM track WHERE id = 'ov'`).get() as { overrides: string }).overrides);
@@ -95,7 +101,7 @@ describe('artist backfill', () => {
 		// Junction rows for every live track with artists; override list wins.
 		const linked = (db.prepare(`SELECT track_id, count(*) AS n FROM track_artist GROUP BY track_id ORDER BY track_id`).all() as Array<{ track_id: string; n: number }>);
 		expect(Object.fromEntries(linked.map((r) => [r.track_id, r.n]))).toEqual({
-			alias: 1, bp: 2, deleted: 1, duo: 2, feat: 2, frames: 2, ov: 2, packed: 3, rmx1: 2, rmx2: 2, rmx3: 1, semi: 2, sp1: 1, sp2: 1, sp3: 1, spot: 2,
+			alias: 1, bp: 2, deleted: 1, duo: 2, feat: 2, frames: 2, ov: 2, packed: 3, rmx1: 2, rmx2: 2, rmx3: 1, rmx4: 2, rmx4own: 1, rmx4singer: 1, semi: 2, sp1: 1, sp2: 1, sp3: 1, spot: 2,
 		});
 		const names = (db.prepare(`SELECT name FROM artist ORDER BY name_ascii`).all() as Array<{ name: string }>).map((r) => r.name);
 		expect(names).toContain('Yohan & David');

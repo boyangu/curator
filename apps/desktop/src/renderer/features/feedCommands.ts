@@ -31,8 +31,9 @@ export interface FeedActions {
 	muteArtist(item: FeedItem, artistId: string, name: string): void;  // mute one artist (track → dismiss; album → chip)
 	muteArtists(item: FeedItem, artists: { id: string; name: string }[]): void; // multi-artist track: mute every credit + remove
 	mutePlaylist(item: FeedItem, playlistId: string, name: string): void; // scoped dismiss: playlist
-	unfollowArtist(artistId: string, name: string): void;
-	unfollowPlaylist(playlistId: string, name: string): void;
+	// `catalogId`: the Global Catalog watch the item's origin names, if any.
+	unfollowArtist(artistId: string, name: string, catalogId?: string): void;
+	unfollowPlaylist(playlistId: string, name: string, catalogId?: string): void;
 	openSpotifyUrl(url: string): void;
 	openSpotifyTrack(sourceTrackId: string): void;
 	openExternal(url: string): void;
@@ -215,7 +216,7 @@ const FEED_COMMANDS: FeedCommand[] = [
 	{
 		id: 'unfollow-artist', group: 'mute',
 		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'artist',
-		build: (c) => leaf('unfollow-artist', `Unfollow artist: ${c.item.origin!.name}`, () => c.actions.unfollowArtist(c.item.origin!.id, c.item.origin!.name), { danger: true }),
+		build: (c) => leaf('unfollow-artist', `Unfollow artist: ${c.item.origin!.name}`, () => c.actions.unfollowArtist(c.item.origin!.id, c.item.origin!.name, c.item.origin!.catalogId), { danger: true }),
 	},
 	{
 		id: 'mute-playlist', group: 'mute',
@@ -225,7 +226,7 @@ const FEED_COMMANDS: FeedCommand[] = [
 	{
 		id: 'unfollow-playlist', group: 'mute',
 		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'playlist',
-		build: (c) => leaf('unfollow-playlist', `Unfollow playlist: ${c.item.origin!.name}`, () => c.actions.unfollowPlaylist(c.item.origin!.id, c.item.origin!.name), { danger: true }),
+		build: (c) => leaf('unfollow-playlist', `Unfollow playlist: ${c.item.origin!.name}`, () => c.actions.unfollowPlaylist(c.item.origin!.id, c.item.origin!.name, c.item.origin!.catalogId), { danger: true }),
 	},
 	// open / search — Open in Spotify (the feed's native source) is always
 	// present; cross-source discovery is browser search on Tidal + Beatport,

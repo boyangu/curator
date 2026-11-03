@@ -15,7 +15,7 @@ import { ClaimBinder, projectAdoptedRecordings } from '../sync-log/claim-bind.js
 import { nextStreamingPlaylistId } from '../sync-log/stable-ids.js';
 import * as mut from '../library/mutators.js';
 import { rawOf } from '../library/artists.js';
-import { SpotifyClient, type SpotifyPlaylist, type SpotifyPlaylistTrack, type SpotifyTrack } from '@curator/spotify';
+import { SpotifyClient, SpotifyPlaylistItemsWithheldError, type SpotifyPlaylist, type SpotifyPlaylistTrack, type SpotifyTrack } from '@curator/spotify';
 import type { FetchLike as BeatportFetch } from '@curator/beatport';
 import { enrichOne } from '../enrich/runner.js';
 import { BeatportEnricher } from '../enrich/enrichers/beatport.js';
@@ -205,7 +205,18 @@ export class SpotifySync {
 					stage: 'playlist-tracks',
 					currentPlaylist: { id: prior?.id ?? null, name: pl.name, index: i + 1, total: playlists.length + 1 },
 				});
-				tracksUpserted += await this.syncPlaylist(pl, client);
+				try {
+					tracksUpserted += await this.syncPlaylist(pl, client);
+				} catch (err) {
+					// Spotify keeps a playlist's items from apps in development
+					// mode unless the user owns or collaborates on it. Its rows
+					// stay as they are and the rest of the run goes on; the cursor
+					// isn't stamped, so a later run retries it.
+					if (!(err instanceof SpotifyPlaylistItemsWithheldError)) throw err;
+					const id = this.upsertPlaylistMeta(pl);
+					this.db.update(playlist).set({ syncStatus: 'error', syncError: err.message }).where(eq(playlist.id, id)).run();
+					synclog.warn('playlist items withheld by Spotify; rows left as they are', { playlist: pl.name });
+				}
 			}
 
 			// "Liked Songs" — synthetic playlist with stable id
@@ -460,7 +471,8 @@ export class SpotifySync {
 						ownerName: pl.owner.display_name,
 						ownerId: pl.owner.id,
 						coverUrl: canonicalSpotifyCover(pl.images?.[0]?.url ?? null),
-						trackCount: pl.tracks.total,
+						// A withheld playlist reports no count; keep the one we have.
+						trackCount: pl.itemsWithheld ? existing.trackCount : pl.tracks.total,
 						isCollaborative: pl.collaborative,
 						isPublic: pl.public,
 						remoteUpdatedAt,

@@ -19,7 +19,10 @@ import { ArtistCredits } from './ArtistCredits.jsx';
 import { searchFold } from '@curator/shared';
 import { buildFeedMenu, feedShow, type FeedActions } from '../features/feedCommands.js';
 import { KeyChip } from './KeyChip.jsx';
-import { shellApi } from '../data/api.js';
+import { catalogApi, shellApi } from '../data/api.js';
+import { FollowingPanel } from './FollowingPanel.jsx';
+import { ManageFollowingModal } from './ManageFollowingModal.jsx';
+import { registerModalOpenSignal } from '../modalGate.js';
 
 // The feed's navigable state — what a history entry records for it.
 export interface DiscoverFeedNavState {
@@ -239,6 +242,23 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		void window.api['feed:role']().then((r) => setFollower(r.role === 'follower')).catch(() => setFollower(false));
 	};
 	loadRole();
+	// Following (the Global Catalog's watches): the cloud tracks followed
+	// artists and labels for every device, so with it a follower device
+	// refreshes too (it reads the cloud's stream; core feed/service.ts).
+	const [catalogAvailable, setCatalogAvailable] = createSignal(false);
+	const [showFollowing, setShowFollowing] = createSignal(false);
+	const [followCount, setFollowCount] = createSignal<number | null>(null);
+	const [manageOpen, setManageOpen] = createSignal(false);
+	// Bumped when Manage following changed the follows: the drawer reloads.
+	const [followVersion, setFollowVersion] = createSignal(0);
+	registerModalOpenSignal(manageOpen);
+	const loadCatalog = (): void => {
+		void catalogApi.status().then((s) => {
+			setCatalogAvailable(s.available);
+			if (s.available) void catalogApi.watches().then((w) => setFollowCount(w.length)).catch(() => {});
+		}).catch(() => setCatalogAvailable(false));
+	};
+	loadCatalog();
 	// itemId → detail for expanded album cards (null while loading).
 	const [expanded, setExpanded] = createSignal<Map<string, FeedItemDetail | null>>(new Map());
 	// sourceTrackIds confirmed region-unavailable. Seeded from the server flag
@@ -659,9 +679,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// Unfollow the source playlist: drops it at Spotify and hard-removes every
 	// feed item it produced (server-side), then reloads so siblings vanish here
 	// too — the same reload shape scoped-dismiss uses.
-	async function unfollowPlaylist(playlistId: string, name: string): Promise<void> {
+	async function unfollowPlaylist(playlistId: string, name: string, catalogId?: string): Promise<void> {
 		try {
-			const res = await window.api['feed:unfollow-playlist'](playlistId);
+			const res = await window.api['feed:unfollow-playlist'](playlistId, catalogId);
 			if (!res.ok) throw new Error(res.error ?? 'unfollow failed');
 			const removed = res.removed ?? 0;
 			props.onToast(`Unfollowed ${name}`, 'success', removed ? `Removed ${removed} item${removed === 1 ? '' : 's'}` : undefined);
@@ -674,9 +694,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// Unfollow the source artist: drops them at Spotify and hard-removes every
 	// feed item they produced or appear on, then reloads — same shape as
 	// unfollowPlaylist.
-	async function unfollowArtist(artistId: string, name: string): Promise<void> {
+	async function unfollowArtist(artistId: string, name: string, catalogId?: string): Promise<void> {
 		try {
-			const res = await window.api['feed:unfollow-artist'](artistId);
+			const res = await window.api['feed:unfollow-artist'](artistId, catalogId);
 			if (!res.ok) throw new Error(res.error ?? 'unfollow failed');
 			const removed = res.removed ?? 0;
 			props.onToast(`Unfollowed ${name}`, 'success', removed ? `Removed ${removed} item${removed === 1 ? '' : 's'}` : undefined);
@@ -722,7 +742,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				{ kind: 'item', id: 'unfollow', label: 'Unfollow playlist', danger: true },
 			], {
 				open: () => { void shellApi.openSpotify(`spotify:playlist:${origin.id}`); },
-				unfollow: () => { void unfollowPlaylist(origin.id, origin.name); },
+				unfollow: () => { void unfollowPlaylist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
 		} else if (origin.kind === 'artist') {
 			openContextMenu([
@@ -732,7 +752,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				{ kind: 'item', id: 'unfollow', label: 'Unfollow artist', danger: true },
 			], {
 				open: () => { void shellApi.openSpotify(`spotify:artist:${origin.id}`); },
-				unfollow: () => { void unfollowArtist(origin.id, origin.name); },
+				unfollow: () => { void unfollowArtist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
 		}
 	}
@@ -989,8 +1009,8 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		muteArtist: (item, artistId, name) => { void muteArtist(item, artistId, name); },
 		muteArtists: (item, artists) => { void muteArtists(item, artists); },
 		mutePlaylist: (item, playlistId, name) => { void dismiss(item, { scope: 'playlist', key: `playlist:${playlistId}`, label: name }); },
-		unfollowArtist: (artistId, name) => { void unfollowArtist(artistId, name); },
-		unfollowPlaylist: (playlistId, name) => { void unfollowPlaylist(playlistId, name); },
+		unfollowArtist: (artistId, name, catalogId) => { void unfollowArtist(artistId, name, catalogId); },
+		unfollowPlaylist: (playlistId, name, catalogId) => { void unfollowPlaylist(playlistId, name, catalogId); },
 		openSpotifyUrl: (url) => { void shellApi.openSpotify(url); },
 		openSpotifyTrack: (sourceTrackId) => { void shellApi.openSpotify(`spotify:track:${sourceTrackId}`); },
 		openExternal: (url) => { void shellApi.openExternal(url); },
@@ -1520,23 +1540,29 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			<div class="feed-toolbar">
 				<span class="feed-toolbar__title">{mode() === 'archived' ? 'Archived' : 'Discover'}</span>
 				<span class="feed-toolbar__count">{total()} items</span>
-				<Show when={mode() === 'feed' && follower()}>
+				<Show when={mode() === 'feed' && follower() && !catalogAvailable()}>
 					<span class="feed-toolbar__count" title="Discover is collected on your account's main device. Archive, dismiss and mute decisions made there apply here, and yours sync back. Make this computer the main device in Settings → Account to collect here.">
 						Collected on your main device
 					</span>
 				</Show>
-				<Show when={mode() === 'feed' && !follower()}>
+				<Show when={mode() === 'feed' && (!follower() || catalogAvailable())}>
 					<button class="feed-toolbar__refresh" disabled={refreshing()} onClick={() => void refreshProducers()}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>
 						{refreshing() ? 'Refreshing…' : 'Refresh'}
 					</button>
+				</Show>
+				<Show when={mode() === 'feed' && !follower()}>
 					{/* TEMPORARY — per-source manual ingestion. Producer ids match
 					    FEED_PRODUCER_IDS in apps/core/src/feed/service.ts. Remove with
 					    refreshOneProducer / refreshingProducer / feed:refresh-producer. */}
-					<button class="feed-toolbar__refresh" disabled={!!refreshingProducer()}
-						onClick={() => void refreshOneProducer('spotify-new-releases', 'Refresh Artists')}>
-						{refreshingProducer() === 'spotify-new-releases' ? 'Refreshing…' : 'Refresh Artists'}
-					</button>
+					{/* Followed artists come from the Global Catalog when it is on
+					    (core feed/service.ts retires the local releases producer). */}
+					<Show when={!catalogAvailable()}>
+						<button class="feed-toolbar__refresh" disabled={!!refreshingProducer()}
+							onClick={() => void refreshOneProducer('spotify-new-releases', 'Refresh Artists')}>
+							{refreshingProducer() === 'spotify-new-releases' ? 'Refreshing…' : 'Refresh Artists'}
+						</button>
+					</Show>
 					<button class="feed-toolbar__refresh" disabled={!!refreshingProducer()}
 						onClick={() => void refreshOneProducer('spotify-playlist-delta', 'Refresh Playlists')}>
 						{refreshingProducer() === 'spotify-playlist-delta' ? 'Refreshing…' : 'Refresh Playlists'}
@@ -1559,7 +1585,35 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						? <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4" /></svg>Archived</>
 						: <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 12H5M12 19l-7-7 7-7" /></svg>Discover</>}
 				</button>
+				<button class="feed-toolbar__refresh feed-toolbar__following" classList={{ 'feed-toolbar__following--on': showFollowing() }}
+					title="The artists and labels whose new releases come to Discover"
+					onClick={() => setShowFollowing((v) => !v)}>
+					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0M17 8v6M14 11h6" /></svg>
+					Following{followCount() !== null ? ` ${followCount()}` : ''}
+				</button>
 			</div>
+			<Show when={showFollowing()}>
+				<FollowingPanel
+					onClose={() => setShowFollowing(false)}
+					onToast={props.onToast}
+					onCountChange={(n) => {
+						setFollowCount(n);
+						loadCatalog();
+					}}
+					onManage={() => setManageOpen(true)}
+					version={followVersion}
+				/>
+			</Show>
+			<Show when={manageOpen()}>
+				<ManageFollowingModal
+					onClose={() => setManageOpen(false)}
+					onToast={props.onToast}
+					onChanged={() => {
+						setFollowVersion((v) => v + 1);
+						loadCatalog();
+					}}
+				/>
+			</Show>
 			<div class="feed-scroll" ref={scrollEl} onScroll={handleScroll}>
 				<Show when={items().length > 0} fallback={
 					<div class="feed-empty">

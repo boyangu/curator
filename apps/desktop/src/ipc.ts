@@ -1,7 +1,7 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, FeedRole, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction } from '@curator/core';
-import type { DeviceInfo } from '@curator/protocol';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedRefreshResult, FeedRole, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, ProductionProfile, ProductionPair, ProductionWinner, ProductionStats, ProductionModelInfo, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction, CatalogClientStatus, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit, CatalogWatch, CatalogFollowManyReport, CatalogEnrichReport, TrackCatalogRefs, FollowCandidate, FollowCandidateKind } from '@curator/core';
+import type { CatalogBrowseResult, DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
 // Renderer → main fire-and-forget log shipping. NOT in TOOL_CATALOG — that
@@ -263,6 +263,13 @@ export interface IpcChannels {
 	'mir:provision':    { args: []; ret: MirStatus };
 	'mir:similar':      { args: [q: SimilarQuery]; ret: SimilarResult };
 
+	// ─── Production quality ──────────────────────────────────────────────
+	'production:profile':   { args: [trackId: string]; ret: ProductionProfile };
+	'production:next-pair': { args: [opts?: { genre?: string | null; playlistId?: string | null }]; ret: ProductionPair | null };
+	'production:judge':     { args: [aTrackId: string, bTrackId: string, winner: ProductionWinner]; ret: ProductionStats };
+	'production:stats':     { args: []; ret: ProductionStats };
+	'production:fit':       { args: []; ret: ProductionModelInfo };
+
 	// ─── Backup & restore (planning/tech/backup.md) ───────────────────────
 	// Settings + scheduler live in core; the engine runs in a utility process.
 	'backup:get-settings':   { args: []; ret: BackupSettings };
@@ -338,14 +345,31 @@ export interface IpcChannels {
 	'feed:detail':   { args: [itemId: string]; ret: FeedItemDetail | null };
 	'feed:enrich':   { args: [itemId: string]; ret: FeedItem | null };
 	'feed:action':   { args: [action: FeedAction]; ret: FeedActionResult };
-	'feed:unfollow-playlist': { args: [playlistId: string]; ret: FeedActionResult };
-	'feed:unfollow-artist':   { args: [artistId: string]; ret: FeedActionResult };
+	'feed:unfollow-playlist': { args: [playlistId: string, catalogId?: string]; ret: FeedActionResult };
+	'feed:unfollow-artist':   { args: [artistId: string, catalogId?: string]; ret: FeedActionResult };
 	'feed:refresh':  { args: []; ret: FeedRefreshResult };
 	// Temporary: manual Refresh of one producer by id (Refresh Artists / Refresh
 	// Playlists buttons). Remove with those buttons.
 	'feed:refresh-producer': { args: [producerId: string]; ret: FeedRefreshResult };
 	'feed:load-more': { args: [days: number]; ret: FeedRefreshResult };
 	'feed:role':     { args: []; ret: FeedRole };
+
+	// ─── Following (Global Catalog watches) ───────────────────────────────
+	// The artists and labels the cloud tracks for Discover (core
+	// catalog-client/service.ts). Every call but status needs the cloud.
+	'catalog:status':    { args: []; ret: CatalogClientStatus };
+	'catalog:watches':   { args: []; ret: CatalogWatch[] };
+	'catalog:search':    { args: [q: string]; ret: CatalogSearchHit[] };
+	'catalog:follow':    { args: [target: CatalogFollowTarget]; ret: CatalogWatch };
+	'catalog:unfollow':  { args: [objectId: string]; ret: void };
+	'catalog:mute':      { args: [objectId: string, muted: boolean]; ret: void };
+	'catalog:refresh':   { args: [objectId: string]; ret: { dueAt: number | null } };
+	'catalog:import-spotify': { args: []; ret: CatalogImportReport };
+	'catalog:enrich-labels':  { args: []; ret: CatalogEnrichReport };
+	'catalog:refs-for-track': { args: [trackId: string]; ret: TrackCatalogRefs };
+	'catalog:browse':         { args: [objectId: string]; ret: CatalogBrowseResult };
+	'catalog:candidates':     { args: [kind: FollowCandidateKind]; ret: FollowCandidate[] };
+	'catalog:follow-many':    { args: [targets: CatalogFollowTarget[]]; ret: CatalogFollowManyReport };
 
 	// ─── Discovery journeys + knowledge base ──────────────────────────────
 	// Journeys are persistent forkable navigation trees; the KB answers
@@ -806,6 +830,11 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'mir:analyze-now': { description: 'Queue tracks for AI embedding ahead of the background backlog (clears earlier failures for them). Works even when background embedding is off.' },
 	'mir:provision': { description: 'Packaged builds only: create the AI engine Python environment (bundled uv + lockfile into userData/mir; multi-GB download), then start the engine.' },
 	'mir:similar': { description: 'Rank library tracks by AI-embedding similarity to seed tracks and/or a text description (text needs a text-capable model). Optional library filter restricts candidates. Returns cosine scores plus seeds that have no vector yet.' },
+	'production:profile': { description: 'Production-quality profile of a track: integrity flags (lossy source, clipping, overs, stereo sub, crushed), every measurement with its percentile and robust z within a genre/era cohort plus explanations, per-section rows, Audiobox aesthetic scores, and the learned probe score. Needs the Production quality analysis stage.' },
+	'production:next-pair': { description: 'Draw the next pair of local tracks for a loudness-matched "which sounds more professionally produced?" comparison (same genre when possible, least-judged first). Returns both sides with audition start and master-volume gains, or null when fewer than two measured playable tracks exist.' },
+	'production:judge': { description: 'Record a pairwise production judgment (a | b | tie) for two tracks; returns the updated judgment stats.' },
+	'production:stats': { description: 'Judgment counts, measured/playable track counts and the fitted probe model (if any) with its accuracy.' },
+	'production:fit': { description: 'Fit the Bradley-Terry production probe over all judgments (needs 30+) and rewrite every measured track\'s production score.' },
 	'backup:get-settings': { description: 'Backup settings: enabled, target (folder path or Google Drive folder name), which data sets are included, snapshots to keep, interval in hours, rekordbox master.db override.' },
 	'backup:set-settings': { description: 'Update backup settings (partial patch). A folder target is validated as absolute + writable; cloud-sync folders are allowed as targets. Persisted in core app_setting.' },
 	'backup:status': { description: 'Backup status: availability, settings, Google connection, last run + last success, next due time, the run in progress (phase/progress), which heavy job the scheduler is waiting for, pending/applied restore markers.' },
@@ -845,12 +874,25 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'feed:detail': { description: 'Return one feed item plus per-track played state. For album items, lazily fetches and caches the tracklist from the source on first call.' },
 	'feed:enrich': { description: 'Run on-view Beatport enrichment for one feed item: fills the album-level genre/label plus per-track bpm/key/genre/label, caches it onto the item, and returns the updated item. Idempotent — an already-enriched item returns untouched (zero Beatport calls). Called after the tracklist renders so rows show instantly and DJ metadata fills in a moment later.' },
 	'feed:action': { description: 'Apply a user action to a feed item: dismiss (aka Delete — soft remove, optional artist/label/playlist scope suppression), archive (set aside to the Archived page), unarchive (restore to the feed), interested (promote into the library as backlog + interested tag), uninterested (reverse of interested — delete the promoted/owned library track and return a promoted item to the feed), seen, expanded, or played (sets played-dimming state and logs the listen signal).' },
-	'feed:unfollow-playlist': { description: 'Unfollow a source playlist surfaced in the feed: drops it at the source (Spotify) and hard-removes every feed item it produced. Returns removed count. Fail-closed when Spotify is disconnected (ok:false, nothing removed).' },
-	'feed:unfollow-artist': { description: 'Unfollow a source artist surfaced in the feed: drops them at the source (Spotify) and hard-removes every feed item they produced or appear on. Returns removed count. Fail-closed when Spotify is disconnected (ok:false, nothing removed).' },
+	'feed:unfollow-playlist': { description: 'Unfollow a source playlist surfaced in the feed. Followed in the Global Catalog (catalogId, or a watch on that Spotify playlist): the watch is removed and Spotify is not touched. Otherwise: drops it at the source (Spotify). Either way hard-removes every feed item it produced. Returns removed count. Fail-closed when Spotify is disconnected (ok:false, nothing removed).' },
+	'feed:unfollow-artist': { description: 'Unfollow a source artist surfaced in the feed. Followed in the Global Catalog (catalogId, or a watch on that Spotify artist): the watch is removed and Spotify is not touched. Otherwise: drops them at the source (Spotify). Either way hard-removes every feed item they produced or appear on, unless another followed artist also credits it. Returns removed count. Fail-closed when Spotify is disconnected (ok:false, nothing removed).' },
 	'feed:filter-options': { description: 'Return the distinct genre and label values present across the visible feed, sorted — populates the Discover genre/label filter dropdowns.' },
 	'feed:refresh': { description: 'Run one manual poll pass over every registered feed producer. Returns per-producer inserted counts and errors.' },
 	'feed:refresh-producer': { description: 'Run one manual poll pass over a SINGLE feed producer by id. Powers the temporary Refresh Artists / Refresh Playlists buttons. Unknown id is a clean no-op.' },
 	'feed:load-more': { description: 'Extend every feed producer\'s history horizon back by N days (clamped 1..60) and ingest the newly-uncovered older items. Powers the "Load more" button at the end of the Discover feed.' },
+	'catalog:status': { description: 'Whether this device can follow artists and labels for Discover: signed in to Curator Cloud, and the server offers the Global Catalog. reason is ok, signed_out or server_off.' },
+	'catalog:watches': { description: 'The artists and labels this account follows, each with its providers (Spotify, Deezer…), mute state and the cloud trackers following it (last run, next due, failing).' },
+	'catalog:search': { description: 'Search for artists and labels to follow: the shared catalogue matches first (most followed first), then Spotify and Deezer artists it does not hold yet. Each hit says whether this account already follows it.' },
+	'catalog:follow': { description: 'Follow an artist or label for Discover: a catalogue object, the provider claim of a search hit, a pasted Spotify/Deezer artist link, or a label by name. The cloud starts tracking it; new releases arrive as Discover items.' },
+	'catalog:unfollow': { description: 'Stop following an artist or label. The cloud stops tracking it once nobody follows it.' },
+	'catalog:mute': { description: 'Mute or unmute a followed artist or label: its new releases stop (or resume) arriving in Discover without unfollowing.' },
+	'catalog:refresh': { description: 'Ask the cloud to check a followed artist or label now (at most once an hour). Returns when it is due, or null inside the hour.' },
+	'catalog:candidates': { description: 'What the user could follow from their own library, for one tab of Manage following: artists, labels, genres or followed streaming playlists, sorted by how many library tracks each appears on, each marked with the watch that already follows it (or why it cannot be followed yet).' },
+	'catalog:follow-many': { description: 'Follow many artists, labels, genres or playlists at once (Manage following). Returns how many were newly followed, how many were already followed, and any that failed.' },
+	'catalog:import-spotify': { description: 'Follow every artist the user follows on Spotify (needs Spotify connected). Re-running sends only new follows. Returns how many were found, newly created in the catalogue, and newly followed.' },
+	'catalog:enrich-labels': { description: 'Register every label in the local library with the shared catalogue and ask it to profile them (their pages elsewhere) and read their releases once. Follows nothing; the feed is untouched. Returns how many labels were sent and queued.' },
+	'catalog:refs-for-track': { description: 'What a library track is in the shared Global Catalog: its recording, release, label and artists as catalogue object ids (with the provider ref each was resolved by). Cached on this device; what is missing or stale is resolved through the Spotify ids of the track and the name of its label. Null where the catalogue holds nothing for it.' },
+	'catalog:browse': { description: 'A Global Catalog object with what hangs off it: the releases of a label (newest first, with who releases there and its roster), the releases and labels of an artist, the tracks of a release by position. Every release and track carries its store handles (Spotify, Deezer, Beatport… ids and links). Takes a catalogue object id, e.g. from catalog:refs-for-track.' },
 	'feed:role': { description: 'Whether this device collects the Discover feed (it is the account\'s master device, or no master is stated) or follows the master: a follower runs no feed producer — Refresh and Load more are refused — and shows the decisions made on the master (archived, dismissed, muted artists).' },
 	'journey:create': { description: 'Start a discovery journey from a seed (library track / KB entity / provider source ref): resolves the seed to a KB entity, creates the journey with that entity as root node + current position, and returns the full journey detail.' },
 	'journey:list': { description: 'List non-archived journeys, most-recently-active first, with node counts and the current node\'s entity name for the resume strip.' },

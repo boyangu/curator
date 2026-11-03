@@ -99,6 +99,9 @@ export interface ContextMenusFeatureDeps {
 	// ── handles mounted by boot() ─────────────────────────────────────────
 	getMainTrackList(): TrackListHandle | null;
 	getAnalyzeModal(): AnalyzeModalHandle | null;
+	// Production quality dialogs (layouts/Production*.tsx).
+	openProductionProfile(trackId: string, title: string): void;
+	openProductionCompare(opts?: { genre?: string | null }): void;
 	// ── flows that still live in main.ts ──────────────────────────────────
 	openSyncToRekordboxModal(target: SyncTarget): Promise<void>;
 	openSyncFromRekordboxModal(target: PullTarget): Promise<void>;

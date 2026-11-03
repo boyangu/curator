@@ -64,6 +64,7 @@ import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
 import { recomputePositions } from './library/playlist-order.js';
 import * as mut from './library/mutators.js';
+import { runRemixerPrefixRepair } from './library/remixer-prefix-repair.js';
 import { inlineSnapshotBuilder, type SnapshotBuilder } from './sync-log/snapshot-build.js';
 import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
 import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
@@ -72,7 +73,7 @@ import { requestRestatement } from './sync-log/restate.js';
 import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
 import { getDeviceId as getSyncDeviceId } from './sync-log/device.js';
-import type { DevicePlatform } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogWatch, DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
 
 export type SourceLinkError = {
@@ -163,6 +164,28 @@ export interface PlaylistUpstreamDrift {
 import { keyToCamelot } from './enrich/keys.js';
 import { SqliteFeedStore } from './feed/store.js';
 import { createFeedService } from './feed/service.js';
+import type { CatalogFeedPort } from './feed/cloud-producer.js';
+import { syncSpotifyFollows, type FollowsSyncState } from './catalog-client/follows-sync.js';
+import { refsForTrack, type TrackCatalogRefs } from './catalog-client/catalog-refs.js';
+import {
+	CatalogUnavailableError,
+	createCatalogClient,
+	type CatalogClient,
+	type CatalogClientStatus,
+	type CatalogFollowManyReport,
+	type CatalogFollowTarget,
+	type CatalogEnrichReport,
+	type CatalogImportReport,
+	type CatalogSearchHit,
+} from './catalog-client/service.js';
+import {
+	artistCandidates,
+	genreCandidates,
+	labelCandidates,
+	playlistCandidates,
+	type FollowCandidate,
+	type FollowCandidateKind,
+} from './catalog-client/library-candidates.js';
 import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedDecisionPort, feedBackfillPending, feedPendingCount, syncedItemsFor } from './feed/sync.js';
 import type { LibraryMembershipLookup } from './feed/pipeline.js';
 import type { FeedAction, FeedActionResult, FeedItem, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRole, EnrichmentResult } from './feed/types.js';
@@ -224,7 +247,7 @@ export type TrackPlaylistEntry = {
 };
 import { CancelToken } from './sync/cancellation.js';
 import { sortColumn as sharedSortColumn, indexSortColumn } from './sync/sort.js';
-import { applyOverrides, computePositionalMoves, normalizeIsrc } from '@curator/library-logic';
+import { applyOverrides, computePositionalMoves, nameFold, normalizeIsrc } from '@curator/library-logic';
 
 // A provider's own track id, as the upstream API takes it: Spotify's 22-char
 // base62 id, Tidal's numeric id. Anything else on a streaming playlist row
@@ -260,6 +283,9 @@ import { createInlineBackupHost } from './backup/host.js';
 import { remapLocalPaths } from './backup/apply.js';
 import type { BackupEngineConfig, BackupEvent, BackupHost, BackupRestorePreview, BackupRestoreRequest, BackupSettings, BackupSnapshotSummary, BackupStatus, BackupTargetStat, GoogleAuthStatus } from './backup/types.js';
 import { createMirLayer } from './mir/layer.js';
+import { AUDIOBOX_MODEL_KEY } from './mir/types.js';
+import { createProductionLayer, PRODUCTION_MODEL_KEY } from './production/layer.js';
+import type { ProductionModelInfo, ProductionPair, ProductionProfile, ProductionStats, ProductionWinner } from './production/types.js';
 import { createCatalogueLayer, type CatalogueLayer } from './catalogue/layer.js';
 import { readCatalogueSettings, writeCatalogueSettings, clampKbps } from './catalogue/mirror.js';
 import type { CatalogueBackfillAction, CatalogueBlobStore, CatalogueEvent, CatalogueSettingsPatch, CatalogueStatus } from './catalogue/types.js';
@@ -1130,10 +1156,11 @@ export interface CoreService {
 	// Unfollow a source playlist surfaced in the feed: drops it at the source
 	// (Spotify) and hard-removes every feed item it produced. No-op-safe when
 	// Spotify is disconnected (returns ok:false).
-	unfollowFeedPlaylist(playlistId: string): Promise<FeedActionResult>;
+	// `catalogId`: the watch the item's origin names (catalogue items).
+	unfollowFeedPlaylist(playlistId: string, catalogId?: string): Promise<FeedActionResult>;
 	// Unfollow a source artist surfaced in the feed: drops them at the source
 	// (Spotify) and hard-removes every feed item they produced/appear on.
-	unfollowFeedArtist(artistId: string): Promise<FeedActionResult>;
+	unfollowFeedArtist(artistId: string, catalogId?: string): Promise<FeedActionResult>;
 	runFeedRefresh(): Promise<FeedRefreshResult>;
 	// Manual Refresh of one feed producer by id (see FEED_PRODUCER_IDS in
 	// feed/service.ts) — drives the temporary per-source Refresh buttons.
@@ -1151,6 +1178,37 @@ export interface CoreService {
 	// master device (feed/sync.ts): a follower runs no producer and shows the
 	// collector's decisions.
 	getFeedRole(): Promise<FeedRole>;
+	// ─── Following (Global Catalog watches; catalog-client/service.ts) ───
+	// Whether this device can follow artists and labels: signed in to the
+	// cloud, and the server offers 'global_catalog'.
+	getCatalogStatus(): Promise<CatalogClientStatus>;
+	catalogWatches(): Promise<CatalogWatch[]>;
+	// The catalogue's artists and labels matching `q`, then Spotify/Deezer
+	// artists it does not hold yet.
+	catalogSearch(q: string): Promise<CatalogSearchHit[]>;
+	// Follow a catalogue object, a provider candidate, a pasted Spotify/Deezer
+	// artist link, or a label by name.
+	catalogFollow(target: CatalogFollowTarget): Promise<CatalogWatch>;
+	catalogUnfollow(objectId: string): Promise<void>;
+	catalogMute(objectId: string, muted: boolean): Promise<void>;
+	catalogRefresh(objectId: string): Promise<{ dueAt: number | null }>;
+	// The artists followed on Spotify, imported as watches.
+	catalogImportSpotifyFollows(): Promise<CatalogImportReport>;
+	// Every label in the local library, registered with the shared catalogue
+	// and queued for its lookups (pages, releases). Follows nothing.
+	catalogEnrichLibraryLabels(): Promise<CatalogEnrichReport>;
+	// What a library track is in the Global Catalog — its recording, release,
+	// label and artists — from catalog_ref, resolving what is missing or stale
+	// (catalog-client/catalog-refs.ts).
+	catalogRefsForTrack(trackId: string): Promise<TrackCatalogRefs>;
+	// A catalogue object with what hangs off it: a label's or an artist's
+	// releases, a release's tracks, each with its store handles.
+	catalogBrowse(objectId: string): Promise<CatalogBrowseResult>;
+	// The Manage following modal: one tab of the library's artists / labels /
+	// genres / followed playlists, by how often each appears in the library,
+	// each marked with the watch that already follows it.
+	catalogFollowCandidates(kind: FollowCandidateKind): Promise<FollowCandidate[]>;
+	catalogFollowMany(targets: CatalogFollowTarget[]): Promise<CatalogFollowManyReport>;
 	// Background Spotify album fill (library/album-enrich.ts): fetches the
 	// full album object for every release with a Spotify id not yet fetched,
 	// paced through the shared rate gate. Called by the desktop main after
@@ -1253,6 +1311,18 @@ export interface CoreService {
 	getTrackVector(trackId: string, model?: string): Promise<number[] | null>;
 	subscribeMirEvents(cb: (e: MirEvent) => void): () => void;
 
+	// ─── Production quality (see production/layer.ts) ───────────────────
+	// Reads the analyzer's production stage (opt-in flag) + Audiobox PQ:
+	// integrity flags, cohort-relative deviations with explanations, the
+	// learned probe's score. Pairs + judgments feed the probe.
+	getProductionProfile(trackId: string): Promise<ProductionProfile>;
+	nextProductionPair(opts?: { genre?: string | null; playlistId?: string | null }): Promise<ProductionPair | null>;
+	recordProductionJudgment(aTrackId: string, bTrackId: string, winner: ProductionWinner): Promise<ProductionStats>;
+	productionStats(): Promise<ProductionStats>;
+	// Fit the Bradley-Terry probe over every judgment and rewrite
+	// track.prod_score for every measured track.
+	fitProductionModel(): Promise<ProductionModelInfo>;
+
 	// ─── Backup & restore (see backup/service.ts) ────────────────────────
 	// Settings live in app_setting ('backup.settings'); the scheduler runs
 	// in core without a renderer. Everything heavy happens in the injected
@@ -1353,6 +1423,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// is gone (plays.ts finalizeInterruptedPlays).
 	const startedAt = Date.now();
 	const { db, sqlite } = createDb(dbPath);
+	// One-time, before the window has anything to show (its backup copies the
+	// whole DB): remixer credits the artist backfill cut to a one-word prefix.
+	if (dbPath !== ':memory:') {
+		try { runRemixerPrefixRepair(db, dbPath); } catch (err) { log.for('artists').warn('remixer credit repair failed; retrying next launch', undefined, err); }
+	}
 	const auth = new AuthService(db);
 	// One cancel token shared across both enrichers — cancelling fires
 	// whichever loop is currently active. Both classes reset it at the start
@@ -1796,7 +1871,57 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// The account's feed decisions (protocol v4, feed/sync.ts): a re-surfacing
 	// item lands with the decision another device made about it.
 	feedStore.setDecisionSource((keys) => syncedItemsFor(sqlite, keys));
+	// Bound once the cloud client exists (below): the feed service is built
+	// before it, and the producer asks the port on each poll.
+	let catalogFeedPort: CatalogFeedPort | null = null;
+	// Which Spotify follows were carried into the catalogue (device-local;
+	// catalog-client/follows-sync.ts). Present = follows live in the catalogue.
+	const FOLLOWS_SYNC_KEY = 'catalog.spotify_follows';
+	const loadFollowsSync = (): FollowsSyncState | null => {
+		const row = db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, FOLLOWS_SYNC_KEY)).get();
+		return (row?.value as FollowsSyncState | undefined) ?? null;
+	};
+	const saveFollowsSync = (s: FollowsSyncState): void => {
+		db.insert(appSetting)
+			.values({ key: FOLLOWS_SYNC_KEY, value: s, updatedAt: new Date() })
+			.onConflictDoUpdate({ target: appSetting.key, set: { value: s, updatedAt: new Date() } })
+			.run();
+	};
 	const feedService = createFeedService({
+		catalogFeed: opts.cloud?.transport.feed
+			? {
+				available: () => catalogFeedPort?.available() ?? false,
+				events: (afterSeq) => catalogFeedPort!.events(afterSeq),
+				recent: (days) => catalogFeedPort!.recent(days),
+				watchedIds: () => catalogFeedPort!.watchedIds(),
+				prepare: () => catalogFeedPort?.prepare?.() ?? Promise.resolve(),
+			}
+			: undefined,
+		catalogFollows: opts.cloud?.transport.catalog
+			? {
+				active: () => (catalogClient?.status().available ?? false) && loadFollowsSync() !== null,
+				reachable: () => catalogClient?.status().available ?? false,
+				watchFor: async (kind, spotifyId) =>
+					(await requireCatalog().watches()).find((w) => w.object.kind === kind && w.object.handles.some((h) => h.provider === 'spotify' && h.id === spotifyId))?.object.id ?? null,
+				watchedSpotifyIds: async (kind) =>
+					new Set(
+						(await requireCatalog().watches())
+							.filter((w) => w.object.kind === kind)
+							.flatMap((w) => w.object.handles.filter((h) => h.provider === 'spotify').map((h) => h.id)),
+					),
+				// A playlist is the cloud's once its Spotify tracker has polled it
+				// cleanly; until then (no login there, a local catalogue without the
+				// gateway, a failing read) this device keeps reading it.
+				deviceTrackedPlaylists: async () =>
+					new Set(
+						(await requireCatalog().watches())
+							.filter((w) => w.object.kind === 'playlist' && !w.tracking.some((t) => t.provider === 'spotify' && t.lastRunAt !== null && !t.failing))
+							.flatMap((w) => w.object.handles.filter((h) => h.provider === 'spotify').map((h) => h.id)),
+					),
+				unwatch: (objectId) => requireCatalog().unfollow(objectId),
+				mute: (objectId, muted) => requireCatalog().mute(objectId, muted),
+			}
+			: undefined,
 		store: feedStore,
 		auth, // AuthService satisfies FeedAuthPort structurally
 		beatportFetch: opts.beatportFetch,
@@ -2028,7 +2153,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// one recompute at the tail, so the UI doesn't render hour-stale
 		// levels during a backfill run.
 		analysisQueue.on('event', (evt: AnalysisJobEvent) => {
-			if (evt.kind === 'completed') cutoffStore.scheduleRecompute();
+			if (evt.kind === 'completed') {
+				cutoffStore.scheduleRecompute();
+				// A fresh production row gets the stored probe's score at once
+				// (no-op without a fitted model or measurements).
+				try { productionLayer.scoreTrack(evt.trackId); }
+				catch (err) { log.for('production').warn('scoring after analysis failed', { trackId: evt.trackId }, err); }
+			}
 		});
 	}
 
@@ -2049,6 +2180,45 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		saveSettings: (s) => { mut.setSetting(db, MIR_SETTINGS_KEY, s); },
 		busyElsewhere: () => analysisQueue?.busy ?? false,
 	});
+
+	const productionLayer = createProductionLayer({
+		sqlite,
+		audioboxVectors: () => mirLayer.trackVectors(AUDIOBOX_MODEL_KEY),
+		audioboxVector: (id) => mirLayer.trackVector(id, AUDIOBOX_MODEL_KEY),
+		loadModel: () => {
+			const row = db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, PRODUCTION_MODEL_KEY)).get();
+			return row?.value && typeof row.value === 'object' ? row.value as ProductionModelInfo : null;
+		},
+		saveModel: (m) => { mut.setSetting(db, PRODUCTION_MODEL_KEY, m); },
+	});
+
+	// Audiobox PQ mirror: the engine stores its scores in mir.db like any
+	// vector; the list sorts on curator.db, so the PQ axis is copied onto the
+	// track row when a score lands, and once at boot for scores already there.
+	const writeAudioboxPq = sqlite.prepare(`UPDATE track SET audiobox_pq = ? WHERE id = ? AND audiobox_pq IS NOT ?`);
+	const mirrorAudioboxPq = (trackId: string): void => {
+		const v = mirLayer.trackVector(trackId, AUDIOBOX_MODEL_KEY);
+		if (v && v.length >= 4 && Number.isFinite(v[3]!)) writeAudioboxPq.run(v[3], trackId, v[3]);
+	};
+	mirLayer.subscribe((e) => {
+		if (e.kind !== 'analyzed' || !e.modelIds.some((id) => id.startsWith(`${AUDIOBOX_MODEL_KEY}@`))) return;
+		try { mirrorAudioboxPq(e.trackId); productionLayer.scoreTrack(e.trackId); }
+		catch (err) { log.for('production').warn('audiobox mirror failed', { trackId: e.trackId }, err); }
+	});
+	setTimeout(() => {
+		try {
+			const vectors = mirLayer.trackVectors(AUDIOBOX_MODEL_KEY);
+			if (vectors.size === 0) return;
+			const n = sqlite.transaction(() => {
+				let changed = 0;
+				for (const [id, v] of vectors) {
+					if (v.length >= 4 && Number.isFinite(v[3]!)) changed += writeAudioboxPq.run(v[3], id, v[3]).changes;
+				}
+				return changed;
+			})();
+			if (n > 0) log.for('production').info('mirrored Audiobox PQ onto tracks', { tracks: n });
+		} catch (err) { log.for('production').warn('Audiobox PQ boot sync failed', undefined, err); }
+	}, 20_000).unref();
 
 	// `filter.similarTo` → ranked ids. Every other filter field narrows the
 	// candidate set first (SQL pushdown), so the ranking happens inside the
@@ -2128,7 +2298,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		recomputeMembership: (trackId) => membership.recomputeForTrack(trackId),
 		requestPeaks: (trackIds) => svcRef!.enqueueAnalysis(trackIds, {
 			priority: 50,
-			analyzeFlags: { beatgrid: false, key: false, segments: false, peaks: true, fingerprint: true, advanced: false },
+			analyzeFlags: { beatgrid: false, key: false, segments: false, peaks: true, fingerprint: true, advanced: false, production: false },
 		}),
 		creditFormat: () => creditFormat,
 	});
@@ -2248,6 +2418,44 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			onIdentityChange: () => membership.recomputeAll(),
 		});
 		cloudClient.subscribe((e) => { if (e.kind === 'status') auth.spotifyGatewayCheck(); });
+	}
+	// Following: the watches behind the cloud feed (catalog-client/service.ts).
+	const catalogProcs = opts.cloud?.transport.catalog;
+	const catalogClient: CatalogClient | null = cloudClient && catalogProcs
+		? createCatalogClient({
+			catalog: catalogProcs,
+			signedIn: () => opts.cloud!.transport.session() !== null,
+			serverOffers: () => opts.cloud!.transport.catalogOffered?.() ?? cloudClient.serverFeatures()?.includes('global_catalog') ?? false,
+			deviceId: () => cloudClient.deviceId(),
+			spotifyToken: () => auth.getSpotifyAccessToken(),
+		})
+		: null;
+	const requireCatalog = (): CatalogClient => {
+		if (!catalogClient) throw new CatalogUnavailableError('Sign in to Curator Cloud to follow artists and labels.');
+		return catalogClient;
+	};
+	// The Global Catalog's events feed Discover ('global_catalog').
+	const feedProcs = opts.cloud?.transport.feed;
+	if (cloudClient && feedProcs) {
+		const transport = opts.cloud!.transport;
+		catalogFeedPort = {
+			available: () => transport.session() !== null && (transport.catalogOffered?.() ?? cloudClient.serverFeatures()?.includes('global_catalog') ?? false),
+			events: (afterSeq) => feedProcs.events({ deviceId: cloudClient.deviceId(), afterSeq }),
+			recent: (days) => feedProcs.recent({ deviceId: cloudClient.deviceId(), days }),
+			watchedIds: async () => new Set((await requireCatalog().watches()).map((w) => w.object.id)),
+			// The Spotify follows, carried into the catalogue behind the scenes.
+			prepare: async () => {
+				if (!catalogClient) return;
+				await syncSpotifyFollows({
+					client: catalogClient,
+					spotifyToken: () => auth.getSpotifyAccessToken(),
+					mutedSpotifyArtistIds: async () =>
+						new Set([...(await feedStore.suppressedKeys('artist'))].map((k) => k.replace(/^artist:/, '')).filter((id) => !id.startsWith('catalog:'))),
+					load: loadFollowsSync,
+					save: saveFollowsSync,
+				});
+			},
+		};
 	}
 	let cloudWakeUnsub: (() => void) | null = null;
 	let cloudRealtimeUnsub: (() => void) | null = null;
@@ -4315,11 +4523,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async feedAction(action) {
 			return feedService.action(action);
 		},
-		async unfollowFeedPlaylist(playlistId) {
-			return feedService.unfollowPlaylist(playlistId);
+		async unfollowFeedPlaylist(playlistId, catalogId) {
+			return feedService.unfollowPlaylist(playlistId, catalogId);
 		},
-		async unfollowFeedArtist(artistId) {
-			return feedService.unfollowArtist(artistId);
+		async unfollowFeedArtist(artistId, catalogId) {
+			return feedService.unfollowArtist(artistId, catalogId);
 		},
 		async runFeedRefresh() {
 			return feedService.refresh();
@@ -4338,6 +4546,71 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 		async getFeedRole() {
 			return feedService.role();
+		},
+
+		// ─── Following ──────────────────────────────────────────────────────
+		async getCatalogStatus() {
+			return catalogClient?.status() ?? { available: false, reason: 'signed_out' };
+		},
+		async catalogWatches() {
+			return requireCatalog().watches();
+		},
+		async catalogSearch(q) {
+			return requireCatalog().search(q);
+		},
+		async catalogFollow(target) {
+			return requireCatalog().follow(target);
+		},
+		// A followed Spotify artist / playlist goes through the feed's unfollow,
+		// which also removes the items it brought (core feed/service.ts).
+		async catalogUnfollow(objectId) {
+			const w = (await requireCatalog().watches()).find((x) => x.object.id === objectId);
+			const spotifyId = w?.object.handles.find((h) => h.provider === 'spotify')?.id;
+			if (w && spotifyId && (w.object.kind === 'artist' || w.object.kind === 'playlist')) {
+				const r = w.object.kind === 'artist' ? await feedService.unfollowArtist(spotifyId, objectId) : await feedService.unfollowPlaylist(spotifyId, objectId);
+				if (!r.ok) throw new Error(r.error ?? 'unfollow failed');
+				return;
+			}
+			return requireCatalog().unfollow(objectId);
+		},
+		async catalogMute(objectId, muted) {
+			return requireCatalog().mute(objectId, muted);
+		},
+		async catalogRefresh(objectId) {
+			return requireCatalog().refresh(objectId);
+		},
+		async catalogEnrichLibraryLabels() {
+			return requireCatalog().enrichLabels(labelCandidates(sqlite).map((c) => c.name));
+		},
+		async catalogRefsForTrack(trackId) {
+			return refsForTrack(sqlite, requireCatalog(), trackId);
+		},
+		async catalogBrowse(objectId) {
+			return requireCatalog().browse(objectId);
+		},
+		async catalogImportSpotifyFollows() {
+			return requireCatalog().importSpotifyFollows();
+		},
+		async catalogFollowCandidates(kind) {
+			const client = requireCatalog();
+			const status = auth.getStatus();
+			const list =
+				kind === 'artist' ? artistCandidates(sqlite)
+				: kind === 'label' ? labelCandidates(sqlite)
+				: kind === 'genre' ? genreCandidates(sqlite)
+				: playlistCandidates(sqlite, { spotify: status.spotify.id ?? null, tidal: status.tidal.id ?? null });
+			// What each watch is matched by: its provider handles, and for labels
+			// and genres its folded name.
+			const followed = new Map<string, string>();
+			for (const w of await client.watches()) {
+				if (w.object.kind !== kind) continue;
+				for (const h of w.object.handles) followed.set(`${h.provider}:${h.id}`, w.object.id);
+				if (kind === 'label' || kind === 'genre') followed.set(`name:${nameFold(w.object.name)}`, w.object.id);
+			}
+			return list.map((c) => ({ ...c, followedObjectId: followed.get(c.matchKey) ?? null }));
+		},
+		async catalogFollowMany(targets) {
+			return requireCatalog().followMany(targets);
 		},
 		startAlbumEnrichment() {
 			albumEnricher.start();
@@ -5621,6 +5894,12 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return mirLayer.subscribe(cb);
 		},
 
+		async getProductionProfile(trackId) { return productionLayer.profile(trackId); },
+		async nextProductionPair(opts) { return productionLayer.nextPair(opts); },
+		async recordProductionJudgment(a, b, winner) { return productionLayer.recordJudgment(a, b, winner); },
+		async productionStats() { return productionLayer.stats(); },
+		async fitProductionModel() { return productionLayer.fitModel(); },
+
 		async getBackupSettings() { return backupService.getSettings(); },
 		async setBackupSettings(patch) { return backupService.setSettings(patch); },
 		async getBackupStatus() { return backupService.getStatus(); },
@@ -5792,6 +6071,13 @@ const SCALAR_BOUND_COLUMNS = {
 	introLengthSec: track.introLengthSec,
 	outroLengthSec: track.outroLengthSec,
 	firstDropSec: track.firstDropSec,
+	prodLufs: track.prodLufs,
+	prodPlr: track.prodPlr,
+	prodCutoffHz: track.prodCutoffHz,
+	prodSubCorr: track.prodSubCorr,
+	prodClipPct: track.prodClipPct,
+	prodScore: track.prodScore,
+	audioboxPq: track.audioboxPq,
 } as const;
 
 // Run a per-chunk IN query and concatenate the rows — keeps any single

@@ -147,6 +147,23 @@ export const track = sqliteTable(
 		firstDropSec: real('first_drop_sec'),
 		dropCount: integer('drop_count'),
 		breakdownCount: integer('breakdown_count'),
+		// Production-stage scalars mirrored from track_analysis (analyzer
+		// 2.5.0+, opt-in stage) — the ones the list sorts/filters on and the
+		// integrity flags derive from. The full measurement set stays in
+		// track_analysis.production_json.
+		prodLufs: real('prod_lufs'),          // integrated loudness, LUFS
+		prodPlr: real('prod_plr'),            // true peak minus integrated loudness, dB
+		prodCutoffHz: real('prod_cutoff_hz'), // lossy lowpass wall; Nyquist = full band
+		prodSubCorr: real('prod_sub_corr'),   // L/R correlation below 120 Hz
+		prodClipPct: real('prod_clip_pct'),   // % of samples in flat full-scale runs
+		// Learned production score from the pairwise-judgment probe
+		// (apps/core/src/production/model.ts). Rewritten for every track on
+		// each fit; null until a model exists or the track lacks features.
+		prodScore: real('prod_score'),
+		// Audiobox Aesthetics production-quality rating (0-10), mirrored from
+		// the engine's stored vector (mir.db) so the list can sort on it; the
+		// mir layer's 'analyzed' event and a boot-time sync keep it current.
+		audioboxPq: real('audiobox_pq'),
 		state: text('state', { enum: TRACK_STATES }).notNull().default('unsorted'),
 		stateChangedAt: integer('state_changed_at', { mode: 'timestamp_ms' }),
 		overrides: text('overrides', { mode: 'json' }).$type<TrackOverrides | null>(),
@@ -268,6 +285,11 @@ export const track = sqliteTable(
 		introLengthSecIdx: index('track_intro_length_sec_idx').on(t.introLengthSec),
 		outroLengthSecIdx: index('track_outro_length_sec_idx').on(t.outroLengthSec),
 		firstDropSecIdx: index('track_first_drop_sec_idx').on(t.firstDropSec),
+		prodLufsIdx: index('track_prod_lufs_idx').on(t.prodLufs),
+		prodPlrIdx: index('track_prod_plr_idx').on(t.prodPlr),
+		prodCutoffHzIdx: index('track_prod_cutoff_hz_idx').on(t.prodCutoffHz),
+		prodScoreIdx: index('track_prod_score_idx').on(t.prodScore),
+		audioboxPqIdx: index('track_audiobox_pq_idx').on(t.audioboxPq),
 		deletedAtIdx: index('track_deleted_at_idx').on(t.deletedAt),
 		membershipIdx: index('track_membership_idx').on(t.membership),
 		// Folded genre/label — the Organize recommender's categorical matching
@@ -871,6 +893,18 @@ export const trackAnalysis = sqliteTable('track_analysis', {
 	dropCount: integer('drop_count'),
 	breakdownCount: integer('breakdown_count'),
 	featuresJson: text('features_json', { mode: 'json' }).$type<Record<string, unknown> | null>(),
+	// Stage 7 — production measurements (analyzer 2.5.0+, opt-in). The six
+	// scalars are the sort/flag surface (mirrored onto `track`); the JSON is
+	// the whole measurement set including per-section rows — see
+	// ProductionMeasurements below and apps/analyzer/.../production.py.
+	// Written as an atomic group only when the stage ran.
+	prodLufs: real('prod_lufs'),
+	prodTruePeak: real('prod_true_peak'),
+	prodPlr: real('prod_plr'),
+	prodCutoffHz: real('prod_cutoff_hz'),
+	prodSubCorr: real('prod_sub_corr'),
+	prodClipPct: real('prod_clip_pct'),
+	productionJson: text('production_json', { mode: 'json' }).$type<ProductionMeasurements | null>(),
 	duration: real('duration'),
 	analyzerVersion: text('analyzer_version').notNull(),
 	analyzedAt: integer('analyzed_at', { mode: 'timestamp_ms' }).notNull(),
@@ -961,6 +995,81 @@ export type SegmentRecord = {
 	fillSec?: number;     // end-of-phrase fill-in marker (track-time seconds)
 	rbKind?: number;      // raw PSSI kind code (1..10), mood-dependent meaning
 };
+
+// ─── PRODUCTION MEASUREMENTS ────────────────────────────────────────────────
+// Stage 7 of the analyzer (apps/analyzer/src/curator_analyzer/production.py),
+// stored verbatim on `track_analysis.production_json`. Every value is a meter
+// reading about the file as delivered, nothing is a judgement; the product
+// layer (apps/core/src/production/) turns them into integrity flags and
+// cohort-relative deviations. Band levels are dB relative to the whole
+// spectrum (loudness-independent); width is side/mid in dB per band.
+export const PRODUCTION_BANDS = ['sub', 'bass', 'lowmid', 'mid', 'himid', 'high'] as const;
+export type ProductionBand = (typeof PRODUCTION_BANDS)[number];
+export const PRODUCTION_WIDTH_BANDS = ['low', 'mid', 'high'] as const;
+export type ProductionWidthBand = (typeof PRODUCTION_WIDTH_BANDS)[number];
+
+export type ProductionSection = {
+	label: string | null;
+	startSec: number;
+	endSec: number;
+	lufs: number | null;        // power mean of the short-term loudness inside the section
+	crest_db: number;           // median 3 s crest factor
+	sub_corr: number;
+	bands_db: Record<ProductionBand, number>;
+	width_db: Record<ProductionWidthBand, number>;
+	tilt_db_oct: number;
+};
+
+export type ProductionMeasurements = {
+	version: number;
+	stereo_source: boolean;     // false = mono file analysed as L == R
+	duration_sec: number;
+	// Loudness / headroom (EBU R128, ITU true peak)
+	lufs_i: number;
+	lra: number;
+	lufs_m_max: number;
+	true_peak_dbtp: number;
+	plr: number;                // true peak minus integrated loudness
+	clip_pct: number;           // % of samples in flat full-scale runs (>= 3 samples)
+	dc_offset: number;
+	// Dynamics
+	crest_db: number;
+	crest_st_p50: number;       // median short-term (3 s) crest factor
+	noise_floor_db: number;     // 1st percentile of 400 ms block RMS, dBFS
+	// Tonal balance
+	bands_db: Record<ProductionBand, number>;
+	centroid_hz: number;
+	tilt_db_oct: number;        // spectral slope over 50 Hz–16 kHz, dB per octave
+	// Bandwidth: a lossy encoder's lowpass wall (Nyquist when none)
+	cutoff_hz: number;
+	cutoff_depth_db: number;
+	// Stereo
+	phase_corr: number;
+	sub_corr: number;           // L/R correlation below 120 Hz
+	width_db: Record<ProductionWidthBand, number>;
+	// Low end against the beatgrid (null without a usable grid)
+	kick_punch_db: number | null;
+	sub_under_kick_db: number | null;
+	sections: ProductionSection[];
+};
+
+// ─── PRODUCTION JUDGMENT ────────────────────────────────────────────────────
+// One pairwise answer to "which sounds more professionally produced?" from the
+// Compare dialog. Pairs are drawn within a genre and played loudness-matched,
+// so the answers carry mix/master quality rather than loudness or taste; the
+// probe (apps/core/src/production/model.ts) fits a Bradley-Terry model over
+// the measurement vectors from these rows.
+export const productionJudgment = sqliteTable('production_judgment', {
+	id: text('id').primaryKey(),
+	aTrackId: text('a_track_id').notNull().references(() => track.id, { onDelete: 'cascade' }),
+	bTrackId: text('b_track_id').notNull().references(() => track.id, { onDelete: 'cascade' }),
+	winner: text('winner', { enum: ['a', 'b', 'tie'] }).notNull(),
+	createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+}, (t) => ({
+	aIdx: index('production_judgment_a_idx').on(t.aTrackId),
+	bIdx: index('production_judgment_b_idx').on(t.bTrackId),
+}));
+export type ProductionJudgment = typeof productionJudgment.$inferSelect;
 
 // ─── CUE ─────────────────────────────────────────────────────────────────────
 // Hot cues + memory cues. A row with `lengthSec` null/0 is a point cue;
@@ -1610,6 +1719,31 @@ export const trackProviderRef = sqliteTable(
 		payload: text('payload').notNull(),
 	},
 	(t) => ({ pk: primaryKey({ columns: [t.trackId, t.ord] }) }),
+);
+
+// The library's entities as the Global Catalog knows them: a track as a
+// catalogue recording, an album as a release, an artist, a label (keyed by its
+// folded name — a label is text on tracks and albums here). Written by the
+// collection import (core cli/catalog-import.ts) and resolved lazily for the
+// rest (catalog-client/catalog-refs.ts). `object_id` is a cache, never a
+// foreign key: catalogue objects merge, and `provider`/`provider_id` — the
+// ref it was resolved by — is what finds it again. Device-local; nothing here
+// syncs.
+export const catalogRef = sqliteTable(
+	'catalog_ref',
+	{
+		entityKind: text('entity_kind', { enum: ['track', 'album', 'artist', 'label'] }).notNull(),
+		entityId: text('entity_id').notNull(),
+		objectId: text('object_id').notNull(),
+		objectKind: text('object_kind', { enum: ['recording', 'release', 'artist', 'label'] }).notNull(),
+		provider: text('provider'),
+		providerId: text('provider_id'),
+		resolvedAt: integer('resolved_at').notNull(),
+	},
+	(t) => ({
+		pk: primaryKey({ columns: [t.entityKind, t.entityId] }),
+		objectIdx: index('catalog_ref_object_idx').on(t.objectId),
+	}),
 );
 
 // Playlist / folder details on the op log (protocol v4 `set-attrs`,

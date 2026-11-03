@@ -39,19 +39,20 @@ import { similarLevelsFor, type SimilarityDim } from './features/similarity.js';
 import { setTrackDragPayload } from './dnd.js';
 import { isRemoteRow, remoteMarkSource, remoteRowTitle } from './remoteRows.js';
 import { fmtReleaseLabel } from './ui/format.js';
+import { productionFlags, worstProductionSeverity } from '@curator/library-logic';
 import {
 	buildDisplayList, groupHeadInnerHeight, groupIdentity, rowHeight, GROUP_GAP_H, TRACK_ROW_H,
 	type DisplayList, type DisplayRow, type GroupBy, type GroupInfo, type RowLines,
 } from './trackGroups.js';
 
-export type Column = 'src' | 'idx' | 'match' | 'art' | 'title' | 'artist' | 'album' | 'rel' | 'label' | 'genre' | 'bpm' | 'key' | 'time' | 'rating' | 'lra' | 'diss' | 'dens' | 'bright' | 'power' | 'punch' | 'tags' | 'added' | 'act';
+export type Column = 'src' | 'idx' | 'match' | 'art' | 'title' | 'artist' | 'album' | 'rel' | 'label' | 'genre' | 'bpm' | 'key' | 'time' | 'rating' | 'lra' | 'diss' | 'dens' | 'bright' | 'power' | 'punch' | 'loud' | 'plr' | 'prodq' | 'pq' | 'tags' | 'added' | 'act';
 // Paired columns of the two-line layout. Each stacks up to two fields
 // (line 1 / line 2) and shows only the fields the per-field visibility
 // (TrackRowOptions.fields — the same set the one-line columns use) allows.
 // src / idx / match / art / added keep their one-line identity.
 export type PairColumn = 'title2' | 'labelrel' | 'genretags' | 'keyfx' | 'timerating';
 export type LayoutColumn = Column | PairColumn;
-export type SortColumn = 'match' | 'index' | 'title' | 'artist' | 'album' | 'releaseDate' | 'label' | 'genre' | 'bpm' | 'keyCamelot' | 'duration' | 'createdAt' | 'rating' | 'loudnessRangeLu' | 'dissonance' | 'density' | 'brightness' | 'power' | 'dynamicComplexity';
+export type SortColumn = 'match' | 'index' | 'title' | 'artist' | 'album' | 'releaseDate' | 'label' | 'genre' | 'bpm' | 'keyCamelot' | 'duration' | 'createdAt' | 'rating' | 'loudnessRangeLu' | 'dissonance' | 'density' | 'brightness' | 'power' | 'dynamicComplexity' | 'prodLufs' | 'prodPlr' | 'prodScore' | 'audioboxPq';
 export type SortDir = 'asc' | 'desc';
 
 export interface TrackRowOptions {
@@ -238,7 +239,7 @@ function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: re
 	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${DERIVED_NOTE}`)];
 	return parts.length ? `Sources: ${parts.join(', ')}` : '';
 }
-export const ALL_COLUMNS: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'tags', 'added'];
+export const ALL_COLUMNS: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'loud', 'plr', 'prodq', 'pq', 'tags', 'added'];
 
 // The two-line layout's columns from the visible fields. idx / title are
 // always there (locked); a paired column shows when any of its fields is
@@ -292,23 +293,42 @@ const ratingCell = (r: number | null | undefined): string => {
 		+ '<span class="rating-stars__off">' + '★'.repeat(5 - n) + '</span>'
 		+ '</span>';
 };
-// "Added" timestamp, bucketed by recency for at-a-glance scanning:
-//   today        → 24-hour clock time  ("14:32")
-//   this month   → month + day         ("Aug 13")
-//   older        → month + year        ("Aug, 2024") — same shape as the
-//                  Release column's month-and-year, so the two date
-//                  columns read consistently. `addedAt`/`createdAt` are full timestamps,
-//                  so unlike Release this always has a real month + year.
-// Buckets are computed in LOCAL calendar terms (getFullYear/Month/Date) — a
-// track added at 23:50 stays "today" until local midnight, matching intuition.
+// "Added" timestamp: "Today" / "Yesterday", otherwise month + year
+// ("Aug, 2024") — same shape as the Release column's month-and-year, so the
+// two date columns read consistently. The tooltip carries the exact day, plus
+// a relative age for anything in the last 90 days.
+// Day distance is counted in LOCAL calendar days — a track added at 23:50
+// stays "Today" until local midnight, matching intuition. Math.round absorbs
+// the ±1h a DST transition puts between two local midnights.
+const FULL_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const ordinal = (n: number): string => {
+	const t = n % 100;
+	if (t >= 11 && t <= 13) return `${n}th`;
+	return `${n}${['th', 'st', 'nd', 'rd'][n % 10] ?? 'th'}`;
+};
+const daysAgo = (date: Date): number => {
+	const now = new Date();
+	const a = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+	const b = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+	return Math.round((b - a) / 86_400_000);
+};
 const fmtAdded = (d: Date | string | null | undefined): string => {
 	if (!d) return '—';
 	const date = new Date(d);
-	const now = new Date();
-	const sameMonth = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth();
-	if (sameMonth && date.getDate() === now.getDate()) return `${fmt2(date.getHours())}:${fmt2(date.getMinutes())}`;
-	if (sameMonth) return `${MONTHS[date.getMonth()]} ${date.getDate()}`;
+	const ago = daysAgo(date);
+	if (ago === 0) return 'Today';
+	if (ago === 1) return 'Yesterday';
 	return `${MONTHS[date.getMonth()]}, ${date.getFullYear()}`;
+};
+// "October 20th, 2026 (7 days ago)"
+const fmtAddedTitle = (d: Date | string | null | undefined): string => {
+	if (!d) return '';
+	const date = new Date(d);
+	const full = `${FULL_MONTHS[date.getMonth()]} ${ordinal(date.getDate())}, ${date.getFullYear()}`;
+	const ago = daysAgo(date);
+	if (ago < 0 || ago > 90) return full;
+	const rel = ago === 0 ? 'today' : ago === 1 ? 'yesterday' : `${ago} days ago`;
+	return `${full} (${rel})`;
 };
 const coverGradient = (i: number): string => {
 	const hues = [25, 65, 105, 145, 195, 230, 280, 320];
@@ -400,7 +420,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// the Pinned/Basket views) preferred when present, falling back to createdAt
 	// for global views.
 	const addedSrc = t.addedAt ?? t.createdAt;
-	const addedCell = `<td class="added" title="${escapeHtml(addedSrc ? new Date(addedSrc).toLocaleString() : '')}">${fmtAdded(addedSrc)}</td>`;
+	const addedCell = `<td class="added" title="${escapeHtml(fmtAddedTitle(addedSrc))}">${fmtAdded(addedSrc)}</td>`;
 	// Tag chips — only resolved when tags render. The resolver is supplied by
 	// the caller (main.ts wires tagsStore). We cap visible chips at
 	// TL_TAG_LIMIT and roll the rest into a `+N` overflow chip (full list in
@@ -429,6 +449,19 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 		const l = sim[d];
 		return l ? ` sim-hl${l > 1 ? ` sim-hl--${l}` : ''}` : '';
 	};
+	// Integrity badge on the PLR cell — the same thresholds the profile uses
+	// (library-logic productionFlags), read off the mirrored track scalars.
+	const prodBadge = ((): { cls: string; title: string; dot: string } => {
+		if (t.prodPlr == null) return { cls: '', title: '', dot: '' };
+		const flags = productionFlags({ prodCutoffHz: t.prodCutoffHz, prodClipPct: t.prodClipPct, prodSubCorr: t.prodSubCorr, prodPlr: t.prodPlr, prodLufs: t.prodLufs });
+		const worst = worstProductionSeverity(flags);
+		if (!worst) return { cls: '', title: '', dot: '' };
+		return {
+			cls: worst === 'bad' ? ' prod-bad' : ' prod-warn',
+			title: ` title="${escapeHtml(flags.map((f) => f.detail).join('\n'))}"`,
+			dot: '<span class="prod-dot"></span>',
+		};
+	})();
 	// Title shows the remix segment in the user's style (Settings → User
 	// Interface); the stored title keeps the release's wording.
 	const title = formatTrackTitle(t.title, t.artists, artistCreditFormat().remixStyle);
@@ -514,6 +547,13 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 			bright: `<td class="bright${simCls('brightness')}">${fmtFixed(t.brightness, 2)}</td>`,
 			power: `<td class="power${simCls('power')}">${fmtFixed(t.power, 2)}</td>`,
 			punch: `<td class="punch">${fmtFixed(t.dynamicComplexity, 1)}</td>`,
+			// Production stage (analyzer 2.5.0+, opt-in). The PLR cell carries
+			// the integrity badge: the worst flag's severity as a dot, every
+			// flag's wording in the tooltip — the file facts a DJ acts on.
+			loud: `<td class="loud">${fmtFixed(t.prodLufs, 1)}</td>`,
+			plr: `<td class="plr${prodBadge.cls}"${prodBadge.title}>${fmtFixed(t.prodPlr, 1)}${prodBadge.dot}</td>`,
+			prodq: `<td class="prodq">${fmtFixed(t.prodScore, 2)}</td>`,
+			pq: `<td class="pq">${fmtFixed(t.audioboxPq, 2)}</td>`,
 			tags: `<td class="tags">${cols.includes('tags') ? tagsHtml() : ''}</td>`,
 			added: addedCell,
 			act: `<td class="act"></td>`,
@@ -649,6 +689,10 @@ const COL_DEFS: Record<Column, { th: string; thAlign?: 'left' | 'center' | 'righ
 	bright: { th: 'Brightness', thAlign: 'right', colClass: 'c-bright',  sortKey: 'brightness',        title: 'Learned brightness score — trebley vs. bassy/muffled.' },
 	power:  { th: 'Power',     thAlign: 'right',  colClass: 'c-power',   sortKey: 'power',             title: 'Learned energy/density score.' },
 	punch:  { th: 'Punch',     thAlign: 'right',  colClass: 'c-punch',   sortKey: 'dynamicComplexity', title: 'Dynamic complexity (dB) — how much loudness varies; high = punchy.' },
+	loud:   { th: 'LUFS',      thAlign: 'right',  colClass: 'c-loud',    sortKey: 'prodLufs',          title: 'Integrated loudness (EBU R128). Production quality analysis stage.' },
+	plr:    { th: 'PLR',       thAlign: 'right',  colClass: 'c-plr',     sortKey: 'prodPlr',           title: 'Peak-to-loudness ratio (dB): true peak minus loudness. Low = crushed master. The dot marks integrity flags (lossy source, clipping, overs, stereo sub) — hover for details, open Production profile for the full read.' },
+	prodq:  { th: 'Prod',      thAlign: 'right',  colClass: 'c-prodq',   sortKey: 'prodScore',         title: 'Learned production score from your pairwise comparisons (Settings → Library → Production quality). Higher = judged more professionally produced.' },
+	pq:     { th: 'PQ',        thAlign: 'right',  colClass: 'c-pq',      sortKey: 'audioboxPq',        title: 'Audiobox Aesthetics production quality, 0–10 (Meta’s learned rating from the audiobox-aesthetics AI engine model). General-purpose, not genre-calibrated — compare within a style.' },
 	// Tags is a set-valued column — sorting on a set has no natural ordering
 	// (alphabetic-first-tag would be misleading), so the header isn't
 	// clickable. Filter via the omnibar's `#tag` syntax instead.

@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS track (
 	first_drop_sec REAL,
 	drop_count INTEGER,
 	breakdown_count INTEGER,
+	prod_lufs REAL,
+	prod_plr REAL,
+	prod_cutoff_hz REAL,
+	prod_sub_corr REAL,
+	prod_clip_pct REAL,
+	prod_score REAL,
+	audiobox_pq REAL,
 	state TEXT NOT NULL DEFAULT 'unsorted',
 	state_changed_at INTEGER,
 	cues_edited_at INTEGER,
@@ -320,6 +327,13 @@ CREATE TABLE IF NOT EXISTS track_analysis (
 	drop_count INTEGER,
 	breakdown_count INTEGER,
 	features_json TEXT,
+	prod_lufs REAL,
+	prod_true_peak REAL,
+	prod_plr REAL,
+	prod_cutoff_hz REAL,
+	prod_sub_corr REAL,
+	prod_clip_pct REAL,
+	production_json TEXT,
 	duration REAL,
 	analyzer_version TEXT NOT NULL,
 	analyzed_at INTEGER NOT NULL,
@@ -1186,6 +1200,19 @@ const ALTER_MIGRATIONS: string[] = [
 		payload TEXT NOT NULL,
 		PRIMARY KEY (track_id, ord)
 	)`,
+	// The library's entities as the Global Catalog knows them (schema.ts
+	// catalogRef): what a track, album, artist or label is in the catalogue.
+	`CREATE TABLE IF NOT EXISTS catalog_ref (
+		entity_kind TEXT NOT NULL,
+		entity_id TEXT NOT NULL,
+		object_id TEXT NOT NULL,
+		object_kind TEXT NOT NULL,
+		provider TEXT,
+		provider_id TEXT,
+		resolved_at INTEGER NOT NULL,
+		PRIMARY KEY (entity_kind, entity_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS catalog_ref_object_idx ON catalog_ref (object_id)`,
 	// Triggers like track_meta_dirty's, for the same reason, but with an
 	// upsert clause instead of INSERT OR IGNORE: an outer UPSERT (the
 	// rekordbox importer's playlist write, a source_link refresh) overrides a
@@ -1363,6 +1390,41 @@ const ALTER_MIGRATIONS: string[] = [
 			AND (OLD.recording_id IS NOT NEW.recording_id OR OLD.remote_only IS NOT NEW.remote_only)
 		BEGIN INSERT INTO track_analysis_dirty (track_id) SELECT NEW.id WHERE EXISTS (SELECT 1 FROM track_analysis WHERE track_id = NEW.id)
 			ON CONFLICT DO NOTHING; END`,
+	// Production measurements (analyzer 2.5.0, opt-in stage 7). Six scalars
+	// on track_analysis + the full JSON; five mirrored onto track for the
+	// list, plus the learned probe score. Additive — nothing existing moves,
+	// so no analyzer_version floor change; the stage is opt-in per analysis.
+	// The applier's "duplicate column" swallow makes the ADDs idempotent.
+	`ALTER TABLE track_analysis ADD COLUMN prod_lufs REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN prod_true_peak REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN prod_plr REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN prod_cutoff_hz REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN prod_sub_corr REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN prod_clip_pct REAL`,
+	`ALTER TABLE track_analysis ADD COLUMN production_json TEXT`,
+	`ALTER TABLE track ADD COLUMN prod_lufs REAL`,
+	`ALTER TABLE track ADD COLUMN prod_plr REAL`,
+	`ALTER TABLE track ADD COLUMN prod_cutoff_hz REAL`,
+	`ALTER TABLE track ADD COLUMN prod_sub_corr REAL`,
+	`ALTER TABLE track ADD COLUMN prod_clip_pct REAL`,
+	`ALTER TABLE track ADD COLUMN prod_score REAL`,
+	`CREATE INDEX IF NOT EXISTS track_prod_lufs_idx ON track(prod_lufs)`,
+	`CREATE INDEX IF NOT EXISTS track_prod_plr_idx ON track(prod_plr)`,
+	`CREATE INDEX IF NOT EXISTS track_prod_cutoff_hz_idx ON track(prod_cutoff_hz)`,
+	`CREATE INDEX IF NOT EXISTS track_prod_score_idx ON track(prod_score)`,
+	`ALTER TABLE track ADD COLUMN audiobox_pq REAL`,
+	`CREATE INDEX IF NOT EXISTS track_audiobox_pq_idx ON track(audiobox_pq)`,
+	// Pairwise "which sounds more professionally produced?" answers from the
+	// Compare dialog (schema.ts productionJudgment).
+	`CREATE TABLE IF NOT EXISTS production_judgment (
+		id TEXT PRIMARY KEY,
+		a_track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		b_track_id TEXT NOT NULL REFERENCES track(id) ON DELETE CASCADE,
+		winner TEXT NOT NULL,
+		created_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS production_judgment_a_idx ON production_judgment(a_track_id)`,
+	`CREATE INDEX IF NOT EXISTS production_judgment_b_idx ON production_judgment(b_track_id)`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.
@@ -2004,8 +2066,12 @@ function backfillArtistTables(sqlite: Database.Database, dbPath: string): void {
 		syncTrackArtistsRaw(sqlite, parsed);
 		// 4. Remixers off the titles — now that the artist table knows every
 		// split name, "(X Remix)" resolves X against it. Titles untouched.
+		// The parser hands in a searchFold ("patrice baumel"); the table is
+		// keyed by artistKey ("patricebaumel"). Querying with the fold as-is
+		// knew no multi-word artist, so "(Patrice Bäumel Remix)" credited the
+		// one-word "Patrice" (repaired by library/remixer-prefix-repair.ts).
 		const knownStmt = sqlite.prepare(`SELECT 1 FROM artist WHERE name_ascii = ?`);
-		const known = (fold: string): boolean => knownStmt.get(fold) != null;
+		const known = (fold: string): boolean => knownStmt.get(artistKey(fold)) != null;
 		const remixRows: typeof parsed = [];
 		for (const r of parsed) {
 			const title = r.overrides?.title ?? r.title;
@@ -2409,7 +2475,7 @@ function reshapeClaimLink(sqlite: Database.Database): void {
 	})();
 }
 
-function backupDatabase(sqlite: Database.Database, dbPath: string, tag: string): void {
+export function backupDatabase(sqlite: Database.Database, dbPath: string, tag: string): void {
 	if (dbPath === ':memory:' || !existsSync(dbPath)) return;
 	const dir = dirname(dbPath);
 	const base = basename(dbPath);

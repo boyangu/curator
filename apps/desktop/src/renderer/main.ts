@@ -35,6 +35,9 @@ import { mountRatingDialog, type RatingDialogHandle } from './layouts/RatingDial
 import { mountNamePromptDialog, type NamePromptHandle, type NamePromptOptions } from './layouts/NamePromptDialog.jsx';
 import { mountDeleteTracksDialog, type DeleteTracksDialogHandle } from './layouts/DeleteTracksDialog.jsx';
 import { mountConfirmDialog, type ConfirmDialogHandle } from './layouts/ConfirmDialog.jsx';
+import { mountProductionProfileDialog, type ProductionProfileDialogHandle } from './layouts/ProductionProfileDialog.jsx';
+import { mountProductionCompareDialog, type ProductionCompareDialogHandle } from './layouts/ProductionCompareDialog.jsx';
+import { configureProductionSettings } from './features/productionSettings.js';
 import { mountWavConvertDialog, type WavConvertDialogHandle } from './layouts/WavConvertDialog.jsx';
 import { mountBackupProgressDialog, type BackupProgressDialogHandle } from './layouts/BackupProgressDialog.jsx';
 import { mountBackupRestoreDialog, type BackupRestoreDialogHandle } from './layouts/BackupRestoreDialog.jsx';
@@ -65,7 +68,7 @@ declare global {
 	}
 }
 
-type SortColumn = 'match' | 'index' | 'title' | 'artist' | 'album' | 'releaseDate' | 'label' | 'genre' | 'bpm' | 'keyCamelot' | 'duration' | 'createdAt' | 'rating' | 'loudnessRangeLu' | 'dissonance' | 'density' | 'brightness' | 'power' | 'dynamicComplexity';
+type SortColumn = 'match' | 'index' | 'title' | 'artist' | 'album' | 'releaseDate' | 'label' | 'genre' | 'bpm' | 'keyCamelot' | 'duration' | 'createdAt' | 'rating' | 'loudnessRangeLu' | 'dissonance' | 'density' | 'brightness' | 'power' | 'dynamicComplexity' | 'prodLufs' | 'prodPlr' | 'prodScore' | 'audioboxPq';
 type SortDir = 'asc' | 'desc';
 
 // Used by sidebar activation handlers to apply per-playlist sort memory:
@@ -76,7 +79,7 @@ type SortDir = 'asc' | 'desc';
 const KNOWN_SORT_COLUMNS = new Set<SortColumn>([
 	'index', 'title', 'artist', 'album', 'releaseDate', 'label', 'genre', 'bpm', 'keyCamelot',
 	'duration', 'createdAt', 'loudnessRangeLu', 'dissonance', 'density',
-	'brightness', 'power', 'dynamicComplexity',
+	'brightness', 'power', 'dynamicComplexity', 'prodLufs', 'prodPlr', 'prodScore', 'audioboxPq',
 ]);
 // One-time migration. For every Spotify playlist already in the user's
 // library, pre-seed a `playlistSorts` entry with `{ column: 'createdAt',
@@ -494,6 +497,8 @@ let ratingDialog: RatingDialogHandle | null = null;
 let namePromptDialog: NamePromptHandle | null = null;
 let deleteTracksDialog: DeleteTracksDialogHandle | null = null;
 let confirmDialog: ConfirmDialogHandle | null = null;
+let productionProfileDialog: ProductionProfileDialogHandle | null = null;
+let productionCompareDialog: ProductionCompareDialogHandle | null = null;
 let wavConvertDialog: WavConvertDialogHandle | null = null;
 let backupProgressDialog: BackupProgressDialogHandle | null = null;
 let backupRestoreDialog: BackupRestoreDialogHandle | null = null;
@@ -4994,6 +4999,8 @@ async function boot(): Promise<void> {
 		// modal below, after this init runs.
 		getMainTrackList: () => mainTrackList,
 		getAnalyzeModal: () => analyzeModal,
+		openProductionProfile: (trackId, title) => productionProfileDialog?.open(trackId, title),
+		openProductionCompare: (opts) => productionCompareDialog?.open(opts),
 		openSyncToRekordboxModal,
 		openSyncFromRekordboxModal,
 		openRatingDialogForTracks,
@@ -5178,6 +5185,20 @@ async function boot(): Promise<void> {
 	// Remove-from-playlist confirmation).
 	const confirmDialogHost = document.getElementById('confirm-dialog-host');
 	if (confirmDialogHost) confirmDialog = mountConfirmDialog(confirmDialogHost);
+	const productionCompareHost = document.getElementById('production-compare-host');
+	if (productionCompareHost) {
+		productionCompareDialog = mountProductionCompareDialog(productionCompareHost, {
+			currentPlaylist: () => { const p = currentEditablePlaylist(); return p ? { id: p.id, name: p.name } : null; },
+		});
+	}
+	const productionProfileHost = document.getElementById('production-profile-host');
+	if (productionProfileHost) {
+		productionProfileDialog = mountProductionProfileDialog(productionProfileHost, {
+			onAnalyze: (trackId) => analyzeModal?.open([trackId]),
+			onCompare: () => productionCompareDialog?.open(),
+		});
+	}
+	configureProductionSettings({ openCompare: () => productionCompareDialog?.open() });
 
 	// WavConvertDialog — live status of a Convert to WAV run (fed by
 	// wireWavConvertEvents).
@@ -6210,7 +6231,7 @@ const COLUMN_LABELS: Record<Column, string> = {
 	src: 'Source', idx: '#', match: 'Match', art: 'Cover', title: 'Title', artist: 'Artist',
 	album: 'Album', rel: 'Released', label: 'Label', genre: 'Genre', bpm: 'BPM', key: 'Key',
 	time: 'Time', rating: 'Rating', lra: 'Dyn Range', diss: 'Dissonance', dens: 'Density',
-	bright: 'Brightness', power: 'Power', punch: 'Punch', tags: 'Tags',
+	bright: 'Brightness', power: 'Power', punch: 'Punch', loud: 'LUFS', plr: 'PLR', prodq: 'Prod score', pq: 'Audiobox PQ', tags: 'Tags',
 	added: 'Added', act: 'Actions',
 };
 // Columns the user can't toggle — they're either structural (the row

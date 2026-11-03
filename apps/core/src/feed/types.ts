@@ -27,6 +27,12 @@ export type LibraryTier = 'local' | 'streaming' | 'followed';
 //   • `spotify` / `tidal` — in one of the user's OWN playlists on that source
 //     (raw `streaming`, named by which source holds it).
 //   • `followed` — only in a playlist the user follows (weakest signal).
+// Where a feed item can be played or opened. The streaming services a
+// library syncs with, plus the providers the Global Catalog reports releases
+// from (feed/cloud-producer.ts). Membership chips, expansion and promotion
+// are Spotify-only today and check for it; other sources show and link out.
+export type FeedSource = StreamingSource | 'deezer';
+
 // Drives the "In Library" / "In {Spotify|Tidal} Library" / "In Followed
 // Playlist" chips. Absent = the library doesn't hold the track.
 export type FeedMembershipTier = 'library' | StreamingSource | 'followed';
@@ -67,8 +73,13 @@ export type EnrichStatus = 'ok' | 'na' | 'err';
 // the card and the scoped-dismiss menu ("don't show from this playlist").
 export interface FeedOrigin {
 	kind: 'playlist' | 'artist' | 'browse';
+	// The provider's id (a Spotify artist / playlist id): what mutes, unfollows
+	// and "open in Spotify" key on, from either producer.
 	id: string;
 	name: string;
+	// The Global Catalog object the follow is a watch on, for items the cloud
+	// raised (feed/cloud-producer.ts): unfollow and mute go to the catalogue.
+	catalogId?: string;
 }
 
 // A track reference inside an album/playlist item's payload. Resolved at
@@ -148,7 +159,7 @@ export interface FeedItemPayload {
 // on dedupeKey (UNIQUE — re-polls and cross-playlist repeats collapse).
 export interface FeedItemDraft {
 	type: FeedItemType;
-	source: StreamingSource;
+	source: FeedSource;
 	sourceId: string;
 	dedupeKey: string;
 	payload: FeedItemPayload;
@@ -166,7 +177,7 @@ export interface FeedItem {
 	// keyed by (protocol v4 feed_item; feed/sync.ts). `id` is this device's.
 	dedupeKey: string;
 	type: FeedItemType;
-	source: StreamingSource;
+	source: FeedSource;
 	sourceId: string;
 	payload: FeedItemPayload;
 	origin: FeedOrigin | null;
@@ -401,7 +412,7 @@ export interface FeedAuthPort {
 // empty drafts and echoes the cursor — disabled is a supported state.
 export interface FeedProducer {
 	readonly id: string;
-	readonly source: StreamingSource;
+	readonly source: FeedSource;
 	readonly displayName: string;
 	poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }>;
 	// Historical "Load more": extend the producer's horizon (the oldest

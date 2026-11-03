@@ -178,6 +178,15 @@ export interface CloudTransport {
 	// gateway.ts). Optional: without them Spotify tokens stay this device's
 	// own, refreshed locally, whatever the server offers.
 	spotify?: CloudService['spotify'];
+	// The Global Catalog ('global_catalog'): watches, search, and the event
+	// stream Discover is fed from (feed/cloud-producer.ts). Optional, like
+	// the rest; used only once the server lists the feature.
+	catalog?: CloudService['catalog'];
+	feed?: CloudService['feed'];
+	// Whether `catalog` / `feed` are served, when they come from a server of
+	// their own (a local catalogue in development) rather than the sync
+	// server whose `features` say so. Absent: the sync server's word.
+	catalogOffered?: () => boolean;
 }
 
 // How a transport reports a failed call. Anything else thrown is treated as
@@ -204,6 +213,12 @@ export type CloudErrorKind =
 	// Spotify refused it (revoked, a scope change, an expired code).
 	| 'spotify_not_connected'
 	| 'spotify_reconnect_required'
+	// catalog.* / feed.events ('global_catalog'): the server runs without the
+	// catalogue; no such object; the watch cap; a claim it cannot hold.
+	| 'catalog_disabled'
+	| 'catalog_not_found'
+	| 'catalog_watch_limit'
+	| 'catalog_claim_invalid'
 	| 'bad_request'; // any other 4xx: a client bug, not worth hammering
 
 export class CloudTransportError extends Error {

@@ -249,13 +249,29 @@ export function formatTrackTitle(title: string, artists: readonly TrackArtist[] 
 	return base + wrapped;
 }
 
+// The segment's name before coreOf strips a generic word that is part of it:
+// "Wild Dark Remix" is Wild Dark's, "Midas 104 Remix" Midas 104's, when the
+// library knows that artist. Tried longest first, one trailing generic word
+// at a time; null when none of them is known.
+function knownCoreOf(seg: string, isKnown: (fold: string) => boolean): string | null {
+	let core = seg.replace(TYPE_END_RE, '').trim();
+	for (;;) {
+		const name = core.replace(POSS_S_RE, '').trim();
+		if (name && isKnown(searchFold(name))) return name;
+		const words = core.split(/\s+/);
+		if (words.length < 2 || !isGeneric(words[words.length - 1]!)) return null;
+		words.pop();
+		core = words.join(' ');
+	}
+}
+
 export function extractRemixers(title: string, opts: RemixCreditOptions = {}): string[] {
 	const creditFolds = new Set((opts.credits ?? []).map((a) => searchFold(a.name)));
 	const isKnown = (fold: string): boolean => creditFolds.has(fold) || (opts.known?.(fold) ?? false);
 	const out: string[] = [];
 	const seen = new Set<string>();
 	for (const { seg, strong } of remixSegments(title)) {
-		const core = coreOf(seg);
+		const core = knownCoreOf(seg, isKnown) ?? coreOf(seg);
 		if (!core) continue;
 		// "A, B Remix" — a plain list of remixers.
 		for (const part of core.split(/\s*[,;]\s*/)) {

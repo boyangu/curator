@@ -68,7 +68,13 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 	readonly source = 'spotify' as const;
 	readonly displayName = 'Spotify playlists';
 
-	constructor(private readonly auth: FeedAuthPort) {}
+	constructor(
+		private readonly auth: FeedAuthPort,
+		// The Spotify playlist ids the Global Catalog watches for this account,
+		// or null without the catalogue: once follows live there, a playlist
+		// unfollowed in Curator stops producing even while Spotify still lists it.
+		private readonly watchedPlaylists?: () => Promise<Set<string> | null>,
+	) {}
 
 	async poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
@@ -93,11 +99,24 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		// every watermark and re-baseline the world — bail without touching
 		// the cursor and let the next poll retry.
 		if (playlists.length === 0) return { drafts: [], nextCursor: cursor };
+		const watched = (await this.watchedPlaylists?.().catch(() => null)) ?? null;
 		for (const pl of playlists) {
 			// Own playlists aren't a discovery source — the user put those
 			// tracks there themselves.
 			if (pl.owner?.id === me.id) continue;
 			const w = prev[pl.id];
+			// Not followed in Curator: kept on its watermark, not read.
+			if (watched && !watched.has(pl.id)) {
+				if (w) next[pl.id] = w;
+				continue;
+			}
+			// Spotify withholds the items of playlists the user neither owns nor
+			// collaborates on from development-mode apps (2026). Nothing to read;
+			// the watermark stays so the playlist resumes if that ever lifts.
+			if (pl.itemsWithheld) {
+				if (w) next[pl.id] = w;
+				continue;
+			}
 			if (w && w.snapshot === pl.snapshot_id) {
 				next[pl.id] = w;
 				continue;
@@ -153,8 +172,10 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		// Same empty-index guard as poll() — don't move the horizon on a
 		// bogus response.
 		if (playlists.length === 0) return { drafts: [], nextCursor: cursor };
+		const watched = (await this.watchedPlaylists?.().catch(() => null)) ?? null;
 		for (const pl of playlists) {
-			if (pl.owner?.id === me.id) continue;
+			if (pl.owner?.id === me.id || pl.itemsWithheld) continue;
+			if (watched && !watched.has(pl.id)) continue;
 			try {
 				const items = await client.getPlaylistTracks(pl.id);
 				for (const it of items) {
@@ -237,9 +258,14 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 		// ArtistDismissFilter. Injected (not the store) to keep the producer free
 		// of feed.db; omitted ⇒ no skipping (the filter still backstops).
 		private readonly mutedArtistKeys?: () => Promise<Set<string>>,
+		// True once the Global Catalog tracks the user's artists (their Spotify
+		// follows carried over, catalog-client/follows-sync.ts): the cloud's
+		// stream brings their releases, and this producer stands down.
+		private readonly retired?: () => boolean,
 	) {}
 
 	async poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+		if (this.retired?.()) return { drafts: [], nextCursor: cursor };
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
 		if (!token) return { drafts: [], nextCursor: cursor };
 		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };
@@ -258,6 +284,7 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 	// deeper per-artist page (50 vs 20) since older releases sit further
 	// down the newest-first listing.
 	async backfill(cursor: unknown, days: number): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+		if (this.retired?.()) return { drafts: [], nextCursor: cursor };
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
 		if (!token) return { drafts: [], nextCursor: cursor };
 		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };

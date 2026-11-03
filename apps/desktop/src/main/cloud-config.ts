@@ -27,3 +27,10 @@ export function cloudAccountConfigured(): boolean {
 export function cloudApiUrl(): string {
 	return text(process.env.CURATOR_CLOUD_API_URL).replace(/\/+$/, '');
 }
+
+// Development only: the base of a local Global Catalog server for the
+// catalog.* / feed.events calls alone (apps/cloud `pnpm local`), or ''.
+// Library sync keeps using cloudApiUrl().
+export function catalogApiUrl(): string {
+	return text(process.env.CURATOR_CATALOG_API_URL).replace(/\/+$/, '');
+}

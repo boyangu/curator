@@ -36,6 +36,14 @@ describe('extractRemixers', () => {
 		expect(extractRemixers("Sing It Back (Herbert's Tasteful Dub)")).toEqual([]);
 	});
 
+	it('keeps a known name whose last word reads as a mix word', () => {
+		expect(extractRemixers('Glow - Ferrin Dark Remix', { known: known('Ferrin Dark', 'Ferrin') })).toEqual(['Ferrin Dark']);
+		expect(extractRemixers('Tide (Vasko 104 Extended Remix)', { known: known('Vasko 104') })).toEqual(['Vasko 104']);
+		expect(extractRemixers('Echo - Holm Dub Remix', { known: known('Holm Dub') })).toEqual(['Holm Dub']);
+		// Not known as a whole: the descriptor still goes.
+		expect(extractRemixers('Glow - Ferrin Dark Remix', { known: known('Ferrin') })).toEqual(['Ferrin']);
+	});
+
 	it('accepts a short unknown name only after a strong word', () => {
 		expect(extractRemixers('Shukran City - Mula Remix')).toEqual(['Mula']);
 		expect(extractRemixers('Chanda (AmuAmu Remix)')).toEqual(['AmuAmu']);

@@ -14,6 +14,7 @@ import { library } from '../data/library.js';
 import { fmtRelative, escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
 import { mountAutoAnalyzeSettings } from './analysisFlagsForm.jsx';
+import { mountProductionSettings } from './productionSettings.js';
 import { log } from '../data/log.js';
 
 export interface LibraryPanelDeps {
@@ -97,6 +98,7 @@ function renderFolderListInner(): string {
 function renderLibraryFoldersModalShellHtml(): string {
 	return `
 		<div id="auto-analyze-host" class="lib-settings-host"></div>
+		<div id="production-settings-host" class="lib-settings-host"></div>
 		<div class="lib-folders__actions">
 			<button class="btn-primary" data-action="add-library-folder">Add Folder…</button>
 		</div>
@@ -311,6 +313,8 @@ export function renderLibraryFoldersModalIfOpen(): void {
 		body.innerHTML = renderLibraryFoldersModalShellHtml();
 		const freshHost = body.querySelector<HTMLElement>('#auto-analyze-host');
 		if (freshHost) autoAnalyzeDisposer = mountAutoAnalyzeSettings(freshHost);
+		const prodHost = body.querySelector<HTMLElement>('#production-settings-host');
+		if (prodHost) mountProductionSettings(prodHost);
 		wireLibraryFoldersPanel(body);
 		return;
 	}

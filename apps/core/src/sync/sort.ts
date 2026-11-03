@@ -49,6 +49,13 @@ export function sortColumn(name: ZTrackSortT['column']) {
 		case 'introLengthSec':     return track.introLengthSec;
 		case 'outroLengthSec':     return track.outroLengthSec;
 		case 'firstDropSec':       return track.firstDropSec;
+		// Production-stage scalars + the learned probe score (persist.ts /
+		// production/model.ts). Indexed on track.
+		case 'prodLufs':           return track.prodLufs;
+		case 'prodPlr':            return track.prodPlr;
+		case 'prodCutoffHz':       return track.prodCutoffHz;
+		case 'prodScore':          return track.prodScore;
+		case 'audioboxPq':         return track.audioboxPq;
 		default: return null;
 	}
 }

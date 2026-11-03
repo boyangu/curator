@@ -264,6 +264,11 @@ export function AppShell() {
 				<div id="name-prompt-host"></div>
 				<div id="delete-tracks-host"></div>
 				<div id="confirm-dialog-host"></div>
+				{/* Production quality: the per-track profile (context menu →
+				    "Production profile…") and the loudness-matched A/B compare
+				    that feeds the learned probe (layouts/Production*.tsx). */}
+				<div id="production-profile-host"></div>
+				<div id="production-compare-host"></div>
 				{/* Convert to WAV run status (layouts/WavConvertDialog.tsx). */}
 				<div id="wav-convert-host"></div>
 

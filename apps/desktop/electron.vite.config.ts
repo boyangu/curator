@@ -28,6 +28,11 @@ const REQUIRED_ENV = [
 	'CURATOR_SUPABASE_PUBLISHABLE_KEY',
 ] as const;
 const OPTIONAL_ENV = ['CURATOR_CLOUD_API_URL'] as const;
+// Development only, baked silently: CURATOR_CATALOG_API_URL sends the Global
+// Catalog's calls (catalog.*, feed.events) to a local server
+// (`pnpm --filter @curator/cloud local`) while library sync stays on the real
+// cloud. A packaged app ignores it (main/index.ts).
+const DEV_ENV = ['CURATOR_CATALOG_API_URL'] as const;
 
 function bakedEnv(mode: string, command: 'build' | 'serve'): Record<string, string> {
 	const env = { ...loadEnv(mode, repoRoot, 'CURATOR_'), ...loadEnv(mode, __dirname, 'CURATOR_') };
@@ -48,7 +53,7 @@ function bakedEnv(mode: string, command: 'build' | 'serve'): Record<string, stri
 	for (const k of OPTIONAL_ENV) {
 		if (!value(k)) console.warn(`[curator] ${verb} without ${k}: library sync will be off`);
 	}
-	return Object.fromEntries([...REQUIRED_ENV, ...OPTIONAL_ENV].map((k) => [`process.env.${k}`, value(k) ? JSON.stringify(value(k)) : 'undefined']));
+	return Object.fromEntries([...REQUIRED_ENV, ...OPTIONAL_ENV, ...DEV_ENV].map((k) => [`process.env.${k}`, value(k) ? JSON.stringify(value(k)) : 'undefined']));
 }
 
 export default defineConfig(({ mode, command }) => ({
@@ -57,7 +62,7 @@ export default defineConfig(({ mode, command }) => ({
 		// (better-sqlite3) + electron stay external.
 		plugins: [
 			externalizeDepsPlugin({
-				exclude: ['@curator/core', '@curator/shared', '@curator/protocol', '@curator/spotify', '@curator/tidal', '@curator/matcher', '@curator/musicbrainz', '@curator/beatport', '@curator/google-drive'],
+				exclude: ['@curator/core', '@curator/shared', '@curator/protocol', '@curator/library-logic', '@curator/spotify', '@curator/tidal', '@curator/matcher', '@curator/musicbrainz', '@curator/beatport', '@curator/google-drive'],
 			}),
 		],
 		define: bakedEnv(mode, command),

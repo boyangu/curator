@@ -59,6 +59,32 @@ import {
 	type SpotifyGrantStatus,
 	type SpotifyTokenInput,
 	type SpotifyTokenResult,
+	type CatalogGetInput,
+	type CatalogBrowseInput,
+	type CatalogBrowseResult,
+	type CatalogImportInput,
+	type CatalogImportResult,
+	type CatalogIngestInput,
+	type CatalogIngestResult,
+	type CatalogListWatchesInput,
+	type CatalogMuteInput,
+	type CatalogObjectDetail,
+	type CatalogEnrichInput,
+	type CatalogEnrichResult,
+	type CatalogRefreshInput,
+	type CatalogRefreshResult,
+	type CatalogResolveInput,
+	type CatalogResolveResult,
+	type CatalogSearchInput,
+	type CatalogSearchResult,
+	type CatalogUnwatchInput,
+	type CatalogWatch,
+	type CatalogWatchInput,
+	type CatalogWatchResult,
+	type FeedEventsInput,
+	type FeedEventsResult,
+	type FeedRecentInput,
+	type FeedRecentResult,
 } from '@curator/protocol';
 import { mainLog } from '../log.js';
 import { createSnapshotBlobStore } from './blobs.js';
@@ -99,6 +125,22 @@ const PROCS = {
 	spotifyStatus: { path: 'spotify.status', type: 'query' },
 	spotifyToken: { path: 'spotify.token', type: 'mutation' },
 	spotifyDisconnect: { path: 'spotify.disconnect', type: 'mutation' },
+	// 'global_catalog'. Search and resolve are mutations so their inputs ride
+	// in the body, like catalogue.lookup.
+	catalogIngest: { path: 'catalog.ingest', type: 'mutation' },
+	catalogResolve: { path: 'catalog.resolve', type: 'mutation' },
+	catalogSearch: { path: 'catalog.search', type: 'mutation' },
+	catalogGet: { path: 'catalog.get', type: 'query' },
+	catalogBrowse: { path: 'catalog.browse', type: 'query' },
+	catalogWatch: { path: 'catalog.watch', type: 'mutation' },
+	catalogUnwatch: { path: 'catalog.unwatch', type: 'mutation' },
+	catalogMute: { path: 'catalog.mute', type: 'mutation' },
+	catalogListWatches: { path: 'catalog.listWatches', type: 'query' },
+	catalogImport: { path: 'catalog.import', type: 'mutation' },
+	catalogRefreshNow: { path: 'catalog.refreshNow', type: 'mutation' },
+	catalogEnrich: { path: 'catalog.enrich', type: 'mutation' },
+	feedEvents: { path: 'feed.events', type: 'query' },
+	feedRecent: { path: 'feed.recent', type: 'query' },
 } as const;
 
 // A snapshot of a 40k-track library inflates to tens of MB; cap what a
@@ -158,6 +200,7 @@ function mapError(err: unknown): CloudTransportError {
 		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
 		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
 		if (reason === 'spotify_not_connected' || reason === 'spotify_reconnect_required') return new CloudTransportError(reason, reason);
+		if (reason === 'catalog_disabled' || reason === 'catalog_not_found' || reason === 'catalog_watch_limit' || reason === 'catalog_claim_invalid') return new CloudTransportError(reason, reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
 		if (status >= 500) return new CloudTransportError('server', `HTTP ${status}`);
 		if (status >= 400) return new CloudTransportError('bad_request', reason ?? `HTTP ${status}`);
@@ -354,5 +397,65 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			token: (input: SpotifyTokenInput) => call<SpotifyTokenResult>(PROCS.spotifyToken, input),
 			disconnect: (input: SpotifyDisconnectInput) => call<SpotifyGrantStatus>(PROCS.spotifyDisconnect, input),
 		},
+		catalog: {
+			ingest: (input: CatalogIngestInput) => call<CatalogIngestResult>(PROCS.catalogIngest, input),
+			resolve: (input: CatalogResolveInput) => call<CatalogResolveResult>(PROCS.catalogResolve, input),
+			search: (input: CatalogSearchInput) => call<CatalogSearchResult>(PROCS.catalogSearch, input),
+			get: (input: CatalogGetInput) => call<CatalogObjectDetail>(PROCS.catalogGet, input),
+			browse: (input: CatalogBrowseInput) => call<CatalogBrowseResult>(PROCS.catalogBrowse, input),
+			watch: (input: CatalogWatchInput) => call<CatalogWatchResult>(PROCS.catalogWatch, input),
+			unwatch: (input: CatalogUnwatchInput) => call<{ ok: true }>(PROCS.catalogUnwatch, input),
+			mute: (input: CatalogMuteInput) => call<{ ok: true }>(PROCS.catalogMute, input),
+			listWatches: (input: CatalogListWatchesInput) => call<CatalogWatch[]>(PROCS.catalogListWatches, input),
+			import: (input: CatalogImportInput) => call<CatalogImportResult>(PROCS.catalogImport, input),
+			refreshNow: (input: CatalogRefreshInput) => call<CatalogRefreshResult>(PROCS.catalogRefreshNow, input),
+			enrich: (input: CatalogEnrichInput) => call<CatalogEnrichResult>(PROCS.catalogEnrich, input),
+		},
+		feed: {
+			events: (input: FeedEventsInput) => call<FeedEventsResult>(PROCS.feedEvents, input),
+			recent: (input: FeedRecentInput) => call<FeedRecentResult>(PROCS.feedRecent, input),
+		},
 	};
+}
+
+// Development only (CURATOR_CATALOG_API_URL): the Global Catalog's calls go to
+// a local server (apps/cloud `pnpm local`) while everything else, library sync
+// above all, stays on `main`. The local server knows nothing of this device,
+// so it is registered there before its first catalogue call; whether the
+// catalogue is offered is that server's health answer, polled.
+export function withLocalCatalog(
+	main: CloudTransport,
+	local: CloudTransport,
+	localBaseUrl: string,
+	device: { name: string; platform: 'win32' | 'darwin' | 'linux' },
+): CloudTransport {
+	let offered = false;
+	const probe = async (): Promise<void> => {
+		try {
+			const res = await fetch(`${localBaseUrl}/trpc/health`, { signal: AbortSignal.timeout(5_000) });
+			const body = (await res.json()) as { result?: { data?: { features?: string[] } } };
+			offered = body.result?.data?.features?.includes('global_catalog') ?? false;
+		} catch {
+			offered = false;
+		}
+	};
+	void probe();
+	setInterval(() => void probe(), 30_000).unref();
+	const registered = new Set<string>();
+	const ensure = async (deviceId: string): Promise<void> => {
+		if (registered.has(deviceId)) return;
+		await local.account.registerDevice({ deviceId, name: `${device.name} (local catalogue)`, platform: device.platform });
+		registered.add(deviceId);
+	};
+	const routed = <T extends object>(procs: T): T =>
+		Object.fromEntries(
+			Object.entries(procs).map(([name, fn]) => [
+				name,
+				async (input: { deviceId: string }) => {
+					await ensure(input.deviceId);
+					return (fn as (i: unknown) => Promise<unknown>)(input);
+				},
+			]),
+		) as T;
+	return { ...main, catalog: routed(local.catalog!), feed: routed(local.feed!), catalogOffered: () => offered };
 }

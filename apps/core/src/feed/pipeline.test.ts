@@ -74,6 +74,14 @@ describe('ArtistDismissFilter', () => {
 		expect(out.map((d) => d.sourceId)).toEqual(['al1', 't2']);
 	});
 
+	it("drops a muted FOLLOWED artist's own release (the album's origin), not one it is merely credited on", async () => {
+		const stage: FeedStage = new ArtistDismissFilter({ suppressedKeys: async () => new Set(['artist:MUTED']) });
+		const own = { ...albumDraft('own', 'MUTED'), origin: { kind: 'artist' as const, id: 'MUTED', name: 'Muted', catalogId: 'cat-1' } };
+		const credited = { ...albumDraft('credited', 'MUTED'), origin: { kind: 'artist' as const, id: 'OTHER', name: 'Other' } };
+		const out = await stage.run([own, credited], CTX);
+		expect(out.map((d) => d.sourceId)).toEqual(['credited']);
+	});
+
 	it('is a no-op when nothing is dismissed', async () => {
 		const stage: FeedStage = new ArtistDismissFilter({ suppressedKeys: async () => new Set() });
 		expect(await stage.run([trackDraft('t1', { artistId: 'X' })], CTX)).toHaveLength(1);

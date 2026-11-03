@@ -31,6 +31,10 @@ export type { CreatePhaseSummary as RekordboxCreateSummary } from './rekordbox/c
 export { config } from './config.js';
 export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/index.js';
 export * from './feed/types.js';
+export type { CatalogClientStatus, CatalogEnrichReport, CatalogFollowManyReport, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit } from './catalog-client/service.js';
+export type { FollowCandidate, FollowCandidateKind } from './catalog-client/library-candidates.js';
+export type { CatalogObjectRef, TrackCatalogRefs } from './catalog-client/catalog-refs.js';
+export type { CatalogWatch, CatalogClaim, CatalogHandle, CatalogKind } from '@curator/protocol';
 export type { FeedStore } from './feed/store.js';
 export * from './knowledge/types.js';
 export type { KnowledgeStore } from './knowledge/store.js';
@@ -40,6 +44,9 @@ export type { AgentStore, AgentSessionSummary, AgentSessionDetail } from './agen
 export type { AgentEvent, AgentStatus, AgentViewCommand, AgentViewContext } from './agent/service.js';
 export type { AgentSidecarSpec } from './agent/sidecar.js';
 export * from './mir/types.js';
+export type { ProductionProfile, ProductionPair, ProductionPairSide, ProductionWinner, ProductionStats, ProductionModelInfo, ProductionCohort, ProductionDeviation, ProductionAudiobox, ProductionLearned } from './production/types.js';
+export { PRODUCTION_FEATURES, PROBE_FEATURE_KEYS } from './production/features.js';
+export { MIN_PAIRS_TO_FIT } from './production/model.js';
 export type { MirSidecarSpec } from './mir/sidecar.js';
 export type { MirProvisionSpec } from './mir/provision.js';
 export { buildMcpWriteTools } from './mcp/write-tools.js';

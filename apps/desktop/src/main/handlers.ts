@@ -160,12 +160,25 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'feed:detail': async (itemId) => svc.getFeedItemDetail(itemId),
 		'feed:enrich': async (itemId) => svc.enrichFeedItem(itemId),
 		'feed:action': async (action) => svc.feedAction(action),
-		'feed:unfollow-playlist': async (playlistId) => svc.unfollowFeedPlaylist(playlistId),
-		'feed:unfollow-artist': async (artistId) => svc.unfollowFeedArtist(artistId),
+		'feed:unfollow-playlist': async (playlistId, catalogId) => svc.unfollowFeedPlaylist(playlistId, catalogId),
+		'feed:unfollow-artist': async (artistId, catalogId) => svc.unfollowFeedArtist(artistId, catalogId),
 		'feed:refresh': async () => svc.runFeedRefresh(),
 		'feed:refresh-producer': async (producerId) => svc.runFeedProducerRefresh(producerId),
 		'feed:load-more': async (days) => svc.loadMoreFeed(days),
 		'feed:role': async () => svc.getFeedRole(),
+		'catalog:status': async () => svc.getCatalogStatus(),
+		'catalog:watches': async () => svc.catalogWatches(),
+		'catalog:search': async (q) => svc.catalogSearch(q),
+		'catalog:follow': async (target) => svc.catalogFollow(target),
+		'catalog:unfollow': async (objectId) => svc.catalogUnfollow(objectId),
+		'catalog:mute': async (objectId, muted) => svc.catalogMute(objectId, muted),
+		'catalog:refresh': async (objectId) => svc.catalogRefresh(objectId),
+		'catalog:import-spotify': async () => svc.catalogImportSpotifyFollows(),
+		'catalog:enrich-labels': async () => svc.catalogEnrichLibraryLabels(),
+		'catalog:refs-for-track': async (trackId) => svc.catalogRefsForTrack(trackId),
+		'catalog:browse': async (objectId) => svc.catalogBrowse(objectId),
+		'catalog:candidates': async (kind) => svc.catalogFollowCandidates(kind),
+		'catalog:follow-many': async (targets) => svc.catalogFollowMany(targets),
 		// Journeys + knowledge base — in-process like the feed (user-paced
 		// reads; the expansion queue already backgrounds provider crawls).
 		'journey:create': async (seed, opts) => svc.createJourney(seed, opts),
@@ -460,6 +473,13 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'mir:analyze-now':  async (trackIds)  => svc.mirAnalyzeNow(trackIds),
 		'mir:provision':    async ()          => svc.mirProvision(),
 		'mir:similar':      async (q)         => svc.getSimilarTracks(q),
+
+		// ─── Production quality ─────────────────────────────────────────────
+		'production:profile':   async (trackId)      => svc.getProductionProfile(trackId),
+		'production:next-pair': async (opts)         => svc.nextProductionPair(opts),
+		'production:judge':     async (a, b, winner) => svc.recordProductionJudgment(a, b, winner),
+		'production:stats':     async ()             => svc.productionStats(),
+		'production:fit':       async ()             => svc.fitProductionModel(),
 
 		// ─── Backup & restore ───────────────────────────────────────────────
 		// In-process: the scheduler + settings live on main's core, the engine

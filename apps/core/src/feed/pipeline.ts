@@ -177,11 +177,12 @@ export class FeedDedupFilter implements FeedStage {
 // stops NEW track items from a dismissed artist at the door; the read-time
 // VISIBLE_WHERE suppression complements it by hiding items already in the bus.
 //
-// ALBUMS are exempt: muting an artist never removes a release (a multi-artist
-// album would vanish over a single credited feature). The album stays and its
-// per-artist tracks are chipped/skipped instead (see getItemDetail). A muted
-// FOLLOWED artist's OWN new releases still don't appear — the new-releases
-// producer skips them upstream before spending the Spotify call, not here.
+// ALBUMS are exempt from credit mutes: muting an artist never removes a
+// release (a multi-artist album would vanish over a single credited feature).
+// The album stays and its per-artist tracks are chipped/skipped instead (see
+// getItemDetail). The one album rule: a muted FOLLOWED artist's own new
+// releases (the artist the item's origin names) are dropped — the local
+// new-releases producer skips them before fetching, the cloud's arrive here.
 export class ArtistDismissFilter implements FeedStage {
 	readonly id = 'artist-dismiss-filter';
 
@@ -191,7 +192,12 @@ export class ArtistDismissFilter implements FeedStage {
 		if (drafts.length === 0) return drafts;
 		const dismissed = await this.store.suppressedKeys('artist');
 		if (dismissed.size === 0) return drafts;
-		return drafts.filter((d) => d.type === 'album' || !d.suppressKeys.some((k) => dismissed.has(k)));
+		// An album stays unless the artist whose follow produced it is muted
+		// (the cloud's releases arrive here unfiltered; the local new-releases
+		// producer skips muted artists before fetching).
+		return drafts.filter((d) =>
+			d.type === 'album' ? !(d.origin?.kind === 'artist' && dismissed.has(`artist:${d.origin.id}`)) : !d.suppressKeys.some((k) => dismissed.has(k)),
+		);
 	}
 }
 
