@@ -73,6 +73,7 @@ export function createBackofficeHandler(db: Db, opts: { library?: () => LocalLib
 					...(severity && ['audit', 'notice', 'approval'].includes(severity) ? { severity: severity as Severity } : {}),
 					...(url.searchParams.get('kind') ? { kind: url.searchParams.get('kind')! } : {}),
 					...(UUID_RE.test(url.searchParams.get('subject') ?? '') ? { subject: url.searchParams.get('subject')! } : {}),
+					...(url.searchParams.get('actor') ? { actor: url.searchParams.get('actor')! } : {}),
 					offset: Number(url.searchParams.get('offset') ?? 0) || 0,
 					limit: Number(url.searchParams.get('limit') ?? 50) || 50,
 				};

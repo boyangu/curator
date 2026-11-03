@@ -102,6 +102,10 @@ pre { font-family: var(--mono); font-size: 12px; background: var(--panel); borde
 .item .about a { margin-right: 8px; }
 .ev { margin-top: 8px; font-size: 13px; color: var(--text); }
 .ev .l { color: var(--muted); }
+.why { border-left: 3px solid var(--accent); padding: 2px 0 2px 10px; margin-bottom: 8px; }
+.why p { margin: 0 0 4px; }
+.why .read a { margin-right: 10px; word-break: break-all; }
+.chip.agent { background: var(--accent-soft); color: var(--accent); }
 .insights > div { padding: 4px 0; }
 .ev table { margin-top: 4px; }
 .ev td, .ev th { padding: 4px 8px; font-size: 12.5px; }
@@ -458,6 +462,7 @@ const FILTERS = [
 	{ f: 'needs', title: 'Needs you', q: 'status=open&severity=approval', count: (c) => c?.approval },
 	{ f: 'notices', title: 'Notices', q: 'status=open&severity=notice', count: (c) => c?.notice },
 	{ f: 'snoozed', title: 'Snoozed', q: 'status=snoozed', count: (c) => c?.snoozed },
+	{ f: 'agent', title: 'Agent', q: 'status=all&actor=agent', count: () => null },
 	{ f: 'all', title: 'All activity', q: 'status=all', count: () => null },
 ];
 const ago = (ms) => {
@@ -478,6 +483,12 @@ function evidenceHtml(it) {
 		if (r.sharedReleaseExamples?.length) parts.push(`<div><span class="l">both hold</span> ${esc(r.sharedReleaseExamples.join(' | '))}</div>`);
 		if (r.sharedArtistExamples?.length) parts.push(`<div><span class="l">both put out</span> ${esc(r.sharedArtistExamples.join(', '))}</div>`);
 	};
+	// The reasoner's items (catalog/agent/apply.ts) lead with why it decided.
+	if (typeof e.rationale === 'string') {
+		const meta = [typeof e.confidence === 'number' ? `${pct(e.confidence)} sure` : null, e.model ? esc(e.model) : null, typeof e.costUsd === 'number' ? `$${e.costUsd.toFixed(4)}` : null, typeof e.case === 'number' ? `case #${e.case}` : null].filter(Boolean).join(' · ');
+		const read = Array.isArray(e.citations) && e.citations.length ? `<div class="l read">read: ${e.citations.map((u) => /^https?:\/\//.test(u) ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>` : esc(u)).join('')}</div>` : '';
+		parts.push(`<div class="why"><p>${esc(e.rationale)}</p>${meta ? `<div class="l">${meta}</div>` : ''}${read}</div>`);
+	}
 	if (e.candidate?.evidence?.kind === 'related_label') related(e.candidate.evidence);
 	if (it.kind === 'review.escalated' && Array.isArray(e.candidates)) {
 		for (const [i, c] of e.candidates.entries()) {
@@ -490,24 +501,32 @@ function evidenceHtml(it) {
 	if (Array.isArray(e.pairs)) {
 		const side = (r) => `${objLink({ id: r.id, name: r.title })}${r.artists?.length ? ` — ${esc(r.artists.join(', '))}` : ''}<span class="l"> ${esc(r.date ?? '')} [${esc((r.providers ?? []).join(','))}] ${fmtN(r.tracks)} tr</span>`;
 		// Open: a box per pair, ticked = merge; an unticked pair is ruled not twins (`except`).
-		const pick = it.status === 'open' && (it.kind === 'release.twins' || it.kind === 'artist.twins');
-		parts.push(`<table><thead><tr>${pick ? '<th title="Merge this pair">Merge</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th></tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><input type="checkbox" data-pair="${i}" checked aria-label="Merge pair ${i}"></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td></tr>`).join('')}</tbody></table>`);
+		const pick = it.status === 'open' && mergesPairs(it);
+		// The model's per-pair answer beside the pair (unsure proposals: tick the twins, untick the rest).
+		const said = Array.isArray(e.verdicts) ? e.verdicts : null;
+		parts.push(`<table><thead><tr>${pick ? '<th title="Merge this pair">Merge</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th>${said ? '<th>Agent</th>' : ''}</tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><input type="checkbox" data-pair="${i}" ${said?.[i] === 'unsure' ? '' : 'checked'} aria-label="Merge pair ${i}"></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td>${said ? `<td class="l">${esc(said[i] ?? '')}</td>` : ''}</tr>`).join('')}</tbody></table>`);
 	}
 	if (it.kind === 'page.mismatch') parts.push(`<div><span class="l">only on this page (${fmtN(e.onlyHere)})</span> ${esc(e.sampleHere ?? '')}</div><div><span class="l">only elsewhere (${fmtN(e.onlyElsewhere)})</span> ${esc(e.sampleElsewhere ?? '')}</div>`);
 	if (it.kind === 'page.dead' || it.kind === 'tracker.failing') parts.push(`<div><span class="l">${esc(e.provider)}</span> failed ${fmtN(e.failCount)}× · last run ${e.lastRunAt ? fmtDate(e.lastRunAt) : '—'} · <span class="mono">${esc(e.lastError ?? '')}</span>${(e.handles ?? []).map((h) => h.url ? ` <a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.id)} ↗</a>` : ` ${esc(h.id)}`).join('')}</div>`);
 	if (e.url && !['page.dead', 'tracker.failing'].includes(it.kind)) parts.push(`<div><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)} ↗</a></div>`);
 	if (e.note) parts.push(`<div><span class="l">agent's note</span> ${esc(e.note)}</div>`);
-	const rest = Object.fromEntries(Object.entries(e).filter(([k, v]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'url', 'note', 'handles', 'sampleHere', 'sampleElsewhere', 'lastError', 'from', 'into'].includes(k) && v !== null && typeof v !== 'object'));
+	const rest = Object.fromEntries(Object.entries(e).filter(([k, v]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'url', 'note', 'handles', 'sampleHere', 'sampleElsewhere', 'lastError', 'from', 'into', 'rationale', 'citations', 'confidence', 'model', 'costUsd', 'case', 'verdicts', 'on', 'page'].includes(k) && v !== null && typeof v !== 'object'));
 	if (Object.keys(rest).length) parts.push(`<div class="l mono">${esc(Object.entries(rest).map(([k, v]) => `${k}: ${v}`).join(' · '))}</div>`);
 	return parts.length ? `<div class="ev">${parts.join('')}</div>` : '';
 }
+
+// Items whose approve merges pairs: a box per pair, an unticked one is `except`.
+const mergesPairs = (it) => it.apply?.op === 'mergeReleases' || it.apply?.op === 'mergeArtists';
 
 // The buttons word what approve / reject do for this item.
 function actionWords(it) {
 	if (it.apply) {
 		if (it.kind === 'review.escalated') return ['Decide', 'Leave it'];
-		if (it.kind === 'release.twins' || it.kind === 'artist.twins') return ['Merge ticked', 'None are twins'];
+		if (mergesPairs(it)) return ['Merge ticked', 'None are twins'];
 		if (it.kind.startsWith('page.')) return ['Unlink', 'Keep the page'];
+		if (it.apply.op === 'blockSource') return ['Block the id', 'Keep the id'];
+		if (it.apply.op === 'recredit') return ['Recredit', 'Leave as is'];
+		if (it.apply.op === 'decideReview') return ['Attach', 'Not the label’s'];
 		return ['Approve', 'Reject'];
 	}
 	return it.undo ? ['OK', 'Undo'] : ['Dismiss', null];
@@ -530,7 +549,7 @@ function itemHtml(it) {
 		</div>`
 		: open ? '<div class="state">read-only here: resolve it from the local catalogue\'s back office or the catalog CLI</div>' : '';
 	return `<div class="item ${open ? '' : 'resolved'}" data-id="${it.id}">
-		<div class="top"><span class="dot ${esc(it.severity)}" title="${esc(it.severity)}"></span><span class="chip">${esc(kindWords(it.kind))}</span><span class="title">${esc(it.title)}</span><span class="who">${esc(it.actor)} · ${ago(it.raisedAt)}${it.approvedBy ? ` · approved in chat by ${esc(it.approvedBy)}` : ''}${it.reviewId != null ? ` · review #${it.reviewId}` : ''} · #${it.id}</span></div>
+		<div class="top"><span class="dot ${esc(it.severity)}" title="${esc(it.severity)}"></span>${it.actor === 'agent' ? '<span class="chip agent">agent</span>' : ''}<span class="chip">${esc(kindWords(it.kind))}</span><span class="title">${esc(it.title)}</span><span class="who">${esc(it.actor)} · ${ago(it.raisedAt)}${it.approvedBy ? ` · approved in chat by ${esc(it.approvedBy)}` : ''}${it.reviewId != null ? ` · review #${it.reviewId}` : ''} · #${it.id}</span></div>
 		${it.subjectNames?.length ? `<div class="about">${it.subjectNames.map(objLink).join('')}</div>` : ''}
 		${evidenceHtml(it)}
 		${actions}

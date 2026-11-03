@@ -78,3 +78,30 @@ export async function detail(tx: Queryable, id: string): Promise<CatalogObjectDe
 	delete attrs._src;
 	return { ...s, attrs, identifiers: idents, discoveredAt: num(row!.discovered_ms), mergedInto: row!.merged_into };
 }
+
+// A twin pair's side as the operator reads it in the inbox (and the
+// regression set keeps it): a release with its artists, date, stores and
+// track count; an artist with its stores and credit count. The detectors and
+// the reasoner raise the same shape, so the back office draws one table.
+export type PairView = { id: string; title: string; artists?: string[]; date?: string | null; providers: string[]; tracks: number };
+
+export async function pairViews(tx: Queryable, ids: string[]): Promise<Map<string, PairView>> {
+	if (!ids.length) return new Map();
+	const rows = await tx.query<{ id: string; kind: string; title: string; date: string | null; artists: string | null; providers: string | null; tracks: unknown }>(
+		`select o.id, o.kind, o.name as title, to_char(o.release_at, 'YYYY-MM-DD') as date,
+			(select string_agg(a.name, '|' order by ar.position) from curator.catalog_edge ar join curator.catalog_object a on a.id = ar.src where ar.dst = o.id and ar.kind = 'artist-release') as artists,
+			(select string_agg(distinct so.provider, '|' order by so.provider) from curator.catalog_source_object so where so.object_id = o.id) as providers,
+			case when o.kind = 'release' then (select count(*) from curator.catalog_edge t where t.src = o.id and t.kind = 'release-recording')
+				else (select count(*) from curator.catalog_edge c where (c.dst = o.id and c.kind = 'recording-artist') or (c.src = o.id and c.kind = 'artist-release')) end as tracks
+		from curator.catalog_object o where o.id = any($1::uuid[])`,
+		[`{${[...new Set(ids)].join(',')}}`],
+	);
+	return new Map(
+		rows.map((r) => [
+			r.id,
+			r.kind === 'release'
+				? { id: r.id, title: r.title, artists: r.artists ? r.artists.split('|') : [], date: r.date, providers: r.providers ? r.providers.split('|') : [], tracks: num(r.tracks) }
+				: { id: r.id, title: r.title, providers: r.providers ? r.providers.split('|') : [], tracks: num(r.tracks) },
+		]),
+	);
+}

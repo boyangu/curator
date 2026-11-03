@@ -21,6 +21,7 @@ import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
 import type { SystemTx } from '../db/system-tx.js';
 import { decideReview, mergeObjects, mergeOverruling, notSame, relinkPage, renameObject, reopenReview, unlinkPage, type ReviewDecision, type UnlinkResult } from './admin.js';
+import { runBlockSource, runRecredit, runUnblockSource } from './agent/apply.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { restoreInsight, retireInsight } from './insights.js';
 import type { Severity } from './inbox-policy.js';
@@ -130,7 +131,7 @@ async function withNames(tx: Queryable, items: InboxItem[]): Promise<InboxRow[]>
 	return items.map((i) => ({ ...i, subjectNames: i.subjects.map((id) => ({ id, kind: names.get(id)?.kind ?? ('label' as CatalogKind), name: names.get(id)?.name ?? id })) }));
 }
 
-export type InboxFilter = { status?: 'open' | 'snoozed' | 'all'; severity?: Severity; kind?: string; subject?: string; limit?: number; offset?: number };
+export type InboxFilter = { status?: 'open' | 'snoozed' | 'all'; severity?: Severity; kind?: string; subject?: string; actor?: string; limit?: number; offset?: number };
 
 // `open` is what waits for the operator now (snoozed ones hidden until due);
 // `all` is the whole log, newest first.
@@ -139,10 +140,11 @@ export async function listInbox(tx: Queryable, f: InboxFilter = {}): Promise<{ t
 	const where = `where ($1::text = 'all'
 			or ($1::text = 'open' and status = 'open' and (snoozed_until is null or snoozed_until <= now()))
 			or ($1::text = 'snoozed' and status = 'open' and snoozed_until > now()))
-		and ($2::text is null or severity = $2) and ($3::text is null or kind = $3) and ($4::uuid is null or $4::uuid = any(subjects))`;
-	const params = [status, f.severity ?? null, f.kind ?? null, f.subject ?? null];
+		and ($2::text is null or severity = $2) and ($3::text is null or kind = $3) and ($4::uuid is null or $4::uuid = any(subjects))
+		and ($5::text is null or actor = $5)`;
+	const params = [status, f.severity ?? null, f.kind ?? null, f.subject ?? null, f.actor ?? null];
 	const [t] = await tx.query<{ n: unknown }>(`select count(*) as n from curator.catalog_inbox ${where}`, params);
-	const rows = await tx.query<Row>(`select ${COLUMNS} from curator.catalog_inbox ${where} order by id desc limit $5::int offset $6::int`, [...params, String(Math.min(f.limit ?? 50, 500)), String(f.offset ?? 0)]);
+	const rows = await tx.query<Row>(`select ${COLUMNS} from curator.catalog_inbox ${where} order by id desc limit $6::int offset $7::int`, [...params, String(Math.min(f.limit ?? 50, 500)), String(f.offset ?? 0)]);
 	return { total: num(t!.n), rows: await withNames(tx, rows.map(toItem)) };
 }
 
@@ -257,6 +259,18 @@ async function runApply(tx: SystemTx, item: InboxItem, d: InboxDecision): Promis
 			await unlinkPage(tx, str(a.objectId), a.page as Page, d.by, d.note ?? (a.note as string | null) ?? null);
 			return;
 		}
+		// The reasoner's proposals (catalog/agent/apply.ts): the operator's
+		// approval runs what the agent would have, under the operator's name.
+		case 'notSame': {
+			for (const p of a.pairs as Pair[]) await notSame(tx, p.keep, p.fold, d.by, d.note ?? str(a.note ?? 'not the same (inbox)'));
+			return;
+		}
+		case 'blockSource':
+			await runBlockSource(tx, { ...a, note: d.note ?? a.note }, d.by);
+			return;
+		case 'recredit':
+			await runRecredit(tx, a, d.by);
+			return;
 		default:
 			throw new Error(`inbox: no apply for ${item.apply!.op}`);
 	}
@@ -282,6 +296,9 @@ async function runDiscard(tx: SystemTx, item: InboxItem, d: InboxDecision): Prom
 		}
 		case 'mergeLabels':
 		case 'unlinkPage':
+		case 'notSame':
+		case 'blockSource':
+		case 'recredit':
 			return;
 		default:
 			throw new Error(`inbox: no discard for ${item.apply!.op}`);
@@ -311,6 +328,9 @@ async function runUndo(tx: SystemTx, item: InboxItem, d: InboxDecision): Promise
 			return;
 		case 'restoreInsight':
 			await restoreInsight(tx, num(a.id));
+			return;
+		case 'unblockSource':
+			await runUnblockSource(tx, a);
 			return;
 		default:
 			throw new Error(`inbox: no undo for ${item.undo!.op}`);

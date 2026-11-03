@@ -17,6 +17,9 @@
 //                    outright — the one thing this pass does itself — unless
 //                    one store holds both under two ids, then proposed.
 //   tracker.failing  a tracker failing run after run for another reason.
+//
+// With the reasoner on, twins become cases (catalog/agent) instead, and two
+// questions only it answers are queued: cut credits and bucket store ids.
 //   provider.parked  a provider the pass keeps parking (a challenge, a rate
 //                    limit) for a day or more.
 
@@ -24,7 +27,9 @@ import { nameFold } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
 import { num } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
-import { artistTwins } from './artist-twins.js';
+import { enqueueCase } from './agent/cases.js';
+import { artistTwins, PLACEHOLDER } from './artist-twins.js';
+import { WEAK_SQL } from './identity.js';
 import { clearInbox, listInbox, raise, type InboxRow } from './inbox.js';
 
 const TWINS_WINDOW_DAYS = 2;
@@ -37,20 +42,50 @@ const MISMATCH_MIN_EACH = 10;
 const DEAD_ERROR = /\b404\b|not found|does not exist|gone\b|no such user/i;
 
 type Log = { info: (m: string, f?: Record<string, unknown>) => void; warn?: (m: string, f?: Record<string, unknown>) => void };
-export type DetectorDeps = { db: Db; log?: Log };
-export type DetectorReport = { twins: number; artists: number; pages: number; trackers: number; cleared: number };
+// `agent`: the reasoner is on (catalog/agent) — twins go to it as cases
+// instead of straight to the operator.
+export type DetectorDeps = { db: Db; log?: Log; agent?: boolean; now?: number };
+export type DetectorReport = { twins: number; artists: number; pages: number; trackers: number; cleared: number; credits: number; buckets: number };
+
+// A step slower than this is logged by name: PGlite has one connection, so a
+// slow detector stalls the whole local server, and the log should say which.
+const SLOW_STEP_MS = 3000;
 
 export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorReport> {
-	const report: DetectorReport = { twins: 0, artists: 0, pages: 0, trackers: 0, cleared: 0 };
-	report.cleared = await withSystemTx(deps.db, (tx) => clearGone(tx));
-	report.twins = await withSystemTx(deps.db, (tx) => detectTwins(tx));
-	const a = await artistTwins(deps.db, { by: 'worker', recentDays: TWINS_WINDOW_DAYS, mergeLimit: 50, proposeLimit: 5 });
+	const report: DetectorReport = { twins: 0, artists: 0, pages: 0, trackers: 0, cleared: 0, credits: 0, buckets: 0 };
+	const timed = async <T>(step: string, run: () => Promise<T>): Promise<T> => {
+		const t0 = Date.now();
+		// CURATOR_DEBUG_PASS=1: name each step as it starts, so a stuck one shows.
+		if (process.env.CURATOR_DEBUG_PASS === '1') deps.log?.info('inbox_detector_start', { step });
+		try {
+			return await run();
+		} finally {
+			const ms = Date.now() - t0;
+			if (ms >= SLOW_STEP_MS) deps.log?.info('inbox_detector_slow', { step, ms });
+		}
+	};
+	report.cleared = await timed('clear', () => withSystemTx(deps.db, (tx) => clearGone(tx)));
+	report.twins = await timed('twins', () => withSystemTx(deps.db, (tx) => detectTwins(tx, deps.agent ?? false)));
+	// Credits and buckets are questions only the reasoner answers: with it off
+	// nothing would drain them.
+	if (deps.agent) {
+		report.credits = await timed('credits', () => withSystemTx(deps.db, (tx) => detectCredits(tx)));
+		// Buckets every few hours, not every pass: the query reads every edge of
+		// every artist a recent release touched (2026-11-03: ~40 s of PGlite
+		// after a backfill), and a bucket does not appear in a minute.
+		const now = deps.now ?? Date.now();
+		if (now >= (bucketsDue.get(deps.db) ?? 0)) {
+			bucketsDue.set(deps.db, now + BUCKETS_EVERY_MS);
+			report.buckets = await timed('buckets', () => withSystemTx(deps.db, (tx) => detectBuckets(tx, { days: BUCKETS_WINDOW_DAYS })));
+		}
+	}
+	const a = await timed('artist-twins', () => artistTwins(deps.db, { by: 'worker', recentDays: TWINS_WINDOW_DAYS, mergeLimit: 50, proposeLimit: 5, agent: deps.agent ?? false }));
 	report.artists = a.merged.reduce((n, m) => n + m.folds.length, 0) + a.proposed.filter((x) => x.item !== null).length;
-	const p = await detectPages(deps.db);
+	const p = await timed('pages', () => detectPages(deps.db));
 	report.pages = p.pages;
 	report.trackers = p.trackers;
-	report.trackers += await withSystemTx(deps.db, (tx) => detectParked(tx));
-	if (report.twins || report.artists || report.pages || report.trackers || report.cleared) deps.log?.info('inbox_detectors_pass', { ...report });
+	report.trackers += await timed('parked', () => withSystemTx(deps.db, (tx) => detectParked(tx)));
+	if (Object.values(report).some((n) => n > 0)) deps.log?.info('inbox_detectors_pass', { ...report });
 	return report;
 }
 
@@ -58,7 +93,7 @@ export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorRep
 
 type TwinRelease = { id: string; title: string; artists: string[]; date: string | null; providers: string[]; tracks: number; discoveredMs: number };
 
-async function detectTwins(tx: Queryable): Promise<number> {
+async function detectTwins(tx: Queryable, agent: boolean): Promise<number> {
 	const labels = await tx.query<{ id: string; name: string }>(
 		`select distinct l.id, l.name from curator.catalog_edge e
 			join curator.catalog_object r on r.id = e.src and r.kind = 'release' and r.merged_into is null
@@ -92,22 +127,201 @@ async function detectTwins(tx: Queryable): Promise<number> {
 		const groups = twinGroups(releases.filter((r) => !proposed.has(r.id)), ruled);
 		if (!groups.length) continue;
 		const pairs = groups.flatMap((g) => g.folds.map((f) => ({ keep: view(g.keep), fold: view(f) })));
-		const id = await raise(tx, {
-			kind: 'release.twins',
-			severity: 'approval',
-			title: `${pairs.length} twin release(s) on «${l.name}»: the same title and artist held twice`,
-			subjects: [l.id],
-			evidence: { pairs },
-			apply: { op: 'mergeReleases', args: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })) } },
-			actor: 'worker',
-			key: pairs.map((p) => p.fold.id).sort().join(','),
-		});
+		const key = pairs.map((p) => p.fold.id).sort().join(',');
+		const id = agent
+			? await enqueueCase(tx, { kind: 'release_twin', subjects: pairs.flatMap((p) => [p.keep.id, p.fold.id]), input: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })), label: { id: l.id, name: l.name } }, key })
+			: await raise(tx, {
+					kind: 'release.twins',
+					severity: 'approval',
+					title: `${pairs.length} twin release(s) on «${l.name}»: the same title and artist held twice`,
+					subjects: [l.id],
+					evidence: { pairs },
+					apply: { op: 'mergeReleases', args: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })) } },
+					actor: 'worker',
+					key,
+				});
 		if (id !== null) raised++;
 	}
 	return raised;
 }
 
 const view = (r: TwinRelease) => ({ id: r.id, title: r.title, artists: r.artists, date: r.date, providers: r.providers, tracks: r.tracks });
+
+// ── buckets ──────────────────────────────────────────────────────────────────────────────
+
+// A store id that may hold several acts under one name (a namesake bucket):
+// what this store credits to the artist is many releases on many labels over
+// a span one act rarely covers, or none of it is what the artist's other
+// stores hold. Asked only of an artist with one store id at that provider
+// (with two, artist-twins already raises the pair, and the edges cannot be
+// told apart by id — ingest evidences an artist's edges with the release's
+// claim, not the artist's), touched by the last days' releases, and not asked
+// in 90 days (enqueueCase dedupes only live cases; a "clean" verdict leaves no
+// mark but its case). The reasoner decides; the numbers only pick who to ask.
+// A later hook: artist-twins' split path (one store, two ids, one name) is the
+// same shape and could run these numbers on both ids.
+export const BUCKET_MIN = { releases: 12, labels: 6, sharedRatio: 0.25, others: 5, labelsElsewhere: 2, labelRatio: 0.2 };
+const BUCKETS_PER_PASS = 20;
+const BUCKETS_EVERY_MS = 6 * 3600_000;
+// The window covers the gap between two bucket passes, with room to spare.
+const BUCKETS_WINDOW_DAYS = 1;
+const bucketsDue = new WeakMap<Db, number>();
+
+// labelsShared: of this store's labels, how many the artist's other stores also
+// put it out on; labelsElsewhere: the labels of what other stores hold.
+export type BucketStats = { releases: number; labels: number; yearSpan: number; shared: number; others: number; labelsShared: number; labelsElsewhere: number };
+export type BucketCandidate = { artist: string; provider: string; providerId: string; stats: BucketStats; suspect: boolean };
+
+// The rule that picks who to ask. Releases, labels and years alone describe a
+// busy career as well as a bucket (2026-11-03: the first rule queued Pysh,
+// Budakid, DSF…), and low release overlap alone describes two stores holding
+// different slices of one catalogue (Sebo, Glenn Morrison on a 30-day dry
+// sweep). Another act under the name puts out on other labels: a bucket is a
+// store whose releases the other stores do not hold, on labels they never
+// show the artist on.
+export function bucketSuspect(n: BucketStats): boolean {
+	if (n.releases < BUCKET_MIN.releases || n.labels < BUCKET_MIN.labels) return false;
+	if (n.others < BUCKET_MIN.others || n.labelsElsewhere < BUCKET_MIN.labelsElsewhere) return false;
+	return n.shared / n.releases <= BUCKET_MIN.sharedRatio && n.labelsShared / n.labels <= BUCKET_MIN.labelRatio;
+}
+
+// Every store id over the floor with its numbers (`catalog agent sweep --dry`
+// lists them); `days`: artists touched by releases of the last days.
+export async function bucketCandidates(tx: Queryable, opts: { days?: number } = {}): Promise<BucketCandidate[]> {
+	// Hash joins only, for this transaction. On a narrow window the planner
+	// expects a handful of touched artists and nests loops over the edge and
+	// evidence tables; the real handful is a thousand after a backfill, and
+	// the 1-day pass query ran for 10+ minutes holding PGlite (2026-11-03)
+	// while the 30-day one, planned with hashes, took under a minute.
+	await tx.query(`set local enable_nestloop = off`);
+	const rows = await tx.query<{ artist: string; provider: string; provider_id: string; releases: unknown; labels: unknown; year_span: unknown; shared: unknown; others: unknown; labels_shared: unknown; labels_elsewhere: unknown }>(
+		// Linear by construction (2026-11-03: the first shape counted shared and
+		// other-store releases with a correlated rescan per row and held PGlite
+		// for minutes on a 30-day sweep): the artists touched lately, their
+		// releases with the stores that evidence each (one array per release),
+		// then counts and spread per store id in one grouping each.
+		`with touched as (
+			select distinct e.src as artist from curator.catalog_object r
+			join curator.catalog_edge e on e.dst = r.id and e.kind = 'artist-release'
+			where r.kind = 'release' and r.merged_into is null and r.discovered_at > now() - make_interval(days => $1::int)
+		), recent as (
+			select s.object_id as artist, s.provider, min(s.provider_id) as provider_id
+			from touched t
+			join curator.catalog_object a on a.id = t.artist and a.merged_into is null and a.name_fold <> all($4::text[])
+			join curator.catalog_source_object s on s.object_id = t.artist and s.kind = 'artist' and not ${WEAK_SQL}
+			group by s.object_id, s.provider having count(*) = 1
+		), fresh as (
+			select r.* from recent r
+			where not exists (select 1 from curator.catalog_source_block b where b.provider = r.provider and b.kind = 'artist' and b.provider_id = r.provider_id)
+				and not exists (
+					select 1 from curator.catalog_agent_case c where c.kind = 'artist_bucket' and c.created_at > now() - interval '90 days'
+						and c.input->'source'->>'provider' = r.provider and c.input->'source'->>'providerId' = r.provider_id)
+		), rel as (
+			select e.src as artist, e.dst as rel, so.provider
+			from curator.catalog_edge e join curator.catalog_edge_evidence ev on ev.edge_id = e.id
+			join curator.catalog_source_object so on so.id = ev.source_object_id
+			where e.kind = 'artist-release' and e.src in (select artist from fresh)
+			union
+			select ra.dst, rr.src, so.provider
+			from curator.catalog_edge ra join curator.catalog_edge_evidence ev on ev.edge_id = ra.id
+			join curator.catalog_source_object so on so.id = ev.source_object_id
+			join curator.catalog_edge rr on rr.dst = ra.src and rr.kind = 'release-recording'
+			where ra.kind = 'recording-artist' and ra.dst in (select artist from fresh)
+		), rp as (
+			select r.artist, r.rel, array_agg(distinct r.provider) as providers
+			from rel r join curator.catalog_object o on o.id = r.rel and o.merged_into is null
+			group by r.artist, r.rel
+		), counts as (
+			select f.artist, f.provider, f.provider_id,
+				count(*) filter (where f.provider = any(rp.providers)) as releases,
+				count(*) filter (where f.provider = any(rp.providers) and cardinality(array_remove(array_remove(rp.providers, f.provider), 'user')) > 0) as shared,
+				count(*) filter (where not f.provider = any(rp.providers) and cardinality(array_remove(rp.providers, 'user')) > 0) as others
+			from fresh f join rp on rp.artist = f.artist
+			group by f.artist, f.provider, f.provider_id
+		), spread as (
+			select f.artist, f.provider,
+				count(distinct coalesce(rl.dst::text, nullif(o.label_text, ''))) as labels,
+				coalesce(max(extract(year from o.release_at)) - min(extract(year from o.release_at)), 0) as year_span
+			from fresh f
+			join rp on rp.artist = f.artist and f.provider = any(rp.providers)
+			join curator.catalog_object o on o.id = rp.rel
+			left join curator.catalog_edge rl on rl.src = rp.rel and rl.kind = 'release-label'
+			group by f.artist, f.provider
+		), lab as (
+			select f.artist, f.provider, coalesce(rl.dst::text, nullif(o.label_text, '')) as label,
+				bool_or(f.provider = any(rp.providers)) as here,
+				bool_or(cardinality(array_remove(array_remove(rp.providers, f.provider), 'user')) > 0) as elsewhere
+			from fresh f
+			join rp on rp.artist = f.artist
+			join curator.catalog_object o on o.id = rp.rel
+			left join curator.catalog_edge rl on rl.src = rp.rel and rl.kind = 'release-label'
+			where coalesce(rl.dst::text, nullif(o.label_text, '')) is not null
+			group by 1, 2, 3
+		), labs as (
+			select artist, provider, count(*) filter (where here and elsewhere) as labels_shared, count(*) filter (where elsewhere) as labels_elsewhere
+			from lab group by artist, provider
+		)
+		select c.artist, c.provider, c.provider_id, c.releases, s.labels, s.year_span, c.shared, c.others,
+			coalesce(l.labels_shared, 0) as labels_shared, coalesce(l.labels_elsewhere, 0) as labels_elsewhere
+		from counts c join spread s on s.artist = c.artist and s.provider = c.provider
+		left join labs l on l.artist = c.artist and l.provider = c.provider
+		where c.releases >= $2::int and s.labels >= $3::int`,
+		[String(opts.days ?? TWINS_WINDOW_DAYS), String(BUCKET_MIN.releases), String(BUCKET_MIN.labels), `{${[...PLACEHOLDER].map((n) => `"${n}"`).join(',')}}`],
+	);
+	return rows.map((r) => {
+		const stats = { releases: num(r.releases), labels: num(r.labels), yearSpan: num(r.year_span), shared: num(r.shared), others: num(r.others), labelsShared: num(r.labels_shared), labelsElsewhere: num(r.labels_elsewhere) };
+		return { artist: r.artist, provider: r.provider, providerId: r.provider_id, stats, suspect: bucketSuspect(stats) };
+	});
+}
+
+// `days`/`limit`: the pass looks at the last days only; a backlog sweep
+// (catalog agent sweep) widens the window once.
+export async function detectBuckets(tx: Queryable, opts: { days?: number; limit?: number } = {}): Promise<number> {
+	const limit = opts.limit ?? BUCKETS_PER_PASS;
+	let queued = 0;
+	for (const c of await bucketCandidates(tx, opts)) {
+		if (!c.suspect) continue;
+		const source = { provider: c.provider, providerId: c.providerId };
+		const id = await enqueueCase(tx, { kind: 'artist_bucket', subjects: [c.artist], input: { artist: c.artist, source, stats: c.stats }, key: `${c.provider}:${c.providerId}` });
+		if (id !== null && ++queued >= limit) break;
+	}
+	return queued;
+}
+
+// ── credits ──────────────────────────────────────────────────────────────────────────────
+
+// A credit a reader may have cut apart: a release of the last two days whose
+// reader kept the raw credit (facts.creditText) and credited two or more
+// artists under name keys from it, where the credit joins with & / and / x /
+// vs or holds a bracket — the shapes the splitter never cuts and a title
+// parse sometimes does ("Pig & Dan" → "Pi", "G & D", "an"). One case per
+// release, for the reasoner (catalog/agent) to call compound or split.
+export async function detectCredits(tx: Queryable, opts: { days?: number; limit?: number } = {}): Promise<number> {
+	const rows = await tx.query<{ release: string; credit: string; provider: string; pieces: string }>(
+		`select r.id as release, f.value #>> '{}' as credit, f.source as provider,
+			string_agg(distinct a.id::text, ',') as pieces
+		from curator.catalog_object r
+		join curator.catalog_fact f on f.object_id = r.id and f.field = 'creditText'
+		join curator.catalog_edge e on e.dst = r.id and e.kind = 'artist-release'
+		join curator.catalog_object a on a.id = e.src and a.merged_into is null
+		where r.kind = 'release' and r.merged_into is null and r.discovered_at > now() - make_interval(days => $1::int)
+			and exists (select 1 from curator.catalog_source_object s where s.object_id = a.id and ${WEAK_SQL})
+			and not exists (select 1 from curator.catalog_source_object s where s.object_id = a.id and not ${WEAK_SQL})
+			and (f.value #>> '{}') ~* '(&| and | x | vs\\.? |[()])'
+		group by r.id, f.value, f.source having count(distinct a.id) >= 2 limit $2::int`,
+		[String(opts.days ?? 2), String(opts.limit ?? 50)],
+	);
+	// A credit already ruled on (compound or split) is settled.
+	const ruled = new Set((await tx.query<{ name_fold: string }>(`select name_fold from curator.catalog_credit_rule`)).map((r) => r.name_fold));
+	let queued = 0;
+	for (const r of rows) {
+		if (ruled.has(nameFold(r.credit))) continue;
+		const pieces = r.pieces.split(',');
+		const id = await enqueueCase(tx, { kind: 'credit', subjects: [r.release, ...pieces], input: { release: r.release, creditText: r.credit, pieces, provider: r.provider }, key: r.credit });
+		if (id !== null) queued++;
+	}
+	return queued;
+}
 
 // Same folded title, a shared folded artist, dates within the gap (or one
 // unknown): one group per such cluster, the best-kept copy as its keep.

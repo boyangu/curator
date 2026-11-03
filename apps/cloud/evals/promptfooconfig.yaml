@@ -1,0 +1,32 @@
+# The catalogue reasoner's regression set (src/catalog/agent/evals.ts).
+#
+#   pnpm --filter @curator/cloud catalog agent evals export   # refresh evals/catalog/twins.jsonl from the inbox
+#   pnpm --filter @curator/cloud eval                         # replay it (needs CURATOR_ANTHROPIC_API_KEY; costs money)
+#
+# A prompt-pack change (src/catalog/agent/prompts.ts) ships only when pair
+# agreement stays at or above the gate in summary.mjs; record the number in
+# the pack CHANGELOG.
+description: Catalogue reasoner — twins decisions replayed against the current prompt packs
+
+prompts:
+  # The provider builds the real prompt from the case's pack; this only names the test.
+  - '{{id}}'
+
+providers:
+  - id: file://dist/provider.mjs
+    label: reasoner
+
+tests: file://catalog/twins.jsonl
+
+defaultTest:
+  assert:
+    - type: javascript
+      value: file://agree.mjs
+    - type: cost
+      threshold: 0.25
+
+evaluateOptions:
+  maxConcurrency: 4
+  cache: false
+
+outputPath: out/results.json

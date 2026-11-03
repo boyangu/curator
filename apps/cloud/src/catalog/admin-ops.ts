@@ -10,11 +10,20 @@ import { nameFold } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
-import { decideInbox, failInbox, getInbox, inboxCounts, listInbox, OPERATOR, raise, snoozeInbox, type InboxChoice, type InboxFilter, type InboxOp, type InboxRow } from './inbox.js';
+import { clearInbox, decideInbox, failInbox, getInbox, inboxCounts, listInbox, OPERATOR, raise, snoozeInbox, type InboxChoice, type InboxFilter, type InboxOp, type InboxRow } from './inbox.js';
 import { mergePolicy, objectFacts, reversiblePolicy } from './inbox-policy.js';
 import { attachPage, decideReview, getReview, holdReview, listReviews, mergeObjects, mergeOverruling, objectReleases, renameObject, scanDuplicates, unlinkPage, type ReviewStatus, type ObjectRelease, type Review, type ReviewCandidate, type ReviewDecision, type ReviewKind } from './admin.js';
 import { candidateReleases, type EvidenceDeps } from './admin-evidence.js';
 import { agentImport, type AgentImport, type AgentImportReport } from './agent-import.js';
+import { CASE_KINDS, caseCounts, enqueueCase, getCase, listCases, type AgentCase, type AgentCaseKind, type AgentCaseStatus } from './agent/cases.js';
+import type { AgentReasonerConfig } from './agent/config.js';
+import { exportEvalCases, type EvalCase } from './agent/evals.js';
+import { bucketCandidates, detectBuckets, detectCredits, type BucketCandidate } from './inbox-detectors.js';
+import type { EvidencePack } from './agent/pack.js';
+import type { ModelCall } from './agent/model.js';
+import { reasonCase, runAgentReasoner, type ReasonerReport } from './agent/reasoner.js';
+
+export type AgentAdvice = { inbox: number; kind: string; title: string; pairs: { i: number; keep: string; fold: string; verdict: string | null }[]; confidence: number | null; rationale: string | null; citations: string[]; searches: number; error: string | null };
 import { findRepresentation } from './identity.js';
 import { addInsight, insightsOf, retireInsight, type Insight } from './insights.js';
 import { ingestClaims } from './ingest.js';
@@ -149,6 +158,17 @@ export type AdminOps = {
 	// A library's labels and releases (with the owner's tracks), ≤ 100 claims
 	// a batch, each release queued for a fill (library-import.ts).
 	libraryImport(args: { claims: unknown[]; key: string; by?: string; dry?: boolean }): Promise<LibraryImportResult>;
+	// The reasoner's cases (catalog/agent): what waits, what was decided and
+	// at what cost; a run now (dry: the verdict without a write); a question
+	// put by hand.
+	agentCases(args: { status?: AgentCaseStatus | 'live'; kind?: AgentCaseKind; limit?: number }): Promise<{ counts: Record<string, number>; cases: AgentCase[]; enabled: boolean }>;
+	agentCase(args: { id: number }): Promise<(AgentCase & { pack: EvidencePack | null }) | null>;
+	agentSweep(args: { days: number; kinds?: ('bucket' | 'credit')[]; limit?: number; dry?: boolean }): Promise<{ buckets: number; credits: number; candidates?: (BucketCandidate & { name: string })[] }>;
+	agentDrop(args: { ids: number[]; reason: string }): Promise<{ dropped: number[]; cleared: number[] }>;
+	agentEvalExport(args: { since?: string }): Promise<{ cases: EvalCase[]; skipped: { inbox: number; why: string }[] }>;
+	agentRun(args: { id?: number; dry?: boolean; batch?: number; by?: string }): Promise<ReasonerReport>;
+	agentAdvise(args: { inbox: number; research?: boolean }): Promise<AgentAdvice>;
+	agentAsk(args: { kind: AgentCaseKind; ids: string[]; source?: { provider: string; providerId: string }; creditText?: string }): Promise<{ id: number | null }>;
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -245,7 +265,7 @@ async function labelView(tx: Queryable, id: string): Promise<LabelView> {
 	};
 }
 
-export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void> } = {}): AdminOps {
+export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void>; agent?: { model: ModelCall; cfg: AgentReasonerConfig } | null } = {}): AdminOps {
 	async function view(r: Review, withEvidence: boolean): Promise<ReviewView> {
 		return withSystemTx(db, async (tx) => {
 			const obj = (await summaries(tx, [r.objectId])).get(r.objectId) ?? null;
@@ -315,6 +335,136 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			const r = await dedupeTracks(db, s, { dry: args.dry, by: args.by });
 			if (!r.dry && r.merged.length) await audit(`Merged ${r.merged.length} duplicate track(s) across ${r.releases} release(s)`, 'release.dedupe', s.labelId ? [s.labelId] : [], { merged: r.merged.slice(0, 50) }, args.by);
 			return r;
+		},
+		async agentCases(args) {
+			return withSystemTx(db, async (tx) => ({ counts: await caseCounts(tx), cases: await listCases(tx, { status: args.status, kind: args.kind, limit: args.limit ?? 50 }), enabled: !!hooks.agent }));
+		},
+		agentCase(args) {
+			return withSystemTx(db, async (tx) => {
+				const c = await getCase(tx, args.id);
+				if (!c) return null;
+				const [p] = await tx.query<{ pack: string | null }>(`select pack::text as pack from curator.catalog_agent_case where id = $1::bigint`, [String(args.id)]);
+				return { ...c, pack: p?.pack ? (JSON.parse(p.pack) as EvidencePack) : null };
+			});
+		},
+		// The backlog the pass's two-day window never reaches: bucket ids and cut
+		// credits over the last `days`, queued for the reasoner like the pass would.
+		async agentSweep(args) {
+			const days = Math.max(1, Math.min(args.days, 3650));
+			// Dry: the bucket candidates with their numbers, nothing queued (to tune the rule).
+			if (args.dry) {
+				return withSystemTx(db, async (tx) => {
+					const cands = await bucketCandidates(tx, { days });
+					const names = await summaries(tx, cands.map((c) => c.artist));
+					return { buckets: cands.filter((c) => c.suspect).length, credits: 0, candidates: cands.map((c) => ({ ...c, name: names.get(c.artist)?.name ?? c.artist })) };
+				});
+			}
+			if (!hooks.agent) throw new Error('the reasoner is off: nothing would answer the cases');
+			const kinds = args.kinds?.length ? args.kinds : ['bucket', 'credit'];
+			return {
+				buckets: kinds.includes('bucket') ? await withSystemTx(db, (tx) => detectBuckets(tx, { days, limit: args.limit ?? 25 })) : 0,
+				credits: kinds.includes('credit') ? await withSystemTx(db, (tx) => detectCredits(tx, { days, limit: args.limit ?? 25 })) : 0,
+			};
+		},
+		// Withdraws cases (a detector asked the wrong question, or asked twice):
+		// moot, with why. A case that already proposed takes its open proposals
+		// with it — cleared, not rejected, so no ruling is recorded.
+		async agentDrop(args) {
+			if (!args.ids.length) throw new Error('agent drop <case id…> --reason "…"');
+			const why = `dropped: ${args.reason}`.slice(0, 500);
+			return withSystemTx(db, async (tx) => {
+				const rows = await tx.query<{ id: unknown }>(
+					`update curator.catalog_agent_case set status = 'moot', last_error = $2, lease_holder = null, lease_until = null where id = any($1::bigint[]) and status in ('queued', 'leased', 'proposed') returning id`,
+					[`{${args.ids.join(',')}}`, why],
+				);
+				const dropped = rows.map((r) => num(r.id));
+				const items = await tx.query<{ id: unknown }>(
+					`select id from curator.catalog_inbox where status = 'open' and actor = 'agent' and (evidence->>'case')::bigint = any($1::bigint[])`,
+					[`{${dropped.join(',') || '0'}}`],
+				);
+				for (const i of items) await clearInbox(tx, num(i.id), why);
+				return { dropped, cleared: items.map((i) => num(i.id)) };
+			});
+		},
+		agentEvalExport(args) {
+			const since = args.since ? Date.parse(args.since) : undefined;
+			if (since !== undefined && Number.isNaN(since)) throw new Error(`--since: not a date: ${args.since}`);
+			return withSystemTx(db, (tx) => exportEvalCases(tx, { since }));
+		},
+		async agentRun(args) {
+			if (!hooks.agent) throw new Error('the reasoner is off: set CURATOR_ANTHROPIC_API_KEY, or CURATOR_AGENT_BACKEND=claude-code for the Claude Code subscription (apps/cloud/.env.example), and restart');
+			const log = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, for: () => log } as unknown as Parameters<typeof runAgentReasoner>[0]['log'];
+			return runAgentReasoner({ db, log, model: hooks.agent.model, cfg: hooks.agent.cfg, holder: 'admin', batch: args.batch, by: args.by ?? 'agent' }, { only: args.id, dry: args.dry });
+		},
+		// The reasoner's opinion on an open twins item the operator holds (raised
+		// before the reasoner was on, or by hand): the same pack and prompt a case
+		// would get, nothing written — the operator decides the item as before.
+		async agentAdvise(args) {
+			if (!hooks.agent) throw new Error('the reasoner is off: nothing to ask');
+			const item = await withSystemTx(db, (tx) => getInbox(tx, args.inbox));
+			if (!item) throw new Error(`no inbox item ${args.inbox}`);
+			if (item.status !== 'open' || !item.apply || !['mergeReleases', 'mergeArtists'].includes(item.apply.op)) throw new Error(`#${item.id} is not an open twins item`);
+			const pairs = item.apply.args.pairs as { keep: string; fold: string }[];
+			const views = (item.evidence.pairs as { keep: { title?: string }; fold: { title?: string }; on?: string[] }[] | undefined) ?? [];
+			const kind = item.apply.op === 'mergeReleases' ? 'release_twin' : 'artist_twin';
+			const input =
+				kind === 'release_twin'
+					? { pairs, label: { id: item.subjects[0]!, name: item.subjectNames[0]?.name ?? 'unknown' } }
+					: { pairs, on: [...new Set(views.flatMap((v) => v.on ?? []))].slice(0, 8) };
+			const c: AgentCase = { id: 0, kind, subjects: pairs.flatMap((p) => [p.keep, p.fold]), input, status: 'leased', attempts: 0, lastError: null, verdict: null, confidence: null, model: null, promptHash: null, usage: null, costUsd: null, inboxId: item.id, createdAt: Date.now(), decidedAt: null, nextDueAt: Date.now() };
+			const quiet = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, for: () => quiet } as unknown as Parameters<typeof runAgentReasoner>[0]['log'];
+			const r = await reasonCase({ db, log: quiet, model: hooks.agent.model, cfg: hooks.agent.cfg, holder: 'advise' }, c, { dry: true, research: args.research });
+			const v = r.verdict as { pairs?: { keep: string; fold: string; verdict: string }[]; confidence?: number; rationale?: string } | null;
+			return {
+				inbox: item.id,
+				kind,
+				title: item.title,
+				pairs: pairs.map((p, i) => ({ i, keep: views[i]?.keep?.title ?? p.keep, fold: views[i]?.fold?.title ?? p.fold, verdict: v?.pairs?.find((q) => q.keep === p.keep && q.fold === p.fold)?.verdict ?? null })),
+				confidence: v?.confidence ?? null,
+				rationale: v?.rationale ?? null,
+				citations: (r.verdict as { citations?: string[] } | null)?.citations ?? [],
+				searches: r.answer?.usage.webSearches ?? 0,
+				error: r.error,
+			};
+		},
+		async agentAsk(args) {
+			if (!CASE_KINDS.includes(args.kind)) throw new Error(`agent ask: kind is one of ${CASE_KINDS.join(', ')}`);
+			return withSystemTx(db, async (tx) => {
+				const ids = args.ids;
+				const names = new Map((await summaries(tx, ids)).entries());
+				for (const id of ids) if (!names.has(id)) throw new Error(`no catalogue object ${id}`);
+				const gone = await tx.query<{ id: string; into: string }>(`select id, merged_into as into from curator.catalog_object where id = any($1::uuid[]) and merged_into is not null`, [`{${ids.join(',')}}`]);
+				if (gone.length) throw new Error(`merged away: ${gone.map((g) => `${g.id} → ${g.into}`).join(', ')} — ask about the live object`);
+				switch (args.kind) {
+					case 'release_twin':
+					case 'artist_twin': {
+						if (ids.length < 2) throw new Error('two ids at least: the one to keep, then the copies');
+						const pairs = ids.slice(1).map((fold) => ({ keep: ids[0]!, fold }));
+						const key = ids.slice(1).sort().join(',');
+						if (args.kind === 'release_twin') {
+							const [label] = await tx.query<{ id: string; name: string }>(
+								`select l.id, l.name from curator.catalog_edge e join curator.catalog_object l on l.id = e.dst and l.merged_into is null where e.src = $1 and e.kind = 'release-label' limit 1`,
+								[ids[0]!],
+							);
+							return { id: await enqueueCase(tx, { kind: 'release_twin', subjects: ids, input: { pairs, label: label ?? { id: ids[0]!, name: names.get(ids[0]!)!.name } }, key }) };
+						}
+						return { id: await enqueueCase(tx, { kind: 'artist_twin', subjects: ids, input: { pairs, on: [] }, key }) };
+					}
+					case 'artist_bucket': {
+						if (!args.source) throw new Error('artist_bucket needs --source <provider>:<id>');
+						return { id: await enqueueCase(tx, { kind: 'artist_bucket', subjects: [ids[0]!], input: { artist: ids[0]!, source: args.source }, key: `${args.source.provider}:${args.source.providerId}` }) };
+					}
+					case 'credit': {
+						if (ids.length < 3) throw new Error('credit: the release id, then two or more artist ids (the pieces)');
+						return { id: await enqueueCase(tx, { kind: 'credit', subjects: ids, input: { release: ids[0]!, creditText: args.creditText ?? null, pieces: ids.slice(1), provider: 'user' }, key: args.creditText ?? ids.slice(1).sort().join(',') }) };
+					}
+					case 'label_pages': {
+						const reviews = (await listReviews(tx, { status: 'open', kind: 'label_page', limit: 200 })).filter((r) => r.objectId === ids[0]).map((r) => r.id);
+						if (!reviews.length) throw new Error('no open label_page review on this label');
+						return { id: await enqueueCase(tx, { kind: 'label_pages', subjects: [ids[0]!], input: { label: ids[0]!, reviews }, key: reviews.join(',') }) };
+					}
+				}
+			});
 		},
 		async libraryImport(args) {
 			const r = await libraryImport(db, { claims: args.claims, key: args.key, by: args.by ?? 'claude-code', dry: args.dry });

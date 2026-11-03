@@ -47,6 +47,8 @@ import { runBackfill } from '../catalog/trackers/backfill.js';
 import { runTrackers } from '../catalog/trackers/sweep.js';
 import type { TrackerAdapter } from '../catalog/trackers/types.js';
 import { ConfigError, flagOf, loadSpotify } from '../config.js';
+import { agentReasonerConfig, reasonerModel } from '../catalog/agent/config.js';
+import { runAgentReasoner } from '../catalog/agent/reasoner.js';
 import { SpotifyUserPlaylistTracker } from '../catalog/trackers/spotify-user-playlist.js';
 import { TokenCrypto } from '../spotify/crypto.js';
 import { SPOTIFY_TIMEOUT_MS } from '../spotify/gateway.js';
@@ -112,11 +114,14 @@ if (gateway) {
 		}),
 	);
 }
+// The catalogue reasoner (catalog/agent): on with CURATOR_ANTHROPIC_API_KEY.
+const agentCfg = agentReasonerConfig(process.env);
+const agentModel = agentCfg ? reasonerModel(agentCfg) : null;
 if (!(await migrationGate(db, log).catch(() => false))) {
 	await db.close().catch(() => {});
 	process.exit(1);
 }
-log.info('catalog_worker', { trackers: adapters.map((a) => a.provider), finders: finders.map((f) => f.provider) });
+log.info('catalog_worker', { trackers: adapters.map((a) => a.provider), finders: finders.map((f) => f.provider), reasoner: agentCfg ? `${agentCfg.backend}:${agentCfg.model}` : 'off' });
 
 const holder = `${hostname()}:${process.pid}`;
 let running = false;
@@ -135,7 +140,8 @@ async function pass(): Promise<void> {
 		await runBackfill({ db, log, adapters, holder }).catch((e: unknown) => log.error('catalog_backfill_failed', { error: e }));
 		await runCataloguePlaylists({ db, log, spotify, holder }).catch((e: unknown) => log.error('catalogue_playlists_pass_failed', { error: e }));
 		await runLabelDedupe({ db, log }).catch((e: unknown) => log.error('label_dedupe_pass_failed', { error: e }));
-		await runInboxDetectors({ db, log }).catch((e: unknown) => log.error('inbox_detectors_failed', { error: e }));
+		await runInboxDetectors({ db, log, agent: agentModel !== null }).catch((e: unknown) => log.error('inbox_detectors_failed', { error: e }));
+		if (agentCfg && agentModel) await runAgentReasoner({ db, log, model: agentModel, cfg: agentCfg, holder }).catch((e: unknown) => log.error('agent_reasoner_failed', { error: e }));
 	} finally {
 		running = false;
 	}

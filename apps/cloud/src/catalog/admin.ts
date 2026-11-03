@@ -354,7 +354,11 @@ export async function unlinkPage(
 	page: { provider: CatalogProvider | null; id: string | null; url: string | null },
 	by: string,
 	note: string | null,
+	// Labels by default; an artist's page (a namesake-bucket store profile,
+	// catalog/agent/apply.ts) is ruled out through an artist_link review.
+	opts: { kind?: 'label' | 'artist' } = {},
 ): Promise<UnlinkResult> {
+	const kind = opts.kind ?? 'label';
 	const norm = (u: string) => u.toLowerCase().replace(/^https?:\/\/(www\.|m\.)?/, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
 	const rows = await tx.query<{ id: string; provider: CatalogProvider; provider_id: string; url: string | null; kind: CatalogKind; payload: string }>(
 		`select id, provider, provider_id, url, kind, payload::text as payload from curator.catalog_source_object where object_id = $1 and ($2::text is null or provider = $2) and provider <> 'user'`,
@@ -371,7 +375,7 @@ export async function unlinkPage(
 		[so.id],
 	);
 	// And the ids the page stands for (a Discogs or MusicBrainz label id), however they were recorded.
-	const namespace = so.provider === 'discogs' ? 'discogs_label' : so.provider === 'musicbrainz' ? 'mbid_label' : null;
+	const namespace = so.provider === 'discogs' ? `discogs_${kind}` : so.provider === 'musicbrainz' ? `mbid_${kind}` : null;
 	const identifiers = await tx.query<{ namespace: string; value: string }>(
 		`delete from curator.catalog_identifier where object_id = $2 and (source_object_id = $1 or (namespace = $3 and value = $4)) returning namespace, value`,
 		[so.id, objectId, namespace, so.provider_id],
@@ -383,7 +387,7 @@ export async function unlinkPage(
 	if (num(left!.n) === 0) await tx.query(`delete from curator.catalog_cursor where object_id = $1 and provider = $2`, [objectId, so.provider]);
 	else await tx.query(`update curator.catalog_cursor set cursor = '{}'::jsonb, fail_count = 0, last_error = null, next_due_at = now() where object_id = $1 and provider = $2`, [objectId, so.provider]);
 	const [name] = await tx.query<{ name: string }>(`select name from curator.catalog_object where id = $1`, [objectId]);
-	const review = await openReview(tx, { kind: 'label_page', objectId, candidates: [{ provider: so.provider, providerId: so.provider_id, name: name?.name ?? '', url: so.url ?? page.url ?? null }], evidence: { reason: 'unlinked by hand: not this label\'s page' } });
+	const review = await openReview(tx, { kind: kind === 'artist' ? 'artist_link' : 'label_page', objectId, candidates: [{ provider: so.provider, providerId: so.provider_id, name: name?.name ?? '', url: so.url ?? page.url ?? null }], evidence: { reason: `unlinked by hand: not this ${kind}'s page` } });
 	if (review !== null) {
 		await tx.query(
 			`update curator.catalog_review set status = 'decided', decision = $2::text::jsonb, decided_by = $3, note = $4, decided_at = now() where id = $1::bigint`,

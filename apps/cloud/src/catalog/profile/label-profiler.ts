@@ -35,6 +35,7 @@ import { num } from '../../db/db.js';
 import { withSystemTx } from '../../db/system-tx.js';
 import type { Logger } from '../../log.js';
 import { objectReleases, openReview, ruledNotSame, type ReviewCandidate } from '../admin.js';
+import { enqueueCase } from '../agent/cases.js';
 import { findRepresentation } from '../identity.js';
 import { Ingester } from '../ingest.js';
 import { ensureCursors } from '../watches.js';
@@ -271,9 +272,14 @@ export class LabelProfiler {
 			// the label's own releases beside the candidates.
 			if (found.reviews.length) {
 				const mine = (await objectReleases(tx, label.id, 15)).map((r) => r.title);
+				const opened: number[] = [];
 				for (const candidates of found.reviews) {
-					await openReview(tx, { kind: 'label_page', objectId: label.id, candidates, evidence: { releases: mine } });
+					const id = await openReview(tx, { kind: 'label_page', objectId: label.id, candidates, evidence: { releases: mine } });
+					if (id !== null) opened.push(id);
 				}
+				// The reasoner (catalog/agent) reads the candidates against the
+				// label's releases first; what it cannot settle stays a review.
+				if (opened.length) await enqueueCase(tx, { kind: 'label_pages', subjects: [label.id], input: { label: label.id, reviews: opened }, key: opened.join(',') });
 			}
 			await ensureCursors(tx, label.id);
 			// Its releases, once, from every provider that can list them

@@ -145,7 +145,7 @@ export class BandcampTracker implements TrackerAdapter {
 			kind: 'release',
 			providerId: String(i.item_id),
 			name: i.title,
-			facts: { ...(date ? { releaseDate: date } : {}), ...(art(i.art_id) ? { coverUrl: art(i.art_id) } : {}), labelText: label.name },
+			facts: { ...(date ? { releaseDate: date } : {}), ...(art(i.art_id) ? { coverUrl: art(i.art_id) } : {}), labelText: label.name, ...(i.artist_name?.trim() && (i.band_id === undefined || String(i.band_id) === labelBandId) ? { creditText: i.artist_name.trim().slice(0, 500) } : {}) },
 			artists: this.artist(i, labelBandId),
 			label,
 		};

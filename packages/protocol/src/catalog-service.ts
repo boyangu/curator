@@ -91,6 +91,9 @@ export type CatalogFacts = {
 	key?: string;
 	catalogNumber?: string;
 	country?: string;
+	// release / recording: the credit as the reader saw it, before any split
+	// ("Saints & Sinners"): what the reasoner reads when the pieces look cut.
+	creditText?: string;
 };
 
 export type CatalogIdentifier = { namespace: CatalogIdNamespace; value: string };
@@ -147,6 +150,7 @@ const ZFacts: z.ZodType<CatalogFacts> = z
 		key: z.string().max(20).optional(),
 		catalogNumber: z.string().max(100).optional(),
 		country: z.string().max(10).optional(),
+		creditText: z.string().max(500).optional(),
 	})
 	.strict();
 

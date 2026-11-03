@@ -58,3 +58,7 @@ apps/mcp/dist-mcpb/
 
 # Claude Design exports (design work stays private, like briefs).
 *.dc.html
+
+# promptfoo runs of the catalogue reasoner regression set
+apps/cloud/evals/out/
+apps/cloud/evals/catalog/

@@ -81,10 +81,59 @@ export class Ingester {
 		const key = `${c.provider}|${c.kind}|${c.providerId}`;
 		let p = this.memo.get(key);
 		if (!p) {
-			p = this.resolve(c, parent);
+			p = this.blocked(c).then((weak) => this.resolve(weak, parent));
 			this.memo.set(key, p);
 		}
 		return p;
+	}
+
+	// What the reasoner or the operator ruled about credits and store ids
+	// (catalog_credit_rule, catalog_source_block; migration 0024), read once
+	// per ingest. Both tables are small.
+	private rulesMemo: Promise<{ credits: Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>; blocked: Set<string> }> | null = null;
+	private rules() {
+		this.rulesMemo ??= (async () => {
+			const credits = new Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>();
+			for (const r of await this.tx.query<{ name_fold: string; name: string; kind: 'compound' | 'split'; pieces: string }>(`select name_fold, name, kind, pieces::text as pieces from curator.catalog_credit_rule`)) {
+				credits.set(r.name_fold, { name: r.name, kind: r.kind, pieces: r.pieces === '{}' ? [] : r.pieces.slice(1, -1).split(',').map((p) => p.replace(/^"|"$/g, '')) });
+			}
+			const blocked = new Set((await this.tx.query<{ k: string }>(`select provider || '|' || kind || '|' || provider_id as k from curator.catalog_source_block`)).map((r) => r.k));
+			return { credits, blocked };
+		})();
+		return this.rulesMemo;
+	}
+
+	// A claim under a blocked store id (a profile that is a bucket of
+	// namesakes) is read as a name only: a weak key the identity rules join
+	// through the release it arrives with, never the store's word on identity.
+	private async blocked(c: CatalogClaim): Promise<CatalogClaim> {
+		if (c.provider === 'user') return c;
+		const { blocked } = await this.rules();
+		if (!blocked.has(`${c.provider}|${c.kind}|${c.providerId}`)) return c;
+		return { ...c, provider: 'user', providerId: `name:${nameFold(c.name)}`, url: null, identifiers: [] };
+	}
+
+	// Credits the catalogue ruled on: a compound rule's pieces, claimed
+	// together, become the one act under the rule's name (a weak key, so the
+	// act's existing object is joined); a split rule's name becomes its pieces.
+	private async creditRules(artists: CatalogClaim[]): Promise<CatalogClaim[]> {
+		if (artists.length === 0) return artists;
+		const { credits } = await this.rules();
+		if (credits.size === 0) return artists;
+		const weak = (name: string): CatalogClaim => ({ provider: 'user', kind: 'artist', providerId: `name:${nameFold(name)}`, name });
+		let out = artists.flatMap((a) => {
+			const rule = credits.get(nameFold(a.name));
+			return rule && rule.kind === 'split' && rule.pieces.length >= 2 ? rule.pieces.map((p) => weak(p)) : [a];
+		});
+		const folds = new Set(out.map((a) => nameFold(a.name)));
+		for (const [, rule] of credits) {
+			if (rule.kind !== 'compound' || rule.pieces.length < 2) continue;
+			const pieceFolds = rule.pieces.map((p) => nameFold(p));
+			if (!pieceFolds.every((f) => folds.has(f))) continue;
+			out = [weak(rule.name), ...out.filter((a) => !pieceFolds.includes(nameFold(a.name)))];
+			for (const f of pieceFolds) folds.delete(f);
+		}
+		return out;
 	}
 
 	private async resolve(c: CatalogClaim, parent?: ClaimParent): Promise<IngestOutcome> {
@@ -241,7 +290,7 @@ export class Ingester {
 		// track's (a store's track-level copy of the release artist).
 		const self: ClaimParent = { id: objectId, kind: c.kind, release: c.kind === 'recording' && parent?.kind === 'release' ? parent.id : undefined };
 		if (c.kind === 'release') {
-			for (const [i, a] of (c.artists ?? []).entries()) {
+			for (const [i, a] of (await this.creditRules(c.artists ?? [])).entries()) {
 				const artist = await this.claim(a, self);
 				if (artist.kind === 'artist') await this.edge(artist.objectId, 'artist-release', objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
 			}
@@ -256,7 +305,7 @@ export class Ingester {
 			}
 		}
 		if (c.kind === 'recording') {
-			for (const [i, a] of (c.artists ?? []).entries()) {
+			for (const [i, a] of (await this.creditRules(c.artists ?? [])).entries()) {
 				const artist = await this.claim(a, self);
 				if (artist.kind === 'artist') await this.edge(objectId, 'recording-artist', artist.objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
 			}

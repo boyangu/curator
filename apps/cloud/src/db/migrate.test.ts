@@ -25,8 +25,10 @@ const USER_TABLES = [
 // The Global Catalog (sql/0011): shared across accounts, reachable only as curator_api.
 const SHARED_TABLES = [
 	'admin_user',
+	'catalog_agent_case',
 	'catalog_audio',
 	'catalog_chart_entry',
+	'catalog_credit_rule',
 	'catalog_cursor',
 	'catalog_edge',
 	'catalog_edge_evidence',
@@ -45,6 +47,7 @@ const SHARED_TABLES = [
 	'catalog_playlist_item',
 	'catalog_review',
 	'catalog_signal',
+	'catalog_source_block',
 	'catalog_source_object',
 	'genre_alias',
 	'provider_budget',

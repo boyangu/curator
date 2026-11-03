@@ -29,8 +29,16 @@
 //   pnpm --filter @curator/cloud catalog repair artist-twins [--dry] [--all] [--merge-only]   (same-name artists on one release merged; one store holding both under two ids → an artist.twins inbox item)
 //   pnpm --filter @curator/cloud catalog artist merge <from id> <into id> --note "…" [--approved]   (held for the operator unless approved)
 //   pnpm --filter @curator/cloud catalog artist recredit <artist id> <release id> <to artist id> --note "…" --approved   (an artist's credits on one release given to another)
+//   pnpm --filter @curator/cloud catalog agent cases [--status queued|decided|applied|proposed|failed|moot|live] [--kind …] [--limit 50]   (the reasoner's queue and log)
+//   pnpm --filter @curator/cloud catalog agent show <case id>
+//   pnpm --filter @curator/cloud catalog agent run [<case id>] [--dry] [--batch 5]   (reason about queued cases now; --dry prints the verdict, writes nothing)
+//   pnpm --filter @curator/cloud catalog agent ask release_twin|artist_twin <keep id> <fold id…> | artist_bucket <artist id> --source deezer:<id> | credit <release id> <piece id…> [--credit "…"] | label_pages <label id>
+//   pnpm --filter @curator/cloud catalog agent sweep [--days 30] [--kind bucket|credit] [--limit 25] [--dry]   (queue the backlog the pass's two-day window misses; --dry lists bucket candidates with their numbers)
+//   pnpm --filter @curator/cloud catalog agent drop <case id…> --reason "…"   (withdraw queued cases)
+//   pnpm --filter @curator/cloud catalog agent advise <inbox id…> [--research]   (the reasoner's opinion on open twins items; writes nothing; --research = web on)
+//   pnpm --filter @curator/cloud catalog agent evals export [--since 2026-11-01] [--size 80 | --all] [--out evals/catalog/twins.jsonl] [--verbose]   (the operator's twin decisions as the regression set; run it with `pnpm --filter @curator/cloud eval`)
 //   pnpm --filter @curator/cloud catalog pass            (run the worker's pass now; local server)
-//   pnpm --filter @curator/cloud catalog inbox [<kind>] [--all] [--limit 30]      (the operator's inbox: what waits for Guy; --all = the activity log)
+//   pnpm --filter @curator/cloud catalog inbox [<kind>] [--all] [--actor agent] [--limit 30]      (the operator's inbox: what waits for Guy; --all = the activity log)
 //   pnpm --filter @curator/cloud catalog inbox show <id>
 //   pnpm --filter @curator/cloud catalog inbox approve|reject <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] --note "…" --by guy   (--except: twin pairs ruled not twins, the rest merged)
 //   pnpm --filter @curator/cloud catalog insight add <object id | label> --topic edition|partial|note "<text>"   (what you concluded, on the object)
@@ -44,8 +52,11 @@
 // talks to the running local catalogue (cli/local.ts) on its loopback
 // `/admin` path, since PGlite is single-process.
 
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { adminOps, type AdminOps, type LabelView, type ReviewView } from '../catalog/admin-ops.js';
+import { coreSet } from '../catalog/agent/evals.js';
+import type { AgentCase } from '../catalog/agent/cases.js';
 import type { ArtistPairView } from '../catalog/artist-twins.js';
 import type { AgentImport } from '../catalog/agent-import.js';
 import type { RelatedEvidence } from '../catalog/label-related.js';
@@ -132,7 +143,25 @@ async function ops(): Promise<AdminOps> {
 		inboxGet: (a) => call('inboxGet', a),
 		inboxDecide: (a) => call('inboxDecide', a),
 		inboxSnooze: (a) => call('inboxSnooze', a),
+		agentCases: (a) => call('agentCases', a),
+		agentCase: (a) => call('agentCase', a),
+		agentRun: (a) => call('agentRun', a),
+		agentAsk: (a) => call('agentAsk', a),
+		agentEvalExport: (a) => call('agentEvalExport', a),
+		agentSweep: (a) => call('agentSweep', a),
+		agentDrop: (a) => call('agentDrop', a),
+		agentAdvise: (a) => call('agentAdvise', a),
 	};
+}
+
+function printCase(c: AgentCase, full: boolean): void {
+	console.log(`\n#${c.id}  ${c.kind}  ${c.status}${c.confidence !== null ? ` · ${Math.round(c.confidence * 100)}%` : ''}${c.costUsd !== null ? ` · $${c.costUsd.toFixed(4)}` : ''}${c.model ? ` · ${c.model}` : ''} · ${when(c.createdAt)}${c.inboxId !== null ? ` · inbox #${c.inboxId}` : ''}`);
+	if (c.lastError) console.log(`  last error: ${c.lastError}`);
+	if (!full) return;
+	console.log(`  subjects: ${c.subjects.join(', ')}`);
+	console.log(`  input: ${JSON.stringify(c.input).slice(0, 800)}`);
+	if (c.verdict) console.log(`  verdict: ${JSON.stringify(c.verdict, null, 1).slice(0, 2000)}`);
+	if (c.usage) console.log(`  usage: ${JSON.stringify(c.usage)}`);
 }
 
 const when = (ms: number | null): string => (ms === null ? '—' : new Date(ms).toISOString().slice(0, 16).replace('T', ' '));
@@ -167,13 +196,19 @@ function printInbox(r: InboxRow, full: boolean): void {
 	if (r.note) console.log(`  note: ${r.note}`);
 	if (!full) return;
 	const e = r.evidence;
+	// The reasoner's items carry why it decided (catalog/agent/apply.ts).
+	if (typeof e.rationale === 'string') console.log(`  why: ${e.rationale}${typeof e.confidence === 'number' ? ` (${Math.round(e.confidence * 100)}% sure` : ''}${typeof e.model === 'string' ? `, ${e.model}` : ''}${typeof e.costUsd === 'number' ? `, $${e.costUsd.toFixed(4)}` : ''}${typeof e.confidence === 'number' ? ')' : ''}${typeof e.case === 'number' ? ` · case #${e.case}` : ''}`);
+	if (Array.isArray(e.citations) && e.citations.length) console.log(`  read: ${(e.citations as string[]).join(' ')}`);
 	if (e.candidate && (e.candidate as { evidence?: { kind?: string } }).evidence?.kind === 'related_label') printRelated((e.candidate as { evidence: RelatedEvidence }).evidence);
 	if (Array.isArray(e.candidates)) for (const [i, c] of (e.candidates as ReviewCandidate[]).entries()) console.log(`  [${i}] ${c.name}  ${c.objectId ? `object ${c.objectId}` : `${c.provider}:${c.providerId}`}${c.url ? `  ${c.url}` : ''}${c.releases?.length ? `\n      lists: ${c.releases.slice(0, 12).join(' | ')}` : ''}`);
-	if (r.kind === 'artist.twins' && Array.isArray(e.pairs)) {
+	// Artist sides carry no artists list (objects.ts PairView), release sides do.
+	const artistPairs = Array.isArray(e.pairs) && (e.pairs as { keep?: { artists?: unknown } }[])[0]?.keep?.artists === undefined;
+	if (Array.isArray(e.verdicts)) console.log(`  model said, per pair: ${(e.verdicts as string[]).map((v, i) => `[${i}] ${v}`).join('  ')}`);
+	if (artistPairs) {
 		for (const [i, p] of (e.pairs as ArtistPairView[]).entries()) console.log(`  [${i}] keep: ${p.keep.title} ${p.keep.id} [${p.keep.providers.join(',')}] ${p.keep.tracks} credit(s)  ⇐ fold: ${p.fold.title} ${p.fold.id} [${p.fold.providers.join(',')}] ${p.fold.tracks} credit(s)
-      both on: ${p.on.join(' | ')}`);
+      both on: ${(p.on ?? []).join(' | ')}`);
 	} else if (Array.isArray(e.pairs)) for (const [i, p] of (e.pairs as { keep: { title: string; artists: string[]; date: string | null; providers: string[] }; fold: { title: string; artists: string[]; date: string | null; providers: string[] } }[]).entries()) console.log(`  [${i}] keep: ${p.keep.title} — ${p.keep.artists.join(', ')} (${p.keep.date ?? '?'}) [${p.keep.providers.join(',')}]  ⇐ fold: ${p.fold.title} — ${p.fold.artists.join(', ')} (${p.fold.date ?? '?'}) [${p.fold.providers.join(',')}]`);
-	const rest = Object.fromEntries(Object.entries(e).filter(([k]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence'].includes(k)));
+	const rest = Object.fromEntries(Object.entries(e).filter(([k]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'rationale', 'citations', 'confidence', 'model', 'costUsd', 'case', 'verdicts', 'on'].includes(k)));
 	if (Object.keys(rest).length) console.log(`  ${JSON.stringify(rest).slice(0, 600)}`);
 }
 
@@ -271,7 +306,7 @@ try {
 			console.log(`#${r.id} snoozed until ${when(r.snoozedUntil)}`);
 		} else {
 			const kind = sub && !sub.startsWith('--') ? sub : arg('--kind');
-			const rows = await api.inboxList({ status: flag('--all') ? 'all' : 'open', kind, limit: Number(arg('--limit') ?? 30) });
+			const rows = await api.inboxList({ status: flag('--all') ? 'all' : 'open', kind, ...(arg('--actor') ? { actor: arg('--actor') } : {}), limit: Number(arg('--limit') ?? 30) });
 			const counts = await api.inboxCounts({});
 			if (json) console.log(JSON.stringify(rows, null, 2));
 			else {
@@ -442,10 +477,84 @@ try {
 			for (const f of r.fixed) console.log(`  "${f.name}" → ${f.into.map((t) => `"${t}"`).join(' + ')} (${f.credits} credit(s))${f.minted.length ? ` — new: ${f.minted.join(', ')}` : ''}`);
 			for (const l of r.left) console.log(`  left: "${l.name}" ${l.id} — ${l.why}`);
 		}
+	} else if (group === 'agent' && (sub === 'cases' || sub === undefined)) {
+		const r = await api.agentCases({ status: arg('--status') as never, kind: arg('--kind') as never, limit: Number(arg('--limit') ?? 50) });
+		if (json) console.log(JSON.stringify(r, null, 2));
+		else {
+			console.log(`reasoner ${r.enabled ? 'on' : 'off (no CURATOR_ANTHROPIC_API_KEY, no CURATOR_AGENT_BACKEND=claude-code)'} · ${Object.entries(r.counts).map(([k, v]) => `${v} ${k}`).join(', ') || 'no cases'}`);
+			for (const c of r.cases) printCase(c, false);
+		}
+	} else if (group === 'agent' && sub === 'show') {
+		const c = await api.agentCase({ id: Number(words[2]) });
+		if (!c) throw new Error(`no case ${words[2]}`);
+		if (json) console.log(JSON.stringify(c, null, 2));
+		else {
+			printCase(c, true);
+			if (c.pack) console.log(`  pack: ${c.pack.question}\n        ${JSON.stringify(c.pack.evidence).length.toLocaleString()} chars of evidence${c.pack.research ? ', research allowed' : ''}`);
+		}
+	} else if (group === 'agent' && sub === 'sweep') {
+		const kind = arg('--kind');
+		const r = await api.agentSweep({ days: Number(arg('--days') ?? 30), dry: flag('--dry'), ...(kind ? { kinds: [kind as 'bucket' | 'credit'] } : {}), ...(arg('--limit') ? { limit: Number(arg('--limit')) } : {}) });
+		if (r.candidates) {
+			if (json) console.log(JSON.stringify(r.candidates, null, 2));
+			else {
+				console.log(`[dry] ${r.candidates.length} store id(s) over the floor, ${r.buckets} the rule would ask about:`);
+				for (const c of r.candidates.sort((a, b) => a.stats.shared / a.stats.releases - b.stats.shared / b.stats.releases)) console.log(`  ${c.suspect ? '?' : ' '} ${c.name} ${c.provider}:${c.providerId}  ${c.stats.releases} rel, ${c.stats.labels} labels, ${c.stats.yearSpan} y, shared ${c.stats.shared} (${Math.round((100 * c.stats.shared) / c.stats.releases)}%), others-only ${c.stats.others}, labels shared ${c.stats.labelsShared}/${c.stats.labels} (elsewhere ${c.stats.labelsElsewhere})`);
+			}
+		} else console.log(`queued ${r.buckets} bucket case(s), ${r.credits} credit case(s); the pass reasons about them a few at a time (catalog agent cases)`);
+	} else if (group === 'agent' && sub === 'advise') {
+		// The reasoner's opinion on open twins items, nothing written.
+		for (const w of words.slice(2)) {
+			const a = await api.agentAdvise({ inbox: Number(w), ...(flag('--research') ? { research: true } : {}) });
+			if (json) console.log(JSON.stringify(a));
+			else {
+				console.log(`\n#${a.inbox}  ${a.title}${a.confidence !== null ? `  (${Math.round(a.confidence * 100)}% sure)` : ''}`);
+				for (const p of a.pairs) console.log(`  [${p.i}] ${p.verdict ?? '?'}  ${p.keep} ⇐ ${p.fold}`);
+				if (a.rationale) console.log(`  why: ${a.rationale}`);
+				if (a.error) console.log(`  error: ${a.error}`);
+			}
+		}
+	} else if (group === 'agent' && sub === 'drop') {
+		const r = await api.agentDrop({ ids: words.slice(2).map(Number).filter(Number.isInteger), reason: arg('--reason') ?? 'withdrawn by hand' });
+		console.log(`dropped ${r.dropped.length} case(s)${r.dropped.length ? `: ${r.dropped.join(', ')}` : ''}${r.cleared.length ? `; cleared their open proposal(s): ${r.cleared.join(', ')}` : ''}`);
+	} else if (group === 'agent' && sub === 'evals' && words[2] === 'export') {
+		// The regression set (agent/evals.ts) as promptfoo test lines (apps/cloud/evals).
+		const r = await api.agentEvalExport({ since: arg('--since') });
+		const out = arg('--out') ?? 'evals/catalog/twins.jsonl';
+		// The core set by default (agent/evals.ts coreSet); --all replays the whole log.
+		// promptfoo reads an array var as a matrix of runs and refuses objects: the
+		// pack and the labels travel as JSON strings (evals/provider.ts, agree.mjs).
+		const picked = flag('--all') ? r.cases : coreSet(r.cases, Number(arg('--size') ?? 80));
+		const lines = picked.map((c) => JSON.stringify({ description: `${c.id} ${c.kind} (${c.packSource})`, vars: { id: c.id, kind: c.kind, pack: JSON.stringify(c.pack), expected: JSON.stringify(c.expected), modelSaid: JSON.stringify(c.modelSaid) } }));
+		mkdirSync(dirname(out), { recursive: true });
+		writeFileSync(out, lines.length ? `${lines.join('\n')}\n` : '');
+		const pairs = picked.flatMap((c) => c.expected.filter((e) => e !== null));
+		console.log(`${picked.length} case(s)${picked.length < r.cases.length ? ` of ${r.cases.length}` : ''}, ${pairs.length} decided pair(s): ${pairs.filter((e) => e === 'same').length} same, ${pairs.filter((e) => e === 'different').length} different → ${out}${r.skipped.length ? ` · ${r.skipped.length} item(s) skipped` : ''}`);
+		if (flag('--verbose')) for (const k of r.skipped) console.log(`  skipped inbox #${k.inbox}: ${k.why}`);
+	} else if (group === 'agent' && sub === 'run') {
+		const id = words[2] ? Number(words[2]) : undefined;
+		const r = await api.agentRun({ id, dry: flag('--dry'), batch: arg('--batch') ? Number(arg('--batch')) : undefined, by: arg('--by') });
+		if (json) console.log(JSON.stringify(r, null, 2));
+		else {
+			console.log(`${flag('--dry') ? '[dry run, nothing written] ' : ''}${r.leased} case(s) taken${r.moot ? `, ${r.moot} moot` : ''}${r.parked ? ` — parked: ${r.parked}` : ''}`);
+			for (const x of r.results) {
+				console.log(`\n#${x.id}  ${x.kind}  → ${x.status}${x.answer ? ` · $${x.answer.costUsd.toFixed(4)} · ${x.answer.model} · ${x.answer.usage.inputTokens}+${x.answer.usage.outputTokens} tokens (${x.answer.usage.cacheReadTokens} cached, ${x.answer.usage.webSearches} searches)` : ''}`);
+				if (x.verdict) console.log(`  ${JSON.stringify(x.verdict, null, 1).slice(0, 2500)}`);
+				if (x.outcome) for (const line of [...x.outcome.applied.map((a) => `  done: ${a}`), ...x.outcome.proposed.map((p) => `  proposed: ${p}`)]) console.log(line);
+				if (x.error) console.log(`  error: ${x.error}`);
+			}
+		}
+	} else if (group === 'agent' && sub === 'ask') {
+		const kind = words[2] as never;
+		const ids = words.slice(3);
+		const src = arg('--source');
+		const [provider, ...rest] = (src ?? '').split(':');
+		const r = await api.agentAsk({ kind, ids, ...(src ? { source: { provider: provider!, providerId: rest.join(':') } } : {}), ...(arg('--credit') ? { creditText: arg('--credit')! } : {}) });
+		console.log(r.id === null ? 'that question is already queued' : `queued as case #${r.id}`);
 	} else if (group === 'pass') {
 		console.log(JSON.stringify(await api.pass({})));
 	} else {
-		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe | artist merge|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | pass   (see the header of src/cli/catalog.ts)');
+		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe | artist merge|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass   (see the header of src/cli/catalog.ts)');
 	}
 } catch (e) {
 	log.error('catalog_cli_failed', { error: e instanceof Error ? e.message : String(e) });

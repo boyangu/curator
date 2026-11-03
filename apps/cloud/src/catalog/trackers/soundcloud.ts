@@ -112,6 +112,7 @@ function recordingOf(t: ScTrack, title: string, artists: CatalogClaim[], at: num
 			...(t.duration && (t.access ?? 'playable') === 'playable' ? { durationSec: Math.round(t.duration / 100) / 10 } : {}),
 			...(t.bpm ? { bpm: t.bpm } : {}),
 			...(t.key_signature ? { key: t.key_signature } : {}),
+			...(t.metadata_artist?.trim() ? { creditText: t.metadata_artist.trim().slice(0, 500) } : {}),
 			...cover(t.artwork_url),
 		},
 		artists,

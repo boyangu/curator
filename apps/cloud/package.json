@@ -20,16 +20,19 @@
 		"catalog": "tsx --env-file-if-exists=../../.env src/cli/catalog.ts",
 		"backoffice": "tsx --env-file-if-exists=../../.env src/cli/backoffice.ts",
 		"test": "vitest run",
+		"eval": "node evals/run.mjs",
 		"test:watch": "vitest",
-		"typecheck": "tsc --noEmit && node ../../scripts/check-package-boundaries.mjs cloud"
+		"typecheck": "tsc --noEmit && tsc -p evals && node ../../scripts/check-package-boundaries.mjs cloud"
 	},
 	"dependencies": {
+		"@anthropic-ai/sdk": "^1.4.0",
 		"@trpc/server": "^11",
 		"jose": "^6.2.12",
 		"postgres": "^3.4.9",
 		"zod": "^3.23.8"
 	},
 	"devDependencies": {
+		"@curator/agent-core": "workspace:*",
 		"@curator/library-logic": "workspace:*",
 		"@curator/protocol": "workspace:*",
 		"@curator/shared": "workspace:*",
@@ -37,6 +40,7 @@
 		"@trpc/client": "^11",
 		"@types/node": "^22.10.0",
 		"esbuild": "^0.28.2",
+		"promptfoo": "0.120.27",
 		"tsx": "^4.19.2",
 		"typescript": "^5.6.3",
 		"vitest": "^2.1.6"

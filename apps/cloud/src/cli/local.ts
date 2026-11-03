@@ -44,6 +44,8 @@ import { SoundCloudTracker } from '../catalog/trackers/soundcloud.js';
 import { YouTubeTracker } from '../catalog/trackers/youtube.js';
 import { soundcloudCredentials, tidalCredentials } from '../config.js';
 import { runInboxDetectors } from '../catalog/inbox-detectors.js';
+import { agentReasonerConfig, describeReasoner, reasonerModel } from '../catalog/agent/config.js';
+import { runAgentReasoner } from '../catalog/agent/reasoner.js';
 import { loadLocalLibrary, type LocalLibrary } from '../catalog/local-library.js';
 import { runLabelDedupe } from '../catalog/label-related.js';
 import { runReleaseFiller } from '../catalog/release-fill.js';
@@ -212,7 +214,11 @@ const fillFetchers = {
 	beatport: (adapters.find((a) => a instanceof BeatportTracker) as BeatportTracker | undefined) ?? null,
 	bandcamp: (adapters.find((a) => a instanceof BandcampTracker) as BandcampTracker | undefined) ?? null,
 };
-const admin = adminOps(db, { spotify, tidal, apple }, { pass: () => freshPass() });
+// The catalogue reasoner (catalog/agent): on with CURATOR_ANTHROPIC_API_KEY in the root .env.
+const agentCfg = agentReasonerConfig(process.env);
+const agentModel = agentCfg ? reasonerModel(agentCfg) : null;
+console.log(`Reasoner: ${describeReasoner(agentCfg)}`);
+const admin = adminOps(db, { spotify, tidal, apple }, { pass: () => freshPass(), agent: agentCfg && agentModel ? { model: agentModel, cfg: agentCfg } : null });
 const adminHandler = async (req: Request): Promise<Response> => {
 	try {
 		const { op, args } = (await req.json()) as { op: keyof AdminOps; args: never };
@@ -303,8 +309,11 @@ function pass(): Promise<void> {
 		await runLabelProfiler({ db, log, spotify, providers: { beatport, bandcamp }, batch: 10 }).catch((e: unknown) => log.error('label_profile_pass_failed', { error: e }));
 		await runBackfill({ db, log, adapters, holder: 'local', batch: 20 }).catch((e: unknown) => log.error('catalog_backfill_failed', { error: e }));
 		await runCataloguePlaylists({ db, log, spotify, holder: 'local', batch: 10 }).catch((e: unknown) => log.error('catalogue_playlists_pass_failed', { error: e }));
+		if (process.env.CURATOR_DEBUG_PASS === '1') log.info('pass_step', { step: 'label-dedupe' });
 		await runLabelDedupe({ db, log }).catch((e: unknown) => log.error('label_dedupe_pass_failed', { error: e }));
-		await runInboxDetectors({ db, log }).catch((e: unknown) => log.error('inbox_detectors_failed', { error: e }));
+		if (process.env.CURATOR_DEBUG_PASS === '1') log.info('pass_step', { step: 'detectors' });
+		await runInboxDetectors({ db, log, agent: agentModel !== null }).catch((e: unknown) => log.error('inbox_detectors_failed', { error: e }));
+		if (agentCfg && agentModel) await runAgentReasoner({ db, log, model: agentModel, cfg: agentCfg, holder: 'local' }).catch((e: unknown) => log.error('agent_reasoner_failed', { error: e }));
 		if (Date.now() - analyzedAt > ANALYZE_EVERY_MS) await analyze().catch((e: unknown) => log.error('analyze_failed', { error: e }));
 	})().finally(() => {
 		current = null;

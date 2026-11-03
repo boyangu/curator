@@ -22,8 +22,10 @@ import { num } from '../db/db.js';
 import type { SystemTx } from '../db/system-tx.js';
 import { withSystemTx } from '../db/system-tx.js';
 import { mergeObjects } from './admin.js';
+import { enqueueCase } from './agent/cases.js';
 import { WEAK_SQL } from './identity.js';
 import { listInbox, raise } from './inbox.js';
+import { pairViews } from './objects.js';
 
 export type ArtistTwinReport = {
 	dry: boolean;
@@ -45,9 +47,11 @@ export type ArtistPairView = { keep: { id: string; title: string; providers: str
 // worker's pass; null = every name), or the artists credited on given releases
 // (after two releases became one, or two of its tracks did).
 type SweepScope = { recentDays: number | null } | { releases: string[] };
-type SweepOpts = { scope: SweepScope; by: string; mergeLimit: number; proposeLimit: number };
+// `agent`: a store's two ids go to the reasoner as a case (catalog/agent)
+// instead of straight to the operator.
+type SweepOpts = { scope: SweepScope; by: string; mergeLimit: number; proposeLimit: number; agent: boolean };
 
-const PLACEHOLDER = new Set(['various artists', 'various', 'va', 'v a', 'unknown', 'unknown artist', 'anonymous', 'traditional', 'n a']);
+export const PLACEHOLDER = new Set(['various artists', 'various', 'va', 'v a', 'unknown', 'unknown artist', 'anonymous', 'traditional', 'n a']);
 
 // The live artists whose folded name another live artist holds — the only ones
 // worth a look (optionally names an artist was minted under lately) — kept in
@@ -194,10 +198,6 @@ async function mergeGroup(tx: SystemTx, g: Twin[], apart: Set<string>, on: 'trac
 	return { keep: keep!, split };
 }
 
-async function providersOf(tx: Queryable, id: string): Promise<string[]> {
-	return (await tx.query<{ provider: string }>(`select distinct provider from curator.catalog_source_object where object_id = $1 order by provider`, [id])).map((r) => r.provider);
-}
-
 async function sweep(tx: SystemTx, opts: SweepOpts, report: ArtistTwinReport): Promise<void> {
 	if (!(await loadSuspects(tx, opts.scope))) return;
 	const full = () => report.merged.length >= opts.mergeLimit;
@@ -238,25 +238,29 @@ async function sweep(tx: SystemTx, opts: SweepOpts, report: ArtistTwinReport): P
 				}
 				const { keep, split } = await mergeGroup(tx, g.map((id) => info.get(id)!), apart, 'release', (k, f) => on.get(pairKey(k, f))?.length ?? 0, opts, report);
 				if (!opts.proposeLimit) continue;
-				const view = async (t: Twin) => ({ id: t.id, title: t.name, providers: await providersOf(tx, t.id), tracks: t.credits });
+				const views = await pairViews(tx, [keep.id, ...split.map((f) => f.id)]);
+				const view = (t: Twin) => ({ id: t.id, title: t.name, providers: views.get(t.id)?.providers ?? [], tracks: t.credits });
 				const pairs: ArtistPairView[] = [];
 				for (const f of split) {
 					if (proposed.has(pairKey(keep.id, f.id))) continue;
 					// Joined through a merged copy: the releases any copy shares with it.
 					const shared = on.get(pairKey(keep.id, f.id)) ?? [...new Set(g.flatMap((x) => on.get(pairKey(x, f.id)) ?? []))];
-					pairs.push({ keep: await view(keep), fold: await view(f), on: shared.slice(0, 5) });
+					pairs.push({ keep: view(keep), fold: view(f), on: shared.slice(0, 5) });
 				}
 				if (!pairs.length) continue;
-				const item = await raise(tx, {
-					kind: 'artist.twins',
-					severity: 'approval',
-					title: `«${keep.name}» held ${pairs.length + 1} times on one release, by one store under two ids`,
-					subjects: [keep.id],
-					evidence: { pairs },
-					apply: { op: 'mergeArtists', args: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })) } },
-					actor: opts.by,
-					key: pairs.map((p) => p.fold.id).sort().join(','),
-				});
+				const key = pairs.map((p) => p.fold.id).sort().join(',');
+				const item = opts.agent
+					? await enqueueCase(tx, { kind: 'artist_twin', subjects: [keep.id, ...pairs.map((p) => p.fold.id)], input: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })), on: [...new Set(pairs.flatMap((p) => p.on))] }, key })
+					: await raise(tx, {
+							kind: 'artist.twins',
+							severity: 'approval',
+							title: `«${keep.name}» held ${pairs.length + 1} times on one release, by one store under two ids`,
+							subjects: [keep.id],
+							evidence: { pairs },
+							apply: { op: 'mergeArtists', args: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })) } },
+							actor: opts.by,
+							key,
+						});
 				report.proposed.push({ name: keep.name, pairs: pairs.length, item });
 			}
 		}
@@ -276,12 +280,12 @@ async function sweep(tx: SystemTx, opts: SweepOpts, report: ArtistTwinReport): P
 
 const blank = (dry: boolean): ArtistTwinReport => ({ dry, merged: [], proposed: [], found: { track: 0, release: 0 }, more: false });
 
-export async function artistTwins(db: Db, opts: { dry?: boolean; by?: string; recentDays?: number | null; mergeLimit?: number; proposeLimit?: number } = {}): Promise<ArtistTwinReport> {
+export async function artistTwins(db: Db, opts: { dry?: boolean; by?: string; recentDays?: number | null; mergeLimit?: number; proposeLimit?: number; agent?: boolean } = {}): Promise<ArtistTwinReport> {
 	const report = blank(!!opts.dry);
 	const rollback = new Error('dry run');
 	try {
 		await withSystemTx(db, async (tx) => {
-			await sweep(tx, { scope: { recentDays: opts.recentDays ?? null }, by: opts.by ?? 'claude-code', mergeLimit: opts.mergeLimit ?? MERGE_LIMIT, proposeLimit: opts.proposeLimit ?? PROPOSE_LIMIT }, report);
+			await sweep(tx, { scope: { recentDays: opts.recentDays ?? null }, by: opts.by ?? 'claude-code', mergeLimit: opts.mergeLimit ?? MERGE_LIMIT, proposeLimit: opts.proposeLimit ?? PROPOSE_LIMIT, agent: opts.agent ?? false }, report);
 			if (opts.dry) throw rollback;
 		});
 	} catch (e) {
@@ -296,6 +300,6 @@ export async function artistTwins(db: Db, opts: { dry?: boolean; by?: string; re
 // merged or put to the operator at once, not when a sweep next comes by.
 export async function artistTwinsOn(tx: SystemTx, releases: string[], by: string): Promise<ArtistTwinReport> {
 	const report = blank(false);
-	await sweep(tx, { scope: { releases }, by, mergeLimit: Number.POSITIVE_INFINITY, proposeLimit: Number.POSITIVE_INFINITY }, report);
+	await sweep(tx, { scope: { releases }, by, mergeLimit: Number.POSITIVE_INFINITY, proposeLimit: Number.POSITIVE_INFINITY, agent: false }, report);
 	return report;
 }
