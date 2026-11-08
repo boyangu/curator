@@ -23,9 +23,11 @@ if (!url) {
 assertConnectionString(url);
 const db = createPostgresDb(url, { max: 4 });
 const backoffice = createBackofficeHandler(db);
-// The page's one write path: the operator resolving inbox items. Only those
-// ops reach the cloud from here; the rest of the back office stays the CLI's.
-const INBOX_OPS: readonly (keyof AdminOps)[] = ['inboxList', 'inboxCounts', 'inboxGet', 'inboxDecide', 'inboxSnooze'];
+// The page's one write path: the operator resolving inbox items and asking for
+// a check. Only those ops reach the cloud from here; the rest of the back
+// office stays the CLI's. A check only makes cursors due: the cloud's worker
+// reads them, under its own budgets.
+const PAGE_OPS: readonly (keyof AdminOps)[] = ['inboxList', 'inboxCounts', 'inboxGet', 'inboxDecide', 'inboxSnooze', 'trackingCheck'];
 const admin = adminOps(db, {});
 const handler = async (req: Request): Promise<Response> => {
 	const res = await backoffice(req);
@@ -33,7 +35,7 @@ const handler = async (req: Request): Promise<Response> => {
 	if (new URL(req.url).pathname === '/admin' && req.method === 'POST') {
 		try {
 			const { op, args } = (await req.json()) as { op: keyof AdminOps; args: never };
-			if (!INBOX_OPS.includes(op)) return Response.json({ ok: false, error: `${String(op)} is not served here: use the catalog CLI` }, { status: 403 });
+			if (!PAGE_OPS.includes(op)) return Response.json({ ok: false, error: `${String(op)} is not served here: use the catalog CLI` }, { status: 403 });
 			return Response.json({ ok: true, result: await admin[op](args) });
 		} catch (e) {
 			return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });

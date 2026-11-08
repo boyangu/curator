@@ -14,10 +14,10 @@ import { mergeObjects } from './admin.js';
 import { ingestClaims } from './ingest.js';
 import { runReleaseFiller } from './release-fill.js';
 import { runBackfill } from './trackers/backfill.js';
-import { DeezerTracker } from './trackers/deezer.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyAppTracker } from './trackers/spotify-app.js';
-
+import { DeezerTracker } from '@curator/catalog-readers';
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyTracker } from '@curator/catalog-readers';
+import { appCredentialsToken } from './spotify-app-token.js';
 const quiet = createLogger(() => {});
 const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { 'content-type': 'application/json' } });
 const LABEL = 'Northfold Records';
@@ -209,7 +209,7 @@ describe('release filler', () => {
 		const epId = (r.results[1] as { objectId: string }).objectId;
 		const calls: string[] = [];
 		const fetchFn = stores(calls);
-		const fetchers = { spotify: new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fetchFn), deezer: new DeezerTracker(fetchFn), apple: null, tidal: null };
+		const fetchers = { spotify: new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fetchFn) }, fetchFn), deezer: new DeezerTracker(fetchFn), apple: null, tidal: null };
 		expect(await runReleaseFiller({ db: app.db, fetchers, holder: 'test' })).toMatchObject({ attempted: 1, done: 1, later: 0 });
 		const tracks = await app.db.query<{ name: string; isrc: string | null }>(
 			`select o.name, (select value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc') as isrc

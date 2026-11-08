@@ -23,6 +23,7 @@ import { mountMirSettings } from './mirSettings.js';
 import { mountBackupSettings } from './backupSettings.js';
 import { mountDeletedTracksSettings } from './deletedTracksSettings.js';
 import { mountAccountSettings } from './accountSettings.js';
+import { renderSettingsDiscover } from './discoverSettings.js';
 import { log } from '../data/log.js';
 
 const slog = log.for('settings');
@@ -68,6 +69,8 @@ export function handleSettingsTabActivate(tab: SettingsTab): void {
 		// of library.libraryFolders() happens via refreshLibraryFolders ahead of
 		// open; the render below is a paint over the up-to-date data.
 		deps.refreshLibraryFolders().then(() => deps.renderLibraryFoldersModalIfOpen());
+	} else if (tab === 'discover') {
+		renderSettingsDiscover().catch((err) => slog.error('discover render failed', err));
 	} else if (tab === 'rekordbox') {
 		renderSettingsRekordbox().catch((err) => slog.error('rekordbox render failed', err));
 	} else if (tab === 'player') {

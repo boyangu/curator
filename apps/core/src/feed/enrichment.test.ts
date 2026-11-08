@@ -57,7 +57,7 @@ function trackItem(id: string, title: string, extra?: Partial<FeedItem>): FeedIt
 		id, dedupeKey: `spotify:track:${id}`, type: 'track', source: 'spotify', sourceId: id,
 		payload: { title, artists: ['A'] },
 		origin: null, publishedAt: null, fetchedAt: 0, score: 0,
-		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null,
+		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null, matchStatus: null, matchedAt: null,
 		promotedTrackId: null, ...extra,
 	};
 }
@@ -67,7 +67,7 @@ function albumItem(id: string, refs: { sourceTrackId: string; title: string }[])
 		id, dedupeKey: `spotify:album:${id}`, type: 'album', source: 'spotify', sourceId: id,
 		payload: { title: id, artists: ['A'], tracks: refs.map((r) => ({ ...r, artists: ['A'], durationSec: 100 })) },
 		origin: null, publishedAt: null, fetchedAt: 0, score: 0,
-		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null,
+		state: 'fresh', playedAt: null, archivedAt: null, enrichedAt: null, enrichStatus: null, matchStatus: null, matchedAt: null,
 		promotedTrackId: null,
 	};
 }
@@ -225,5 +225,36 @@ describe('FeedEnrichmentQueue — outcome status (ok / na / err)', () => {
 		const al = store.items.get('al')!;
 		expect(al.enrichStatus).toBe('ok');
 		expect(al.payload.tracks?.[0]?.enrichStatus).toBe('ok');
+	});
+});
+
+describe('FeedEnrichmentQueue — catalogue first, enrichment fills gaps', () => {
+	it('a track that already carries BPM, key and genre is settled without a lookup', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'hit', { payload: { title: 'hit', artists: ['A'], bpm: 122, keyCamelot: '8A', genre: 'Deep House', label: 'Cat' } }));
+		const calls: string[] = [];
+		const out = await queue(store, enricher('bp', (t) => { calls.push(t); return FULL; })).enrichItem('t1');
+		expect(calls).toEqual([]);
+		expect(out?.enrichStatus).toBe('ok');
+		expect(out?.payload).toMatchObject({ bpm: 122, genre: 'Deep House', label: 'Cat' });
+	});
+
+	it('a lookup fills only what is empty: the catalogue’s BPM and label stand', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'hit', { payload: { title: 'hit', artists: ['A'], bpm: 122, label: 'Cat' } }));
+		const out = await queue(store, enricher('bp', () => FULL)).enrichItem('t1');
+		expect(out?.payload).toMatchObject({ bpm: 122, label: 'Cat', keyCamelot: '8A', genre: 'House' });
+	});
+
+	it('album rows keep the card’s genre and the album keeps its own genre and label', async () => {
+		const store = new FakeStore();
+		const al = albumItem('al', [{ sourceTrackId: 's1', title: 'one' }]);
+		al.payload.genre = 'Progressive House';
+		al.payload.label = 'Cat';
+		al.payload.tracks![0] = { ...al.payload.tracks![0]!, catalogId: 'r1', genre: 'Progressive House' };
+		store.add(al);
+		const out = await queue(store, enricher('bp', () => FULL)).enrichItem('al');
+		expect(out?.payload.tracks?.[0]).toMatchObject({ genre: 'Progressive House', bpm: 120, keyCamelot: '8A' });
+		expect(out?.payload).toMatchObject({ genre: 'Progressive House', label: 'Cat' });
 	});
 });

@@ -28,6 +28,7 @@
 //   pnpm --filter @curator/cloud catalog repair credits [--dry]   (artists the SoundCloud/Bandcamp splitter cut out of a credit → the artists they were cut from)
 //   pnpm --filter @curator/cloud catalog repair artist-twins [--dry] [--all] [--merge-only]   (same-name artists on one release merged; one store holding both under two ids → an artist.twins inbox item)
 //   pnpm --filter @curator/cloud catalog artist merge <from id> <into id> --note "…" [--approved]   (held for the operator unless approved)
+//   pnpm --filter @curator/cloud catalog release merge <from id> <into id> --note "…" [--approved]   (two copies of one release the twins detector did not pair; held unless approved)
 //   pnpm --filter @curator/cloud catalog artist recredit <artist id> <release id> <to artist id> --note "…" --approved   (an artist's credits on one release given to another)
 //   pnpm --filter @curator/cloud catalog agent cases [--status queued|decided|applied|proposed|failed|moot|live] [--kind …] [--limit 50]   (the reasoner's queue and log)
 //   pnpm --filter @curator/cloud catalog agent show <case id>
@@ -38,6 +39,8 @@
 //   pnpm --filter @curator/cloud catalog agent advise <inbox id…> [--research]   (the reasoner's opinion on open twins items; writes nothing; --research = web on)
 //   pnpm --filter @curator/cloud catalog agent evals export [--since 2026-11-01] [--size 80 | --all] [--out evals/catalog/twins.jsonl] [--verbose]   (the operator's twin decisions as the regression set; run it with `pnpm --filter @curator/cloud eval`)
 //   pnpm --filter @curator/cloud catalog pass            (run the worker's pass now; local server)
+//   pnpm --filter @curator/cloud catalog tracking        (per source: checked, due, failing, paused until when)
+//   pnpm --filter @curator/cloud catalog tracking check all|artists|labels|playlists|genres|<object id> [--provider beatport]   (due now; a provider's pause and anything read within the hour are left alone)
 //   pnpm --filter @curator/cloud catalog inbox [<kind>] [--all] [--actor agent] [--limit 30]      (the operator's inbox: what waits for Guy; --all = the activity log)
 //   pnpm --filter @curator/cloud catalog inbox show <id>
 //   pnpm --filter @curator/cloud catalog inbox approve|reject <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] --note "…" --by guy   (--except: twin pairs ruled not twins, the rest merged)
@@ -62,12 +65,14 @@ import type { AgentImport } from '../catalog/agent-import.js';
 import type { RelatedEvidence } from '../catalog/label-related.js';
 import type { InboxRow } from '../catalog/inbox.js';
 import type { ReviewCandidate } from '../catalog/admin.js';
-import { SpotifyAppTracker } from '../catalog/trackers/spotify-app.js';
+import { SpotifyTracker } from '@curator/catalog-readers';
 import { TidalApp } from '../catalog/trackers/tidal-app.js';
+import type { CheckScope, TrackingKind } from '../catalog/tracking.js';
 import { tidalCredentials } from '../config.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
 import { createLogger } from '../log.js';
 
+import { appCredentialsToken } from '../catalog/spotify-app-token.js';
 const argv = process.argv.slice(2);
 const arg = (name: string): string | undefined => {
 	const i = argv.indexOf(name);
@@ -85,7 +90,7 @@ async function ops(): Promise<AdminOps> {
 		const id = process.env.CURATOR_SPOTIFY_APP_CLIENT_ID?.trim() || process.env.CURATOR_SPOTIFY_CLIENT_ID?.trim();
 		const secret = process.env.CURATOR_SPOTIFY_APP_CLIENT_SECRET?.trim();
 		const tidal = tidalCredentials(process.env);
-		return adminOps(db, { spotify: id && secret ? new SpotifyAppTracker({ clientId: id, clientSecret: secret }) : null, tidal: tidal ? new TidalApp(tidal) : null });
+		return adminOps(db, { spotify: id && secret ? new SpotifyTracker({ token: appCredentialsToken({ clientId: id, clientSecret: secret }) }) : null, tidal: tidal ? new TidalApp(tidal) : null });
 	}
 	const base = `http://127.0.0.1:${process.env.CURATOR_LOCAL_CLOUD_PORT ?? '8787'}/admin`;
 	const call = async <T>(op: string, args: unknown): Promise<T> => {
@@ -125,6 +130,8 @@ async function ops(): Promise<AdminOps> {
 		labelRefresh: (a) => call('labelRefresh', a),
 		labelReleases: (a) => call('labelReleases', a),
 		pass: (a) => call('pass', a),
+		trackingOverview: (a) => call('trackingOverview', a),
+		trackingCheck: (a) => call('trackingCheck', a),
 		releaseStubs: (a) => call('releaseStubs', a),
 		releaseFill: (a) => call('releaseFill', a),
 		releaseLink: (a) => call('releaseLink', a),
@@ -136,6 +143,7 @@ async function ops(): Promise<AdminOps> {
 		repairCredits: (a) => call('repairCredits', a),
 		repairArtistTwins: (a) => call('repairArtistTwins', a),
 		artistMerge: (a) => call('artistMerge', a),
+		releaseMerge: (a) => call('releaseMerge', a),
 		artistRecredit: (a) => call('artistRecredit', a),
 		libraryImport: (a) => call('libraryImport', a),
 		inboxList: (a) => call('inboxList', a),
@@ -274,6 +282,11 @@ try {
 	} else if (group === 'artist' && sub === 'merge') {
 		if (rest.length !== 2) throw new Error('artist merge <from id> <into id> --note "why they are one" [--approved]');
 		const r = await api.artistMerge({ from: rest[0]!, into: rest[1]!, note: arg('--note') ?? '', by: arg('--by') ?? 'claude-code', approved: flag('--approved') });
+		if (r.moved) console.log(`merged ${rest[0]} into ${rest[1]}: ${JSON.stringify(r.moved)}`);
+		else console.log(`held for the operator${r.held !== null && r.held !== undefined ? ` as inbox #${r.held}` : ' (already waiting in the inbox)'}: nothing merged yet — pass --approved only when Guy said so in chat`);
+	} else if (group === 'release' && sub === 'merge') {
+		if (rest.length !== 2) throw new Error('release merge <from id> <into id> --note "why they are one" [--approved]');
+		const r = await api.releaseMerge({ from: rest[0]!, into: rest[1]!, note: arg('--note') ?? '', by: arg('--by') ?? 'claude-code', approved: flag('--approved') });
 		if (r.moved) console.log(`merged ${rest[0]} into ${rest[1]}: ${JSON.stringify(r.moved)}`);
 		else console.log(`held for the operator${r.held !== null && r.held !== undefined ? ` as inbox #${r.held}` : ' (already waiting in the inbox)'}: nothing merged yet — pass --approved only when Guy said so in chat`);
 	} else if (group === 'artist' && sub === 'recredit') {
@@ -553,8 +566,30 @@ try {
 		console.log(r.id === null ? 'that question is already queued' : `queued as case #${r.id}`);
 	} else if (group === 'pass') {
 		console.log(JSON.stringify(await api.pass({})));
+	} else if (group === 'tracking' && sub === 'check') {
+		const target = rest[0] ?? '';
+		const kinds: Record<string, TrackingKind> = { artists: 'artist', labels: 'label', playlists: 'playlist', genres: 'genre' };
+		const scope: CheckScope = target === 'all' ? { all: true } : kinds[target] ? { kind: kinds[target] } : { id: target };
+		const r = await api.trackingCheck({ ...scope, ...(arg('--provider') ? { provider: arg('--provider')! } : {}) });
+		if (json) console.log(JSON.stringify(r, null, 2));
+		else {
+			console.log(`${r.queued} queued${r.started ? ', pass started' : ''}`);
+			for (const p of r.byProvider) console.log(`${p.provider.padEnd(11)} queued ${p.queued}  already due ${p.alreadyDue}  read within the hour ${p.recent}  reading ${p.reading}  paused ${p.paused}`);
+			for (const p of r.pauses) console.log(`${p.provider} paused until ${when(p.until)} UTC: ${p.error}`);
+		}
+	} else if (group === 'tracking') {
+		const o = await api.trackingOverview({});
+		if (json) console.log(JSON.stringify(o, null, 2));
+		else {
+			console.log(o.kinds.map((k) => `${k.kind} ${k.tracked}/${k.followed} tracked`).join(' · '));
+			for (const w of o.workers) console.log(`${w.live ? 'WORKER ' : 'worker (silent) '}${w.name} [${w.deviceId}] can read ${w.providers.join(', ')} · checked ${w.trackers === null ? 'everything' : w.trackers.join(', ') || 'nothing'} · checked in ${when(w.checkedInAt)} UTC · week of ${w.weekOf}`);
+			for (const p of o.pauses) console.log(`${p.provider} PAUSED until ${when(p.until)} UTC: ${p.error}`);
+			for (const t of o.trackers.filter((x) => x.cursors > 0)) {
+				console.log(`${t.kind.padEnd(9)}${t.provider.padEnd(11)} ${String(t.cursors).padStart(5)} followed${t.unwanted ? ` (${t.unwanted} switched off)` : ''}  ${String(t.checkedDay).padStart(5)} read in 24h  ${String(t.due).padStart(5)} due  ${String(t.failing).padStart(4)} failing  last ${when(t.lastCheckedAt)}  next ${when(t.nextDueAt)}  calls ${t.callsToday}/${t.callsPerDay ?? '?'}`);
+			}
+		}
 	} else {
-		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe | artist merge|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass   (see the header of src/cli/catalog.ts)');
+		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe|merge | artist merge|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass | tracking [check]   (see the header of src/cli/catalog.ts)');
 	}
 } catch (e) {
 	log.error('catalog_cli_failed', { error: e instanceof Error ? e.message : String(e) });

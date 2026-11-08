@@ -41,6 +41,7 @@ import type {
 } from './catalog-service.js';
 import type { Op, RejectReason } from './ops.js';
 import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, SpotifyGrantStatus, SpotifyTokenInput, SpotifyTokenResult } from './spotify-gateway.js';
+import type { CatalogWorkerDueInput, CatalogWorkerDueResult, CatalogWorkerReportInput, CatalogWorkerReportResult } from './catalog-service.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -118,6 +119,10 @@ export type PushInput = {
 //     `server_outdated` for the whole push) and keeps hydrating analysis
 //     from the catalogue; with it the catalogue moves only waveform peaks,
 //     one track at a time when the player asks.
+//   - 'feed_lenses_v6': the server reads protocol v6 — the account setting
+//     `feed.lenses` (the Discover feed's standing lenses). Before it a
+//     desktop keeps that op in its outbox (a v5 server answers it
+//     `server_outdated`); the lenses still apply on the device that set them.
 //   - 'spotify_gateway': the `spotify.*` procedures exist and are switched on
 //     (spotify-gateway.ts): the account's Spotify grant lives in the cloud
 //     and devices ask it for access tokens. Like 'catalogue', listed only by
@@ -126,7 +131,11 @@ export type PushInput = {
 //     (catalog-service.ts): the shared catalogue of artists, labels,
 //     releases and recordings, watches, and the event stream devices feed
 //     their Discover from. Listed only by a server configured for it.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog'] as const;
+//   - 'catalog_workers': `catalog.workerDue` / `catalog.workerReport` exist:
+//     a desktop may read the catalogue's providers for its user's follows
+//     and report the polls, the cloud applying them as its own
+//     (catalog-service.ts, workers section). With 'global_catalog' only.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -485,6 +494,9 @@ export interface CloudService {
 		import(input: CatalogImportInput): Promise<CatalogImportResult>;
 		refreshNow(input: CatalogRefreshInput): Promise<CatalogRefreshResult>;
 		enrich(input: CatalogEnrichInput): Promise<CatalogEnrichResult>;
+		// 'catalog_workers'.
+		workerDue(input: CatalogWorkerDueInput): Promise<CatalogWorkerDueResult>;
+		workerReport(input: CatalogWorkerReportInput): Promise<CatalogWorkerReportResult>;
 	};
 	feed: {
 		events(input: FeedEventsInput): Promise<FeedEventsResult>;

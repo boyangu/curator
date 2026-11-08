@@ -296,9 +296,11 @@ export class RekordboxExporter extends EventEmitter {
 			const wantsCreate = (opts.targetKind === 'playlist' && !!opts.targetIds[0])
 				|| (opts.targetKind === 'tracks' && opts.flags.createMissing === true && opts.targetIds.length > 0);
 			if (wantsCreate) {
+				xlog.info('push: planning create phase', { target: opts.targetKind, ids: opts.targetIds.length });
 				const plan = opts.targetKind === 'playlist'
 					? await planCreatePhase(this.db, opts.targetIds[0]!, opts.flags.syncPlaylist, this.creditFormat())
 					: await planCreateForTracks(this.db, opts.targetIds, this.creditFormat());
+				xlog.info('push: create plan', { creates: plan?.contentOps.length ?? 0, playlist: plan?.playlistOp != null, unplayable: plan?.unplayable ?? 0 });
 				if (plan) {
 					created = await runCreatePhase(
 						{
@@ -349,13 +351,22 @@ export class RekordboxExporter extends EventEmitter {
 			// edit and would mask it.)
 			const pushStartedAt = new Date();
 
+			// Step logs name the phase a hang is parked in — a stuck sync
+			// showed "Resolving tracks…" with nothing in the log to say
+			// whether it ever left target resolution.
+			const t0 = Date.now();
+			xlog.info('push: resolving targets', { target: opts.targetKind, ids: opts.targetIds.length, created: created != null });
+
 			// 1. Resolve target → (curatorTrackId, rbContentId) pairs.
 			const targets = this.resolveTargets(opts);
-			await this.sweepStaleRelations(opts, targets.linked);
+			xlog.info('push: targets resolved', { linked: targets.linked.length, skipped: targets.skipped, playlists: targets.playlistOrders?.length ?? 0, ms: Date.now() - t0 });
+			const swept = await this.sweepStaleRelations(opts, targets.linked);
+			xlog.info('push: stale sweep done', { added: swept, ms: Date.now() - t0 });
 			emit({ kind: 'progress', phase: 'resolve', done: targets.linked.length, total: targets.linked.length + targets.skipped });
 
 			// 2. Build write ops.
 			const { ops, holds } = this.buildWriteOps(opts, targets.linked, targets.playlistOrders ?? []);
+			xlog.info('push: write ops built', { ops: ops.length, holds: holds.length, ms: Date.now() - t0 });
 			// Folder-name reconcile — for a folder-target sync, push the current
 			// name of the target folder + every descendant folder. playlist_merge
 			// carries playlist names, but the writer skips folder names there, so
@@ -410,6 +421,7 @@ export class RekordboxExporter extends EventEmitter {
 			if (ops.length === 0) {
 				// Nothing to write — still produce a result so the UI can
 				// toast "no changes" cleanly. No backup needed.
+				xlog.info('push: no ops — completing without a write session', { tombstones: pendingTombstones.length, ms: Date.now() - t0 });
 				const result: ExportResult = {
 					backupPath: backupInfo?.path ?? '',
 					tracksConsidered: targets.linked.length + targets.skipped,
@@ -429,6 +441,7 @@ export class RekordboxExporter extends EventEmitter {
 					created,
 				};
 				emit({ kind: 'completed', result });
+				xlog.info('push: completed event emitted (no-op push)', { listeners: this.listenerCount('event') });
 				return result;
 			}
 
@@ -439,6 +452,7 @@ export class RekordboxExporter extends EventEmitter {
 				emit({ kind: 'progress', phase: 'backup', done: 1, total: 1 });
 			}
 			const backupPathForRun = backupInfo!.path;
+			xlog.info('push: backup taken, opening for write', { backupPath: backupPathForRun, ops: ops.length });
 
 			// 4. Open for write, apply batch, commit.
 			await this.sidecar.openForWrite({ dbPath: opts.dbPath, key: opts.key });
@@ -632,11 +646,13 @@ export class RekordboxExporter extends EventEmitter {
 				created,
 			};
 			emit({ kind: 'completed', result });
+			xlog.info('push: completed event emitted', { listeners: this.listenerCount('event'), verifyOk: result.verifyOk });
 			return result;
 		} catch (err) {
 			const e = err as SidecarError;
 			const kind = e.kind ?? 'internal';
 			const message = e.message ?? String(err);
+			xlog.error('push: failed', err, { errorKind: kind, backupPath: backupInfo?.path });
 			emit({ kind: 'failed', errorKind: kind, message, backupPath: backupInfo?.path });
 			throw err;
 		} finally {

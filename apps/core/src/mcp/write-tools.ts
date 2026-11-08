@@ -15,7 +15,7 @@
 import type { StreamingSource, TrackOverrides, ZTrackSortT } from '@curator/shared';
 import { splitArtistCredit, type TrackArtist } from '@curator/shared';
 import type { CoreService } from '../service.js';
-import type { WireToolSpec } from '@curator/agent-core';
+import type { ToolAnnotations, WireToolSpec } from '@curator/agent-core';
 import { keyToCamelot } from '../enrich/keys.js';
 
 export interface McpConfirmRequest {
@@ -34,10 +34,20 @@ export interface McpWritePorts {
 	notify(message: string): void;
 }
 
+// MCP hints for the write registry. Worst case where the arguments decide:
+// create/add/rename can reach a streaming account, so they say openWorld; the
+// confirm gate (buildMcpWriteTools' confirm) stays the authority.
+const READ: ToolAnnotations = { readOnly: true, idempotent: true };
+const LOCAL_EDIT: ToolAnnotations = { readOnly: false, destructive: false, idempotent: true, openWorld: false };
+const STREAMING_ADD: ToolAnnotations = { readOnly: false, destructive: false, idempotent: false, openWorld: true };
+const STREAMING_EDIT: ToolAnnotations = { readOnly: false, destructive: false, idempotent: true, openWorld: true };
+const STREAMING_REMOVE: ToolAnnotations = { readOnly: false, destructive: true, idempotent: true, openWorld: true };
+
 export interface McpWriteTool {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	annotations: ToolAnnotations;
 	execute(args: unknown): Promise<unknown>;
 }
 
@@ -94,6 +104,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 	const tools: McpWriteTool[] = [
 		{
 			name: 'list_playlists',
+			annotations: READ,
 			description: 'List the user\'s playlists (all sources: spotify, tidal, local, rekordbox) with ids, sources and track counts. Use the returned playlistId with get_playlist_tracks / playlist write tools.',
 			parameters: {
 				type: 'object',
@@ -126,6 +137,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'get_playlist_tracks',
+			annotations: READ,
 			description: 'List a playlist\'s tracks in playlist order (compact rows with library track ids).',
 			parameters: {
 				type: 'object',
@@ -165,6 +177,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'create_playlist',
+			annotations: STREAMING_ADD,
 			description: 'Create a new playlist from library track ids. on="local" (default) creates a Curator-local playlist instantly. on="spotify" creates the playlist ON THE USER\'S LIVE SPOTIFY ACCOUNT (private) — this requires the user to approve an in-app confirmation, and tracks without a Spotify link are skipped.',
 			parameters: {
 				type: 'object',
@@ -200,6 +213,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'add_tracks_to_playlist',
+			annotations: STREAMING_EDIT,
 			description: 'Add library tracks to an existing playlist. Adding to a spotify/tidal playlist MODIFIES THE USER\'S LIVE ACCOUNT and requires the user to approve an in-app confirmation; local playlists apply instantly. Idempotent for tracks already in the playlist. The result\'s `upstream` says whether the provider actually received the add (pushed / write-sync-off / not-owner / failed / none) — anything but pushed/none means the rows exist only in Curator.',
 			parameters: {
 				type: 'object',
@@ -234,6 +248,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'remove_tracks_from_playlist',
+			annotations: STREAMING_REMOVE,
 			description: 'Remove tracks from a playlist. DESTRUCTIVE — always requires the user to approve an in-app confirmation; removal from a spotify/tidal playlist also removes them on the user\'s live account.',
 			parameters: {
 				type: 'object',
@@ -263,6 +278,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'rename_playlist',
+			annotations: STREAMING_EDIT,
 			description: 'Rename a playlist. Renaming a spotify/tidal playlist pushes the new name to the user\'s live account and requires in-app confirmation.',
 			parameters: {
 				type: 'object',
@@ -295,6 +311,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'tag_tracks',
+			annotations: LOCAL_EDIT,
 			description: 'Add and/or remove Curator tags on library tracks (local metadata only — never touches streaming accounts). Tag names are matched case-insensitively; createMissing creates unknown tags in `add`.',
 			parameters: {
 				type: 'object',
@@ -343,6 +360,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'set_rating',
+			annotations: LOCAL_EDIT,
 			description: 'Set the rating (0–5 stars, or null to clear) on library tracks. Local metadata only.',
 			parameters: {
 				type: 'object',
@@ -368,6 +386,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'set_track_source_links',
+			annotations: LOCAL_EDIT,
 			description:
 				'Link a library track to its provider page by URL (spotify / tidal / beatport). Upserts the source link and refetches that provider\'s metadata server-side, filling canonical fields the user hasn\'t overridden. '
 				+ 'Errors per source when the URL doesn\'t parse or the provider track is already linked to a DIFFERENT library track (identity guard). Local metadata only. Does not delete links — omit sources to leave them unchanged.',
@@ -401,6 +420,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'update_track_fields',
+			annotations: LOCAL_EDIT,
 			description:
 				'Update metadata on one or more library tracks: title, artists, albumTitle, label, genre, bpm, key (Camelot "8A" or musical "Am"/"Bb major"), releaseDate ("2021" / "2021-03" / "2021-03-15"). '
 				+ 'Non-null values become user overrides that shadow synced values and survive re-sync/enrichment; pass null for a field to CLEAR it (drops the override AND empties the stored value, except title/artists which revert to the synced value). '
@@ -514,6 +534,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 		},
 		{
 			name: 'set_play_session_kind',
+			annotations: LOCAL_EDIT,
 			description:
 				'Reclassify a play session as "set" (a real DJ set) or "prep" (auditioning). Overrides the automatic '
 				+ 'classification permanently — future rekordbox imports will not change it back. Local-DB only; '
@@ -544,7 +565,7 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 
 	const byName = new Map(tools.map((t) => [t.name, t]));
 	return {
-		specs: () => tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+		specs: () => tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, annotations: t.annotations })),
 		has: (name) => byName.has(name),
 		async execute(name, args) {
 			const tool = byName.get(name);

@@ -15,7 +15,7 @@ import type { SpotifyClient } from '@curator/spotify';
 import type { BeatportClient } from '@curator/beatport';
 import type { CoreService } from '../service.js';
 import type { KbAspect, KbEntity, KbEntityDetail, KbExpansion } from '../knowledge/types.js';
-import type { WireToolSpec } from '@curator/agent-core';
+import type { ToolAnnotations, WireToolSpec } from '@curator/agent-core';
 import { draftsFromWorkspaceRows, ProviderHitCache, type AgentResultItemDraft } from './result-set.js';
 import type { SessionWorkspace, WorkspaceLoadSummary, RowProvenance } from './workspace/manager.js';
 import { validTableName, type WorkspaceColumn } from './workspace/engine.js';
@@ -33,13 +33,28 @@ export interface AgentToolCtx {
 		summary?: string;
 		items: AgentResultItemDraft[];
 	}): Promise<{ resultSetId: string; accepted: number; rejected: { index: number; reason: string }[] }>;
-	setFeedFilters(input: { genre?: string | null; label?: string | null }): Promise<{ ok: boolean; note?: string }>;
 }
+
+// What each tool does to the world (MCP's hints; agent-core ToolAnnotations).
+// Outside models see them over MCP; the in-app model does not (toolSpecs
+// leaves them out so the cached prefix and prompt hash stay put). Hints, never
+// authority: this registry is read-only by construction, except the feed's
+// standing lenses — a setting the user sees as a chip and removes with ×.
+const READ: ToolAnnotations = { readOnly: true, idempotent: true };
+// Reads a provider over the network (Spotify, Beatport).
+const READ_OPEN: ToolAnnotations = { readOnly: true, idempotent: true, openWorld: true };
+// Changes what the app shows or holds (workspace tables, a presented result
+// set, the feed's standing lenses) — nothing in the library.
+const UI: ToolAnnotations = { readOnly: false, destructive: false, idempotent: true };
+const UI_OPEN: ToolAnnotations = { readOnly: false, destructive: false, idempotent: true, openWorld: true };
+// Web research written into knowledge.db (and paid for with the user's key).
+const RESEARCH: ToolAnnotations = { readOnly: false, destructive: false, idempotent: true, openWorld: true };
 
 export interface AgentTool {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	annotations: ToolAnnotations;
 	// Host-side watchdog override for long-running tools (the pipeline map);
 	// absent ⇒ the sidecar manager's 60s default.
 	timeoutMs?: number;
@@ -223,6 +238,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 	const tools: AgentTool[] = [
 		{
 			name: 'query_library',
+			annotations: READ,
 			description:
 				'Search the user\'s music library (their canonical track collection). Filterable by free-text search, '
 				+ 'genre, label, Camelot key, BPM range, workflow state and playlist. Returns one page of compact rows '
@@ -319,6 +335,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_library_facets',
+			annotations: READ,
 			description:
 				'Return the library\'s total track count, distinct genres and labels (capped lists), track counts per '
 				+ 'workflow state, and the user\'s playlists (id + name). Call this before filtering by genre/label/playlist '
@@ -349,6 +366,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_library_favorites',
+			annotations: READ,
 			description:
 				'The user\'s top artists / labels / genres, derived from their library: track count + average rating per '
 				+ 'name, most-collected first. THE first call for any "my favourite …" request. Then cross-reference in '
@@ -401,6 +419,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_track_detail',
+			annotations: READ,
 			description: 'Full detail for one library track by id: all fields, per-provider source links, and audio analysis (BPM, key, brightness, power) when available.',
 			parameters: {
 				type: 'object',
@@ -430,6 +449,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'query_feed',
+			annotations: READ,
 			description:
 				'Page through the user\'s Discover feed (new releases from followed artists/playlists, newest first). '
 				+ 'Optional genre/label filter (use values from the feed itself — an unknown value returns nothing). '
@@ -521,6 +541,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_feed_item',
+			annotations: READ,
 			description: 'Expand one Discover feed item by id: album tracklist with per-track DJ metadata (BPM/key/genre/label) and which tracks the library already holds. Pass loadInto to add the tracklist rows to a workspace table.',
 			parameters: {
 				type: 'object',
@@ -588,6 +609,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'search_kb',
+			annotations: READ,
 			description:
 				'Search the knowledge base (everything Curator has already learned about artists, releases, tracks, labels '
 				+ 'and genres) by name. Local and instant — never hits the network. Use get_kb_entity on a hit to see its '
@@ -612,6 +634,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_kb_entity',
+			annotations: READ,
 			description:
 				'Read one knowledge-base entity by id: its fields, relationship edges (releases, tracks, labels, genres, '
 				+ 'agent-researched similar artists with confidence + citations), and which related tracks are already in '
@@ -632,9 +655,10 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'expand_kb_entity',
+			annotations: RESEARCH,
 			description:
 				'Fetch one aspect of a KB entity through the resolver ladder: "detail" / "releases" (artist), "tracks" '
-				+ '(release) hit the catalog; "similar-artists" (artist) runs web research and can take up to a minute — '
+				+ '(release) hit the catalog; "similar-artists" (artist) runs web research with the assistant\'s own API key and can take up to a minute — '
 				+ 'if this returns status "running", continue with other work and re-call later to collect results.',
 			parameters: {
 				type: 'object',
@@ -681,6 +705,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'search_spotify',
+			annotations: READ_OPEN,
 			description:
 				'Search the Spotify catalog (via the user\'s connected account) for tracks or artists. Use for music that '
 				+ 'is NOT in the library/feed/KB yet. Track hits are playable and can be cited in result sets by their id. '
@@ -758,6 +783,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'lookup_beatport',
+			annotations: READ_OPEN,
 			description:
 				'Look up one specific track on Beatport by title + artists to get DJ metadata (BPM, key, genre, label, '
 				+ 'release date). One track per call, rate-limited — use for tracks you are seriously considering, not for '
@@ -801,6 +827,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'query_workspace',
+			annotations: UI,
 			description: [
 				'Run ONE SQL statement per call (SQLite) over the workspace: your loaded tables (from loadInto on',
 				'query_library / query_feed / search_spotify / get_feed_item / expand_kb_entity) plus live READ-ONLY',
@@ -861,6 +888,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'present_result_set',
+			annotations: UI,
 			description:
 				'Present a curated list of tracks/releases to the user — it renders as a playable track list in the app. '
 				+ 'Two modes (exactly one): `fromWorkspace.sql` — a workspace SELECT whose rows become the list (must '
@@ -984,24 +1012,68 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 			},
 		},
 		{
-			name: 'update_feed_filters',
+			name: 'add_feed_lens',
+			annotations: UI,
 			description:
-				'Change the genre/label filters of the Discover feed the user is looking at. Pass null to clear a filter. '
-				+ 'Values must exist in the feed (see query_feed / the feed\'s filter options); unknown values are rejected.',
+				'Add a STANDING lens to the Discover feed: a filter that stays until the user removes it (it shows as a chip on the feed; × removes it). '
+				+ 'Only for a standing request in the user\'s own words ("from now on…", "stop showing me…", "only show…"); a one-off question is a query_feed, not a lens. '
+				+ 'Kinds: library-artist (has:false = artists the user does NOT have in their library, has:true = only artists they have), '
+				+ 'archived-artist (hide artists the user archived/dismissed at least atLeast times), '
+				+ 'set-artist (only artists played in the user\'s rekordbox sets at least atLeast times), genre / label (value must exist in the feed). '
+				+ 'One lens per kind: adding replaces that kind\'s lens. label = the user\'s own words, short (the chip text).',
 			parameters: {
 				type: 'object',
 				properties: {
-					genre: { type: ['string', 'null'] },
-					label: { type: ['string', 'null'] },
+					kind: { type: 'string', enum: ['library-artist', 'archived-artist', 'set-artist', 'genre', 'label'] },
+					has: { type: 'boolean', description: 'library-artist only.' },
+					atLeast: { type: 'integer', minimum: 1, description: 'archived-artist / set-artist only.' },
+					value: { type: 'string', description: 'genre / label only.' },
+					label: { type: 'string', description: 'The chip text: the user\'s own words, at most ~6 words.' },
+				},
+				required: ['kind', 'label'],
+				additionalProperties: false,
+			},
+			async execute(rawArgs) {
+				const a = asArgs(rawArgs);
+				const kind = str(a['kind']);
+				let rule: Record<string, unknown>;
+				if (kind === 'library-artist') rule = { kind, has: a['has'] === true };
+				else if (kind === 'archived-artist' || kind === 'set-artist') rule = { kind, atLeast: typeof a['atLeast'] === 'number' ? a['atLeast'] : 1 };
+				else if (kind === 'genre' || kind === 'label') {
+					const options = await ports.svc().getFeedFilterOptions();
+					const pool = kind === 'genre' ? options.genres : options.labels;
+					const value = str(a['value']) ?? '';
+					const hit = pool.find((g) => g.localeCompare(value, undefined, { sensitivity: 'accent' }) === 0)
+						?? pool.find((g) => g.toLowerCase() === value.toLowerCase());
+					if (!hit) return { ok: false, note: `${kind} "${value}" does not exist in the feed — available: ${pool.slice(0, 30).join(', ')}` };
+					rule = { kind, value: hit };
+				} else return { ok: false, note: `unknown lens kind "${kind ?? ''}"` };
+				const lenses = await ports.svc().addFeedLens({ rule, label: str(a['label']) ?? null, by: 'assistant' });
+				return { ok: true, lenses: lenses.map((l) => ({ id: l.id, kind: l.rule.kind, label: l.label })) };
+			},
+		},
+		{
+			name: 'remove_feed_lens',
+			annotations: UI,
+			description:
+				'Remove a standing lens from the Discover feed, by id (from the current view context or add_feed_lens) or by kind. '
+				+ 'Only when the user asks to drop it; they can also click × on the chip.',
+			parameters: {
+				type: 'object',
+				properties: {
+					id: { type: 'string' },
+					kind: { type: 'string', enum: ['library-artist', 'archived-artist', 'set-artist', 'genre', 'label'] },
 				},
 				additionalProperties: false,
 			},
-			async execute(rawArgs, ctx) {
+			async execute(rawArgs) {
 				const a = asArgs(rawArgs);
-				return ctx.setFeedFilters({
-					...('genre' in a ? { genre: a['genre'] === null ? null : str(a['genre']) ?? null } : {}),
-					...('label' in a ? { label: a['label'] === null ? null : str(a['label']) ?? null } : {}),
-				});
+				const current = await ports.svc().getFeedLenses();
+				const id = str(a['id']) ?? current.find((l) => l.rule.kind === str(a['kind']))?.id;
+				const target = current.find((l) => l.id === id);
+				const view = (ls: typeof current) => ls.map((l) => ({ id: l.id, kind: l.rule.kind, label: l.label }));
+				if (!target) return { ok: false, note: 'no such lens', lenses: view(current) };
+				return { ok: true, removed: target.label, lenses: view(await ports.svc().removeFeedLens(target.id)) };
 			},
 		},
 
@@ -1012,6 +1084,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		// rekordbox auditioning; rekordbox rows carry no duration data).
 		{
 			name: 'get_play_history',
+			annotations: READ,
 			description:
 				'Play history for ONE library track, newest first — when it was played, from which player '
 				+ '(curator local/spotify vs rekordbox), in which session (set vs prep), how long, and whether 75% '
@@ -1052,6 +1125,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'list_play_sessions',
+			annotations: READ,
 			description:
 				'List play sessions (groups of tracks played together), newest first. origin "rekordbox" = imported '
 				+ 'rekordbox history (kind "set" = played from USB/CDJs, "prep" = auditioning in rekordbox); origin '
@@ -1094,6 +1168,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_play_session',
+			annotations: READ,
 			description:
 				'One play session with its tracks in played order (set order for rekordbox sessions). Rows carry track '
 				+ 'title/artists when the play is linked to a library track; unlinked rekordbox plays surface their '
@@ -1139,6 +1214,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'get_top_played',
+			annotations: READ,
 			description:
 				'Most-played library tracks by play count (optionally within a date range and/or one origin — '
 				+ '"rekordbox" for DJ history, "curator" for in-app listening). Returns trackId/title/artists/plays/lastPlayedAt.',
@@ -1176,6 +1252,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		// (local-file) library. Streaming-only tracks have no vectors.
 		{
 			name: 'get_similar_tracks',
+			annotations: READ,
 			description:
 				'Library tracks that SOUND most like the given seed track(s), ranked by the AI audio engine embedding '
 				+ 'similarity (score = cosine, higher is closer). Several seeds = "more like all of these". Optional BPM '
@@ -1202,6 +1279,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 		},
 		{
 			name: 'search_tracks_by_sound',
+			annotations: READ,
 			description:
 				'Find library tracks matching a description of how they SOUND ("warm rolling bassline", "dark hypnotic '
 				+ 'techno with vocal chops"), via a text-capable AI audio model (MuQ-MuLan / CLAP) — the text lands in the '
@@ -1260,6 +1338,7 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 	const byName = new Map(tools.map((t) => [t.name, t]));
 	tools.push({
 		name: 'map_tool_over_table',
+		annotations: UI_OPEN,
 		timeoutMs: 300_000,
 		description: [
 			'Run one tool once per row of a workspace table, host-side, without the results passing through the',
@@ -1386,8 +1465,9 @@ export function buildAgentTools(ports: AgentToolPorts): AgentTool[] {
 	return tools;
 }
 
-export function toolSpecs(tools: AgentTool[]): WireToolSpec[] {
+export function toolSpecs(tools: AgentTool[], opts: { annotations?: boolean } = {}): WireToolSpec[] {
 	// Fixed registry order — the serialized tool list is part of the cached
-	// prompt prefix; reordering would cold the cache.
-	return tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+	// prompt prefix; reordering would cold the cache. Annotations only for
+	// outside models (MCP): the in-app model's prefix stays as it was.
+	return tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, ...(opts.annotations ? { annotations: t.annotations } : {}) }));
 }

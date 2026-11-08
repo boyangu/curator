@@ -31,12 +31,26 @@ function fridayWindow(t: number, from: string, to: string): { start: number; end
 	return { start, end };
 }
 
-export function nextDueAt(now: number, cadence: Cadence): number {
+// `spread` (0 ≤ s < 1, the cursor's own — spreadOf) keeps a tracker's cursors
+// from coming due in one instant: outside the window each lands up to one
+// Friday interval after its start instead of all at the start (1,842
+// followed artists did on 2026-11-06, and the drain that followed took a
+// 3-hour quota ban); inside it, each next poll is 1 to 1.5 intervals away, so
+// a cluster the first wave left thins with every wave.
+export function nextDueAt(now: number, cadence: Cadence, spread = 0): number {
 	const base = now + cadence.everyMin * MIN;
 	if (!cadence.friday) return base;
 	const w = fridayWindow(now, cadence.friday.fromUtc, cadence.friday.toUtc);
-	if (now >= w.start && now < w.end) return Math.min(base, now + cadence.friday.everyMin * MIN);
-	return Math.min(base, w.start);
+	const interval = cadence.friday.everyMin * MIN;
+	if (now >= w.start && now < w.end) return Math.min(base, now + Math.round(interval * (1 + 0.5 * spread)));
+	return Math.min(base, w.start + Math.round(interval * spread));
+}
+
+// A cursor's place in a wave, stable per object id (FNV-1a), in [0, 1).
+export function spreadOf(objectId: string): number {
+	let h = 2166136261;
+	for (const ch of objectId) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
+	return (h % 10_000) / 10_000;
 }
 
 // After a failed poll: 15 min, doubling per consecutive failure, capped at a day.

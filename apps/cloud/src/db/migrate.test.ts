@@ -30,6 +30,7 @@ const SHARED_TABLES = [
 	'catalog_chart_entry',
 	'catalog_credit_rule',
 	'catalog_cursor',
+	'catalog_worker',
 	'catalog_edge',
 	'catalog_edge_evidence',
 	'catalog_enrich_task',

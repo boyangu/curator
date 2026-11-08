@@ -139,6 +139,25 @@ export async function connect(deps: GatewayDeps, userId: string, caller: Caller,
 	return r.status;
 }
 
+// The local catalogue's own login (cli/local.ts): its operator signs in to
+// Spotify from the back office, which is no registered device, on a loopback
+// host that is the user's own machine. A separate grant from the real cloud's:
+// copying that one here would leave two holders of one rotating refresh token.
+export async function connectLocal(deps: GatewayDeps, userId: string, input: { code: string; codeVerifier: string; redirectUri: string }): Promise<SpotifyGrantStatus> {
+	const { gateway: gw } = deps;
+	const r = await withUserTx(deps.db, userId, async (tx) => {
+		const grant = await exchangeCode(gw, input).catch(refusedToCloud);
+		if (!grant.refreshToken) throw new CloudError('FORBIDDEN', 'spotify_reconnect_required');
+		const profile = await fetchProfile(gw, grant.accessToken);
+		await tx.query(GRANT_LOCK);
+		const prior = await readGrant(tx);
+		await storeGrant(tx, gw, userId, { ...grant, refreshToken: grant.refreshToken }, grant.scopes ?? [], profile);
+		return { status: statusOf(await readGrant(tx)), replaced: prior !== undefined };
+	});
+	deps.audit('spotify_connected', { scopes: r.status.scopes.length, replaced: r.replaced });
+	return r.status;
+}
+
 // spotify.adopt: a device moves the grant it already holds. A refresh proves
 // it, and what is kept is that refresh's result: the rotated refresh token
 // when Spotify returned one (the device's copy may be dead already), else the

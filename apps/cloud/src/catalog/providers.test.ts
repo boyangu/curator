@@ -8,11 +8,15 @@ import { createLogger } from '../log.js';
 import { createTestApp } from '../test/harness.js';
 import { ingestClaims } from './ingest.js';
 import { DeezerFinder, runPlanner, SpotifyFinder } from './planner.js';
-import { DeezerTracker } from './trackers/deezer.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyAppTracker } from './trackers/spotify-app.js';
+import { DeezerTracker } from '@curator/catalog-readers';
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyTracker } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
+import { appCredentialsToken } from './spotify-app-token.js';
+
+// The app-credentials form the cloud runs: the token comes from the same fake fetch.
+const spotifyTracker = (fetch: FetchLike) => new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 'secret' }, fetch) }, fetch);
 
 const quiet = createLogger(() => {});
 const today = new Date().toISOString().slice(0, 10);
@@ -96,11 +100,10 @@ describe('DeezerTracker', () => {
 	});
 });
 
-describe('SpotifyAppTracker', () => {
+describe('SpotifyTracker', () => {
 	it('authenticates once with app credentials and reads UPCs from the full album', async () => {
 		const calls: string[] = [];
-		const sp = new SpotifyAppTracker(
-			{ clientId: 'id', clientSecret: 'secret' },
+		const sp = spotifyTracker(
 			fakeFetch(
 				{
 					'/api/token': { access_token: 'app-token', expires_in: 3600 },
@@ -126,8 +129,7 @@ describe('SpotifyAppTracker', () => {
 	});
 
 	it("parks on Spotify's 429 with its Retry-After", async () => {
-		const sp = new SpotifyAppTracker(
-			{ clientId: 'id', clientSecret: 'secret' },
+		const sp = spotifyTracker(
 			fakeFetch({ '/api/token': { access_token: 't', expires_in: 3600 }, '/artists/sa1/albums': new Response('', { status: 429, headers: { 'retry-after': '120' } }) }),
 		);
 		const err = await sp.poll(target('artist', 'Northfold', 'sa1'), AbortSignal.timeout(5000)).catch((e: unknown) => e);
@@ -199,8 +201,7 @@ describe('identity planner', () => {
 			}),
 		);
 		await runTrackers({ db: app.db, log: quiet, adapters: [dz], holder: 'test', sleep: async () => {} });
-		const spotify = new SpotifyAppTracker(
-			{ clientId: 'id', clientSecret: 'secret' },
+		const spotify = spotifyTracker(
 			fakeFetch({
 				'/api/token': { access_token: 't', expires_in: 3600 },
 				'/search': { artists: { items: [{ id: 'sa1', name: 'Northfold' }] } },

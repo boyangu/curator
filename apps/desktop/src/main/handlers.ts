@@ -156,17 +156,23 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		// CoreService instance.
 		'feed:get-page': async (req) => svc.getFeedPage(req),
 		'feed:filter-options': async () => svc.getFeedFilterOptions(),
+		'feed:lenses': async () => svc.getFeedLenses(),
+		'feed:add-lens': async (input) => svc.addFeedLens({ rule: input.rule, label: input.label ?? null, by: 'user' }),
+		'feed:remove-lens': async (id) => svc.removeFeedLens(id),
 		'feed:archived-page': async (req) => svc.getArchivedFeedPage(req),
 		'feed:detail': async (itemId) => svc.getFeedItemDetail(itemId),
-		'feed:enrich': async (itemId) => svc.enrichFeedItem(itemId),
+		'feed:fill': async (itemId, opts) => svc.fillFeedItem(itemId, opts),
 		'feed:action': async (action) => svc.feedAction(action),
 		'feed:unfollow-playlist': async (playlistId, catalogId) => svc.unfollowFeedPlaylist(playlistId, catalogId),
 		'feed:unfollow-artist': async (artistId, catalogId) => svc.unfollowFeedArtist(artistId, catalogId),
-		'feed:refresh': async () => svc.runFeedRefresh(),
-		'feed:refresh-producer': async (producerId) => svc.runFeedProducerRefresh(producerId),
+		'feed:refresh': async (scope) => svc.runFeedRefresh(scope),
 		'feed:load-more': async (days) => svc.loadMoreFeed(days),
+		'feed:refresh-status': async () => svc.getFeedRefreshStatus(),
 		'feed:role': async () => svc.getFeedRole(),
 		'catalog:status': async () => svc.getCatalogStatus(),
+		'catalog:worker-status': async () => svc.getCatalogWorkerStatus(),
+		'catalog:read-sources': async () => svc.getCatalogReadSources(),
+		'catalog:set-read-sources': async (patch) => svc.setCatalogReadSources(patch),
 		'catalog:watches': async () => svc.catalogWatches(),
 		'catalog:search': async (q) => svc.catalogSearch(q),
 		'catalog:follow': async (target) => svc.catalogFollow(target),
@@ -568,7 +574,18 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'rekordbox:sync-from':              async (args) => svc.syncFromRekordbox(args),
 		'rekordbox:resolve-pull-conflicts': async (args) => svc.resolveRekordboxPullConflicts(args),
 		// ─── Rekordbox write-side ──────────────────────────────────────────
-		'rekordbox:sync':           async (args)                       => svc.syncToRekordbox(args),
+		'rekordbox:sync':           async (args)                       => {
+			const hlog = mainLog.for('rb-sync-ipc');
+			hlog.info('rekordbox:sync invoked', { target: args.targetKind, ids: args.targetIds.length });
+			try {
+				const outcome = await svc.syncToRekordbox(args);
+				hlog.info('rekordbox:sync replying', { status: outcome.status });
+				return outcome;
+			} catch (err) {
+				hlog.error('rekordbox:sync rejecting', err);
+				throw err;
+			}
+		},
 		'rekordbox:create-preview': async (playlistId)                 => svc.previewRekordboxCreate(playlistId),
 		'rekordbox:create-preview-tracks': async (trackIds)            => svc.previewRekordboxCreateTracks(trackIds),
 		'rekordbox:missing-files':  async ()                            => svc.findRekordboxMissingFiles(),

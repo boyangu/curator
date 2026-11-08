@@ -68,6 +68,8 @@ import { z } from 'zod';
 import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import * as catalog from './catalog/catalog.js';
+import * as workers from './catalog/workers.js';
+import { ZCatalogWorkerDueInput, ZCatalogWorkerReportInput, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
 import { BaseInvariantError } from './sync/base.js';
@@ -87,7 +89,10 @@ import type { BootstrapResult, HealthResult } from './wire.js';
 // answer with this one list, so a client never sees them disagree.
 export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'catalog'>): SyncFeature[] {
 	return SYNC_FEATURES.filter(
-		(f) => (f !== 'catalogue' || deps.catalogue !== null) && (f !== 'spotify_gateway' || deps.spotify !== null) && (f !== 'global_catalog' || deps.catalog),
+		(f) =>
+			(f !== 'catalogue' || deps.catalogue !== null) &&
+			(f !== 'spotify_gateway' || deps.spotify !== null) &&
+			((f !== 'global_catalog' && f !== 'catalog_workers') || deps.catalog),
 	);
 }
 
@@ -387,6 +392,21 @@ export const appRouter = router({
 		refreshNow: authedProcedure.input(ZCatalogRefreshInput).mutation(({ ctx, input }): Promise<CatalogRefreshResult> =>
 			catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => catalog.refresh(d, ctx.user.id, callerOf(ctx), input)),
 		),
+		// 'catalog_workers' (src/catalog/workers.ts): a desktop reading for its
+		// user's follows. workerDue is a timer read like feed.events (the pull
+		// bucket); workerReport writes, one batched call a minute.
+		workerDue: authedProcedure.input(ZCatalogWorkerDueInput).mutation(async ({ ctx, input }): Promise<CatalogWorkerDueResult> => {
+			ctx.call.deviceId = input.deviceId;
+			if (!ctx.deps.catalog) throw new CloudError('PRECONDITION_FAILED', 'catalog_disabled');
+			rateLimit(ctx, 'pull', pullKey(ctx.user));
+			const r = await workers.workerDue({ db: ctx.deps.db, audit: ctx.call.audit, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), input);
+			ctx.call.opsOut = r.tasks.length;
+			return r;
+		}),
+		workerReport: authedProcedure.input(ZCatalogWorkerReportInput).mutation(({ ctx, input }): Promise<CatalogWorkerReportResult> => {
+			ctx.call.opsIn = input.results.length;
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workers.workerReport({ ...d, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), input));
+		}),
 	}),
 
 	// The event stream devices feed their Discover from. The pull bucket: a

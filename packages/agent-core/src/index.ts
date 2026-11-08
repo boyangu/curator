@@ -12,6 +12,7 @@
 // import list in this package's typecheck.
 
 export * from './protocol.js';
+export * from './bridge.js';
 export * from './harness/types.js';
 export { capToolResult, defaultLoop } from './harness/loop.js';
 export * from './harness/status.js';

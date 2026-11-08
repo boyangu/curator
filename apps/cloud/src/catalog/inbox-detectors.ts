@@ -23,7 +23,7 @@
 //   provider.parked  a provider the pass keeps parking (a challenge, a rate
 //                    limit) for a day or more.
 
-import { nameFold } from '@curator/library-logic';
+import { nameFold, creditsShareAct } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
 import { num } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
@@ -340,8 +340,9 @@ export function twinGroups(releases: TwinRelease[], ruled: Set<string>): { keep:
 				const b = group[j]!;
 				const [x, y] = [a.id, b.id].sort();
 				if (ruled.has(`${x}|${y}`)) continue;
-				const shared = a.artists.some((n) => b.artists.map(nameFold).includes(nameFold(n)));
-				if (!shared) continue;
+				// A duo credited as one act by one store and as two people by
+				// another shares an act (creditsShareAct).
+				if (!creditsShareAct(a.artists, b.artists)) continue;
 				if (a.date && b.date && Math.abs(Date.parse(a.date) - Date.parse(b.date)) > TWINS_DATE_GAP_DAYS * 86400_000) continue;
 				parent.set(find(a.id), find(b.id));
 			}

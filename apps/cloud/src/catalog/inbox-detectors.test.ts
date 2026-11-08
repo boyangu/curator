@@ -30,6 +30,15 @@ describe('twin groups', () => {
 		// A pair ruled apart stays apart.
 		expect(twinGroups([twin('a'), twin('b')], new Set(['a|b']))).toEqual([]);
 	});
+
+	it('a duo one store credits as one act and another as two people is one release', () => {
+		const g = twinGroups([twin('a', { artists: ['Frankey & Sandrino'], providers: ['bandcamp'] }), twin('b', { artists: ['Frankey', 'Sandrino', 'Premiere: Jepe'], providers: ['beatport', 'spotify'] })], new Set());
+		expect(g).toHaveLength(1);
+		expect(g[0]!.keep.id).toBe('b');
+		expect(g[0]!.folds.map((f) => f.id)).toEqual(['a']);
+		// A different act on a same-titled release stays apart.
+		expect(twinGroups([twin('a', { artists: ['Frankey & Sandrino'] }), twin('b', { artists: ['Someone & Else'] })], new Set())).toEqual([]);
+	});
 });
 
 describe('page overlap', () => {

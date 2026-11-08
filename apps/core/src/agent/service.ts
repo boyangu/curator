@@ -16,7 +16,7 @@ import type { AgentTool, AgentToolCtx } from './tools.js';
 import { toolSpecs } from './tools.js';
 import { CompositeProviderHits, ProviderHitCache, validateResultItems, type AgentResultSet, type ResultRefPorts } from './result-set.js';
 import type { WorkspaceManager } from './workspace/manager.js';
-import { assemblePrompt, type AgentConfig, type AgentProvider, type DecisionToolCall, type RunUsage, type WireMessage, type WireToolSpec } from '@curator/agent-core';
+import { assemblePrompt, type AgentConfig, type AgentProvider, type DecisionToolCall, type RunStopReason, type RunUsage, type WireMessage, type WireToolSpec } from '@curator/agent-core';
 
 const alog = log.for('agent');
 
@@ -82,7 +82,7 @@ const SYSTEM_PROMPT = [
 	'- "My favourite artists/labels/genres" questions are TWO calls: get_library_favorites, then one present_result_set fromWorkspace (or query_workspace) cross-referencing those names — e.g. new feed releases via v_feed_item + v_feed_artist. Live view rows present directly with the \'feed-item\'/\'library-track\' _kind alias — no loading needed.',
 	'',
 	'Current view context:',
-	'- User messages may end with "[current view: …]" — where the user is standing right now. AMBIGUOUS asks scope to it: "show me tracks" / "filter these" / "sort by bpm" on a playlist means that playlist (query_library playlistId), on the Spotify/Tidal/Rekordbox tab means that source (query_library source), on the Discover feed means the feed with its active filters (query_feed / update_feed_filters).',
+	'- User messages may end with "[current view: …]" — where the user is standing right now. AMBIGUOUS asks scope to it: "show me tracks" / "filter these" / "sort by bpm" on a playlist means that playlist (query_library playlistId), on the Spotify/Tidal/Rekordbox tab means that source (query_library source), on the Discover feed means the feed as the user sees it (query_feed already applies the standing lenses).',
 	'- EXPLICIT references override the view: "in my library", "overall", "my favourite artists (most songs in my library)" always mean the whole library, whatever tab is open.',
 	'- Never mention the context line itself — it is instrumentation, not something the user typed.',
 	'- Loaded tables persist across the conversation but are lost on app restart or a workspace reset — just re-load.',
@@ -91,7 +91,11 @@ const SYSTEM_PROMPT = [
 	'- When the user asks for tracks/releases/a list to explore, ALWAYS finish by calling present_result_set — that renders a playable list in the app. Keep your text short: how you built the list, caveats, next-step suggestions. Never enumerate the list again in text.',
 	'- Every result-set item must carry an id you obtained from a tool call this turn (or workspace rows loaded this session). Rejected items come back with reasons — fix and re-present.',
 	'- Cite web sources on items that rest on web research (citations you actually read).',
-	'- When the user asks to narrow/change what they see in the feed, call update_feed_filters.',
+	'',
+	'Standing lenses on the feed:',
+	'- A STANDING request about what the feed shows ("from now on only artists I don\'t have", "stop showing me artists I keep archiving", "only artists I\'ve played out") is add_feed_lens, with the user\'s own words as the label. A one-off question ("what new releases are there from artists I don\'t have?") is a query, never a lens.',
+	'- After adding one, say in a sentence that it shows as a chip on the feed and × removes it. Never ask for confirmation first — the chip is the confirmation.',
+	'- Remove a lens (remove_feed_lens) only when the user asks.',
 	'',
 	'Answer in the user\'s language. Be concise — this is a working tool, not a chat companion.',
 ].join('\n');
@@ -105,8 +109,6 @@ export interface AgentStatus {
 	researchModel?: string;
 }
 
-export type AgentViewCommand = { type: 'set-feed-filters'; genre?: string | null; label?: string | null };
-
 // Where the user is standing when they send a message — captured by the
 // renderer at send time and appended to the user turn (never the frozen
 // system prompt: dynamic context would cold the cache). The model scopes
@@ -119,7 +121,9 @@ export interface AgentViewContext {
 	source?: string;
 	playlist?: { id: string; name: string; source: string };
 	folderName?: string;
-	discover?: { mode: string; genre?: string | null; label?: string | null };
+	// The feed's standing lenses (id + chip label), so "drop that filter" can
+	// name one.
+	discover?: { mode: string; lenses?: { id: string; label: string }[] };
 }
 
 // One readable line, appended to the wire user message (and stripped for
@@ -129,8 +133,8 @@ export function describeViewContext(ctx: AgentViewContext): string {
 		const d = ctx.discover;
 		if (d?.mode === 'journeys') return 'Discover tab, Journeys view';
 		if (d?.mode === 'agent-results') return 'Discover tab, viewing an agent result list';
-		const filters = [d?.genre ? `genre filter "${d.genre}"` : null, d?.label ? `label filter "${d.label}"` : null].filter(Boolean);
-		return `Discover feed${filters.length > 0 ? ` with ${filters.join(' and ')}` : ''}`;
+		const lenses = (d?.lenses ?? []).map((l) => `"${l.label}" (lens ${l.id})`);
+		return `Discover feed${lenses.length > 0 ? ` with standing lenses ${lenses.join(', ')}` : ''}`;
 	}
 	if (ctx.view === 'interested') return 'the Interested (pinned) tracks view';
 	if (ctx.view === 'basket') return 'the Basket tracks view';
@@ -156,7 +160,6 @@ export type AgentEvent =
 	| { kind: 'tool-finished'; sessionId: string; turnId: string; callId: string; tool: string; ok: boolean; summary: string }
 	| { kind: 'source'; sessionId: string; turnId: string; url: string; title?: string }
 	| { kind: 'result-set'; sessionId: string; turnId: string; resultSet: AgentResultSet }
-	| { kind: 'view-command'; sessionId: string; turnId: string; command: AgentViewCommand }
 	| { kind: 'turn-finished'; sessionId: string; turnId: string; stopReason: string; usage: RunUsage; costUsd: number | null }
 	| { kind: 'error'; sessionId: string; turnId?: string; message: string };
 
@@ -166,8 +169,6 @@ export interface AgentServiceDeps {
 	sidecar?: AgentSidecarManager;
 	tools: AgentTool[];
 	refs: ResultRefPorts;
-	// Validation source for update_feed_filters.
-	getFeedFilterOptions(): Promise<{ genres: string[]; labels: string[] }>;
 	// Absent ⇒ the workspace is off (:memory: core) — tools report it
 	// unavailable; everything else works.
 	workspace?: WorkspaceManager;
@@ -197,6 +198,8 @@ export interface AgentService {
 export function createAgentService(deps: AgentServiceDeps): AgentService {
 	const { store, sidecar, tools, refs } = deps;
 	const specs = toolSpecs(tools);
+	// Outside models (the MCP bridge) also get each tool's hints.
+	const externalSpecs = toolSpecs(tools, { annotations: true });
 	// The prompt version every turn is logged under: the frozen system prompt
 	// plus the tool list in its fixed order — exactly the provider's cached
 	// prefix (agent-core prompts/assemble.ts).
@@ -250,26 +253,6 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 				emit({ kind: 'result-set', sessionId, turnId, resultSet: rs });
 				return { resultSetId: rs.id, accepted: accepted.length, rejected };
 			},
-			async setFeedFilters(input) {
-				const options = await deps.getFeedFilterOptions();
-				const match = (value: string | null | undefined, pool: string[], what: string): { ok: true; value: string | null } | { ok: false; note: string } => {
-					if (value == null) return { ok: true, value: null };
-					const hit = pool.find((g) => g.localeCompare(value, undefined, { sensitivity: 'accent' }) === 0)
-						?? pool.find((g) => g.toLowerCase() === value.toLowerCase());
-					return hit ? { ok: true, value: hit } : { ok: false, note: `${what} "${value}" does not exist in the feed — available: ${pool.slice(0, 30).join(', ')}` };
-				};
-				const genre = 'genre' in input ? match(input.genre, options.genres, 'genre') : null;
-				const label = 'label' in input ? match(input.label, options.labels, 'label') : null;
-				if (genre && !genre.ok) return { ok: false, note: genre.note };
-				if (label && !label.ok) return { ok: false, note: label.note };
-				const command: AgentViewCommand = {
-					type: 'set-feed-filters',
-					...(genre ? { genre: genre.value } : {}),
-					...(label ? { label: label.value } : {}),
-				};
-				emit({ kind: 'view-command', sessionId, turnId, command });
-				return { ok: true };
-			},
 		};
 	};
 
@@ -281,7 +264,7 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 		let mode: 'quick' | 'research' = 'research';
 		// The turn on the decision log, whatever ended it. Logging must never
 		// fail a turn that already ran.
-		const record = (stopReason: 'done' | 'cancelled' | 'max-steps' | 'error', usage: RunUsage, text: string): void => {
+		const record = (stopReason: RunStopReason, usage: RunUsage, text: string): void => {
 			try {
 				store.record({
 					id: turnId,
@@ -473,7 +456,7 @@ export function createAgentService(deps: AgentServiceDeps): AgentService {
 		},
 
 		externalToolSpecs() {
-			return specs;
+			return externalSpecs;
 		},
 
 		createExternalSession(title) {

@@ -6,6 +6,7 @@
 // reference written at promotion time (interested → ingest as backlog).
 
 import type { StreamingSource } from '@curator/shared';
+import type { CatalogHandle } from '@curator/protocol';
 import type { SourceLinkDraft } from '../enrich/contract.js';
 
 export type FeedItemType = 'track' | 'album' | 'playlist' | 'set';
@@ -27,11 +28,16 @@ export type LibraryTier = 'local' | 'streaming' | 'followed';
 //   • `spotify` / `tidal` — in one of the user's OWN playlists on that source
 //     (raw `streaming`, named by which source holds it).
 //   • `followed` — only in a playlist the user follows (weakest signal).
-// Where a feed item can be played or opened. The streaming services a
-// library syncs with, plus the providers the Global Catalog reports releases
-// from (feed/cloud-producer.ts). Membership chips, expansion and promotion
-// are Spotify-only today and check for it; other sources show and link out.
-export type FeedSource = StreamingSource | 'deezer';
+// Where a feed item can be played. The streaming services a library syncs
+// with, or 'catalog': a Global Catalog item no connected player can play yet
+// (no Spotify handle), whose sourceId is the catalogue object id. Such an item
+// shows and links out to its stores (payload.handles); when a Spotify handle
+// arrives the row is upgraded in place to 'spotify' (store.ts mergeFacts).
+export type FeedSource = StreamingSource | 'catalog';
+
+// A representation of a catalogue object on one provider (its id there and
+// its page) — what playback routing and the store links read.
+export type FeedHandle = CatalogHandle;
 
 // Drives the "In Library" / "In {Spotify|Tidal} Library" / "In Followed
 // Playlist" chips. Absent = the library doesn't hold the track.
@@ -69,17 +75,40 @@ export type FeedSuppressionScope = 'artist' | 'label' | 'playlist' | 'source';
 // known outcome rather than "still loading". Absent/null = not yet attempted.
 export type EnrichStatus = 'ok' | 'na' | 'err';
 
+// The lazy Spotify match of an item that arrived without a Spotify id
+// (feed/spotify-match.ts): found and upgraded in place ('ok'), not on
+// Spotify as far as a search can tell ('none', asked again days later), or
+// the lookup threw ('err', asked again within the hour).
+export type MatchStatus = 'ok' | 'none' | 'err';
+
+// What the desktop is doing to one item right now — the lazy Spotify match
+// or the DJ-metadata enrichment — so a card on screen can say so instead of
+// looking empty. `null` ends it. Pushed to the renderer as 'feed:activity'.
+export type FeedItemActivity = { itemId: string; activity: 'spotify' | 'enrich' | null };
+
 // Attribution — which follow produced this item. Drives the origin chip on
 // the card and the scoped-dismiss menu ("don't show from this playlist").
+//   - playlist / artist: id is the provider's id (a Spotify playlist / artist
+//     id) — what mutes, unfollows and "open in Spotify" key on, from either
+//     producer; an artist the catalogue knows without a Spotify id reads
+//     `catalog:<objectId>`.
+//   - label / genre: catalogue watches (feed/cloud-producer.ts); id is the
+//     catalogue object id. A genre origin is a chart entry, with its rank.
+//   - browse: anything else the catalogue filed the item under.
 export interface FeedOrigin {
-	kind: 'playlist' | 'artist' | 'browse';
-	// The provider's id (a Spotify artist / playlist id): what mutes, unfollows
-	// and "open in Spotify" key on, from either producer.
+	kind: 'playlist' | 'artist' | 'label' | 'genre' | 'browse';
 	id: string;
 	name: string;
 	// The Global Catalog object the follow is a watch on, for items the cloud
 	// raised (feed/cloud-producer.ts): unfollow and mute go to the catalogue.
 	catalogId?: string;
+	// Chart position (1 = top) for a genre origin.
+	rank?: number | null;
+	// The profile a playlist origin belongs to (Spotify owner id + display
+	// name), so the card can say "New on <playlist> by <profile>" and open
+	// the profile. Absent on origins stored before it was recorded; the
+	// renderer then falls back to the synced playlist row's owner.
+	owner?: { id: string; name: string | null };
 }
 
 // A track reference inside an album/playlist item's payload. Resolved at
@@ -117,6 +146,12 @@ export interface FeedTrackRef {
 	// Per-track enrichment outcome (drives the row's N/A / ERR marker). Set by
 	// the album drain after this ref's Beatport lookup; absent until attempted.
 	enrichStatus?: EnrichStatus;
+	// The catalogue recording and its provider handles, for refs from a
+	// catalogue card. `sourceTrackId` is the Spotify id when a handle has one,
+	// else the catalogue recording id (feed/handles.ts spotifyIdOf tells them
+	// apart).
+	catalogId?: string;
+	handles?: FeedHandle[];
 }
 
 // Display metadata for a card. `raw` carries the source's native track
@@ -148,6 +183,13 @@ export interface FeedItemPayload {
 	// persists as a source_link; carried so promotion mirrors a direct enrich.
 	sourceLinks?: SourceLinkDraft[];
 	tracks?: FeedTrackRef[];
+	// The catalogue object (release / recording) and its provider handles,
+	// for items the cloud raised: identity across producers and where the
+	// item can be played or bought (feed/handles.ts).
+	catalogId?: string;
+	handles?: FeedHandle[];
+	catalogNumber?: string | null;
+	upc?: string | null;
 	// True once on-demand ISRC fill has run for `tracks` (album items). Guards
 	// the first-expand fill in getFeedItemDetail so a re-expand doesn't refetch
 	// — set even when no ISRC landed, same "don't retry" posture as enrichedAt.
@@ -168,13 +210,19 @@ export interface FeedItemDraft {
 	// Suppression-match keys, e.g. 'artist:<id>', 'playlist:<id>',
 	// 'label:<name>', 'source:spotify'.
 	suppressKeys: string[];
+	// Other identities of the same item (store.ts feed_item_alias): a
+	// catalogue item's Spotify / ISRC keys, so the local producers' items and
+	// re-announced events land on one row.
+	aliasKeys?: string[];
 }
 
 export interface FeedItem {
 	id: string;
-	// The item's identity on every device and in the cloud (`isrc:<ISRC>`,
-	// `spotify:track:<id>`, `spotify:album:<id>`): what synced decisions are
-	// keyed by (protocol v4 feed_item; feed/sync.ts). `id` is this device's.
+	// The item's identity on every device and in the cloud
+	// (`catalog:release:<id>` / `catalog:recording:<id>` for catalogue items;
+	// `isrc:<ISRC>`, `spotify:track:<id>`, `spotify:album:<id>` from the local
+	// producers): what synced decisions are keyed by (protocol v4 feed_item;
+	// feed/sync.ts). `id` is this device's.
 	dedupeKey: string;
 	type: FeedItemType;
 	source: FeedSource;
@@ -206,6 +254,10 @@ export interface FeedItem {
 	// 'ok'/'na' are terminal; 'err' is retried by the drain. Per-album-track
 	// status lives on each FeedTrackRef.enrichStatus for the row-level marker.
 	enrichStatus: EnrichStatus | null;
+	// The lazy Spotify match (feed/spotify-match.ts): its last outcome and
+	// when. Null until a card without a Spotify id was first viewed.
+	matchStatus: MatchStatus | null;
+	matchedAt: number | null;
 	promotedTrackId: string | null;
 	// DISPLAY membership tier of THIS track item, stamped per page by the
 	// LibraryPort probe (resolved from the raw tier + the pinned tag + the owning
@@ -347,11 +399,55 @@ export interface FeedActionResult {
 	error?: string;
 }
 
+// The kinds a Refresh can be scoped to: the Following panel's four, as the
+// catalogue tracks them (protocol CATALOG_TRACKING_KINDS, kept apart so the
+// feed's types import nothing of the wire contract).
+export type FeedRefreshKind = 'artist' | 'label' | 'playlist' | 'genre';
+
+// What a manual Refresh asks beyond reading what is there: `check` makes the
+// user's follows due now on their checked sources (the catalogue worker's
+// check, catalog-worker/service.ts tickNow) before the events are read —
+// of one kind, or of every checked kind. Only producers serving that kind
+// run (FeedProducer.kinds).
+export type FeedRefreshScope = { check: true; kind?: FeedRefreshKind };
+
 export interface FeedRefreshResult {
-	producers: { producerId: string; inserted: number; error: string | null }[];
+	// `name`: the producer's displayName, for messages a person reads.
+	// `skipped`: why it did not look this time (FeedProducerResult.skipped).
+	// `note`: what it did beyond reading (FeedProducerResult.note).
+	producers: { producerId: string; name: string; inserted: number; error: string | null; skipped: string | null; note: string | null }[];
 	// Set when nothing ran because another device collects the feed for the
 	// account (feed/sync.ts feedRole).
 	skipped?: 'follower';
+}
+
+// One producer's place in the pass in flight (feed/scheduler.ts).
+export interface FeedRefreshStep {
+	producerId: string;
+	name: string;
+	state: 'pending' | 'running' | 'done' | 'skipped' | 'error';
+	// While running: what it is doing right now ("Playlist 12 of 136: …").
+	// Skipped: why it did not look.
+	detail: string | null;
+	// Set once done.
+	inserted: number | null;
+	error: string | null;
+}
+
+// What the scheduler is doing, live: the Discover toolbar, its progress toast
+// and the Discover tab's pulse all read this. Background passes (timers) and
+// manual ones (Refresh, Load more) look the same but for `manual`.
+export interface FeedRefreshStatus {
+	// The pass in flight, or null when the scheduler is idle.
+	pass: {
+		mode: 'poll' | 'backfill';
+		// Started by the user, not by a timer.
+		manual: boolean;
+		startedAt: number;
+		steps: FeedRefreshStep[];
+	} | null;
+	// Passes queued behind it — the scheduler runs one at a time.
+	waiting: number;
 }
 
 // Who collects the Discover feed (decided 2026-10-21: the account's master
@@ -413,14 +509,44 @@ export interface FeedAuthPort {
 export interface FeedProducer {
 	readonly id: string;
 	readonly source: FeedSource;
+	// Shown to the user as the step's name in the refresh status.
 	readonly displayName: string;
-	poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }>;
+	// False while the producer has stood down for good (its content arrives
+	// another way): the scheduler skips it and the status leaves it out.
+	// Absent ⇒ on. A passing reason not to look is FeedProducerResult.skipped.
+	active?(): boolean;
+	// The follow kinds this producer brings, for a Refresh scoped to one
+	// (FeedRefreshScope.kind). Absent ⇒ runs for any scope.
+	readonly kinds?: readonly FeedRefreshKind[];
+	poll(cursor: unknown, ctx?: FeedProducerContext): Promise<FeedProducerResult>;
 	// Historical "Load more": extend the producer's horizon (the oldest
 	// boundary it has fetched, kept inside its cursor) back by `days` and
 	// emit only the newly-uncovered window. Engine-level dedupe makes
 	// overlap with prior fetches free. Optional — producers without a
 	// meaningful history (e.g. push sources) just don't implement it.
-	backfill?(cursor: unknown, days: number): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }>;
+	backfill?(cursor: unknown, days: number, ctx?: FeedProducerContext): Promise<FeedProducerResult>;
+}
+
+export interface FeedProducerResult {
+	drafts: FeedItemDraft[];
+	nextCursor: unknown;
+	// Why the producer did not look this time (not connected, rate-limited),
+	// in words the user reads in the refresh status. Absent when it looked.
+	skipped?: string;
+	// What it did beyond reading, kept on the finished step and the result
+	// ("Checked 1,846 artists on Spotify, Deezer: 1,802 queued, …").
+	note?: string;
+}
+
+// What the scheduler hands a producer for one pass.
+export interface FeedProducerContext {
+	// Say what the producer is doing now, for the refresh status. Cheap and
+	// coalesced by the scheduler, so calling it per item of a long walk is fine.
+	report(detail: string): void;
+	// Started by the user (Refresh, Load more), not by a timer.
+	manual?: boolean;
+	// The Refresh's ask beyond reading (a check now), when it made one.
+	scope?: FeedRefreshScope;
 }
 
 // DJ metadata fields (bpm/key/genre/label) live on FeedItemPayload (track

@@ -39,17 +39,17 @@ import { enqueueCase } from '../agent/cases.js';
 import { findRepresentation } from '../identity.js';
 import { Ingester } from '../ingest.js';
 import { ensureCursors } from '../watches.js';
-import { BROWSER_USER_AGENT, fetchNextData, queryData } from '../trackers/beatport-pages.js';
-import { getJson, type FetchLike } from '../trackers/http.js';
-import type { SpotifyAppTracker } from '../trackers/spotify-app.js';
-import { TrackerRateLimitedError } from '../trackers/types.js';
+import { BROWSER_USER_AGENT, fetchNextData, queryData } from '@curator/catalog-readers';
+import { getJson, type FetchLike } from '@curator/catalog-readers';
+import type { SpotifyTracker } from '@curator/catalog-readers';
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
 import { classifyUrl, extractLinks, websiteLink, type PageLink } from './links.js';
 
 export type ProfilerDeps = {
 	db: Db;
 	log: Logger;
 	fetch?: FetchLike;
-	spotify?: SpotifyAppTracker | null;
+	spotify?: SpotifyTracker | null;
 	// Which page-reading providers this worker runs (their trackers' switches).
 	providers?: { beatport?: boolean; bandcamp?: boolean };
 	batch?: number;

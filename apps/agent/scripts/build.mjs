@@ -1,16 +1,12 @@
 // Bundles the sidecar into dist/main.js, the file the desktop spawns under
 // ELECTRON_RUN_AS_NODE (apps/desktop/src/main/index.ts getAgentSpec).
 //
-// @curator/agent-core exports TypeScript source, which plain Node will not
-// load from node_modules, so it is bundled in (hence a devDependency, as
-// apps/cloud does with @curator/protocol); the AI SDK packages stay external
-// and are resolved from node_modules at run time.
+// Everything is bundled: @curator/agent-core (TypeScript source, which plain
+// Node will not load from node_modules) and the AI SDK + zod (pure JS). A
+// packaged app ships resources/agent/dist/main.js alone, with no
+// node_modules beside it (scripts/build-sidecars.mjs stages it).
 
 import { build } from 'esbuild';
-import { readFileSync } from 'node:fs';
-
-const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-const external = Object.keys(pkg.dependencies ?? {}).flatMap((name) => [name, `${name}/*`]);
 
 await build({
 	entryPoints: { main: 'src/main.ts' },
@@ -20,6 +16,6 @@ await build({
 	target: 'node22',
 	format: 'esm',
 	sourcemap: true,
-	external,
+	external: [],
 	logLevel: 'info',
 });

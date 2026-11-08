@@ -11,7 +11,7 @@
 
 import type { DjMetadataPatch, Enricher, SourceLinkDraft, TrackQuery } from '../enrich/contract.js';
 import { enrichOne } from '../enrich/runner.js';
-import type { EnrichStatus, FeedItem, FeedItemPayload, FeedTrackRef } from './types.js';
+import type { EnrichStatus, FeedItem, FeedItemActivity, FeedItemPayload, FeedTrackRef } from './types.js';
 import type { FeedStore } from './store.js';
 import { log } from '../log.js';
 
@@ -25,6 +25,28 @@ const BATCH_SIZE = 20;
 // re-scrape it.
 function refHasMetadata(r: FeedTrackRef): boolean {
 	return r.bpm != null || r.keyCamelot != null || r.genre != null || r.label != null;
+}
+
+// The DJ facts a lookup would add are all there already (a catalogue card
+// that carried Beatport's BPM, key and genre): no lookup. A catalogue ref's
+// genre/label can be the release's, so they alone don't settle it.
+function hasDjFacts(r: Pick<FeedTrackRef, 'bpm' | 'keyCamelot' | 'genre'>): boolean {
+	return r.bpm != null && !!r.keyCamelot && !!r.genre;
+}
+
+// Catalogue first, enrichment fills gaps (2026-11-04): a lookup only sets
+// what is still empty, so the catalogue's facts — and anything the user
+// already saw on the card — are never replaced by a scrape.
+function fillOnly<T extends object>(target: T, patch: DjMetadataPatch): boolean {
+	let changed = false;
+	for (const [k, v] of Object.entries(patch)) {
+		if (v === undefined || v === null || v === '') continue;
+		const cur = (target as Record<string, unknown>)[k];
+		if (cur !== undefined && cur !== null && cur !== '') continue;
+		(target as Record<string, unknown>)[k] = v;
+		changed = true;
+	}
+	return changed;
 }
 
 // Most frequent non-empty value (ties → first seen). Used to collapse per-track
@@ -53,6 +75,9 @@ export class FeedEnrichmentQueue {
 		// landed genre/label/bpm chips appear without a manual refresh. Best-
 		// effort — a throwing listener must not derail the drain.
 		private readonly onEnriched?: (item: FeedItem) => void,
+		// Fired when an item's enrichment starts and ends (background drain AND
+		// on-view), so a card on screen can say "Enriching…" meanwhile.
+		private readonly onActivity?: (a: FeedItemActivity) => void,
 	) {}
 
 	// Start (or continue) draining the unenriched worklist. Idempotent —
@@ -115,6 +140,7 @@ export class FeedEnrichmentQueue {
 	// 'na' (clean miss — terminal), or 'err' (a lookup threw — the drain retries
 	// it next pass instead of stranding it like the old "stamp on any outcome").
 	private async runOne(item: FeedItem): Promise<FeedItem> {
+		this.activity(item.id, 'enrich');
 		try {
 			const { payload, status } = item.type === 'album'
 				? await this.enrichAlbumPayload(item)
@@ -130,13 +156,20 @@ export class FeedEnrichmentQueue {
 			flog.warn('enrichment failed', { itemId: item.id }, err);
 			await this.store.markEnriched(item.id, 'err');
 			return { ...item, enrichStatus: 'err', enrichedAt: Date.now() };
+		} finally {
+			this.activity(item.id, null);
 		}
+	}
+
+	private activity(itemId: string, activity: FeedItemActivity['activity']): void {
+		try { this.onActivity?.({ itemId, activity }); } catch (err) { flog.warn('onActivity listener threw', undefined, err); }
 	}
 
 	// Track item → one lookup. Returns the merged payload + outcome status: a
 	// hit yields the patched payload + 'ok'; a miss yields no payload change and
 	// 'na' (clean no-match) or 'err' (the lookup threw — retryable).
 	private async enrichTrackPayload(item: FeedItem): Promise<{ payload: FeedItemPayload | null; status: EnrichStatus }> {
+		if (hasDjFacts(item.payload)) return { payload: null, status: 'ok' };
 		const { patch, sourceLinks, errored } = await this.lookup({
 			title: item.payload.title,
 			artists: item.payload.artists,
@@ -144,7 +177,11 @@ export class FeedEnrichmentQueue {
 			isrc: item.payload.isrc ?? null,
 			label: item.payload.label ?? null,
 		});
-		if (patch) return { payload: { ...item.payload, ...patch, sourceLinks }, status: 'ok' };
+		if (patch) {
+			const payload = { ...item.payload, sourceLinks };
+			fillOnly(payload, patch);
+			return { payload, status: 'ok' };
+		}
 		return { payload: null, status: errored ? 'err' : 'na' };
 	}
 
@@ -167,7 +204,7 @@ export class FeedEnrichmentQueue {
 		for (const ref of tracks) {
 			if (this.stopped) break;
 			if (ref.enrichStatus === 'ok' || ref.enrichStatus === 'na') continue;
-			if (!ref.enrichStatus && refHasMetadata(ref)) { ref.enrichStatus = 'ok'; changed = true; continue; }
+			if (!ref.enrichStatus && (ref.catalogId ? hasDjFacts(ref) : refHasMetadata(ref))) { ref.enrichStatus = 'ok'; changed = true; continue; }
 			const { patch, sourceLinks, errored } = await this.lookup({
 				title: ref.title,
 				artists: ref.artists,
@@ -176,7 +213,7 @@ export class FeedEnrichmentQueue {
 				label: ref.label ?? null,
 			});
 			if (patch) {
-				Object.assign(ref, patch);
+				fillOnly(ref, patch);
 				ref.sourceLinks = sourceLinks;
 				ref.enrichStatus = 'ok';
 			} else {
@@ -191,16 +228,20 @@ export class FeedEnrichmentQueue {
 	}
 
 	// Set the album-level genre/label from the track refs' modal values (a
-	// release carries one label and one (sub)genre). Pure, no network. Returns
-	// true when it changed the payload. Don't blank an existing value on a miss —
-	// only set when the tracks actually surfaced one.
+	// release carries one label and one (sub)genre) when the album has none —
+	// a catalogue card's own genre/label stand. Pure, no network. Returns true
+	// when it changed the payload.
 	private applyAlbumGenreLabel(item: FeedItem): boolean {
 		const tracks = item.payload.tracks ?? [];
-		const genre = modeOf(tracks.map((t) => t.genre));
-		const label = modeOf(tracks.map((t) => t.label));
 		let changed = false;
-		if (genre && genre !== item.payload.genre) { item.payload.genre = genre; changed = true; }
-		if (label && label !== item.payload.label) { item.payload.label = label; changed = true; }
+		if (!item.payload.genre) {
+			const genre = modeOf(tracks.map((t) => t.genre));
+			if (genre) { item.payload.genre = genre; changed = true; }
+		}
+		if (!item.payload.label) {
+			const label = modeOf(tracks.map((t) => t.label));
+			if (label) { item.payload.label = label; changed = true; }
+		}
 		return changed;
 	}
 

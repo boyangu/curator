@@ -7,7 +7,7 @@
   "main": "./out/main/index.cjs",
   "scripts": {
     "predev": "node scripts/rebuild-sqlite.mjs",
-    "dev": "electron-vite dev",
+    "dev": "node scripts/dev.mjs",
     "prebuild": "node scripts/rebuild-sqlite.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",

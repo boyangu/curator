@@ -7,9 +7,8 @@ import { createLogger } from '../log.js';
 import { createTestApp } from '../test/harness.js';
 import { runLabelProfiler } from './profile/label-profiler.js';
 import { runBackfill } from './trackers/backfill.js';
-import type { FetchLike } from './trackers/http.js';
-import { BeatportTracker } from './trackers/beatport.js';
-
+import type { FetchLike } from '@curator/catalog-readers';
+import { BeatportTracker } from '@curator/catalog-readers';
 const quiet = createLogger(() => {});
 const today = new Date().toISOString().slice(0, 10);
 

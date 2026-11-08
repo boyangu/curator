@@ -29,6 +29,11 @@ function log(msg: string): void {
 // Chromium's own logging to stderr too.
 app.commandLine.appendSwitch('enable-logging', 'stderr');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+// Do NOT add --audio-buffer-size here. On Windows, Chromium's WASAPI output
+// insists that the packet size equal the endpoint's device period (~10 ms);
+// any other value makes the stream open fail and playback falls back to a
+// silent fake sink — position advances, no sound, nothing logged (2026-11-04).
+// Output-buffer headroom for Spotify has to come from the OS/driver side.
 
 // ── RPC socket to the host ──────────────────────────────────────────────────
 function argValue(name: string): string {

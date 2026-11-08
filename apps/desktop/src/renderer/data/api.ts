@@ -223,6 +223,10 @@ export const journeyApi = {
 // Following — the artists and labels the cloud tracks for Discover.
 export const catalogApi = {
 	status: () => api()['catalog:status'](),
+	workerStatus: () => api()['catalog:worker-status'](),
+	readSources: () => api()['catalog:read-sources'](),
+	setReadSources: (patch: Parameters<typeof window.api['catalog:set-read-sources']>[0]) => api()['catalog:set-read-sources'](patch),
+	onWorkerStatus: (cb: Parameters<typeof window.api.onCatalogWorkerStatus>[0]) => api().onCatalogWorkerStatus(cb),
 	watches: () => api()['catalog:watches'](),
 	search: (q: string) => api()['catalog:search'](q),
 	follow: (...args: Parameters<typeof window.api['catalog:follow']>) => api()['catalog:follow'](...args),

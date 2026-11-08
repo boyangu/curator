@@ -164,6 +164,8 @@ export interface PlaylistUpstreamDrift {
 import { keyToCamelot } from './enrich/keys.js';
 import { SqliteFeedStore } from './feed/store.js';
 import { createFeedService } from './feed/service.js';
+import { FEED_LENSES_SETTING, normalizeLenses, parseRule, serializeLenses, withLens, withoutLens, type FeedLens } from './feed/lenses.js';
+import { libraryArtistKeys, setPlayCounts } from './library/artist-signals.js';
 import type { CatalogFeedPort } from './feed/cloud-producer.js';
 import { syncSpotifyFollows, type FollowsSyncState } from './catalog-client/follows-sync.js';
 import { refsForTrack, type TrackCatalogRefs } from './catalog-client/catalog-refs.js';
@@ -188,13 +190,23 @@ import {
 } from './catalog-client/library-candidates.js';
 import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedDecisionPort, feedBackfillPending, feedPendingCount, syncedItemsFor } from './feed/sync.js';
 import type { LibraryMembershipLookup } from './feed/pipeline.js';
-import type { FeedAction, FeedActionResult, FeedItem, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRole, EnrichmentResult } from './feed/types.js';
+import type { FeedAction, FeedActionResult, FeedItem, FeedItemActivity, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, EnrichmentResult } from './feed/types.js';
+import { createCatalogWorker, type CatalogWorker, type CatalogWorkerStatus } from './catalog-worker/service.js';
+import { checkedTrackers, readReadSources, writeReadSources, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
+import { createFactsUp } from './catalog-client/facts-up.js';
+
+// After the catalogue worker reports new events: one background pass of
+// the catalogue producer, so a drain of many reads is one pass.
+const WORKER_EVENTS_POLL_DELAY_MS = 30_000;
+
+// A build with no cloud transport has no worker to report on.
+const NO_CATALOG_WORKER: CatalogWorkerStatus = { reason: 'server_off', active: false, providers: [], trackers: [], weekEndsAt: null, lastAskedAt: null, lastReportAt: null, polled: 0, events: 0, inHand: 0, paused: [], lastError: null, check: null };
 import { resolveFeedMembership } from './feed/types.js';
 import { LibrarySink } from './enrich/sinks/library-sink.js';
 import type { FeedFilter } from './feed/store.js';
 import { SqliteKnowledgeStore } from './knowledge/store.js';
 import { createKnowledgeService } from './knowledge/service.js';
-import { ResearcherSidecar } from './knowledge/researcher-sidecar.js';
+import { AgentResearchPort } from './knowledge/agent-research.js';
 import type {
 	JourneyDetail,
 	JourneyNode,
@@ -208,7 +220,8 @@ import type {
 	KbExpansion,
 } from './knowledge/types.js';
 import type { SpotifyTrack } from '@curator/spotify';
-import { SpotifyClient } from '@curator/spotify';
+import { SpotifyClient, configureSpotifyBackoffStore } from '@curator/spotify';
+import { spotifyBackoffStore } from './sources/spotify-backoff.js';
 import { SqliteAgentStore, type AgentSessionDetail, type AgentSessionSummary } from './agent/store.js';
 import { AgentSidecarManager, type AgentSidecarSpec } from './agent/sidecar.js';
 import { buildAgentTools } from './agent/tools.js';
@@ -353,23 +366,12 @@ export interface CoreServiceOptions {
 		cwd?: string;
 		env?: NodeJS.ProcessEnv;
 	};
-	// Spawn-spec for the Node research sidecar (apps/researcher — agent
-	// research over the Claude Agent SDK). When omitted, the KB's agent tier
-	// is off: similar-artists reads "unavailable", everything else works.
-	// The desktop main only passes this when an Anthropic API key is
-	// configured (the env must carry ANTHROPIC_API_KEY).
-	researcher?: {
-		executable: string;
-		args?: string[];
-		cwd?: string;
-		env?: NodeJS.ProcessEnv;
-	};
 	// Spawn-spec for the Node agent sidecar (apps/agent — the in-app agent's
 	// provider-generic harness loop). When omitted, the agent is off: status
-	// reads 'disabled', the panel shows an unavailable state. Unlike the
-	// researcher, no API key is required at spawn — the sidecar boots
-	// unconfigured and is armed via configureAgent (BYOK key over RPC, so
-	// rotation never respawns).
+	// reads 'disabled', the panel shows an unavailable state, and the KB's
+	// research tier (similar-artists) is off with it. No API key is required
+	// at spawn — the sidecar boots unconfigured and is armed via
+	// configureAgent (BYOK key over RPC, so rotation never respawns).
 	agent?: AgentSidecarSpec;
 	// Factory for the agent workspace's execution host. The desktop main
 	// injects the utilityProcess-backed host (OS-killable — agent-written SQL
@@ -1139,19 +1141,35 @@ export interface CoreService {
 	// Feed items live in their own feed.db behind the FeedStore seam — see
 	// planning/tech/discover-core.md. These method shapes are the contract
 	// the future cloud-hosted feed keeps.
+	// The visible feed through the account's standing lenses. genre/label
+	// narrow further (the assistant's query_feed) and AND with any lens.
 	getFeedPage(req?: { cursor?: string | null; limit?: number } & FeedFilter): Promise<FeedPage>;
 	// Distinct genre/label values across the visible feed — populates the
 	// renderer's filter dropdowns.
 	getFeedFilterOptions(): Promise<{ genres: string[]; labels: string[] }>;
+	// Standing lenses (feed/lenses.ts): typed filters set once and obeyed
+	// until removed, stored in the account setting `feed.lenses` (synced). One
+	// lens per kind — adding replaces that kind's lens. `label` is the user's
+	// own words (the chip text); omitted ⇒ a default. Each returns the list.
+	getFeedLenses(): Promise<FeedLens[]>;
+	addFeedLens(input: { rule: unknown; label?: string | null; by: 'user' | 'assistant' }): Promise<FeedLens[]>;
+	removeFeedLens(id: string): Promise<FeedLens[]>;
+	// Fires with the new list whenever the lenses change: here, from the
+	// assistant, or by a pull from another device.
+	subscribeFeedLenses(cb: (lenses: FeedLens[]) => void): () => void;
 	// The Archived page — items set aside via the 'archive' action.
 	getArchivedFeedPage(req?: { cursor?: string | null; limit?: number }): Promise<FeedPage>;
 	// Lazily resolves album tracklists (one source call, cached onto the
 	// item payload) and returns per-track played-state for dimming.
 	getFeedItemDetail(itemId: string): Promise<FeedItemDetail | null>;
-	// On-view Beatport enrichment for one feed item: fills the album-level
-	// genre/label + per-track bpm/key/genre/label, persists, and returns the
-	// updated item. Idempotent (already-enriched items return untouched).
-	enrichFeedItem(itemId: string): Promise<FeedItem | null>;
+	// The lazy fill of a viewed feed item (feed/service.ts fillItem): the
+	// Spotify match when it has no Spotify id, then the Beatport enrichment
+	// (album-level genre/label + per-track bpm/key/genre/label). Persists and
+	// returns the updated item; idempotent.
+	fillFeedItem(itemId: string, opts?: { enrich?: boolean }): Promise<FeedItem | null>;
+	// What the desktop is doing to a feed item right now (matching on
+	// Spotify, enriching), forwarded as 'feed:activity' so the card says so.
+	subscribeFeedActivity(cb: (a: FeedItemActivity) => void): () => void;
 	feedAction(action: FeedAction): Promise<FeedActionResult>;
 	// Unfollow a source playlist surfaced in the feed: drops it at the source
 	// (Spotify) and hard-removes every feed item it produced. No-op-safe when
@@ -1161,13 +1179,18 @@ export interface CoreService {
 	// Unfollow a source artist surfaced in the feed: drops them at the source
 	// (Spotify) and hard-removes every feed item they produced/appear on.
 	unfollowFeedArtist(artistId: string, catalogId?: string): Promise<FeedActionResult>;
-	runFeedRefresh(): Promise<FeedRefreshResult>;
-	// Manual Refresh of one feed producer by id (see FEED_PRODUCER_IDS in
-	// feed/service.ts) — drives the temporary per-source Refresh buttons.
-	runFeedProducerRefresh(producerId: string): Promise<FeedRefreshResult>;
+	// Manual Refresh: the feed's producers now; with a scope, the catalogue
+	// worker's check first (feed/types.ts FeedRefreshScope).
+	runFeedRefresh(scope?: FeedRefreshScope): Promise<FeedRefreshResult>;
 	// "Load more" — push every producer's history horizon back by `days`
 	// (clamped 1..60) and ingest the newly-uncovered older window.
 	loadMoreFeed(days: number): Promise<FeedRefreshResult>;
+	// What the feed is fetching right now: the pass in flight (manual or
+	// background) with each source's step, and how many passes wait behind it.
+	// The subscription fires on every change, progress lines coalesced; the
+	// desktop forwards it as the 'feed:refresh-status' push.
+	getFeedRefreshStatus(): Promise<FeedRefreshStatus>;
+	subscribeFeedRefreshStatus(cb: (status: FeedRefreshStatus) => void): () => void;
 	// Per-item feed enrichment completions (background drain + on-view). The
 	// desktop forwards these as a 'feed:enriched' push so cards update live.
 	subscribeFeedEnriched(cb: (item: FeedItem) => void): () => void;
@@ -1178,6 +1201,19 @@ export interface CoreService {
 	// master device (feed/sync.ts): a follower runs no producer and shows the
 	// collector's decisions.
 	getFeedRole(): Promise<FeedRole>;
+	// ─── This desktop as a catalogue worker (catalog-worker/service.ts) ──
+	// Started by desktop main after the renderer bootstrap lands, like
+	// startFeedPolling; idles while signed out or on a server without
+	// 'catalog_workers'. The status is what Settings → Account shows; the
+	// desktop forwards changes as 'catalog:worker-event'.
+	startCatalogWorker(): void;
+	getCatalogWorkerStatus(): Promise<CatalogWorkerStatus>;
+	subscribeCatalogWorker(cb: (status: CatalogWorkerStatus) => void): () => void;
+	// The user's tracking choices (catalog-worker/settings.ts): which sources
+	// are read for their follows, per kind. Unchecked means nobody reads it.
+	// Device-local; applied at the worker's next ask.
+	getCatalogReadSources(): Promise<CatalogReadSources>;
+	setCatalogReadSources(patch: CatalogReadSourcesPatch | null): Promise<CatalogReadSources>;
 	// ─── Following (Global Catalog watches; catalog-client/service.ts) ───
 	// Whether this device can follow artists and labels: signed in to the
 	// cloud, and the server offers 'global_catalog'.
@@ -1423,6 +1459,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// is gone (plays.ts finalizeInterruptedPlays).
 	const startedAt = Date.now();
 	const { db, sqlite } = createDb(dbPath);
+	// A Spotify quota ban outlives the process (sources/spotify-backoff.ts):
+	// restored before anything below can place a Spotify call.
+	configureSpotifyBackoffStore(spotifyBackoffStore(sqlite));
 	// One-time, before the window has anything to show (its backup copies the
 	// whole DB): remixer credits the artist backfill cut to a one-word prefix.
 	if (dbPath !== ':memory:') {
@@ -1887,7 +1926,34 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			.onConflictDoUpdate({ target: appSetting.key, set: { value: s, updatedAt: new Date() } })
 			.run();
 	};
+	// Standing lenses, cached from app_setting: the feed reads them on every
+	// page, so they're not re-read per page. Writers go through
+	// writeFeedLenses; a pull from another device is noticed in the sync
+	// client's onApplied (reloadFeedLenses).
+	const readFeedLenses = (): FeedLens[] =>
+		normalizeLenses(db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, FEED_LENSES_SETTING)).get()?.value);
+	let feedLenses = readFeedLenses();
+	const feedLensListeners = new Set<(lenses: FeedLens[]) => void>();
+	const lensesChanged = (next: FeedLens[]): void => {
+		feedLenses = next;
+		feedService.invalidateLensSignals();
+		for (const l of feedLensListeners) {
+			try { l(next); } catch (err) { log.for('feed').warn('feed lens listener failed', undefined, err); }
+		}
+	};
+	const writeFeedLenses = (next: FeedLens[]): FeedLens[] => {
+		const stored = serializeLenses(next);
+		// An account key, so setSetting also states it to the op log.
+		mut.setSetting(db, FEED_LENSES_SETTING, stored);
+		lensesChanged(normalizeLenses(stored));
+		return feedLenses;
+	};
+	const reloadFeedLenses = (): void => {
+		const fresh = readFeedLenses();
+		if (JSON.stringify(fresh) !== JSON.stringify(feedLenses)) lensesChanged(fresh);
+	};
 	const feedService = createFeedService({
+		lenses: () => feedLenses,
 		catalogFeed: opts.cloud?.transport.feed
 			? {
 				available: () => catalogFeedPort?.available() ?? false,
@@ -1895,6 +1961,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				recent: (days) => catalogFeedPort!.recent(days),
 				watchedIds: () => catalogFeedPort!.watchedIds(),
 				prepare: () => catalogFeedPort?.prepare?.() ?? Promise.resolve(),
+				checkNow: (kind) => catalogFeedPort?.checkNow?.(kind) ?? Promise.resolve(null),
 			}
 			: undefined,
 		catalogFollows: opts.cloud?.transport.catalog
@@ -1909,6 +1976,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 							.filter((w) => w.object.kind === kind)
 							.flatMap((w) => w.object.handles.filter((h) => h.provider === 'spotify').map((h) => h.id)),
 					),
+				watchedCatalogIds: async (kind) => new Set((await requireCatalog().watches()).filter((w) => w.object.kind === kind).map((w) => w.object.id)),
 				// A playlist is the cloud's once its Spotify tracker has polled it
 				// cleanly; until then (no login there, a local catalogue without the
 				// gateway, a failing read) this device keeps reading it.
@@ -1925,7 +1993,19 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		store: feedStore,
 		auth, // AuthService satisfies FeedAuthPort structurally
 		beatportFetch: opts.beatportFetch,
-		library: { membership: feedLibraryMembership, promote: feedPromote, libraryTrackIds: feedLibraryTrackIds, deletedKeys: feedLibraryDeletedKeys, unpromote: feedUnpromote },
+		library: {
+			membership: feedLibraryMembership,
+			promote: feedPromote,
+			libraryTrackIds: feedLibraryTrackIds,
+			deletedKeys: feedLibraryDeletedKeys,
+			unpromote: feedUnpromote,
+			// Two scans with a turn of the event loop between them.
+			artistSignals: async () => {
+				const library = libraryArtistKeys(sqlite);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				return { library, setPlays: setPlayCounts(sqlite) };
+			},
+		},
 		// Feed unfollow (playlist/artist) mutates the live account — same gate.
 		remoteWriteGate,
 		decisions: createFeedDecisionPort(sqlite),
@@ -1935,15 +2015,18 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// knowledge.db is the third DB file: the KB's write-behind memory +
 	// journey trees (see planning/tech/discovery-journeys.md). The library
 	// port reuses the feed's promotion adapter verbatim so a journey-promoted
-	// track is byte-identical to a feed-promoted one. The research sidecar is
-	// spawned only when a spec was injected (⇒ an Anthropic key exists) —
-	// disabled is a supported state; without it the agent tier simply isn't
-	// registered.
+	// track is byte-identical to a feed-promoted one. Research (the agent
+	// tier) runs in the agent sidecar's research lane with the assistant's
+	// BYOK key: registered whenever the sidecar exists, rejecting cleanly
+	// while it is unconfigured. agent.db (the decision log) and the sidecar
+	// are opened here, before the KB, so the research port can use both.
 	const knowledgeDbPath = dbPath === ':memory:' ? ':memory:' : joinPath(dirname(dbPath), 'knowledge.db');
-	let researcherSidecar: ResearcherSidecar | null = null;
-	if (opts.researcher) {
-		researcherSidecar = new ResearcherSidecar(opts.researcher);
-		researcherSidecar.start();
+	const agentDbPath = dbPath === ':memory:' ? ':memory:' : joinPath(dirname(dbPath), 'agent.db');
+	const agentStore = new SqliteAgentStore(agentDbPath);
+	let agentSidecar: AgentSidecarManager | undefined;
+	if (opts.agent) {
+		agentSidecar = new AgentSidecarManager(opts.agent);
+		agentSidecar.start();
 	}
 	const knowledgeService = createKnowledgeService({
 		store: new SqliteKnowledgeStore(knowledgeDbPath),
@@ -1973,7 +2056,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				};
 			},
 		},
-		...(researcherSidecar ? { researcher: researcherSidecar } : {}),
+		...(agentSidecar ? { researcher: new AgentResearchPort(agentSidecar, agentStore) } : {}),
 	});
 
 	// ─── Agent service (in-app agent) ──────────────────────────────────
@@ -1983,13 +2066,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// forward-ref (svcRef) because the agent registry calls the same public
 	// query surface the renderer uses; result-set ref validation resolves
 	// against the three stores so the model can never present an id it
-	// didn't actually see.
-	const agentDbPath = dbPath === ':memory:' ? ':memory:' : joinPath(dirname(dbPath), 'agent.db');
-	let agentSidecar: AgentSidecarManager | undefined;
-	if (opts.agent) {
-		agentSidecar = new AgentSidecarManager(opts.agent);
-		agentSidecar.start();
-	}
+	// didn't actually see. (agent.db and the sidecar were opened above.)
 	const agentRefs: ResultRefPorts = {
 		async libraryTracks(ids) {
 			const out = new Map<string, string | null>();
@@ -2041,11 +2118,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			}),
 		);
 	const agentService = createAgentService({
-		store: new SqliteAgentStore(agentDbPath),
+		store: agentStore,
 		...(agentSidecar ? { sidecar: agentSidecar } : {}),
 		...(workspaceManager ? { workspace: workspaceManager } : {}),
 		refs: agentRefs,
-		getFeedFilterOptions: () => feedService.filterOptions(),
 		tools: buildAgentTools({
 			svc: () => svcRef!,
 			getSpotifyClient: async () => {
@@ -2388,6 +2464,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			onApplied: (a) => {
 				if (a.tracks.length > 5_000) membership.recomputeAll();
 				else if (a.tracks.length > 0) membership.recomputeForTracks(a.tracks);
+				// Another device may have changed the lenses. The applied entity
+				// list is capped, so compare the stored value instead (one PK read).
+				reloadFeedLenses();
 			},
 			snapshot: { ...opts.cloud.snapshot, builder: opts.cloud.snapshot?.builder ?? inlineSnapshotBuilder(dbPath) },
 			// The feed's decisions live in feed.db (feed/sync.ts).
@@ -2430,6 +2509,54 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			spotifyToken: () => auth.getSpotifyAccessToken(),
 		})
 		: null;
+	// This desktop as a catalogue worker (catalog-worker/service.ts): reads
+	// the providers for the user's follows and reports to the master. Built
+	// whenever there is a cloud transport; whether it may run is the server's
+	// `catalog_workers` (the local catalogue's own list in development), read
+	// every tick, so a sign-in or a server upgrade needs no restart.
+	const catalogWorker: CatalogWorker | null = cloudClient && catalogProcs
+		? createCatalogWorker({
+			procs: () => catalogProcs,
+			deviceId: () => cloudClient.deviceId(),
+			offered: () => {
+				if (opts.cloud!.transport.session() === null) return 'signed_out';
+				const features = opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? [];
+				return features.includes('catalog_workers') ? 'ok' : 'server_off';
+			},
+			spotifyToken: () => auth.getSpotifyAccessToken(),
+			trackers: () => checkedTrackers(sqlite),
+			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
+		})
+		: null;
+	// The worker's reads raise events on the master; the feed's timer would
+	// bring them within the half hour. A check's releases should reach
+	// Discover as they land: once the worker's event count grows, one
+	// background pass of the catalogue producer, half a minute later so a
+	// drain of many reads is one pass, not one per report.
+	if (catalogWorker) {
+		let seenEvents = 0;
+		let pollTimer: ReturnType<typeof setTimeout> | null = null;
+		catalogWorker.subscribe((s) => {
+			if (s.events <= seenEvents) {
+				if (s.events < seenEvents) seenEvents = s.events;
+				return;
+			}
+			seenEvents = s.events;
+			if (pollTimer) return;
+			pollTimer = setTimeout(() => {
+				pollTimer = null;
+				feedService.pollCatalog().catch((err: unknown) => log.for('feed').warn('catalogue poll after worker events failed', undefined, err));
+			}, WORKER_EVENTS_POLL_DELAY_MS);
+			pollTimer.unref();
+		});
+	}
+	// Findings up (catalog-client/facts-up.ts): what this desktop's store
+	// lookups found for the feed's cards, to the catalogue.
+	const factsUp = createFactsUp({
+		store: feedStore,
+		ingest: () => (catalogClient?.status().available ? (claims, idempotencyKey) => catalogClient.reportEnrichment(claims, idempotencyKey) : null),
+		subscribe: (cb) => feedService.subscribeEnriched(cb),
+	});
 	const requireCatalog = (): CatalogClient => {
 		if (!catalogClient) throw new CatalogUnavailableError('Sign in to Curator Cloud to follow artists and labels.');
 		return catalogClient;
@@ -2443,6 +2570,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			events: (afterSeq) => feedProcs.events({ deviceId: cloudClient.deviceId(), afterSeq }),
 			recent: (days) => feedProcs.recent({ deviceId: cloudClient.deviceId(), days }),
 			watchedIds: async () => new Set((await requireCatalog().watches()).map((w) => w.object.id)),
+			checkNow: (kind) => catalogWorker?.tickNow(kind ? { kind } : {}) ?? Promise.resolve(null),
 			// The Spotify follows, carried into the catalogue behind the scenes.
 			prepare: async () => {
 				if (!catalogClient) return;
@@ -4511,14 +4639,33 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async getFeedFilterOptions() {
 			return feedService.filterOptions();
 		},
+		async getFeedLenses() {
+			return feedLenses;
+		},
+		async addFeedLens(input) {
+			const rule = parseRule(input.rule);
+			if (!rule) throw new Error('invalid lens rule');
+			return writeFeedLenses(withLens(feedLenses, { rule, label: input.label ?? null, by: input.by === 'assistant' ? 'assistant' : 'user' }));
+		},
+		async removeFeedLens(id) {
+			const next = withoutLens(feedLenses, id);
+			return next.length === feedLenses.length ? feedLenses : writeFeedLenses(next);
+		},
+		subscribeFeedLenses(cb) {
+			feedLensListeners.add(cb);
+			return () => { feedLensListeners.delete(cb); };
+		},
 		async getArchivedFeedPage(req) {
 			return feedService.getArchivedPage(req);
 		},
 		async getFeedItemDetail(itemId) {
 			return feedService.getItemDetail(itemId);
 		},
-		async enrichFeedItem(itemId) {
-			return feedService.enrichItem(itemId);
+		async fillFeedItem(itemId, opts) {
+			return feedService.fillItem(itemId, opts);
+		},
+		subscribeFeedActivity(cb) {
+			return feedService.subscribeActivity(cb);
 		},
 		async feedAction(action) {
 			return feedService.action(action);
@@ -4529,23 +4676,42 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async unfollowFeedArtist(artistId, catalogId) {
 			return feedService.unfollowArtist(artistId, catalogId);
 		},
-		async runFeedRefresh() {
-			return feedService.refresh();
-		},
-		async runFeedProducerRefresh(producerId) {
-			return feedService.refreshProducer(producerId);
+		async runFeedRefresh(scope) {
+			return feedService.refresh(scope);
 		},
 		async loadMoreFeed(days) {
 			return feedService.loadMore(days);
+		},
+		async getFeedRefreshStatus() {
+			return feedService.refreshStatus();
+		},
+		subscribeFeedRefreshStatus(cb) {
+			return feedService.subscribeRefreshStatus(cb);
 		},
 		subscribeFeedEnriched(cb) {
 			return feedService.subscribeEnriched(cb);
 		},
 		startFeedPolling() {
 			feedService.startPolling();
+			factsUp.start();
 		},
 		async getFeedRole() {
 			return feedService.role();
+		},
+		startCatalogWorker() {
+			catalogWorker?.start();
+		},
+		async getCatalogWorkerStatus() {
+			return catalogWorker?.status() ?? NO_CATALOG_WORKER;
+		},
+		subscribeCatalogWorker(cb) {
+			return catalogWorker?.subscribe(cb) ?? (() => {});
+		},
+		async getCatalogReadSources() {
+			return readReadSources(sqlite);
+		},
+		async setCatalogReadSources(patch) {
+			return writeReadSources(sqlite, patch);
 		},
 
 		// ─── Following ──────────────────────────────────────────────────────
@@ -4564,10 +4730,19 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// A followed Spotify artist / playlist goes through the feed's unfollow,
 		// which also removes the items it brought (core feed/service.ts).
 		async catalogUnfollow(objectId) {
+			// Through the feed, so the items the follow brought leave with it.
+			// An artist / playlist without a Spotify id is keyed `catalog:<id>`
+			// in the feed (cloud-producer.ts); a label / genre by its object id.
 			const w = (await requireCatalog().watches()).find((x) => x.object.id === objectId);
-			const spotifyId = w?.object.handles.find((h) => h.provider === 'spotify')?.id;
-			if (w && spotifyId && (w.object.kind === 'artist' || w.object.kind === 'playlist')) {
-				const r = w.object.kind === 'artist' ? await feedService.unfollowArtist(spotifyId, objectId) : await feedService.unfollowPlaylist(spotifyId, objectId);
+			const kind = w?.object.kind;
+			let r: FeedActionResult | null = null;
+			if (kind === 'artist' || kind === 'playlist') {
+				const feedId = w!.object.handles.find((h) => h.provider === 'spotify')?.id ?? `catalog:${objectId}`;
+				r = kind === 'artist' ? await feedService.unfollowArtist(feedId, objectId) : await feedService.unfollowPlaylist(feedId, objectId);
+			} else if (kind === 'label' || kind === 'genre') {
+				r = await feedService.unfollowOrigin(kind, objectId);
+			}
+			if (r) {
 				if (!r.ok) throw new Error(r.error ?? 'unfollow failed');
 				return;
 			}
@@ -5786,6 +5961,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// and those are just as real). Clean pause — no write session
 			// is open, conflicts are persisted rows.
 			const conflicts = listOpenConflicts(db, creditFormat);
+			log.for('rb-sync').info('pull phase done', { conflicts: conflicts.length, target: args.targetKind });
 			if (conflicts.length > 0) {
 				return { status: 'conflicts', conflicts };
 			}
@@ -5798,6 +5974,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				dbPath,
 				key: args.key,
 			});
+			log.for('rb-sync').info('push phase done — returning to IPC', { verifyOk: result.verifyOk, tracksWritten: result.tracksWritten, playlistsWritten: result.playlistsWritten });
 			return { status: 'completed', result };
 		},
 		async resolveSyncConflicts(args) {
@@ -6038,9 +6215,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// handle is gone.
 			sourceScheduler.stopAll();
 			albumEnricher.stop();
+			catalogWorker?.stop();
+			factsUp.stop();
 			feedService.stop(); // stops scheduler + enrichment + closes feed.db
 			knowledgeService.stop(); // stops the expansion queue + closes knowledge.db
-			pending.push(researcherSidecar?.shutdown());
 			pending.push(agentService.stop()); // closes agent.db, then the workspace
 			pending.push(agentSidecar?.shutdown());
 			pending.push(mirLayer.close()); // engine shutdown (3 s grace) + closes mir.db

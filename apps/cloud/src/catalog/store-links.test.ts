@@ -9,7 +9,7 @@ import { createTestApp } from '../test/harness.js';
 import { ingestClaims } from './ingest.js';
 import { runStoreLinker } from './store-links.js';
 import { AppleLookup } from './trackers/apple.js';
-import type { FetchLike } from './trackers/http.js';
+import type { FetchLike } from '@curator/catalog-readers';
 import { TidalApp } from './trackers/tidal-app.js';
 
 const quiet = createLogger(() => {});

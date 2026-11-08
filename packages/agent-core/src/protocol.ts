@@ -14,7 +14,8 @@
 // turn. `configure` can be re-sent at any time (key rotation without
 // respawn); the sidecar boots unconfigured and rejects `run` until armed.
 
-export const AGENT_PROTOCOL = 1;
+// 2: the `research` method (research runs in this sidecar; apps/researcher is gone).
+export const AGENT_PROTOCOL = 2;
 export const AGENT_SIDECAR_NAME = 'curator-agent';
 
 export type AgentProvider = 'anthropic' | 'openai' | 'deepseek' | 'openai-compatible';
@@ -114,6 +115,11 @@ export interface RunParams {
 		maxSteps: number;
 		maxToolResultBytes: number;
 	};
+	// The name of a tool in `tools` whose first call ends the run: its
+	// arguments are the answer (RunResult.structured) and it is never
+	// executed. Research and verdict-style runs answer through one strict
+	// tool instead of prose that has to be parsed.
+	terminalTool?: string;
 }
 
 export interface RunUsage {
@@ -123,7 +129,7 @@ export interface RunUsage {
 	steps: number;
 }
 
-export type RunStopReason = 'done' | 'cancelled' | 'max-steps' | 'error';
+export type RunStopReason = 'done' | 'structured' | 'cancelled' | 'max-steps' | 'error';
 
 export interface RunResult {
 	turnId: string;
@@ -136,10 +142,43 @@ export interface RunResult {
 	usage: RunUsage;
 	// Present when stopReason === 'error'.
 	errorMessage?: string;
+	// The terminal tool's arguments, when stopReason === 'structured'.
+	structured?: unknown;
 }
 
 export interface ClassifyResult {
 	mode: 'quick' | 'research';
+}
+
+// One research run: a single prompt, the provider's web tools, and one
+// terminal tool (`record_claims`, the given schema) whose arguments are the
+// answer. No host tools, no streamed deltas; runs in its own lane beside an
+// assistant turn. The host owns the prompt, validation and the decision log
+// (apps/core/src/knowledge/agent-research.ts).
+export const RESEARCH_TOOL = 'record_claims';
+
+export interface ResearchParams {
+	requestId: string;
+	system: string;
+	prompt: string;
+	// JSON Schema of record_claims' arguments.
+	claimsSchema: Record<string, unknown>;
+	limits: {
+		maxSteps: number;
+		maxToolResultBytes: number;
+	};
+}
+
+export interface ResearchResult {
+	requestId: string;
+	stopReason: RunStopReason;
+	// record_claims' arguments (unvalidated) when stopReason === 'structured'.
+	structured: unknown;
+	usage: RunUsage;
+	model: string;
+	// Pages the provider's web tools cited along the way.
+	sources: { url: string; title?: string }[];
+	errorMessage?: string;
 }
 
 // ─── Frames ──────────────────────────────────────────────────────────────
@@ -157,7 +196,9 @@ export type AgentHostFrame =
 	| { id: number; method: 'configure'; params: AgentConfig }
 	| { id: number; method: 'classify'; params: { messages: WireMessage[] } }
 	| { id: number; method: 'run'; params: RunParams }
+	| { id: number; method: 'research'; params: ResearchParams }
 	| { method: 'tool-result'; callId: string; result: unknown }
 	| { method: 'tool-error'; callId: string; message: string }
+	// turnId: an assistant turn's id or a research requestId.
 	| { method: 'cancel'; params: { turnId: string } }
 	| { method: 'shutdown' };

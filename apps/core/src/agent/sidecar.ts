@@ -3,8 +3,7 @@
 // streamed delta fan-out, reverse-RPC tool-call dispatch, cancellation, and
 // re-arm (configure) after a respawn.
 //
-// Protocol contract lives at apps/agent/src/protocol.ts; host-side copy of
-// the types in ./protocol.ts — keep them in sync.
+// Protocol contract: @curator/agent-core (protocol.ts), shared by both ends.
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { log } from '../log.js';
@@ -14,6 +13,8 @@ import {
 	type AgentConfig,
 	type AgentDelta,
 	type ClassifyResult,
+	type ResearchParams,
+	type ResearchResult,
 	type RunParams,
 	type RunResult,
 	type WireMessage,
@@ -41,6 +42,8 @@ export interface RunHandlers {
 
 const CONFIGURE_TIMEOUT_MS = 10_000;
 const CLASSIFY_TIMEOUT_MS = 30_000;
+// A web-research task (search, fetch, record): 10–60 s typically.
+const RESEARCH_TIMEOUT_MS = 180_000;
 // Host-side per-tool-call watchdog: a tool that hangs must not wedge the
 // whole turn — the sidecar receives a tool-error and the model reacts.
 const TOOL_CALL_TIMEOUT_MS = 60_000;
@@ -128,6 +131,18 @@ export class AgentSidecarManager {
 			return (await this.rpc('run', params, null)) as RunResult;
 		} finally {
 			this.runs.delete(params.turnId);
+		}
+	}
+
+	// One research task in the sidecar's research lane, beside any running
+	// turn. Its own watchdog: research that outruns RESEARCH_TIMEOUT_MS is
+	// cancelled in the sidecar and rejected here.
+	async research(params: ResearchParams): Promise<ResearchResult> {
+		try {
+			return (await this.rpc('research', params, RESEARCH_TIMEOUT_MS)) as ResearchResult;
+		} catch (err) {
+			if (err instanceof Error && err.message.includes('timed out')) this.cancel(params.requestId);
+			throw err;
 		}
 	}
 

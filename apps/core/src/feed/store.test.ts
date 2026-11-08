@@ -383,3 +383,92 @@ describe('SqliteFeedStore recording collapse', () => {
 		}
 	});
 });
+
+describe('SqliteFeedStore catalogue identity (v9 aliases)', () => {
+	const catalogAlbum = (relId: string, spotifyAlbum: string | null, extra?: Partial<FeedItemDraft['payload']>): FeedItemDraft => ({
+		type: 'album',
+		source: spotifyAlbum ? 'spotify' : 'catalog',
+		sourceId: spotifyAlbum ?? relId,
+		dedupeKey: `catalog:release:${relId}`,
+		aliasKeys: spotifyAlbum ? [`spotify:album:${spotifyAlbum}`] : [],
+		payload: {
+			title: 'Glass Rivers',
+			artists: ['A'],
+			catalogId: relId,
+			label: 'Cat',
+			handles: spotifyAlbum ? [{ provider: 'spotify', id: spotifyAlbum, url: null }] : [{ provider: 'bandcamp', id: '9', url: 'https://a.bandcamp.com/album/g' }],
+			tracks: [{ sourceTrackId: spotifyAlbum ? 'st1' : 'r1', catalogId: 'r1', title: 'Glass Rivers', artists: ['A'], durationSec: 300 }],
+			...extra,
+		},
+		origin: { kind: 'label', id: 'lbl', name: 'Cat', catalogId: 'lbl' },
+		publishedAt: null,
+		suppressKeys: ['label:lbl'],
+	});
+	const localAlbum = (): FeedItemDraft => ({
+		...draft('album', 'al1', 'spotify:album:al1', { tracks: [{ sourceTrackId: 'st1', title: 'Glass Rivers', artists: ['A'], durationSec: 300 }] }),
+		origin: { kind: 'artist', id: 'sa1', name: 'A' },
+		suppressKeys: ['artist:sa1'],
+	});
+
+	it('a local Spotify album, then the catalogue card for it: one row, both keys, the card fills the facts', async () => {
+		const s = new SqliteFeedStore(':memory:');
+		await s.upsertItems([localAlbum()]);
+		expect(await s.upsertItems([catalogAlbum('rel1', 'al1')])).toEqual({ inserted: 0 });
+		const { items } = await s.getPage();
+		expect(items).toHaveLength(1);
+		expect(items[0]).toMatchObject({ dedupeKey: 'spotify:album:al1', payload: { catalogId: 'rel1', label: 'Cat' } });
+		expect(items[0]!.sources?.map((o) => o.kind).sort()).toEqual(['artist', 'label']);
+		expect(await s.existingDedupeKeys(['catalog:release:rel1', 'spotify:album:al1'])).toEqual(new Set(['catalog:release:rel1', 'spotify:album:al1']));
+		s.close();
+	});
+
+	it('the catalogue card first, then the local album: still one row', async () => {
+		const s = new SqliteFeedStore(':memory:');
+		await s.upsertItems([catalogAlbum('rel1', 'al1')]);
+		expect(await s.upsertItems([localAlbum()])).toEqual({ inserted: 0 });
+		const { items } = await s.getPage();
+		expect(items.map((i) => i.dedupeKey)).toEqual(['catalog:release:rel1']);
+		s.close();
+	});
+
+	it('a release no player could play becomes playable in place when it is announced again with a Spotify id', async () => {
+		const s = new SqliteFeedStore(':memory:');
+		await s.upsertItems([catalogAlbum('rel1', null)]);
+		const before = (await s.getPage()).items[0]!;
+		expect(before).toMatchObject({ source: 'catalog', sourceId: 'rel1' });
+		await s.upsertItems([catalogAlbum('rel1', 'al1', { url: 'https://open.spotify.com/album/al1' })]);
+		const after = (await s.getPage()).items;
+		expect(after).toHaveLength(1);
+		expect(after[0]).toMatchObject({ id: before.id, source: 'spotify', sourceId: 'al1', payload: { url: 'https://open.spotify.com/album/al1' } });
+		expect(after[0]!.payload.handles?.map((h) => h.provider)).toEqual(['bandcamp', 'spotify']);
+		expect(after[0]!.payload.tracks?.[0]?.sourceTrackId).toBe('st1');
+		s.close();
+	});
+
+	it('a decision another device stated under the Spotify key finds the catalogue row', async () => {
+		const s = new SqliteFeedStore(':memory:');
+		await s.upsertItems([catalogAlbum('rel1', 'al1')]);
+		s.applySyncedDecisions([{ dedupeKey: 'spotify:album:al1', state: 'archived', stateAt: 5, promotedTrackId: null, playedAt: null, listened: [] }], []);
+		expect((await s.getPage()).items).toEqual([]);
+		expect((await s.getArchivedPage()).items.map((i) => i.dedupeKey)).toEqual(['catalog:release:rel1']);
+		s.close();
+	});
+
+	it('v8 → v9 migration seeds each row’s Spotify and ISRC keys as aliases', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v9-'));
+		const path = join(dir, 'feed.db');
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([draft('track', 'st9', 'isrc:GBAAA2600009', { isrc: 'GBAAA2600009' })]);
+			s.close();
+			const raw = new Database(path);
+			raw.exec(`DELETE FROM feed_item_alias; UPDATE feed_meta SET value = '8' WHERE key = 'schema_version';`);
+			raw.close();
+			const s2 = new SqliteFeedStore(path);
+			expect(await s2.existingDedupeKeys(['spotify:track:st9'])).toEqual(new Set(['spotify:track:st9']));
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});

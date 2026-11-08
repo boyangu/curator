@@ -4,6 +4,11 @@
 // Spotify sync code. The renderer mirrors this map in editTrack.ts.
 export function keyToCamelot(key: string | null): string | null {
 	if (!key) return null;
+	// Already Camelot (a catalogue fact can arrive in it).
+	const camelot = /^\s*(1[0-2]|[1-9])\s*([ABab])\s*$/.exec(key);
+	if (camelot) return `${camelot[1]}${camelot[2]!.toUpperCase()}`;
+	// Beatport and SoundCloud spell accidentals with the music signs.
+	key = key.replace(/♯/g, '#').replace(/♭/g, 'b');
 	// Collapse spelled-out qualities to the bare ''/'m' the map uses, so
 	// "Bb major" / "D minor" resolve instead of falling through to null.
 	// Mirrors parseKeyInput() in the renderer's editTrack.ts.

@@ -1,5 +1,6 @@
-// Agent resolver — routes KB aspects no catalog API can answer to the
-// research sidecar. v1: artist.similar-artists only.
+// Agent resolver — routes KB aspects no catalog API can answer to research
+// (the agent sidecar's research lane, knowledge/agent-research.ts). v1:
+// artist.similar-artists only.
 //
 // Everything that comes back is a CLAIM: the drafts carry source='agent'
 // with a name-keyed source id (research has no stable provider ids), the
@@ -8,7 +9,7 @@
 // artist; ambiguity mints a stub; merges never happen off a claim).
 
 import { searchFold } from '@curator/shared';
-import type { ResearchPort } from '../researcher-sidecar.js';
+import type { ResearchPort } from '../research.js';
 import type { KbAspect, KbEdgeDraft, KbEntityDraft, KbEntityKind, KbResolver, KbResolverPage } from '../types.js';
 
 export class ResearcherKbResolver implements KbResolver {

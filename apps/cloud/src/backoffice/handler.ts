@@ -4,9 +4,9 @@
 // cli/backoffice.ts against DATABASE_URL. Never by server.ts.
 //
 // Every call runs in a READ ONLY transaction, so a query here cannot write to
-// the catalogue even when the connection's role could. The one thing the page
-// writes — resolving an inbox item — goes to the host's /admin endpoint (the
-// CLI's, loopback), never through here.
+// the catalogue even when the connection's role could. What the page writes —
+// resolving an inbox item, asking for a check — goes to the host's /admin
+// endpoint (the CLI's, loopback), never through here.
 
 import { readFileSync } from 'node:fs';
 import type { Db, Queryable } from '../db/db.js';
@@ -15,6 +15,21 @@ import { browseList, browseObject, type BrowseKind, type BrowseSort } from '../c
 import { getInbox, inboxCounts, listInbox, type InboxFilter } from '../catalog/inbox.js';
 import type { Severity } from '../catalog/inbox-policy.js';
 import type { LocalLibrary } from '../catalog/local-library.js';
+import { queueOverview, trackingObjects, trackingOverview, TRACKING_KINDS, TRACKING_STATES, type ReaderNote, type TrackingKind, type TrackingState } from '../catalog/tracking.js';
+
+// The pass of a worker in this process (the local catalogue), step by step:
+// the steps done so far in this pass with how long each took, the one running
+// and since when, and the last finished pass to compare with.
+export type WorkerStep = { step: string; ms: number };
+export type WorkerStatus = {
+	running: boolean;
+	step: string | null;
+	stepStartedAt: number | null;
+	startedAt: number | null;
+	finishedAt: number | null;
+	steps: WorkerStep[];
+	lastPass: { startedAt: number; ms: number; steps: WorkerStep[] } | null;
+};
 
 const KINDS: readonly BrowseKind[] = ['label', 'artist', 'recording'];
 const SORTS: readonly BrowseSort[] = ['name', 'recent', 'watched', 'scanned', 'stale', 'tracks', 'fewest_tracks'];
@@ -26,7 +41,18 @@ export type BackofficeHandler = (req: Request) => Promise<Response | null>;
 // Answers requests under /backoffice; null for anything else, so a host can
 // chain it in front of its own handler. `library`: the owner's local library
 // when the host loaded one (the local catalogue), for the lists' filter.
-export function createBackofficeHandler(db: Db, opts: { library?: () => LocalLibrary | null } = {}): BackofficeHandler {
+// `worker` + `readers`: the pass this process runs and the trackers it can
+// read; absent, the worker is elsewhere (the cloud's).
+export function createBackofficeHandler(
+	db: Db,
+	opts: {
+		library?: () => LocalLibrary | null;
+		worker?: () => WorkerStatus;
+		readers?: () => readonly { provider: string; kinds: readonly string[] }[];
+		// Why a missing reader is missing, in words for the page.
+		readerNotes?: () => readonly ReaderNote[];
+	} = {},
+): BackofficeHandler {
 	const read = <T>(fn: (tx: Queryable) => Promise<T>) =>
 		db.begin(async (tx) => {
 			await tx.query('set transaction read only');
@@ -63,6 +89,37 @@ export function createBackofficeHandler(db: Db, opts: { library?: () => LocalLib
 					}),
 				);
 				return Response.json(page);
+			}
+			if (path === '/backoffice/api/tracking') {
+				const notes = opts.readerNotes?.() ?? [];
+				const overview = await read((tx) => trackingOverview(tx, opts.readers?.()));
+				const trackers = overview.trackers.map((t) => ({ ...t, readerNote: t.reader === false ? notes.find((n) => n.provider === t.provider && n.kind === t.kind)?.why ?? null : null }));
+				return Response.json({ ...overview, trackers, worker: opts.worker?.() ?? null });
+			}
+			if (path === '/backoffice/api/queue') {
+				const queue = await read((tx) => queueOverview(tx, { ...(opts.readers ? { readers: opts.readers() } : {}), notes: opts.readerNotes?.() ?? [] }));
+				return Response.json({ ...queue, worker: opts.worker?.() ?? null });
+			}
+			if (path === '/backoffice/api/tracking/objects') {
+				const id = url.searchParams.get('id');
+				if (id && !UUID_RE.test(id)) return Response.json({ error: 'not an id' }, { status: 400 });
+				const kind = url.searchParams.get('kind') as TrackingKind;
+				const state = url.searchParams.get('state') as TrackingState;
+				const provider = url.searchParams.get('provider');
+				const q = url.searchParams.get('q');
+				return Response.json(
+					await read((tx) =>
+						trackingObjects(tx, {
+							...(id ? { id } : {}),
+							...(TRACKING_KINDS.includes(kind) ? { kind } : {}),
+							...(TRACKING_STATES.includes(state) ? { state } : {}),
+							...(provider ? { provider } : {}),
+							...(q ? { q } : {}),
+							offset: Number(url.searchParams.get('offset') ?? 0) || 0,
+							limit: Number(url.searchParams.get('limit') ?? 50) || 50,
+						}),
+					),
+				);
 			}
 			if (path === '/backoffice/api/inbox/counts') return Response.json(await read((tx) => inboxCounts(tx)));
 			if (path === '/backoffice/api/inbox') {

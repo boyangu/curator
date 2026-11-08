@@ -11,29 +11,40 @@
 // get big enough to need it — items arrive 50 at a time, so the DOM grows
 // only as fast as the user actually scrolls.
 
-import { For, Show, createSignal, createEffect, type JSX } from 'solid-js';
+import { For, Show, createSignal, createEffect, createRoot, type JSX } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, JourneySeed } from '@curator/core';
-import { openContextMenu } from './ContextMenu.jsx';
+import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, JourneySeed, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
+import { openContextMenu, type ContextMenuItem } from './ContextMenu.jsx';
 import { ArtistCredits } from './ArtistCredits.jsx';
 import { searchFold } from '@curator/shared';
-import { buildFeedMenu, feedShow, type FeedActions } from '../features/feedCommands.js';
+import { buildFeedMenu, feedShow, spotifyPlaylistOrigin, type FeedActions } from '../features/feedCommands.js';
+import { BRAND_ICONS, BRAND_ORDER, brandIcon } from '../features/brandIcons.js';
+import { discoverSettingsSignal } from '../features/discoverSettings.js';
+import { library } from '../data/library.js';
 import { KeyChip } from './KeyChip.jsx';
 import { catalogApi, shellApi } from '../data/api.js';
 import { FollowingPanel } from './FollowingPanel.jsx';
 import { ManageFollowingModal } from './ManageFollowingModal.jsx';
 import { registerModalOpenSignal } from '../modalGate.js';
+import { cardPlayable, isSpotifyArtistId, playableId, providerLabel, storeLinks } from '../features/feedHandles.js';
 
-// The feed's navigable state — what a history entry records for it.
+// The Refresh menu's words for the follow kinds.
+const KIND_TITLES: Record<FeedRefreshKind, string> = { artist: 'Artists', label: 'Labels', playlist: 'Playlists', genre: 'Genres' };
+const KIND_WORDS: Record<FeedRefreshKind, string> = { artist: 'artists', label: 'labels', playlist: 'playlists', genre: 'genres' };
+import { feedRefresh } from '../data/feedRefreshStatus.js';
+import { ACTIVITY_TEXT, feedActivity } from '../data/feedActivity.js';
+import { progressBody, resultBody } from '../features/feedRefreshText.js';
+import type { ProgressToast } from '../ui/toast.js';
+
+// The feed's navigable state — what a history entry records for it. The
+// standing lenses are settings, not navigation, so Back never revokes one.
 export interface DiscoverFeedNavState {
 	archived: boolean;
-	genre: string | null;
-	label: string | null;
 }
 
 export interface DiscoverViewProps {
-	// A feed navigation the view is about to apply itself (Feed ↔ Archived,
-	// a genre/label filter): the target state, reported BEFORE the reload so
+	// A feed navigation the view is about to apply itself (Feed ↔ Archived):
+	// the target state, reported BEFORE the reload so
 	// main.ts can snapshot the view being left onto its history entry.
 	onNavigate?: (next: DiscoverFeedNavState) => void;
 	onPlay: (req: {
@@ -63,12 +74,19 @@ export interface DiscoverViewProps {
 		rollback: (trackId: string) => Promise<void>;
 	}) => void;
 	onToast: (msg: string, kind: 'info' | 'error' | 'success', sub?: string) => void;
+	// A toast that stays while a refresh runs and then becomes its result
+	// (ui/toast.ts showProgressToast).
+	onProgressToast: (title: string, sub?: string) => ProgressToast;
 	// Start a discovery journey from a feed track — main.ts flips Discover
 	// into Journeys mode and creates the journey from the seed.
 	onStartJourney: (seed: JourneySeed) => void;
 	// "Show in library" on an artist name — main.ts resolves the name against
 	// the library's artist table and opens the "Artist: X" scope.
 	onShowArtistInLibrary: (name: string) => void;
+	// The playlist name on a "New on <playlist> by <profile>" line — main.ts
+	// opens the followed playlist under the Spotify tab (it is synced into
+	// the library), or the Spotify app when the library has no row for it yet.
+	onOpenSpotifyPlaylist: (spotifyPlaylistId: string) => void;
 	// Keeps the Discover tab chip in sync with the visible-item count.
 	onTotalChange: (total: number) => void;
 	// Seconds the playhead must reach before a track counts as "listened" — the
@@ -105,12 +123,9 @@ export interface DiscoverViewHandle {
 	// from the feed. No-op (returns false) unless a feed track is what's playing
 	// — main.ts wires it to a right-click on the docked Discover player strip.
 	openPlayingTrackMenu(evt: MouseEvent): boolean;
-	// Programmatic filter change (the agent's update_feed_filters view
-	// command). Omitted field = leave that filter alone; null = clear it.
-	// Values are pre-validated host-side against feed:filter-options.
-	setFilters(filters: { genre?: string | null; label?: string | null }): void;
-	// Current filter state — captured into the agent's view context.
-	getFilters(): { genre: string | null; label: string | null };
+	// The standing lenses (id + chip label) — captured into the agent's view
+	// context so "drop that filter" can name one.
+	getLenses(): { id: string; label: string }[];
 	// History: the feed's navigable state, and applying one (traversal / tab
 	// re-entry). `reload` re-fetches page 1; a traversal onto the state the
 	// feed already shows passes false and keeps the list + scroll as they are.
@@ -156,16 +171,70 @@ function fmtFeedDate(epochMs: number): { label: string; title: string } {
 	return { label, title };
 }
 
-function originLabel(item: FeedItem): string {
-	if (!item.origin) return '';
-	return item.origin.kind === 'playlist' ? `new in ${item.origin.name}` : `new release · ${item.origin.name}`;
+// "Added <when>" on a followed-playlist card — the same coarse-to-fine
+// steps as fmtFeedDate, worded as a relative time ("3 days ago"); past two
+// months, the plain date.
+function fmtAddedWhen(epochMs: number): string {
+	const d = new Date(epochMs);
+	const now = new Date();
+	const days = Math.floor((now.getTime() - epochMs) / 86_400_000);
+	if (days <= 0) return 'today';
+	if (days === 1) return 'yesterday';
+	if (days < 14) return `${days} days ago`;
+	if (days < 60) { const w = Math.floor(days / 7); return w === 1 ? '1 week ago' : `${w} weeks ago`; }
+	const md = `${SHORT_MONTHS[d.getMonth()]} ${d.getDate()}`;
+	return d.getFullYear() === now.getFullYear() ? md : `${md}, ${d.getFullYear()}`;
 }
 
-// Tooltip body for the "+N sources" badge — every playlist/artist that surfaced
-// the track, one per line (artists prefixed so a mixed list reads clearly).
+// A source's release date ("YYYY-MM-DD" / "YYYY-MM" / "YYYY" — Spotify's
+// precision varies) as "Oct 31, 2026" / "Oct 2026" / "2026". null when the
+// string is not a date at all.
+function fmtReleaseDate(raw: string | null | undefined): string | null {
+	const m = raw?.match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/);
+	if (!m) return null;
+	const [, y, mo, d] = m;
+	const mon = mo ? SHORT_MONTHS[Number(mo) - 1] : undefined;
+	if (!mon) return y!;
+	return d ? `${mon} ${Number(d)}, ${y}` : `${mon} ${y}`;
+}
+
+// Every service the item is known on, with the page to open there: the
+// item's own source, the catalogue's handles and the store the desktop's
+// enrichment matched (where BPM/key came from). Only providers with a brand
+// mark, in display order. A Tidal-sourced item has no page URL to hand the
+// browser (the player owns it), so it shows the mark without a link.
+function itemSources(item: FeedItem): { provider: string; url: string | null }[] {
+	const urls = new Map<string, string | null>();
+	const add = (provider: string, url: string | null | undefined): void => {
+		if (!brandIcon(provider)) return;
+		if (!urls.has(provider) || (!urls.get(provider) && url)) urls.set(provider, url ?? null);
+	};
+	if (item.source === 'spotify') add('spotify', item.payload.url ?? `https://open.spotify.com/${item.type === 'track' ? 'track' : 'album'}/${item.sourceId}`);
+	if (item.source === 'tidal') add('tidal', null);
+	for (const h of item.payload.handles ?? []) add(h.provider, h.url);
+	for (const l of item.payload.sourceLinks ?? []) add(l.source, l.url);
+	return BRAND_ORDER.filter((p) => urls.has(p)).map((p) => ({ provider: p, url: urls.get(p)! }));
+}
+
+// Attribution chip text: which follow brought this item.
+function originLabel(item: FeedItem): string {
+	const o = item.origin;
+	if (!o) return '';
+	switch (o.kind) {
+		case 'playlist': return `new in ${o.name}`;
+		case 'label': return `new on ${o.name}`;
+		case 'genre': return o.rank ? `#${o.rank} in ${o.name}` : `charting in ${o.name}`;
+		default: return `new release · ${o.name}`;
+	}
+}
+
+const ORIGIN_PREFIX: Partial<Record<FeedOrigin['kind'], string>> = { artist: 'Artist: ', label: 'Label: ', genre: 'Genre: ' };
+
+// Tooltip body for the "+N sources" badge — every follow that surfaced the
+// item, one per line (kinds prefixed so a mixed list reads clearly).
 function sourcesTooltip(item: FeedItem): string {
 	const list = item.sources ?? (item.origin ? [item.origin] : []);
-	const lines = list.map((o) => (o.kind === 'artist' ? `Artist: ${o.name}` : o.name));
+	const lines = list.map((o) => `${ORIGIN_PREFIX[o.kind] ?? ''}${o.name}`);
 	return ['Sources:', ...lines].join('\n');
 }
 
@@ -220,15 +289,19 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	const [nextCursor, setNextCursor] = createSignal<string | null>(null);
 	const [loading, setLoading] = createSignal(false);
 	const [refreshing, setRefreshing] = createSignal(false);
-	// Temporary: id of the single producer currently mid-refresh (Refresh
-	// Artists / Refresh Playlists), or null. Remove with those buttons.
-	const [refreshingProducer, setRefreshingProducer] = createSignal<string | null>(null);
+	// Any pass in flight, whoever started it (data/feedRefreshStatus.ts).
+	const passRunning = (): boolean => feedRefresh.status().pass !== null;
 	const [total, setTotal] = createSignal(0);
-	// Genre/label feed filter. null = unconstrained. Options come from
-	// feed:filter-options (distinct values across the visible feed); changing
-	// either resets pagination to the first page.
-	const [genreFilter, setGenreFilter] = createSignal<string | null>(null);
-	const [labelFilter, setLabelFilter] = createSignal<string | null>(null);
+	// Standing lenses (core feed/lenses.ts): stored in the synced setting
+	// feed.lenses and applied by core to every page, so the renderer only
+	// shows them as chips and reloads when they change. The genre/label
+	// dropdowns are how the user adds those two kinds; options come from
+	// feed:filter-options (distinct values across the visible feed).
+	const [lenses, setLenses] = createSignal<FeedLens[]>([]);
+	const lensValue = (kind: 'genre' | 'label'): string | null => {
+		const r = lenses().find((l) => l.rule.kind === kind && !l.inert)?.rule;
+		return r && (r.kind === 'genre' || r.kind === 'label') ? r.value : null;
+	};
 	const [filterOptions, setFilterOptions] = createSignal<{ genres: string[]; labels: string[] }>({ genres: [], labels: [] });
 	// 'feed' = the live Discover feed; 'archived' = the set-aside list. The
 	// same card list/pager serves both, switching the source channel.
@@ -279,8 +352,10 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// and tracks whose artist the user muted (`muted` = the detail's
 	// mutedSourceTrackIds). Muted rows stay manually playable — just not
 	// auto-played-into.
-	const firstPlayableTrack = (tracks: readonly FeedTrackRef[], muted?: ReadonlySet<string>): FeedTrackRef | undefined =>
-		tracks.find((t) => !isUnavailable(t.sourceTrackId) && !muted?.has(t.sourceTrackId));
+	// Rows no player here can play (a catalogue track not on Spotify yet) are
+	// skipped too.
+	const firstPlayableTrack = (item: FeedItem, tracks: readonly FeedTrackRef[], muted?: ReadonlySet<string>): FeedTrackRef | undefined =>
+		tracks.find((t) => playableId(item, t) !== null && !isUnavailable(t.sourceTrackId) && !muted?.has(t.sourceTrackId));
 	let loadedOnce = false;
 	// A reset requested while a page load is in flight (first mount + an
 	// immediate history apply) runs once that load settles instead of being
@@ -332,11 +407,15 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			const base = { cursor: reset ? null : nextCursor(), limit: 50 };
 			const page = mode() === 'archived'
 				? await window.api['feed:archived-page'](base)
-				: await window.api['feed:get-page']({ ...base, genre: genreFilter(), label: labelFilter() });
+				: await window.api['feed:get-page'](base);
 			// Skip ids already on screen: a re-ranked item (new source accrued →
 			// order_ts lifted) can cross the keyset cursor between page loads.
 			const have = reset ? null : new Set(items().map((i) => i.id));
 			setItems(have ? [...items(), ...page.items.filter((i) => !have.has(i.id))] : page.items);
+			// The lazy fill: a card without a Spotify id is matched on Spotify as
+			// the page lands (core feed:fill, one at a time; a settled item spends
+			// nothing). The expand path fills the rest.
+			queueFills(page.items.filter((i) => i.source === 'catalog' && (i.matchStatus === null || i.matchStatus !== 'ok')).map((i) => i.id));
 			noteUnavailable(page.items.filter((i) => i.type === 'track' && i.unavailable).map((i) => i.sourceId));
 			setNextCursor(page.nextCursor);
 			setTotal(page.total);
@@ -351,11 +430,61 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		}
 	}
 
+	// Fills asked for by page loads, run one after another (core serialises
+	// them too; this keeps the IPC quiet). The result folds onto the card the
+	// way a live enrichment push does.
+	const fillQueue: string[] = [];
+	const fillQueued = new Set<string>();
+	let filling = false;
+	function queueFills(ids: string[]): void {
+		for (const id of ids) if (!fillQueued.has(id)) { fillQueued.add(id); fillQueue.push(id); }
+		if (filling) return;
+		filling = true;
+		void (async () => {
+			try {
+				for (let id = fillQueue.shift(); id !== undefined; id = fillQueue.shift()) {
+					fillQueued.delete(id);
+					if (!items().some((i) => i.id === id)) continue;
+					try {
+						const updated = await window.api['feed:fill'](id, { enrich: false });
+						if (updated) applyEnriched(updated);
+					} catch { /* best effort: the card keeps its store links */ }
+				}
+			} finally {
+				filling = false;
+			}
+		})();
+	}
+
 	function ensureLoaded(): void {
 		if (loadedOnce) return;
 		loadedOnce = true;
 		void loadPage(true);
 		void loadFilterOptions();
+		void loadLenses();
+	}
+
+	async function loadLenses(): Promise<void> {
+		try {
+			setLenses(await window.api['feed:lenses']());
+		} catch { /* no chips; the page still applies whatever core holds */ }
+	}
+
+	// A lens change from anywhere (a chip here, the assistant, another device):
+	// redraw the chips and reload page 1 — the keyset cursor is lens-specific.
+	// Our own writes come back as an event too; an identical list is skipped.
+	function lensesChanged(next: FeedLens[]): void {
+		if (JSON.stringify(next) === JSON.stringify(lenses())) return;
+		setLenses(next);
+		if (mode() === 'feed') void loadPage(true);
+	}
+
+	async function changeLenses(op: () => Promise<FeedLens[]>, what: string): Promise<void> {
+		try {
+			lensesChanged(await op());
+		} catch (err) {
+			props.onToast(`Couldn’t ${what}`, 'error', err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	// Refresh the genre/label dropdown options. Cheap (two DISTINCT queries);
@@ -366,21 +495,20 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		} catch { /* leave existing options */ }
 	}
 
-	// Apply a genre/label filter change: store it, then reload from the first
-	// page (the keyset cursor is filter-specific, so it can't be reused).
-	function applyFilter(kind: 'genre' | 'label', value: string | null): void {
-		if (kind === 'genre') setGenreFilter(value); else setLabelFilter(value);
-		void loadPage(true);
+	// A dropdown pick becomes that kind's lens (replacing it); "All …" removes it.
+	function pickFilter(kind: 'genre' | 'label', value: string | null): void {
+		if (value) {
+			void changeLenses(() => window.api['feed:add-lens']({ rule: { kind, value } }), `filter by ${kind}`);
+			return;
+		}
+		const lens = lenses().find((l) => l.rule.kind === kind);
+		if (lens) void changeLenses(() => window.api['feed:remove-lens'](lens.id), `clear the ${kind} filter`);
 	}
 
-	const navState = (): DiscoverFeedNavState => ({ archived: mode() === 'archived', genre: genreFilter(), label: labelFilter() });
+	const navState = (): DiscoverFeedNavState => ({ archived: mode() === 'archived' });
 
-	// User-initiated filter / mode changes are history navigations: report
-	// the target state first (props.onNavigate), then apply.
-	function userApplyFilter(kind: 'genre' | 'label', value: string | null): void {
-		props.onNavigate?.({ ...navState(), [kind]: value });
-		applyFilter(kind, value);
-	}
+	// A mode change is a history navigation: report the target state first
+	// (props.onNavigate), then apply.
 	function userSetViewMode(next: 'feed' | 'archived'): void {
 		if (mode() === next) return;
 		props.onNavigate?.({ ...navState(), archived: next === 'archived' });
@@ -392,8 +520,10 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// patches an item already in the list — a dismissed/off-page item is ignored.
 	function applyEnriched(updated: FeedItem): void {
 		if (!items().some((i) => i.id === updated.id)) return;
+		// The same push carries a lazy Spotify match: the row moved to source
+		// 'spotify' with its id, so the card becomes playable in place.
 		setItems(items().map((i) => i.id === updated.id
-			? { ...i, payload: updated.payload, enrichStatus: updated.enrichStatus, enrichedAt: updated.enrichedAt }
+			? { ...i, source: updated.source, sourceId: updated.sourceId, payload: updated.payload, enrichStatus: updated.enrichStatus, enrichedAt: updated.enrichedAt, matchStatus: updated.matchStatus, matchedAt: updated.matchedAt }
 			: i));
 		// A newly surfaced genre/label should appear in the filter dropdowns.
 		const { genre, label } = updated.payload;
@@ -401,50 +531,130 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		if ((genre && !opts.genres.includes(genre)) || (label && !opts.labels.includes(label))) void loadFilterOptions();
 	}
 
-	async function refreshProducers(): Promise<void> {
+	// The progress toasts of the manual passes whose calls are still out. Each
+	// follows the scheduler's status (feed:refresh-status) until its call
+	// returns: a pass can take minutes (a Spotify walk, a slow catalogue) and
+	// was a silent wait before, with one toast at the very end.
+	const passToasts = new Set<{ title: string; toast: ProgressToast }>();
+	// A root of its own: the view's signals live outside the render root.
+	const disposePassToasts = createRoot((dispose) => {
+		createEffect(() => {
+			const body = progressBody(feedRefresh.status());
+			for (const t of passToasts) t.toast.update(t.title, body);
+		});
+		return dispose;
+	});
+
+	// One manual pass with its progress on screen: the toast opens with the
+	// click, shows each source's step while the pass runs (or the background
+	// pass it queued behind), then turns into the result. Null when the call
+	// itself failed.
+	async function runPass(opts: {
+		title: string;
+		call: () => Promise<FeedRefreshResult>;
+		// The result's headline when every source went through.
+		done: (inserted: number) => string;
+		errors: string;
+		failed: string;
+	}): Promise<FeedRefreshResult | null> {
+		const entry = { title: opts.title, toast: props.onProgressToast(opts.title, progressBody(feedRefresh.status())) };
+		passToasts.add(entry);
+		try {
+			const res = await opts.call();
+			const inserted = res.producers.reduce((n, p) => n + p.inserted, 0);
+			const sub = resultBody(res);
+			if (res.producers.some((p) => p.error)) {
+				entry.toast.finish(opts.errors, { kind: 'error', sub, durationMs: 9000 });
+			} else {
+				// A per-source breakdown takes longer to read than one line.
+				entry.toast.finish(opts.done(inserted), { kind: inserted > 0 ? 'success' : 'info', sub, durationMs: sub ? 6000 : undefined });
+			}
+			return res;
+		} catch (err) {
+			entry.toast.finish(opts.failed, { kind: 'error', sub: err instanceof Error ? err.message : String(err), durationMs: 9000 });
+			return null;
+		} finally {
+			passToasts.delete(entry);
+		}
+	}
+
+	// Refresh: the feed's producers now. With a scope (the Refresh menu's
+	// "check now" rows), the catalogue is first asked to check the follows
+	// of that kind on their checked sources — answered in seconds, read by
+	// this computer's worker over the following minutes, the releases
+	// landing in Discover as they are read (the tab pulses meanwhile).
+	async function refreshProducers(scope?: FeedRefreshScope): Promise<void> {
 		if (refreshing()) return;
 		setRefreshing(true);
+		const what = scope?.kind ? `your ${KIND_WORDS[scope.kind]}` : 'everything you follow';
 		try {
-			const res = await window.api['feed:refresh']();
-			const inserted = res.producers.reduce((n, p) => n + p.inserted, 0);
-			const errors = res.producers.filter((p) => p.error);
-			if (errors.length) {
-				props.onToast('Feed refresh finished with errors', 'error', errors.map((e) => `${e.producerId}: ${e.error}`).join('\n'));
-			} else {
-				props.onToast(inserted > 0 ? `${inserted} new items` : 'Feed is up to date', inserted > 0 ? 'success' : 'info');
+			const res = await runPass({
+				title: scope ? `Checking ${what}…` : 'Refreshing Discover…',
+				call: () => window.api['feed:refresh'](scope),
+				done: (n) => {
+					if (n > 0) return `${n} new items`;
+					if (scope) return `Check started — new releases land as they are read`;
+					return 'Feed is up to date';
+				},
+				errors: 'Feed refresh finished with errors',
+				failed: 'Feed refresh failed',
+			});
+			if (!res) return;
+			if (scope && !res.producers.length) {
+				props.onToast(`Nothing reads ${what} while signed out of Curator Cloud`, 'info');
 			}
 			await loadPage(true);
 			void loadFilterOptions();
-		} catch (err) {
-			props.onToast('Feed refresh failed', 'error', err instanceof Error ? err.message : String(err));
 		} finally {
 			setRefreshing(false);
 		}
 	}
 
-	// TEMPORARY (will be removed): poll one Spotify producer on demand. The
-	// producers are registered manual-only (no background polling), so these
-	// buttons — "Refresh Artists" (new releases) and "Refresh Playlists"
-	// (playlist deltas) — are the way to pull ingestion from Spotify by hand.
-	async function refreshOneProducer(producerId: string, label: string): Promise<void> {
-		if (refreshingProducer()) return;
-		setRefreshingProducer(producerId);
+	// The Refresh menu: a "check now" row per kind, each with its sources as
+	// checkboxes — the user's tracking choices (core catalog-worker
+	// /settings.ts). Unchecked means nobody reads that source for the user's
+	// follows, this computer and the cloud alike.
+	async function openRefreshMenu(anchor: HTMLElement): Promise<void> {
+		let sources: Awaited<ReturnType<typeof catalogApi.readSources>>;
 		try {
-			const res = await window.api['feed:refresh-producer'](producerId);
-			const inserted = res.producers.reduce((n, p) => n + p.inserted, 0);
-			const errors = res.producers.filter((p) => p.error);
-			if (errors.length) {
-				props.onToast(`${label} finished with errors`, 'error', errors.map((e) => `${e.producerId}: ${e.error}`).join('\n'));
-			} else {
-				props.onToast(inserted > 0 ? `${label}: ${inserted} new items` : `${label}: up to date`, inserted > 0 ? 'success' : 'info');
-			}
-			await loadPage(true);
-			void loadFilterOptions();
+			sources = await catalogApi.readSources();
 		} catch (err) {
-			props.onToast(`${label} failed`, 'error', err instanceof Error ? err.message : String(err));
-		} finally {
-			setRefreshingProducer(null);
+			props.onToast('Could not read your tracking choices', 'error', err instanceof Error ? err.message : String(err));
+			return;
 		}
+		const items: ContextMenuItem[] = [{ kind: 'header', label: 'Check now' }, { kind: 'item', id: 'check-all', label: 'Everything you follow', chip: 'check now', title: 'Make every follow due now on its checked sources' }];
+		const handlers: Record<string, () => void | Promise<void>> = { 'check-all': () => refreshProducers({ check: true }) };
+		const state = new Map<string, boolean>();
+		for (const r of sources) {
+			items.push({ kind: 'divider' }, { kind: 'item', id: `check-${r.kind}`, label: KIND_TITLES[r.kind], chip: 'check now', title: `Make your ${KIND_WORDS[r.kind]} due now on the checked sources` });
+			handlers[`check-${r.kind}`] = () => refreshProducers({ check: true, kind: r.kind });
+			for (const s of r.sources) {
+				const key = `${r.kind}/${s.provider}`;
+				state.set(key, s.checked);
+				items.push({
+					kind: 'check',
+					id: `src-${key}`,
+					label: providerLabel(s.provider),
+					checked: s.checked,
+					...(s.cloudOnly ? { chip: 'cloud' } : {}),
+					title: s.cloudOnly
+						? 'Only the cloud can read this source (its keys are the cloud’s). Unchecked, nobody reads it for your follows.'
+						: 'Unchecked, nobody reads this source for your follows — not this computer, not the cloud.',
+				});
+				handlers[`src-${key}`] = async () => {
+					const next = !state.get(key);
+					state.set(key, next);
+					try {
+						await catalogApi.setReadSources({ [key]: next });
+						setFollowVersion((v) => v + 1);
+					} catch (err) {
+						props.onToast('Could not save that choice', 'error', err instanceof Error ? err.message : String(err));
+					}
+				};
+			}
+		}
+		items.push({ kind: 'divider' }, { kind: 'header', label: 'Unchecked sources are read by nobody. The computer reading for you this week decides.' });
+		openContextMenu(items, handlers, { anchor, align: 'end', variant: 'popup' });
 	}
 
 	// "Load more" — move every producer's history horizon back by the
@@ -454,20 +664,19 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	async function loadMoreHistory(): Promise<void> {
 		if (loadingMore()) return;
 		setLoadingMore(true);
+		const days = loadMoreDays();
 		try {
-			const res = await window.api['feed:load-more'](loadMoreDays());
-			const inserted = res.producers.reduce((n, p) => n + p.inserted, 0);
-			const errors = res.producers.filter((p) => p.error);
+			const res = await runPass({
+				title: `Loading ${days} more days…`,
+				call: () => window.api['feed:load-more'](days),
+				done: (n) => (n > 0 ? `${n} older items loaded` : `No items in the previous ${days} days`),
+				errors: 'Load more finished with errors',
+				failed: 'Load more failed',
+			});
+			if (!res) return;
 			const last = items()[items().length - 1];
 			if (last) setNextCursor(`${last.publishedAt ?? last.fetchedAt}|${last.id}`);
 			await loadPage(items().length === 0);
-			if (errors.length) {
-				props.onToast('Load more finished with errors', 'error', errors.map((e) => `${e.producerId}: ${e.error}`).join('\n'));
-			} else {
-				props.onToast(inserted > 0 ? `${inserted} older items loaded` : `No items in the previous ${loadMoreDays()} days`, 'info');
-			}
-		} catch (err) {
-			props.onToast('Load more failed', 'error', err instanceof Error ? err.message : String(err));
 		} finally {
 			setLoadingMore(false);
 		}
@@ -499,13 +708,14 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		for (let i = Math.max(0, idx); i < list.length; i++) {
 			const it = list[i]!;
 			if (it.type === 'track') {
-				if (isUnavailable(it.sourceId)) continue;
+				if (isUnavailable(it.sourceId) || !playableId(it)) continue;
 				await play(it);
 				return;
 			}
 			if (it.type === 'album') {
+				if (!cardPlayable(it)) continue;
 				const det = await loadDetail(it);
-				const first = firstPlayableTrack(det?.item.payload.tracks ?? [], new Set(det?.mutedSourceTrackIds));
+				const first = firstPlayableTrack(it, det?.item.payload.tracks ?? [], new Set(det?.mutedSourceTrackIds));
 				if (first) {
 					await play(it, first);
 					return;
@@ -520,8 +730,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		// Idempotent: if this album is already the one playing, don't restart it
 		// from track 1 (e.g. double-clicking its cover/card while it plays).
 		if (lastPlayed()?.itemId === item.id && nowPlaying()) return;
+		if (!cardPlayable(item)) { notOnSpotify(item); return; }
 		const det = await loadDetail(item);
-		const first = firstPlayableTrack(det?.item.payload.tracks ?? [], new Set(det?.mutedSourceTrackIds));
+		const first = firstPlayableTrack(item, det?.item.payload.tracks ?? [], new Set(det?.mutedSourceTrackIds));
 		if (first) await play(item, first);
 		else props.onToast('Album has no playable tracks', 'info');
 	}
@@ -538,7 +749,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			const det = await loadDetail(item);
 			const tracks = det?.item.payload.tracks ?? [];
 			const ti = tracks.findIndex((t) => t.sourceTrackId === lp.sourceTrackId);
-			const nextTrack = ti >= 0 ? firstPlayableTrack(tracks.slice(ti + 1), new Set(det?.mutedSourceTrackIds)) : undefined;
+			const nextTrack = ti >= 0 ? firstPlayableTrack(item, tracks.slice(ti + 1), new Set(det?.mutedSourceTrackIds)) : undefined;
 			if (nextTrack) {
 				await play(item, nextTrack);
 				return;
@@ -710,13 +921,16 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// Library lookup is by name; mute needs the Spotify artist id, which the
 	// feed payload carries position-aligned with the names (absent on
 	// legacy items — then the mute entry is simply not offered).
-	function showArtistMenu(evt: MouseEvent, item: FeedItem, name: string, spotifyId: string | undefined): void {
+	// `artistId` is a Spotify id, or `catalog:<objectId>` for an artist the
+	// catalogue knows without one (mutable all the same, never a Spotify ref).
+	function showArtistMenu(evt: MouseEvent, item: FeedItem, name: string, artistId: string | undefined): void {
+		const spotifyId = isSpotifyArtistId(artistId) ? artistId : undefined;
 		const items: Parameters<typeof openContextMenu>[0] = [
 			{ kind: 'header', label: name },
 			{ kind: 'item', id: 'library', label: 'Show in library' },
 			{ kind: 'item', id: 'journey', label: 'Start journey' },
 		];
-		if (spotifyId) items.push({ kind: 'divider' }, { kind: 'item', id: 'mute', label: `Mute artist: ${name}`, danger: true });
+		if (artistId) items.push({ kind: 'divider' }, { kind: 'item', id: 'mute', label: `Mute artist: ${name}`, danger: true });
 		openContextMenu(items, {
 			library: () => props.onShowArtistInLibrary(name),
 			// Same seed identities the KB already mints: a Spotify artist ref
@@ -725,13 +939,13 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			journey: () => props.onStartJourney(spotifyId
 				? { kind: 'source-ref', source: 'spotify', sourceKind: 'artist', sourceId: spotifyId, entityKind: 'artist', name }
 				: { kind: 'source-ref', source: 'local', sourceKind: 'artist', sourceId: `name:${searchFold(name)}`, entityKind: 'artist', name }),
-			mute: () => { if (spotifyId) void muteArtist(item, spotifyId, name); },
+			mute: () => { if (artistId) void muteArtist(item, artistId, name); },
 		}, { at: evt });
 	}
 
 	// Right-click on an origin chip — the playlist/artist "name" surface.
 	// Browse origins carry no follow, so they fall through to the card menu.
-	function showOriginMenu(evt: MouseEvent, origin: FeedOrigin): void {
+	function showOriginMenu(evt: MouseEvent, origin: FeedOrigin, item: FeedItem): void {
 		evt.preventDefault();
 		evt.stopPropagation();
 		if (origin.kind === 'playlist') {
@@ -745,15 +959,58 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				unfollow: () => { void unfollowPlaylist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
 		} else if (origin.kind === 'artist') {
+			const onSpotify = isSpotifyArtistId(origin.id);
 			openContextMenu([
 				{ kind: 'header', label: origin.name },
-				{ kind: 'item', id: 'open', label: 'Open artist in Spotify' },
-				{ kind: 'divider' },
+				...(onSpotify ? [{ kind: 'item' as const, id: 'open', label: 'Open artist in Spotify' }, { kind: 'divider' as const }] : []),
 				{ kind: 'item', id: 'unfollow', label: 'Unfollow artist', danger: true },
 			], {
 				open: () => { void shellApi.openSpotify(`spotify:artist:${origin.id}`); },
 				unfollow: () => { void unfollowArtist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
+		} else if ((origin.kind === 'label' || origin.kind === 'genre') && origin.catalogId) {
+			const kind = origin.kind;
+			const catalogId = origin.catalogId;
+			openContextMenu([
+				{ kind: 'header', label: origin.name },
+				{ kind: 'item', id: 'mute', label: `Mute ${kind}` },
+				{ kind: 'divider' },
+				{ kind: 'item', id: 'unfollow', label: `Unfollow ${kind}`, danger: true },
+			], {
+				mute: () => { void muteOrigin(item, kind, catalogId, origin.name); },
+				unfollow: () => { void unfollowOrigin(kind, catalogId, origin.name); },
+			}, { at: evt });
+		}
+	}
+
+	// A catalogue label / genre the user follows (a watch): unfollowing it
+	// removes the items it brought that no other follow also credits.
+	async function unfollowOrigin(kind: 'label' | 'genre', catalogId: string, name: string): Promise<void> {
+		try {
+			await window.api['catalog:unfollow'](catalogId);
+			props.onToast(`Unfollowed ${name}`, 'success');
+			void loadPage(true);
+		} catch (err) {
+			props.onToast('Unfollow failed', 'error', err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	// Mute a label: its watch stops bringing releases (core mutes the watch
+	// with the suppression) and what it already brought is hidden. A genre has
+	// no feed-side scope: its watch is muted and this item set aside.
+	async function muteOrigin(item: FeedItem, kind: 'label' | 'genre', catalogId: string, name: string): Promise<void> {
+		try {
+			if (kind === 'label') {
+				const res = await window.api['feed:action']({ kind: 'mute', scopes: [{ scope: 'label', key: `label:${catalogId}` }] });
+				if (!res.ok) throw new Error(res.error ?? 'mute failed');
+			} else {
+				await window.api['catalog:mute'](catalogId, true);
+				await dismiss(item);
+			}
+			props.onToast(`Muted ${name}`, 'success');
+			void loadPage(true);
+		} catch (err) {
+			props.onToast('Mute failed', 'error', err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -865,9 +1122,19 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		}
 	}
 
+	// Nothing here can play it (a catalogue item not on Spotify yet): say so
+	// and point at the store pages it does have.
+	function notOnSpotify(item: FeedItem, track?: FeedTrackRef): void {
+		const links = storeLinks(track?.handles?.length ? track.handles : item.payload.handles);
+		props.onToast('Not on Spotify yet', 'info', links.length > 0 ? `Open it in ${links.map((l) => l.label).join(' or ')} from its menu` : 'The catalogue has not found a playable copy yet');
+	}
+
 	async function play(item: FeedItem, track?: FeedTrackRef): Promise<void> {
-		const sourceTrackId = track ? track.sourceTrackId : item.sourceId;
 		if (item.type !== 'track' && !track) return;
+		// The Spotify id from the item's handles: a catalogue item's sourceId
+		// can be a catalogue id (feedHandles.ts).
+		const sourceTrackId = playableId(item, track);
+		if (!sourceTrackId) { notOnSpotify(item, track); return; }
 		// Already-known dead track — don't bother the player (guards every direct
 		// play path: card click, dblclick, track-row button).
 		if (isUnavailable(sourceTrackId)) { props.onToast('Track unavailable in your region', 'info'); return; }
@@ -945,7 +1212,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				// re-expand of a settled album spends nothing. Fire while the item
 				// is unattempted (null) or last errored — an 'err' album retries
 				// its failed rows on expand; 'ok'/'na' are terminal.
-				if (detail.item.enrichStatus == null || detail.item.enrichStatus === 'err') void enrichExpanded(item.id);
+				if (detail.item.enrichStatus == null || detail.item.enrichStatus === 'err' || detail.item.source === 'catalog') void fillExpanded(item.id);
 				return detail;
 			}
 			after.delete(item.id);
@@ -965,12 +1232,12 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// (so the tracklist rows gain bpm/key) and the list card (so the collapsed
 	// card's genre/label chips light up). Best-effort — a miss leaves the rows
 	// as-is. Guarded by the caller on enrichedAt so this fires at most once.
-	async function enrichExpanded(itemId: string): Promise<void> {
+	async function fillExpanded(itemId: string): Promise<void> {
 		let updated: FeedItem | null = null;
 		try {
-			updated = await window.api['feed:enrich'](itemId);
+			updated = await window.api['feed:fill'](itemId);
 		} catch {
-			return; // enrichment is best-effort; leave the unenriched rows
+			return; // best-effort; leave the rows as they are
 		}
 		if (!updated) return;
 		const det = expanded().get(itemId);
@@ -981,9 +1248,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			next.set(itemId, { ...det, item: updated });
 			setExpanded(next);
 		}
-		setItems(items().map((i) =>
-			i.id === itemId ? { ...i, payload: updated!.payload, enrichedAt: updated!.enrichedAt, enrichStatus: updated!.enrichStatus } : i,
-		));
+		applyEnriched(updated);
 	}
 
 	async function toggleExpand(item: FeedItem): Promise<void> {
@@ -1014,12 +1279,14 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		openSpotifyUrl: (url) => { void shellApi.openSpotify(url); },
 		openSpotifyTrack: (sourceTrackId) => { void shellApi.openSpotify(`spotify:track:${sourceTrackId}`); },
 		openExternal: (url) => { void shellApi.openExternal(url); },
+		unfollowOrigin: (kind, catalogId, name) => { void unfollowOrigin(kind, catalogId, name); },
+		muteOrigin: (item, kind, catalogId, name) => { void muteOrigin(item, kind, catalogId, name); },
 		copySpotifyUrl: (url) => { void shellApi.copyText(url).then(() => props.onToast('Copied Spotify URL', 'success', url)); },
 		isUnavailable,
 		notInterested: (item, libraryTrackId) => { void notInterested(item, libraryTrackId); },
 		openOrganize: (libraryTrackId) => { props.onOpenOrganize([libraryTrackId]); },
 		startJourney: (item, track) => {
-			const sourceId = track?.sourceTrackId ?? (item.type === 'track' ? item.sourceId : null);
+			const sourceId = track || item.type === 'track' ? playableId(item, track) : null;
 			if (!sourceId) return;
 			props.onStartJourney({
 				kind: 'source-ref',
@@ -1134,16 +1401,27 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// the disc is pinned visible as a play/pause control — clicking toggles the
 	// player rather than restarting — and `playing` flips the glyph (pause while
 	// advancing, play while paused). `heard` shows a "listened" tick.
+	// A card nothing here can play (a catalogue item not on Spotify yet) swaps
+	// the disc for its first store page — the way to hear or buy it — until
+	// the catalogue finds it on Spotify and the row becomes playable in place.
 	const CardCover = (p: {
 		item: FeedItem;
 		onActivate: () => void;
 		active?: boolean;
 		playing?: boolean;
 		heard?: boolean;
-	}) => (
+	}) => {
+		const playable = () => cardPlayable(p.item);
+		const store = () => (playable() ? undefined : storeLinks(p.item.payload.handles)[0]);
+		return (
 		<div
 			class="feed-card__cover"
-			onClick={(e) => { e.stopPropagation(); if (p.active) props.onTogglePause(); else p.onActivate(); }}
+			classList={{ 'feed-card__cover--offline': !playable() }}
+			onClick={(e) => {
+				e.stopPropagation();
+				if (!playable()) { const s = store(); if (s) void shellApi.openExternal(s.url); else notOnSpotify(p.item); return; }
+				if (p.active) props.onTogglePause(); else p.onActivate();
+			}}
 			onDblClick={(e) => e.stopPropagation()}
 		>
 			<Show when={p.item.payload.coverUrl} fallback={<div class="feed-card__cover-ph" />}>
@@ -1156,12 +1434,28 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			</Show>
 			{/* The cover div owns the click; this button is the visual disc only
 			    (out of the tab order). Pinned + accent while the card is loaded. */}
-			<button class="feed-card__cover-play" classList={{ 'feed-card__cover-play--active': !!p.active }} title={p.active ? 'Play / pause' : 'Audition'} tabindex={-1}>
-				<Show when={p.playing} fallback={<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20" /></svg>}>
-					<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+			<Show when={playable()} fallback={
+				<Show when={store()}>
+					<button class="feed-card__cover-play feed-card__cover-play--store" title={`Not on Spotify yet — open in ${store()!.label}`} tabindex={-1}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>
+					</button>
 				</Show>
-			</button>
+			}>
+				<button class="feed-card__cover-play" classList={{ 'feed-card__cover-play--active': !!p.active }} title={p.active ? 'Play / pause' : 'Audition'} tabindex={-1}>
+					<Show when={p.playing} fallback={<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 20,12 6,20" /></svg>}>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></svg>
+					</Show>
+				</button>
+			</Show>
 		</div>
+		);
+	};
+
+	// "Not on Spotify" chip for a card nothing here can play yet.
+	const OfflineChip = (p: { item: FeedItem }) => (
+		<Show when={!cardPlayable(p.item)}>
+			<span class="feed-chip feed-chip--offline" title={(() => { const l = storeLinks(p.item.payload.handles); return l.length ? `On ${l.map((x) => x.label).join(', ')}` : 'No playable copy found yet'; })()}>NOT ON SPOTIFY</span>
+		</Show>
 	);
 
 	// "Now playing" chip on the loaded feed card. Static play glyph — no animated
@@ -1199,7 +1493,71 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			: (p.item.publishedAt ?? p.item.fetchedAt);
 		const fmt = () => fmtFeedDate(ts());
 		const title = () => archived() ? `Archived ${fmt().title}` : fmt().title;
-		return <span class="feed-card__date" title={title()}>{fmt().label}</span>;
+		// A followed-playlist card in the live feed says when the track was
+		// added to the playlist and, when the source gave one, its release date.
+		const playlistAdded = () => !archived() && spotifyPlaylistOrigin(p.item) && p.item.publishedAt ? p.item.publishedAt : null;
+		return (
+			<Show when={playlistAdded()} fallback={<span class="feed-card__date" title={title()}>{fmt().label}</span>}>
+				{(added) => (
+					<span class="feed-card__when" title={`Added ${fmtFeedDate(added()).title}`}>
+						Added <b>{fmtAddedWhen(added())}</b>
+						<Show when={fmtReleaseDate(p.item.payload.releaseDate)}>{(rd) => <>, Released <b>{rd()}</b></>}</Show>
+					</span>
+				)}
+			</Show>
+		);
+	};
+
+	// The brand marks at the top-right of a card: one per service the item is
+	// known on (itemSources). Click opens the item there — the Spotify app for
+	// Spotify, the browser for a store. Settings → Discover → Source logos.
+	const CardSources = (p: { item: FeedItem }) => (
+		<Show when={discoverSettingsSignal().showSourceLogos && itemSources(p.item).length > 0}>
+			<span class="feed-card__sources">
+				<For each={itemSources(p.item)}>
+					{(src) => (
+						<button
+							class="feed-card__src"
+							type="button"
+							title={src.url ? `Open on ${providerLabel(src.provider)}` : `On ${providerLabel(src.provider)}`}
+							data-url={src.url ?? undefined}
+							innerHTML={brandIcon(src.provider)}
+							onClick={(e) => {
+								e.stopPropagation();
+								if (!src.url) return;
+								if (src.provider === 'spotify') void shellApi.openSpotify(src.url);
+								else void shellApi.openExternal(src.url);
+							}}
+						/>
+					)}
+				</For>
+			</span>
+		</Show>
+	);
+
+	// "New on <playlist> by <profile>" for a card raised by a followed Spotify
+	// playlist. The playlist name opens it under the Spotify tab, the profile
+	// name opens the profile in the Spotify app; right-click keeps the origin
+	// menu (open / mute / unfollow). The owner rides the origin when the
+	// producer recorded it; older rows fall back to the synced playlist row.
+	const SpotifyPlaylistOrigin = (p: { item: FeedItem; origin: FeedOrigin }) => {
+		const owner = () => {
+			if (p.origin.owner) return p.origin.owner;
+			const pl = library.allPlaylists().find((x) => x.source === 'spotify' && x.sourceId === p.origin.id);
+			return pl?.ownerId ? { id: pl.ownerId, name: pl.ownerName } : undefined;
+		};
+		return (
+			<span
+				class="feed-card__origin feed-card__origin--followable"
+				title="Right-click to mute or unfollow"
+				onContextMenu={(e) => showOriginMenu(e, p.origin, p.item)}
+			>
+				New on <b class="feed-card__link" title="Open the playlist under the Spotify tab" onClick={(e) => { e.stopPropagation(); props.onOpenSpotifyPlaylist(p.origin.id); }}>{p.origin.name}</b>
+				<Show when={owner()}>
+					{(o) => <> by <b class="feed-card__link" title="Open the profile on Spotify" onClick={(e) => { e.stopPropagation(); void shellApi.openSpotify(`spotify:user:${o().id}`); }}>{o().name || o().id}</b></>}
+				</Show>
+			</span>
+		);
 	};
 
 	// Origin attribution chip — followable origins (playlist / artist) right-click
@@ -1210,16 +1568,20 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		const extra = () => Math.max((p.item.sources?.length ?? 0) - 1, 0);
 		return (
 			<>
-				<Show when={p.item.origin}>
+				<Show when={spotifyPlaylistOrigin(p.item)}>
+					{(o) => <SpotifyPlaylistOrigin item={p.item} origin={o()} />}
+				</Show>
+				<Show when={p.item.origin && !spotifyPlaylistOrigin(p.item)}>
 					{(() => {
 						const o = () => p.item.origin!;
-						const followable = () => o().kind === 'playlist' || o().kind === 'artist';
+						// Every follow kind but a bare browse filing has a menu.
+						const followable = () => o().kind !== 'browse' && (o().kind === 'playlist' || o().kind === 'artist' || !!o().catalogId);
 						return (
 							<span
 								class="feed-card__origin"
 								classList={{ 'feed-card__origin--followable': followable() }}
 								title={followable() ? 'Right-click to unfollow' : undefined}
-								onContextMenu={(e) => { if (followable()) showOriginMenu(e, o()); }}
+								onContextMenu={(e) => { if (followable()) showOriginMenu(e, o(), p.item); }}
 							>{originLabel(p.item)}</span>
 						);
 					})()}
@@ -1274,7 +1636,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					onDblClick={(e) => {
 						// Buttons own their own actions — a fast double-tap on
 						// dismiss/interested must not also start playback.
-						if ((e.target as HTMLElement).closest('button')) return;
+						if ((e.target as HTMLElement).closest('button, .feed-card__link')) return;
 						void play(item());
 					}}
 				>
@@ -1282,7 +1644,10 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					<div class="feed-card__body">
 						<div class="feed-card__title-row">
 							<span class="feed-card__title" title={item().payload.title}>{item().payload.title}</span>
-							<span class="feed-chip feed-chip--track">TRACK</span>
+							<Show when={spotifyPlaylistOrigin(item())} fallback={<span class="feed-chip feed-chip--track">TRACK</span>}>
+								<span class="feed-chip feed-chip--sp-playlist" title="From a Spotify playlist you follow"><span class="feed-chip__brand" innerHTML={BRAND_ICONS.spotify} />PLAYLIST</span>
+							</Show>
+							<OfflineChip item={item()} />
 							<Show when={isPlaying()}><PlayingChip /></Show>
 							<Show when={item().playedAt && !isPlaying()}><span class="feed-chip feed-chip--played">LISTENED</span></Show>
 							<Show when={unavailable()}><span class="feed-chip feed-chip--unavailable">UNAVAILABLE</span></Show>
@@ -1293,6 +1658,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 							<Show when={item().membership === 'spotify'}><span class="feed-chip feed-chip--spotify">IN SPOTIFY LIBRARY</span></Show>
 							<Show when={item().membership === 'tidal'}><span class="feed-chip feed-chip--tidal">IN TIDAL LIBRARY</span></Show>
 							<Show when={item().membership === 'followed'}><span class="feed-chip feed-chip--followed">IN FOLLOWED</span></Show>
+							<CardSources item={item()} />
 						</div>
 						<div class="feed-card__artists">
 							<ArtistCredits
@@ -1307,11 +1673,14 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 								item().payload.bpm ? <span class="feed-meta-dj">{Math.round(item().payload.bpm!)} BPM</span> : null,
 								item().payload.keyCamelot ? <KeyChip keyCamelot={item().payload.keyCamelot} /> : null,
 								fmtDuration(item().payload.durationSec) ? <span class="feed-card__dur">{fmtDuration(item().payload.durationSec)}</span> : null,
-								// No DJ metadata landed — show the Beatport outcome (N/A no-match /
-								// ERR failed) so the empty line reads as a known state, not loading.
-								(!item().payload.bpm && !item().payload.genre && !item().payload.label && enrichMarker(item().enrichStatus))
-									? <span class={`feed-meta-enrich feed-meta-enrich--${item().enrichStatus}`}>{enrichMarker(item().enrichStatus)}</span>
-									: null,
+								// Being matched on Spotify or enriched right now: say so.
+								feedActivity.of(item().id)
+									? <span class="feed-meta-enrich feed-meta-enrich--busy">{ACTIVITY_TEXT[feedActivity.of(item().id)!]}</span>
+									// No DJ metadata landed — show the Beatport outcome (N/A no-match /
+									// ERR failed) so the empty line reads as a known state, not loading.
+									: (!item().payload.bpm && !item().payload.genre && !item().payload.label && enrichMarker(item().enrichStatus))
+										? <span class={`feed-meta-enrich feed-meta-enrich--${item().enrichStatus}`}>{enrichMarker(item().enrichStatus)}</span>
+										: null,
 							]} />
 							<div class="feed-card__meta-line">
 								<CardDate item={item()} />
@@ -1322,7 +1691,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					</div>
 					<div class="feed-card__actions">
 						<Show when={feedShow.quickInterested(item(), mode())}>
-							<button class="feed-act feed-act--keep" title="Interested — add to library backlog" onClick={() => void interested(item(), item().sourceId, { pin: true, organize: false })}>
+							<button class="feed-act feed-act--keep" title="Interested — add to library backlog" onClick={() => { const sid = playableId(item()); if (sid) void interested(item(), sid, { pin: true, organize: false }); }}>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14" /></svg>
 							</button>
 						</Show>
@@ -1380,7 +1749,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					onDblClick={(e) => {
 						// Buttons own their own actions — a fast double-tap on
 						// dismiss/interested must not also start playback.
-						if ((e.target as HTMLElement).closest('button')) return;
+						if ((e.target as HTMLElement).closest('button, .feed-card__link')) return;
 						void playAlbum(item());
 					}}
 				>
@@ -1389,8 +1758,10 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						<div class="feed-card__title-row">
 							<span class="feed-card__title" title={item().payload.title}>{item().payload.title}</span>
 							<span class="feed-chip feed-chip--album">{item().payload.albumType === 'single' ? 'SINGLE' : 'ALBUM'}</span>
+							<OfflineChip item={item()} />
 							<Show when={isPlaying()}><PlayingChip /></Show>
 							<Show when={item().playedAt && !isPlaying()}><span class="feed-chip feed-chip--played">LISTENED</span></Show>
+							<CardSources item={item()} />
 						</div>
 						<div class="feed-card__artists">
 							<ArtistCredits
@@ -1402,6 +1773,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 							<MetaLine nodes={[
 								item().payload.genre ? <span>{item().payload.genre}</span> : null,
 								item().payload.label ? <span>{item().payload.label}</span> : null,
+								item().payload.catalogNumber ? <span class="feed-card__catno" title="Catalogue number">{item().payload.catalogNumber}</span> : null,
+								// Being matched on Spotify or enriched right now: say so.
+								feedActivity.of(item().id) ? <span class="feed-meta-enrich feed-meta-enrich--busy">{ACTIVITY_TEXT[feedActivity.of(item().id)!]}</span> : null,
 							]} />
 							<div class="feed-card__meta-line">
 								<CardDate item={item()} />
@@ -1472,14 +1846,19 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 									// Artist of this row is muted: keep it visible + playable, just
 									// flagged and dimmed (and skipped by autoplay — firstPlayableTrack).
 									const muted = () => detail()!.mutedSourceTrackIds.includes(t.sourceTrackId);
+									// Not on Spotify yet: the row opens its store page instead.
+									const offline = () => playableId(detail()!.item, t) === null;
+									const rowStore = () => storeLinks(t.handles?.length ? t.handles : detail()!.item.payload.handles)[0];
 									return (
 										<div
 											class="feed-track"
-											classList={{ 'feed-track--listened': listened(), 'feed-track--playing': playing(), 'feed-track--unavailable': isUnavailable(t.sourceTrackId), 'feed-track--muted': muted() }}
+											classList={{ 'feed-track--listened': listened(), 'feed-track--playing': playing(), 'feed-track--unavailable': isUnavailable(t.sourceTrackId), 'feed-track--muted': muted(), 'feed-track--offline': offline() }}
+											title={offline() ? (rowStore() ? `Not on Spotify yet — double-click to open in ${rowStore()!.label}` : 'Not on Spotify yet') : undefined}
 											onDblClick={(e) => {
 												// Let the row's menu button own its clicks — a double-tap
 												// on it must not also re-trigger playback here.
-												if ((e.target as HTMLElement).closest('button')) return;
+												if ((e.target as HTMLElement).closest('button, .feed-card__link')) return;
+												if (offline()) { const s = rowStore(); if (s) void shellApi.openExternal(s.url); return; }
 												void play(item(), t);
 											}}
 											onContextMenu={(e) => showTrackMenu(e, item(), t)}
@@ -1489,7 +1868,11 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 											    tracklist). The play button is gone — double-click or the
 											    row menu start playback. */}
 											<span class="feed-track__num">
-												<Show when={playing()} fallback={t.trackNumber ?? ''}>
+												<Show when={playing()} fallback={
+													<Show when={offline()} fallback={t.trackNumber ?? ''}>
+														<svg class="feed-track__offline" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-label="not on Spotify"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>
+													</Show>
+												}>
 													<span class="now-playing-eq" aria-label="now playing"><i /><i /><i /><i /></span>
 												</Show>
 											</span>
@@ -1546,36 +1929,28 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					</span>
 				</Show>
 				<Show when={mode() === 'feed' && (!follower() || catalogAvailable())}>
+					{/* The icon turns for any pass in flight, the background poll
+					    included ("Checking…"); the steps are in the progress toast
+					    and on the Discover tab's popover. */}
 					<button class="feed-toolbar__refresh" disabled={refreshing()} onClick={() => void refreshProducers()}>
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>
-						{refreshing() ? 'Refreshing…' : 'Refresh'}
+						<svg classList={{ 'feed-toolbar__icon--spin': refreshing() || passRunning() }} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>
+						{refreshing() ? 'Refreshing…' : passRunning() ? 'Checking…' : 'Refresh'}
 					</button>
-				</Show>
-				<Show when={mode() === 'feed' && !follower()}>
-					{/* TEMPORARY — per-source manual ingestion. Producer ids match
-					    FEED_PRODUCER_IDS in apps/core/src/feed/service.ts. Remove with
-					    refreshOneProducer / refreshingProducer / feed:refresh-producer. */}
-					{/* Followed artists come from the Global Catalog when it is on
-					    (core feed/service.ts retires the local releases producer). */}
-					<Show when={!catalogAvailable()}>
-						<button class="feed-toolbar__refresh" disabled={!!refreshingProducer()}
-							onClick={() => void refreshOneProducer('spotify-new-releases', 'Refresh Artists')}>
-							{refreshingProducer() === 'spotify-new-releases' ? 'Refreshing…' : 'Refresh Artists'}
-						</button>
-					</Show>
-					<button class="feed-toolbar__refresh" disabled={!!refreshingProducer()}
-						onClick={() => void refreshOneProducer('spotify-playlist-delta', 'Refresh Playlists')}>
-						{refreshingProducer() === 'spotify-playlist-delta' ? 'Refreshing…' : 'Refresh Playlists'}
-					</button>
+					{/* The Refresh menu: check now per kind, and which sources are
+					    read for the follows (openRefreshMenu). */}
+					<button class="feed-toolbar__refresh feed-toolbar__refresh-menu" disabled={refreshing()}
+						title="Check your follows now, and choose which sources are read for them"
+						aria-label="Refresh options"
+						onClick={(e) => void openRefreshMenu(e.currentTarget)}>▾</button>
 				</Show>
 				<Show when={mode() === 'feed'}>
-					<select class="feed-toolbar__filter" title="Filter by genre"
-						value={genreFilter() ?? ''} onChange={(e) => userApplyFilter('genre', e.currentTarget.value || null)}>
+					<select class="feed-toolbar__filter" title="Filter by genre (stays until you remove it)"
+						value={lensValue('genre') ?? ''} onChange={(e) => pickFilter('genre', e.currentTarget.value || null)}>
 						<option value="">All genres</option>
 						<For each={filterOptions().genres}>{(g) => <option value={g}>{g}</option>}</For>
 					</select>
-					<select class="feed-toolbar__filter" title="Filter by label"
-						value={labelFilter() ?? ''} onChange={(e) => userApplyFilter('label', e.currentTarget.value || null)}>
+					<select class="feed-toolbar__filter" title="Filter by label (stays until you remove it)"
+						value={lensValue('label') ?? ''} onChange={(e) => pickFilter('label', e.currentTarget.value || null)}>
 						<option value="">All labels</option>
 						<For each={filterOptions().labels}>{(l) => <option value={l}>{l}</option>}</For>
 					</select>
@@ -1592,6 +1967,21 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					Following{followCount() !== null ? ` ${followCount()}` : ''}
 				</button>
 			</div>
+			{/* Standing lenses: each chip is one filter the feed obeys until ×.
+			    The label is the user's own words (or the assistant's quote of
+			    them) — the chip is the confirmation, there is no dialog. */}
+			<Show when={mode() === 'feed' && lenses().length > 0}>
+				<div class="feed-lenses" aria-label="Standing filters">
+					<For each={lenses()}>{(l) => (
+						<span class="feed-lens" classList={{ 'feed-lens--inert': !!l.inert }}
+							title={l.inert ? 'Made on a newer version of Curator — not applied here' : l.by === 'assistant' ? 'Set by the assistant. Stays until you remove it.' : 'Stays until you remove it.'}>
+							<span class="feed-lens__label">{l.label}</span>
+							<button class="feed-lens__x" aria-label={`Remove “${l.label}”`} title="Remove"
+								onClick={() => void changeLenses(() => window.api['feed:remove-lens'](l.id), 'remove the filter')}>×</button>
+						</span>
+					)}</For>
+				</div>
+			</Show>
 			<Show when={showFollowing()}>
 				<FollowingPanel
 					onClose={() => setShowFollowing(false)}
@@ -1666,31 +2056,25 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// Live enrichment push — fold fresh genre/label/bpm onto cards as the
 	// background drain lands them (no manual refresh). Unsubscribed on destroy.
 	const unsubEnriched = window.api.onFeedEnriched?.((item) => applyEnriched(item));
+	const unsubLenses = window.api.onFeedLensesChanged?.((next) => lensesChanged(next));
 	return {
-		destroy: () => { unsubEnriched?.(); dispose(); },
+		destroy: () => { unsubEnriched?.(); unsubLenses?.(); disposePassToasts(); dispose(); },
 		refresh: () => { loadRole(); void loadPage(true); },
 		playNext: () => { void playNextFromLast(); },
 		markUnavailable: (itemId, sourceTrackId) => { void handleUnavailable(itemId, sourceTrackId); },
 		setNowPlaying: (sourceTrackId) => { setNowPlaying(sourceTrackId); },
 		notePlayback: (positionSec, playing) => { notePlayback(positionSec, playing); },
 		openPlayingTrackMenu: (evt) => openPlayingTrackMenu(evt),
-		setFilters: (filters) => {
-			if ('genre' in filters) setGenreFilter(filters.genre ?? null);
-			if ('label' in filters) setLabelFilter(filters.label ?? null);
-			void loadPage(true);
-		},
-		getFilters: () => ({ genre: genreFilter(), label: labelFilter() }),
+		getLenses: () => lenses().map((l) => ({ id: l.id, label: l.label })),
 		getNavState: navState,
 		applyNavState: (next, { reload }) => {
 			const cur = navState();
-			const changed = cur.archived !== next.archived || cur.genre !== next.genre || cur.label !== next.label;
-			if (cur.archived !== next.archived) {
+			const changed = cur.archived !== next.archived;
+			if (changed) {
 				setMode(next.archived ? 'archived' : 'feed');
 				setItems([]);
 				setNextCursor(null);
 			}
-			setGenreFilter(next.genre);
-			setLabelFilter(next.label);
 			// The mount-time self-load already serves an unchanged state — don't
 			// queue a second page-1 fetch behind it.
 			if (changed || (reload && !(loading() && items().length === 0))) void loadPage(true);

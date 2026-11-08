@@ -33,13 +33,13 @@ import { browseForClient } from './browse.js';
 import { withSystemTx, type SystemTx } from '../db/system-tx.js';
 import { CloudError } from '../errors.js';
 import { eventsFor, recentFor, recentForUser } from './events.js';
-import { ingestClaims } from './ingest.js';
+import { ingestClaims, Ingester, type IngestOutcome } from './ingest.js';
 import { detail, resolveRefs, search } from './objects.js';
 import { addWatch, liveTarget, listWatches, refreshNow, removeWatch, setMuted } from './watches.js';
 
 export type CatalogDeps = { db: Db; audit: AuditEmit };
 
-async function gated<T>(deps: CatalogDeps, userId: string, caller: Caller, deviceId: string, fn: (tx: SystemTx) => Promise<T>): Promise<T> {
+export async function gated<T>(deps: CatalogDeps, userId: string, caller: Caller, deviceId: string, fn: (tx: SystemTx) => Promise<T>): Promise<T> {
 	return withSystemTx(deps.db, async (tx) => {
 		await tx.asUser(userId, (q) => gateDevice(q, caller, deviceId));
 		return fn(tx);
@@ -115,19 +115,40 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 	);
 }
 
+// A device's facts-up (reason 'enrichment'): what its Beatport / Traxsource
+// lookups found for a card — bpm, key, genre, label text — and the Spotify
+// ids its lazy match found for a release and its tracks, attached to the
+// objects the catalogue already holds (by the provider's id, the UPC or ISRC
+// with the length guard, or the title / artist / date rules: identity.ts),
+// so every device's card carries them and none re-searches what another
+// found. Never creates an object, never an event, never a follow-up task; a
+// claim naming nothing known is `unknown` (an undefined outcome) and the
+// device moves on.
+async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
+	const ingester = new Ingester(tx, { reason: 'enrichment' });
+	const outcomes: (IngestOutcome | undefined)[] = [];
+	for (const c of claims) {
+		const known = c.kind === 'recording' ? await ingester.attachIfKnown(c, { genres: true }) : c.kind === 'release' ? await ingester.attachIfKnown(c) : null;
+		outcomes.push(known ?? undefined);
+	}
+	return { outcomes, created: 0, attached: ingester.stats.attached };
+}
+
 export async function ingest(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogIngestInput): Promise<CatalogIngestResult> {
 	return gated(deps, userId, caller, input.deviceId, async (tx) => {
 		const producer = `user:${userId}`;
 		const prior = await priorBatch<CatalogIngestResult>(tx, producer, input.idempotencyKey);
 		if (prior) return { ...prior, duplicate: true };
 		const { claims, index, rejected } = parseClaims(input.claims);
-		const r = await ingestClaims(tx, claims, { reason: input.reason satisfies CatalogClientReason });
+		const r = input.reason === 'enrichment' ? await attachFacts(tx, claims) : await ingestClaims(tx, claims, { reason: input.reason satisfies CatalogClientReason });
 		const results: CatalogIngestResult['results'] = input.claims.map((_, i) => {
 			const at = index.indexOf(i);
-			return at === -1 ? { rejected: rejected.get(i) ?? 'invalid' } : { objectId: r.outcomes[at]!.objectId, created: r.outcomes[at]!.created };
+			if (at === -1) return { rejected: rejected.get(i) ?? 'invalid' };
+			const o = r.outcomes[at];
+			return o ? { objectId: o.objectId, created: o.created } : { rejected: 'unknown' };
 		});
 		const result: CatalogIngestResult = { results, created: r.created, attached: r.attached, duplicate: false };
-		if (input.reason === 'library_import') await queueLibraryFollowUps(tx, r.outcomes, { profileLabels: false });
+		if (input.reason === 'library_import') await queueLibraryFollowUps(tx, r.outcomes.filter((o): o is IngestOutcome => o !== undefined), { profileLabels: false });
 		await recordBatch(tx, producer, input.idempotencyKey, input.reason, claims.length, r.created, r.attached, result);
 		deps.audit('catalog_ingested', { reason: input.reason, claims: claims.length, rejected: rejected.size, created: r.created, attached: r.attached });
 		return result;

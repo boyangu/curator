@@ -4,11 +4,13 @@
 import { describe, expect, it } from 'vitest';
 import type { CatalogEventTrackCardV1 } from '@curator/protocol';
 import { createLogger } from '../log.js';
+import { connectLocal } from '../spotify/gateway.js';
 import { createTestApp, type TestApp } from '../test/harness.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyUserPlaylistTracker } from './trackers/spotify-user-playlist.js';
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyUserPlaylistTracker } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
 
+import { gatewayPlaylistToken } from './spotify-app-token.js';
 const quiet = createLogger(() => {});
 const VERIFIER = 'pkce-verifier-'.padEnd(64, 'x');
 const REDIRECT = 'http://127.0.0.1:43821/spotify/callback';
@@ -57,7 +59,7 @@ async function setup(connectSpotify = true) {
 	return { app, fan, playlistId: w.watch.object.id };
 }
 
-const tracker = (app: TestApp, fetch: FetchLike) => new SpotifyUserPlaylistTracker({ db: app.db, log: quiet, gateway: app.deps.spotify! }, fetch);
+const tracker = (app: TestApp, fetch: FetchLike) => new SpotifyUserPlaylistTracker({ token: gatewayPlaylistToken({ db: app.db, log: quiet, gateway: app.deps.spotify! }) }, fetch);
 const run = (app: TestApp, fetch: FetchLike) => runTrackers({ db: app.db, log: quiet, adapters: [tracker(app, fetch)], holder: 'test', sleep: async () => {} });
 const settle = (app: TestApp) => app.pg.query(`update curator.catalog_event set first_seen_at = first_seen_at - interval '5 minutes'`);
 const due = (app: TestApp) => app.pg.query(`update curator.catalog_cursor set next_due_at = now() - interval '1 minute'`);
@@ -101,5 +103,15 @@ describe('Spotify playlists in the catalogue', () => {
 		expect(pass).toMatchObject({ claimed: 1, failed: 1, events: 0 });
 		const [cur] = await app.db.query<{ last_error: string }>(`select last_error from curator.catalog_cursor`);
 		expect(cur!.last_error).toMatch(/no watcher/);
+	});
+
+	it('reads with a login the local catalogue keeps itself, connected with no device', async () => {
+		const { app, fan } = await setup(false);
+		const deps = { db: app.db, log: quiet, audit: () => {}, gateway: app.deps.spotify! };
+		const status = await connectLocal(deps, fan.userId, { code: app.spotify!.authorize(VERIFIER, REDIRECT), codeVerifier: VERIFIER, redirectUri: REDIRECT });
+		expect(status).toMatchObject({ connected: true, needsReconnect: false });
+		const state = { snapshot: 's1', entries: [{ id: '2', name: 'Fresh Add', addedDaysAgo: 2 }] };
+		const [pass] = await run(app, fakeApi(state).fetch);
+		expect(pass).toMatchObject({ polled: 1, events: 1, failed: 0 });
 	});
 });

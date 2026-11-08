@@ -14,6 +14,7 @@ mod controllers;
 mod convert;
 mod decode;
 mod engine;
+mod mmcss;
 mod protocol;
 mod wav_writer;
 

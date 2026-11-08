@@ -315,6 +315,15 @@ describe('protocol v3: set-meta and the master device setting', () => {
 		expect(safeParseOp({ ...s, schema_version: 3 }).ok).toBe(true);
 	});
 
+	it('stamps the feed.lenses setting v6 and refuses it below (a v5 reader holds it aside)', () => {
+		expect(SCHEMA_VERSION).toBe(6);
+		expect(isAccountSettingKey('feed.lenses')).toBe(true);
+		expect(opSchemaVersion({ entity: 'setting', kind: 'set', entity_id: 'feed.lenses' })).toBe(6);
+		const s = { ...envelope('setting', 'set', 'feed.lenses', { value: [{ id: 'l1', label: 'x', rule: { kind: 'genre', value: 'House' }, by: 'user', createdAt: 1 }] }), schema_version: 5 };
+		expect(safeParseOp(s)).toMatchObject({ ok: false, error: { reason: 'invalid_payload' } });
+		expect(safeParseOp({ ...s, schema_version: 6 }).ok).toBe(true);
+	});
+
 	it('takes only http(s) cover urls and whole-number counts', () => {
 		const bad = (p: Record<string, unknown>) => safeParseOp(envelope('library_track', 'set-meta', REC_A, { ...meta, ...p })).ok;
 		expect(bad({ cover_url: 'file:///C:/covers/a.jpg' })).toBe(false);
@@ -401,8 +410,7 @@ describe('protocol v5: set-analysis', () => {
 	const a = (p as { analysis: Record<string, unknown> }).analysis;
 	const ok = (payload: unknown, version = SCHEMA_VERSION) => safeParseOp({ ...envelope('library_track', 'set-analysis', id, payload), schema_version: version }).ok;
 
-	it('is v5, stamped 5; a v4 client must hold it, so it is refused stamped 4', () => {
-		expect(SCHEMA_VERSION).toBe(5);
+	it('stamps set-analysis 5; a v4 client must hold it, so it is refused stamped 4', () => {
 		expect(MIN_SUPPORTED_SCHEMA_VERSION).toBe(1);
 		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-analysis' })).toBe(5);
 		expect(opSchemaVersion({ entity: 'library_track', kind: 'set-attrs' })).toBe(4);

@@ -13,6 +13,7 @@
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from 'solid-js';
 import type { CatalogClientStatus, CatalogSearchHit, CatalogWatch } from '@curator/core';
 import { catalogApi, shellApi } from '../data/api.js';
+import { providerLabel } from '../features/feedHandles.js';
 
 export interface FollowingPanelProps {
 	onClose: () => void;
@@ -24,22 +25,6 @@ export interface FollowingPanelProps {
 	// Bumped when follows changed elsewhere (the modal): reload the list.
 	version: () => number;
 }
-
-const PROVIDER_LABEL: Record<string, string> = {
-	spotify: 'Spotify',
-	deezer: 'Deezer',
-	youtube: 'YouTube',
-	beatport: 'Beatport',
-	musicbrainz: 'MusicBrainz',
-	discogs: 'Discogs',
-	soundcloud: 'SoundCloud',
-	tidal: 'Tidal',
-	bandcamp: 'Bandcamp',
-	traxsource: 'Traxsource',
-	instagram: 'Instagram',
-	website: 'Website',
-	user: 'by name',
-};
 
 const looksLikeLink = (s: string): boolean => /^(https?:\/\/|spotify:)/i.test(s.trim());
 
@@ -59,20 +44,25 @@ function errorText(e: unknown): string {
 	return msg.replace(/^Error invoking remote method '[^']+': (\w+Error: )?/, '');
 }
 
-// How the cloud is following an object, in one line.
-function trackingLine(w: CatalogWatch): string {
+// How the cloud is following an object, in one line. `off`: the sources
+// the user switched off for this kind in the Discover Refresh menu (nobody
+// reads them), named so a silent source is not taken for a broken one.
+function trackingLine(w: CatalogWatch, off: readonly string[] = []): string {
 	if (w.muted) return 'Muted: releases are not shown';
+	const offNote = off.length ? ` · ${off.map(providerLabel).join(', ')} off` : '';
 	// A Spotify playlist is read by this computer's Spotify login until the
 	// cloud has polled it cleanly (core service.ts deviceTrackedPlaylists).
 	if (w.object.kind === 'playlist' && w.object.handles.some((h) => h.provider === 'spotify')
 		&& !w.tracking.some((t) => t.provider === 'spotify' && t.lastRunAt !== null && !t.failing)) {
 		return 'Spotify · tracked on this computer';
 	}
-	if (!w.tracking.length) return w.object.kind === 'artist' ? 'Waiting to be tracked' : 'Not tracked yet';
-	const failing = w.tracking.filter((t) => t.failing).map((t) => PROVIDER_LABEL[t.provider] ?? t.provider);
-	const last = Math.max(...w.tracking.map((t) => t.lastRunAt ?? 0));
-	const via = w.tracking.map((t) => PROVIDER_LABEL[t.provider] ?? t.provider).join(' + ');
-	return `${via} · checked ${ago(last || null)}${failing.length ? ` · ${failing.join(', ')} failing` : ''}`;
+	if (!w.tracking.length) return `${w.object.kind === 'artist' ? 'Waiting to be tracked' : 'Not tracked yet'}${offNote}`;
+	const on = w.tracking.filter((t) => !off.includes(t.provider));
+	if (!on.length) return `Switched off in the Refresh menu: nobody reads ${off.map(providerLabel).join(', ')} for it`;
+	const failing = on.filter((t) => t.failing).map((t) => providerLabel(t.provider));
+	const last = Math.max(...on.map((t) => t.lastRunAt ?? 0));
+	const via = on.map((t) => providerLabel(t.provider)).join(' + ');
+	return `${via} · checked ${ago(last || null)}${failing.length ? ` · ${failing.join(', ')} failing` : ''}${offNote}`;
 }
 
 export function FollowingPanel(props: FollowingPanelProps) {
@@ -84,6 +74,15 @@ export function FollowingPanel(props: FollowingPanelProps) {
 	const [busy, setBusy] = createSignal<string | null>(null);
 	const [filter, setFilter] = createSignal('');
 	const [importing, setImporting] = createSignal(false);
+	// The sources switched off per kind (the Discover Refresh menu), so the
+	// line under a follow can say "Beatport off" rather than look stuck.
+	const [offSources, setOffSources] = createSignal<Record<string, string[]>>({});
+	const offFor = (kind: string): string[] => offSources()[kind] ?? [];
+	const loadOff = (): void => {
+		void catalogApi.readSources?.()
+			.then((rs) => setOffSources(Object.fromEntries(rs.map((r) => [r.kind, r.sources.filter((s) => !s.checked).map((s) => s.provider)]))))
+			.catch(() => {});
+	};
 
 	const loadWatches = async (): Promise<void> => {
 		try {
@@ -96,12 +95,14 @@ export function FollowingPanel(props: FollowingPanelProps) {
 	};
 
 	onMount(() => {
+		loadOff();
 		void catalogApi.status().then((s) => {
 			setStatus(s);
 			if (s.available) void loadWatches();
 		});
 	});
 	createEffect(on(props.version, () => {
+		loadOff();
 		if (status()?.available) void loadWatches();
 	}, { defer: true }));
 
@@ -240,7 +241,7 @@ export function FollowingPanel(props: FollowingPanelProps) {
 
 	const Providers = (p: { list: string[] }) => (
 		<span class="following-providers">
-			<For each={p.list}>{(prov) => <span class={`following-chip following-chip--${prov}`}>{PROVIDER_LABEL[prov] ?? prov}</span>}</For>
+			<For each={p.list}>{(prov) => <span class={`following-chip following-chip--${prov}`}>{providerLabel(prov)}</span>}</For>
 		</span>
 	);
 
@@ -368,13 +369,13 @@ export function FollowingPanel(props: FollowingPanelProps) {
 														<span class="following-row__name" title={w.object.name}>{w.object.name}</span>
 														<span class="following-row__sub">
 															<Providers list={[...new Set(w.object.handles.map((x) => x.provider))]} />
-															<span class="following-row__meta" classList={{ 'following-row__meta--warn': w.tracking.some((t) => t.failing) }}>{trackingLine(w)}</span>
+															<span class="following-row__meta" classList={{ 'following-row__meta--warn': w.tracking.some((t) => t.failing) }}>{trackingLine(w, offFor(w.object.kind))}</span>
 														</span>
 													</div>
 													<div class="following-row__acts">
 														<Show when={w.object.handles.find((x) => x.url)}>
 															{(hd) => (
-																<button class="following-icon" title={`Open on ${PROVIDER_LABEL[hd().provider] ?? hd().provider}`} onClick={() => void shellApi.openExternal(hd().url!)}>
+																<button class="following-icon" title={`Open on ${providerLabel(hd().provider)}`} onClick={() => void shellApi.openExternal(hd().url!)}>
 																	<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" /></svg>
 																</button>
 															)}

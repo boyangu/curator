@@ -28,12 +28,11 @@ import { storeRef } from './agent-import.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
 import { applyReleaseClaims, storeClaims, type StoreReaders } from './store-links.js';
-import type { BandcampTracker } from './trackers/bandcamp.js';
-import type { BeatportTracker } from './trackers/beatport.js';
-import type { DeezerTracker } from './trackers/deezer.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
-import { fetchAlbums, type SpotifyAppTracker } from './trackers/spotify-app.js';
-
+import type { BandcampTracker } from '@curator/catalog-readers';
+import type { BeatportTracker } from '@curator/catalog-readers';
+import type { DeezerTracker } from '@curator/catalog-readers';
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
+import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
 export type ReleaseScope = { labelId?: string; artistId?: string; ids?: string[] };
 
 export type ReleaseStub = {

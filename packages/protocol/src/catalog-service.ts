@@ -63,11 +63,37 @@ export const CATALOG_ID_NAMESPACES = ['isrc', 'upc', 'mbid_artist', 'mbid_label'
 export type CatalogIdNamespace = (typeof CATALOG_ID_NAMESPACES)[number];
 
 // Why a batch of claims arrived. Only trackers raise events; the reasons a
-// device may send are the three below, the rest are the server's own.
+// device may send are the four below, the rest are the server's own. A
+// device's 'enrichment' is facts-up (what its Beatport/Traxsource lookups
+// found for a card): fill-only, attached to recordings the catalogue already
+// has, never an object or an event.
 export const CATALOG_INGEST_REASONS = ['library_import', 'playlist_import', 'manual_registration', 'tracker', 'enrichment', 'migration'] as const;
 export type CatalogIngestReason = (typeof CATALOG_INGEST_REASONS)[number];
-export const CATALOG_CLIENT_REASONS = ['library_import', 'playlist_import', 'manual_registration'] as const satisfies readonly CatalogIngestReason[];
+export const CATALOG_CLIENT_REASONS = ['library_import', 'playlist_import', 'manual_registration', 'enrichment'] as const satisfies readonly CatalogIngestReason[];
 export type CatalogClientReason = (typeof CATALOG_CLIENT_REASONS)[number];
+
+// What each live kind can be read on (the catalogue's trackers, kind ×
+// provider), and which of those only the cloud reads (their keys are the
+// cloud's). The user's Refresh menu offers exactly these; a device's worker
+// offers its checked ones; the master leases by them. `cloudOnly` sources
+// are still the user's to switch off: unchecked means nobody reads it.
+// The kinds with trackers of their own (a chart is read through its genre).
+export const CATALOG_TRACKING_KINDS = ['artist', 'label', 'playlist', 'genre'] as const satisfies readonly CatalogLiveKind[];
+export type CatalogTrackingKind = (typeof CATALOG_TRACKING_KINDS)[number];
+export type CatalogTracker = `${CatalogTrackingKind}/${CatalogProvider}`;
+export const CATALOG_TRACKERS: readonly { kind: CatalogTrackingKind; provider: CatalogProvider; cloudOnly: boolean }[] = [
+	{ kind: 'artist', provider: 'spotify', cloudOnly: false },
+	{ kind: 'artist', provider: 'deezer', cloudOnly: false },
+	{ kind: 'label', provider: 'spotify', cloudOnly: false },
+	{ kind: 'label', provider: 'deezer', cloudOnly: false },
+	{ kind: 'label', provider: 'beatport', cloudOnly: false },
+	{ kind: 'label', provider: 'bandcamp', cloudOnly: false },
+	{ kind: 'label', provider: 'soundcloud', cloudOnly: true },
+	{ kind: 'label', provider: 'youtube', cloudOnly: true },
+	{ kind: 'playlist', provider: 'spotify', cloudOnly: false },
+	{ kind: 'genre', provider: 'beatport', cloudOnly: false },
+];
+export const trackerKey = (kind: CatalogTrackingKind, provider: CatalogProvider): CatalogTracker => `${kind}/${provider}`;
 
 // Facts a claim may carry. Raw provider values: the catalogue keeps each
 // source's value and folds them into the object's current attributes.
@@ -189,8 +215,13 @@ export type CatalogHandle = { provider: CatalogProvider; id: string; url: string
 
 // The card frozen into an event when it is raised: a device renders it as is,
 // with no call back to the catalogue. Versioned: a device that meets a newer
-// version than it knows shows a generic card instead of misreading it.
-export const CATALOG_EVENT_CARD_VERSION = 1;
+// version than it knows shows nothing for it instead of misreading it. v2
+// (2026-11-05) is a strict superset of v1 — the facts a DJ card shows (BPM,
+// key, per-track genres, catalogue number, UPC; the label on a track card) —
+// so a v2 reader takes stored v1 cards with those facts empty. Events keep
+// the card they were raised with; a re-announce rebuilds it at the current
+// version.
+export const CATALOG_EVENT_CARD_VERSION = 2;
 export type CatalogEventCardV1 = {
 	version: 1;
 	// A release card; absent on cards raised before track cards existed.
@@ -232,7 +263,29 @@ export type CatalogEventTrackCardV1 = {
 	rank: number | null;
 	addedAt: number | null;
 };
-export type CatalogEventCard = CatalogEventCardV1 | CatalogEventTrackCardV1 | { version: number; kind?: string; title?: string };
+// v2 additions. `key` is the catalogue's folded value in the provider's own
+// notation ("A Minor", "F♯ min"); a device converts it. `genres` are the
+// recording's canonical genre names (Beatport's genre and sub-genre).
+export type CatalogEventTrackFactsV2 = { bpm: number | null; key: string | null; genres: string[] };
+export type CatalogEventCardV2 = Omit<CatalogEventCardV1, 'version' | 'tracks'> & {
+	version: 2;
+	catalogNumber: string | null;
+	upc: string | null;
+	tracks: (CatalogEventCardV1['tracks'][number] & CatalogEventTrackFactsV2)[];
+};
+export type CatalogEventTrackCardV2 = Omit<CatalogEventTrackCardV1, 'version'> &
+	CatalogEventTrackFactsV2 & {
+		version: 2;
+		// The label of the release the recording sits on, when the catalogue
+		// knows one (an entity, or a bare string with id null).
+		label: { id: string | null; name: string } | null;
+	};
+export type CatalogEventCard =
+	| CatalogEventCardV1
+	| CatalogEventCardV2
+	| CatalogEventTrackCardV1
+	| CatalogEventTrackCardV2
+	| { version: number; kind?: string; title?: string };
 
 export type CatalogEvent = {
 	seq: number;
@@ -407,6 +460,158 @@ export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.
 export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional() }).strict();
 export const ZFeedRecentInput = z.object({ deviceId: ZDeviceId, days: z.number().int().min(1).max(FEED_RECENT_MAX_DAYS) }).strict();
 
+// ── workers ('catalog_workers') ─────────────────────────────────────────────
+//
+// A desktop reads the catalogue's providers for the objects its user follows
+// and reports each poll; the cloud keeps the cursors, budgets, ingest and
+// events, and applies a reported poll exactly as it applies its own. One
+// worker per user per week: the first device to ask holds it, a second idles
+// (`active: false`), a holder silent for hours or past the week is replaced.
+//
+// `CatalogTrackerTarget` / `CatalogTrackerPoll` are the reader contract
+// (@curator/catalog-readers aliases them): what one poll of one live object
+// takes, and what it found.
+
+export type CatalogTrackerTarget = {
+	object: { id: string; kind: CatalogKind; name: string };
+	// The object's id on this provider; null for a tracker that works by name.
+	representation: { providerId: string; url: string | null } | null;
+	// What the reader returned as `cursor` last time ({} at first).
+	cursor: Record<string, unknown>;
+	// Other objects the poll reads through, loaded by the sweep: a label's
+	// catalogue playlists for the Spotify label tracker.
+	related?: { providerId: string; url: string | null }[];
+};
+
+export type CatalogTrackerPoll = {
+	// The children found (releases, mostly), as claims.
+	children: CatalogClaim[];
+	// A digest of the listing: unchanged since the last poll means nothing to
+	// ingest, so a quiet artist costs one call and one cursor update.
+	listingHash: string;
+	cursor: Record<string, unknown>;
+	// Provider calls this poll made, against the day's budget.
+	calls: number;
+	// The tracked object's own current representation (name, image), applied
+	// in place: a live object's details are not history.
+	self?: CatalogClaim;
+	// A chart poll (a genre's top list): per entry, the child (by index into
+	// `children`, a release carrying the charted track) and the track's rank.
+	chart?: { index: number; rank: number; recording: CatalogRef }[];
+	// Uploads (a label's channel or profile): a claim here is attached to the
+	// recording it names when the catalogue already knows one, and is
+	// otherwise not an object at all but an announcement signal on the
+	// tracked object. A premiere video is not a release until a release is.
+	tentative?: CatalogClaim[];
+	// The children are releases of the tracked label even though no label
+	// entity rides on them (a label's catalogue playlist): the sweep ties each
+	// to it with a release-label edge.
+	labelOf?: boolean;
+	// The id the provider's API knows the object by, when the stored
+	// representation still carried a slug the poll had to resolve: the sweep
+	// re-points the representation before ingesting.
+	resolvedId?: string;
+};
+
+export type CatalogProviderPause = { provider: CatalogProvider; until: number };
+
+// Every minute while the app runs: the providers this device can read now
+// (Spotify only while its login vends), the trackers its user has checked
+// (CATALOG_TRACKERS; cloud-only ones included, so the master knows they are
+// wanted), the providers it has parked after a rate limit of its own, so the
+// master hands it nothing of those, and — on a Refresh — a check: the user's
+// follows of that kind (every checked kind without one) on the checked
+// sources become due now, read within the hour left alone, and are leased
+// by this same call.
+export type CatalogWorkerDueInput = {
+	deviceId: string;
+	providers: CatalogProvider[];
+	trackers: CatalogTracker[];
+	paused?: CatalogProviderPause[];
+	check?: { kind?: CatalogTrackingKind };
+};
+// Per provider, what became of the cursors a check named: due now (queued),
+// due anyway, read within the hour, being read, or on a provider that asked
+// the master to wait (`pauses` says until when).
+export type CatalogCheckProvider = { provider: CatalogProvider; queued: number; alreadyDue: number; recent: number; reading: number; paused: number };
+export type CatalogCheckReport = { queued: number; byProvider: CatalogCheckProvider[]; pauses: CatalogProviderPause[] };
+export type CatalogWorkerTask = {
+	objectId: string;
+	provider: CatalogProvider;
+	kind: CatalogKind;
+	target: CatalogTrackerTarget;
+	// The tracker's pacing between polls of one provider, and the poll's timeout.
+	minGapMs: number;
+	timeoutMs: number;
+};
+export type CatalogWorkerDueResult = {
+	// False while another device of the account is the week's worker.
+	active: boolean;
+	weekEndsAt: number;
+	// Leased to this device for ten minutes: report them, or they lapse back.
+	tasks: CatalogWorkerTask[];
+	// Providers paused on the master's side of this device's reads.
+	pauses: CatalogProviderPause[];
+	// What the call's `check` did, when it carried one.
+	check?: CatalogCheckReport;
+};
+export type CatalogWorkerOutcome = { poll: CatalogTrackerPoll } | { error: { message: string; rateLimitedSec: number | null } };
+export type CatalogWorkerReportInput = { deviceId: string; results: { objectId: string; provider: CatalogProvider; outcome: CatalogWorkerOutcome }[] };
+// `stale`: results whose lease this device no longer held (lapsed, or a
+// resend after a timeout); nothing of theirs was applied.
+export type CatalogWorkerReportResult = { applied: number; stale: number; events: number };
+
+export const CATALOG_WORKER_MAX_RESULTS = 100;
+// A chart carries 100 entries; a first read of a long listing a few hundred.
+const CATALOG_POLL_MAX_CHILDREN = 500;
+// The cursor is stored as given (`rememberSeen` keeps 300 ids).
+const CATALOG_POLL_MAX_CURSOR_BYTES = 64 * 1024;
+
+const ZRepresentation = z.object({ providerId: z.string().trim().min(1).max(200), url: z.string().max(1000).nullable() }).strict();
+const ZCursor = z.record(z.unknown()).refine((c) => JSON.stringify(c).length <= CATALOG_POLL_MAX_CURSOR_BYTES, { message: 'cursor too large' });
+export const ZCatalogTrackerTarget: z.ZodType<CatalogTrackerTarget> = z
+	.object({
+		object: z.object({ id: ZObjectId, kind: ZKind, name: z.string().max(500) }).strict(),
+		representation: ZRepresentation.nullable(),
+		cursor: ZCursor,
+		related: z.array(ZRepresentation).max(100).optional(),
+	})
+	.strict();
+export const ZCatalogTrackerPoll: z.ZodType<CatalogTrackerPoll> = z
+	.object({
+		children: z.array(ZCatalogClaim).max(CATALOG_POLL_MAX_CHILDREN),
+		listingHash: z.string().max(200),
+		cursor: ZCursor,
+		calls: z.number().int().nonnegative().max(10_000),
+		self: ZCatalogClaim.optional(),
+		chart: z.array(z.object({ index: z.number().int().nonnegative(), rank: z.number().int().positive(), recording: ZCatalogRef }).strict()).max(CATALOG_POLL_MAX_CHILDREN).optional(),
+		tentative: z.array(ZCatalogClaim).max(CATALOG_POLL_MAX_CHILDREN).optional(),
+		labelOf: z.boolean().optional(),
+		resolvedId: z.string().trim().min(1).max(200).optional(),
+	})
+	.strict();
+const ZPause = z.object({ provider: ZProvider, until: z.number().int().nonnegative() }).strict();
+const ZTracker = z.custom<CatalogTracker>((v) => typeof v === 'string' && CATALOG_TRACKERS.some((t) => trackerKey(t.kind, t.provider) === v), { message: 'not a tracker' });
+export const ZCatalogWorkerDueInput = z
+	.object({
+		deviceId: ZDeviceId,
+		providers: z.array(ZProvider).max(CATALOG_PROVIDERS.length),
+		trackers: z.array(ZTracker).max(CATALOG_TRACKERS.length),
+		paused: z.array(ZPause).max(CATALOG_PROVIDERS.length).optional(),
+		check: z.object({ kind: z.enum(CATALOG_TRACKING_KINDS).optional() }).strict().optional(),
+	})
+	.strict();
+const ZOutcome: z.ZodType<CatalogWorkerOutcome> = z.union([
+	z.object({ poll: ZCatalogTrackerPoll }).strict(),
+	z.object({ error: z.object({ message: z.string().max(1000), rateLimitedSec: z.number().int().positive().nullable() }).strict() }).strict(),
+]);
+export const ZCatalogWorkerReportInput = z
+	.object({
+		deviceId: ZDeviceId,
+		results: z.array(z.object({ objectId: ZObjectId, provider: ZProvider, outcome: ZOutcome }).strict()).max(CATALOG_WORKER_MAX_RESULTS),
+	})
+	.strict();
+
 // The schemas and the types above must say the same thing.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const _claim: Same<z.infer<typeof ZCatalogClaim>, CatalogClaim> = true;
@@ -416,6 +621,8 @@ const _search: Same<z.infer<typeof ZCatalogSearchInput>, CatalogSearchInput> = t
 const _watch: Same<z.infer<typeof ZCatalogWatchInput>, CatalogWatchInput> = true;
 const _import: Same<z.infer<typeof ZCatalogImportInput>, CatalogImportInput> = true;
 const _events: Same<z.infer<typeof ZFeedEventsInput>, FeedEventsInput> = true;
+const _workerDue: Same<z.infer<typeof ZCatalogWorkerDueInput>, CatalogWorkerDueInput> = true;
+const _workerReport: Same<z.infer<typeof ZCatalogWorkerReportInput>, CatalogWorkerReportInput> = true;
 const _recent: Same<z.infer<typeof ZFeedRecentInput>, FeedRecentInput> = true;
 const _browse: Same<z.infer<typeof ZCatalogBrowseInput>, CatalogBrowseInput> = true;
 void [_claim, _ingest, _resolve, _search, _watch, _import, _events, _recent, _browse];

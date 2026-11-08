@@ -162,3 +162,29 @@ describe('fillAlbumTrackIsrcs', () => {
 		expect(refs[1]!.artistIds).toBeUndefined();
 	});
 });
+
+describe('catalogue drafts in the pipeline', () => {
+	it('a draft held under one of its aliases is a repeat', async () => {
+		const accrued: string[] = [];
+		const stage: FeedStage = new FeedDedupFilter({
+			existingDedupeKeys: async (keys) => new Set(keys.filter((k) => k === 'spotify:album:al1')),
+			accrueSources: async (ds) => { accrued.push(...ds.map((d) => d.dedupeKey)); },
+		});
+		const d: FeedItemDraft = { ...albumDraft('al1', 'A'), dedupeKey: 'catalog:release:rel1', aliasKeys: ['spotify:album:al1'] };
+		expect(await stage.run([d], CTX)).toEqual([]);
+		expect(accrued).toEqual(['catalog:release:rel1']);
+	});
+
+	it('the library filter reads a catalogue track’s Spotify id from its handles, and never its catalogue id', async () => {
+		const seen: string[][] = [];
+		const stage: FeedStage = new LibraryFilter(async (keys) => {
+			seen.push(keys.spotifyTrackIds);
+			return { membershipByIsrc: {}, membershipBySpotifyId: { localSpotifyId: 'local' }, pinnedByIsrc: new Set(), pinnedBySpotifyId: new Set(), sourceByIsrc: {}, sourceBySpotifyId: {} };
+		});
+		const onSpotify: FeedItemDraft = { ...trackDraft('localSpotifyId'), payload: { title: 'x', artists: [], handles: [{ provider: 'spotify', id: 'localSpotifyId', url: null }] } };
+		const offSpotify: FeedItemDraft = { ...trackDraft('rec-9'), source: 'catalog', payload: { title: 'y', artists: [], handles: [{ provider: 'beatport', id: '3', url: null }] } };
+		const out = await stage.run([onSpotify, offSpotify], CTX);
+		expect(out.map((d) => d.sourceId)).toEqual(['rec-9']);
+		expect(seen).toEqual([['localSpotifyId']]);
+	});
+});

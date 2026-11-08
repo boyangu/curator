@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { CloudSyncStatusReport } from '@curator/core';
+import type { CatalogWorkerStatus, CloudSyncStatusReport } from '@curator/core';
 import {
-	accountActions, deviceRows, fmtAgo, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM,
+	accountActions, catalogWorkerLine, deviceRows, fmtAgo, MASTER_HINT, MASTER_UNAVAILABLE, masterChoices, remoteOnlyLine, REVOKED_LINE, revokeConfirm, syncLine, UNLINK_CONFIRM,
 	type AccountDevice, type AccountStatus,
 } from './accountModel.js';
 
@@ -143,5 +143,31 @@ describe('account panel: the library status line', () => {
 		expect(fmtAgo(NOW - 3 * 3_600_000, NOW)).toBe('3h ago');
 		expect(fmtAgo(NOW - 2 * 86_400_000, NOW)).toBe('2d ago');
 		expect(fmtAgo(NOW + 5_000, NOW)).toBe('0s ago');
+	});
+});
+
+describe('catalogWorkerLine', () => {
+	const base: CatalogWorkerStatus = { reason: 'ok', active: true, providers: ['spotify', 'deezer'], trackers: ['artist/spotify', 'artist/deezer', 'label/beatport'], weekEndsAt: NOW + 86400_000, lastAskedAt: NOW - 30_000, lastReportAt: null, polled: 0, events: 0, inHand: 0, paused: [], lastError: null, check: null };
+
+	it('says what this computer reads, what the user checked, and what it has done', () => {
+		expect(catalogWorkerLine(base, NOW)).toBe('This computer reads the catalogue’s sources for your follows this week (spotify, deezer) · checked: artists on spotify, deezer; labels on beatport · nothing due yet.');
+		expect(catalogWorkerLine({ ...base, lastReportAt: NOW - 120_000, polled: 14, events: 1 }, NOW)).toBe(
+			'This computer reads the catalogue’s sources for your follows this week (spotify, deezer) · checked: artists on spotify, deezer; labels on beatport · last report 2m ago · 14 read, 1 new release this session.',
+		);
+		expect(catalogWorkerLine({ ...base, trackers: [] }, NOW)).toMatch(/every source unchecked/);
+		expect(catalogWorkerLine({ ...base, check: { at: NOW, queued: 1802, polled: 120 } }, NOW)).toMatch(/reading 120 of 1802 you asked to check/);
+	});
+
+	it('names a pause and an error', () => {
+		const line = catalogWorkerLine({ ...base, paused: [{ provider: 'beatport', until: NOW + 3600_000 }], lastError: 'network' }, NOW);
+		expect(line).toMatch(/beatport paused after a rate limit until \d/);
+		expect(line).toMatch(/last error: network\.$/);
+	});
+
+	it('explains why it is not reading', () => {
+		expect(catalogWorkerLine({ ...base, reason: 'inactive', active: false }, NOW)).toMatch(/^Another of your devices/);
+		expect(catalogWorkerLine({ ...base, reason: 'signed_out' }, NOW)).toMatch(/^Sign in/);
+		expect(catalogWorkerLine({ ...base, reason: 'server_off' }, NOW)).toMatch(/doesn’t hand out/);
+		expect(catalogWorkerLine(null, NOW)).toBe('Catalogue reading: status unavailable.');
 	});
 });

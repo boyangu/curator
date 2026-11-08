@@ -13,6 +13,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListResourcesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { BridgeClient, BridgeUnavailableError } from './bridge-client.js';
+import { toCallResult, toMcpTool } from './tools.js';
 import { log } from './log.js';
 
 const SHIM_VERSION = '0.1.0';
@@ -93,9 +94,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 		tools: [
 			STATUS_TOOL,
 			...(tools ?? []).map((t) => ({
-				name: t.name,
-				description: t.description,
-				inputSchema: t.parameters as { type: 'object'; [k: string]: unknown },
+				...toMcpTool(t),
 				...(UI_ENABLED && WIDGET_TOOLS.has(t.name) ? { _meta: WIDGET_META } : {}),
 			})),
 		],
@@ -126,8 +125,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 			: text('Curator is NOT running. Ask the user to launch the Curator desktop app — tools refresh automatically once it is up.');
 	}
 	try {
-		const result = await bridge.call(name, args ?? {});
-		return text(typeof result === 'string' ? result : JSON.stringify(result));
+		return toCallResult(await bridge.call(name, args ?? {}));
 	} catch (err) {
 		const message = err instanceof BridgeUnavailableError
 			? err.message

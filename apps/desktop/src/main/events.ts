@@ -8,12 +8,21 @@
 
 import { BrowserWindow } from 'electron';
 import type { EventChannels } from '../ipc.js';
+import { mainLog } from './log.js';
 
 // Broadcast to every open window. The default — all current event streams
 // are global app state (sync progress, analyzer ticks, audio position).
+// `send` throws synchronously when the payload isn't structured-cloneable;
+// an event stream must never take its emitter down with it, so the throw
+// is logged (with the channel) rather than propagated.
 export function broadcastEvent<K extends keyof EventChannels>(channel: K, payload: EventChannels[K]): void {
 	for (const w of BrowserWindow.getAllWindows()) {
-		if (!w.isDestroyed()) w.webContents.send(channel, payload);
+		if (w.isDestroyed()) continue;
+		try {
+			w.webContents.send(channel, payload);
+		} catch (err) {
+			mainLog.for('ipc-events').error('broadcast failed', err, { channel });
+		}
 	}
 }
 

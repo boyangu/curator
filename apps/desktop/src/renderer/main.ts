@@ -3,7 +3,7 @@ import type { Track, Playlist, PlaylistFolder, PinnedSearch, SegmentRecord } fro
 import type { ArtistLink, ArtistScope, ArtistSummary } from '@curator/shared';
 import { artistExternalLinks } from './features/artistLinks.js';
 import type { ClearableTrackField } from '@curator/core';
-import type { SyncProgress, DownloadJob, QueueSummary, AuthStatus, ScanProgress, JourneySeed, AgentResultSet, AgentViewCommand, AgentViewContext } from '@curator/core';
+import type { SyncProgress, DownloadJob, QueueSummary, AuthStatus, ScanProgress, JourneySeed, AgentResultSet, AgentViewContext } from '@curator/core';
 import * as player from './player.js';
 import type { PlayerState } from './player.js';
 import { initPlayTracker, setPlayContextProvider } from './play-tracker.js';
@@ -133,13 +133,16 @@ import { agentApi } from './data/agent.js';
 import { downloads } from './data/downloads.js';
 import { syncState } from './data/sync.js';
 import { analysisStatus } from './data/analysisStatus.js';
+import { feedRefresh } from './data/feedRefreshStatus.js';
+import { feedActivity } from './data/feedActivity.js';
+import { statusTooltip } from './features/feedRefreshText.js';
 import { library } from './data/library.js';
 import { tracksData } from './data/tracks.js';
 import { fmtTime, fmtAgo, coverGradient, escapeHtml } from './ui/format.js';
-import { showToast } from './ui/toast.js';
+import { showToast, showProgressToast } from './ui/toast.js';
 import { wireDataEvents } from './data/events.js';
 import { log, installGlobalErrorCapture } from './data/log.js';
-import { backupApi, cloudSyncApi } from './data/api.js';
+import { backupApi, cloudSyncApi, shellApi } from './data/api.js';
 import { initBackupSettingsFeature } from './features/backupSettings.js';
 import { initDeletedTracksSettingsFeature } from './features/deletedTracksSettings.js';
 import { initAccountSettingsFeature } from './features/accountSettings.js';
@@ -1748,14 +1751,32 @@ function startSyncToRekordbox(
 	// emits 'failed' AND throws (so the IPC promise also rejects). Both
 	// signals can arrive on the renderer; we only show one toast.
 	let outcomeHandled = false;
-	syncToRekordboxExportUnsub = window.api.onRekordboxExportEvent((evt) => {
+	const slog = log.for('sync-to-rb');
+	slog.info('starting', { target: target.kind, ids: target.ids.length, resume: !!resolutions });
+	// Named so the IPC outcome below can replay a 'completed' the event
+	// stream didn't deliver (2026-11-08: a zero-op push completed in core
+	// but the modal sat at "Resolving tracks…" with no way out).
+	const onExportEvent = (evt: Parameters<Parameters<typeof window.api.onRekordboxExportEvent>[0]>[0]): void => {
+		if (evt.kind === 'progress') {
+			slog.debug('event', { kind: evt.kind, phase: evt.phase, done: evt.done, total: evt.total });
+		} else {
+			slog.info('event', { kind: evt.kind, outcomeHandled, modalOpen: syncToRekordboxModal?.isOpen() ?? null });
+		}
 		if (evt.kind === 'started') {
 			syncToRekordboxModal?.setProgress('resolve', 0, 1);
 		} else if (evt.kind === 'progress') {
 			syncToRekordboxModal?.setProgress(evt.phase, evt.done, evt.total);
 		} else if (evt.kind === 'completed') {
+			if (outcomeHandled) {
+				slog.info('completed already handled — ignoring duplicate');
+				return;
+			}
 			outcomeHandled = true;
 			const r = evt.result;
+			slog.info('completed', {
+				verifyOk: r.verifyOk, tracksConsidered: r.tracksConsidered, tracksWritten: r.tracksWritten,
+				playlistsWritten: r.playlistsWritten, holds: r.removalsHeld.length, writeFailures: r.writeFailures.length,
+			});
 			// The re-key is committed Curator-side even when verify fails.
 			if (r.created?.rekeyedPlaylistId && target.ids[0]) {
 				void followRekeyedPlaylist(target.ids[0], r.created.rekeyedPlaylistId);
@@ -1879,7 +1900,8 @@ function startSyncToRekordbox(
 				kind: 'error',
 			});
 		}
-	});
+	};
+	syncToRekordboxExportUnsub = window.api.onRekordboxExportEvent(onExportEvent);
 
 	// Fire the IPC. Errors bubble through onSidecarEvent's 'failed' event
 	// above; we don't need to .catch() here — but we do clean up the
@@ -1913,10 +1935,20 @@ function startSyncToRekordbox(
 		key: settings.key ?? undefined,
 		dbPathOverride: settings.dbPathOverride ?? undefined,
 	};
+	// The IPC result is the authoritative completion signal; the event
+	// stream normally gets there first and paints the outcome, but the
+	// result replays it whenever the event didn't land on this listener.
 	const call = resolutions
 		? window.api['sync:resolve-conflicts']({ provider: 'rekordbox', resolutions, ...wireArgs })
-			.then(() => { /* completion surfaced via the export 'completed' event */ })
+			.then((result) => {
+				slog.info('IPC resolved (resume)', { outcomeHandled });
+				if (!outcomeHandled) {
+					slog.warn('completed via IPC result; export event was not delivered');
+					onExportEvent({ kind: 'completed', result });
+				}
+			})
 		: window.api['rekordbox:sync'](wireArgs).then((outcome) => {
+			slog.info('IPC resolved', { status: outcome.status, outcomeHandled });
 			if (outcome.status === 'conflicts') {
 				// Clean pause — nothing was pushed, conflicts are persisted
 				// rows. The modal collects decisions and re-enters via
@@ -1924,6 +1956,9 @@ function startSyncToRekordbox(
 				// re-created on the resume call.
 				outcomeHandled = true;
 				syncToRekordboxModal?.setConflicts(outcome.conflicts);
+			} else if (outcome.status === 'completed' && !outcomeHandled) {
+				slog.warn('completed via IPC result; export event was not delivered');
+				onExportEvent({ kind: 'completed', result: outcome.result });
 			}
 		});
 	call.catch((err) => {
@@ -1932,7 +1967,7 @@ function startSyncToRekordbox(
 		// Gated on `outcomeHandled` because the 'failed' event handler
 		// above already shows a toast — without this guard the user would
 		// see two error toasts for one sync.
-		log.for('sync-to-rb').error('IPC rejected', err);
+		slog.error('IPC rejected', err);
 		if (!outcomeHandled) {
 			outcomeHandled = true;
 			syncToRekordboxModal?.close();
@@ -1942,6 +1977,7 @@ function startSyncToRekordbox(
 			});
 		}
 	}).finally(() => {
+		slog.info('listener torn down', { outcomeHandled, modalOpen: syncToRekordboxModal?.isOpen() ?? null });
 		syncToRekordboxExportUnsub?.();
 		syncToRekordboxExportUnsub = null;
 	});
@@ -3694,9 +3730,17 @@ function mountDiscoverRegion(): void {
 	});
 	discoverView = mountDiscoverView(feedHost, {
 		onShowArtistInLibrary: (name) => { void showArtistInLibrary(name); },
-		// Feed ↔ Archived and the genre/label filters are history entries the
-		// view applies itself; it reports the target state before reloading.
-		onNavigate: (next) => recordNavigation({ kind: 'discover', mode: 'feed', archived: next.archived, genre: next.genre, label: next.label }),
+		// A followed playlist is synced into the library, so its name on a card
+		// opens it under the Spotify tab; before the first sync lands (no row
+		// yet) the Spotify app is the only place it exists.
+		onOpenSpotifyPlaylist: (spotifyPlaylistId) => {
+			const pl = library.allPlaylists().find((p) => p.source === 'spotify' && p.sourceId === spotifyPlaylistId);
+			if (pl) void openPlaylistById(pl.id);
+			else void shellApi.openSpotify(`spotify:playlist:${spotifyPlaylistId}`);
+		},
+		// Feed ↔ Archived is a history entry the view applies itself; it
+		// reports the target state before reloading. Lenses are not history.
+		onNavigate: (next) => recordNavigation({ kind: 'discover', mode: 'feed', archived: next.archived }),
 		onPlay: async (req) => {
 			try {
 				shell.notePlaybackOrigin();
@@ -3722,6 +3766,7 @@ function mountDiscoverRegion(): void {
 		onOpenOrganizeDeferred: (session) => { void openOrganizeForFeedPromotion(session); },
 		onStartJourney: (seed) => startJourneyFromSeed(seed),
 		onToast: (msg, kind, sub) => showToast(msg, { kind, sub }),
+		onProgressToast: (title, sub) => showProgressToast(title, sub),
 		onTotalChange: (totalCount) => {
 			setTagCountsSignal((prev) => ({ ...prev, discover: totalCount }));
 		},
@@ -3859,7 +3904,7 @@ function locationLabel(loc: NavLocation): string {
 		case 'downloads': return 'Downloads';
 		case 'discover':
 			switch (loc.mode) {
-				case 'feed': return ['Discover', loc.archived ? 'Archived' : null, loc.genre, loc.label].filter(Boolean).join(' · ');
+				case 'feed': return loc.archived ? 'Discover · Archived' : 'Discover';
 				case 'journeys': return loc.journeyId ? 'Journey' : 'Journeys';
 				case 'agent-results': return 'Agent results';
 			}
@@ -3884,8 +3929,8 @@ function currentTracksScope(): TracksScope {
 }
 
 function feedLocation(): NavLocation {
-	const f = discoverView?.getNavState() ?? { archived: false, genre: null, label: null };
-	return { kind: 'discover', mode: 'feed', archived: f.archived, genre: f.genre, label: f.label };
+	const f = discoverView?.getNavState() ?? { archived: false };
+	return { kind: 'discover', mode: 'feed', archived: f.archived };
 }
 
 // Where Discover currently stands (mode + sub-state) — what a Discover tab
@@ -4096,7 +4141,7 @@ async function applyDiscoverLocation(loc: Extract<NavLocation, { kind: 'discover
 			setDiscoverMode('feed');
 			// A fresh entry / tab click refreshes (the tab-click contract); a
 			// traversal onto the state the feed already shows restores it as-is.
-			discoverView?.applyNavState({ archived: loc.archived, genre: loc.genre, label: loc.label }, { reload: refresh || moved });
+			discoverView?.applyNavState({ archived: loc.archived }, { reload: refresh || moved });
 			if (!refresh && !moved && restore?.scrollTop != null) discoverView?.setScrollTop(restore.scrollTop);
 			return true;
 		case 'journeys': {
@@ -4348,8 +4393,8 @@ function toggleAgentDock(): void {
 function captureAgentViewContext(): AgentViewContext {
 	const view = shell.activeView();
 	if (view === 'discover') {
-		const filters = discoverView?.getFilters();
-		return { view, discover: { mode: currentDiscoverMode, ...(filters ?? {}) } };
+		const lenses = discoverView?.getLenses() ?? [];
+		return { view, discover: { mode: currentDiscoverMode, ...(lenses.length > 0 ? { lenses } : {}) } };
 	}
 	const ctx: AgentViewContext = { view };
 	if (view === 'tracks') {
@@ -4374,19 +4419,6 @@ function showAgentResultSet(rs: AgentResultSet): void {
 	void navigate({ kind: 'discover', mode: 'agent-results', resultSetId: rs.id }, { label: rs.title });
 }
 
-function applyAgentViewCommand(cmd: AgentViewCommand): void {
-	if (cmd.type !== 'set-feed-filters') return;
-	// Omitted field = leave that filter alone; null = clear it.
-	const cur = discoverView?.getNavState() ?? { archived: false, genre: null, label: null };
-	void navigate({
-		kind: 'discover',
-		mode: 'feed',
-		archived: cur.archived,
-		genre: 'genre' in cmd ? cmd.genre ?? null : cur.genre,
-		label: 'label' in cmd ? cmd.label ?? null : cur.label,
-	});
-}
-
 function mountAgentDock(): void {
 	const host = document.getElementById('agent-dock-host');
 	if (!host) return;
@@ -4405,7 +4437,6 @@ function mountAgentDock(): void {
 	agentPanel = mountAgentPanel(host, {
 		onToast: (msg, kind, sub) => showToast(msg, { kind, sub }),
 		onResultSet: (rs) => showAgentResultSet(rs),
-		onViewCommand: (cmd) => applyAgentViewCommand(cmd),
 		getViewContext: () => captureAgentViewContext(),
 	});
 	setAgentDockOpen(localStorage.getItem(AGENT_DOCK_KEY) === '1');
@@ -5504,6 +5535,8 @@ async function boot(): Promise<void> {
 	wireLibraryScanEvents();
 	wireAnalysisEvents();
 	wireCloudSyncEvents();
+	feedRefresh.connect();
+	feedActivity.connect();
 	// Drive the analysis-source resolution from the player setting. Runs at
 	// boot (applies the persisted choice) and on every toggle — the store
 	// re-resolves cached tracks from their stored rb/curator slots and repaints
@@ -5632,6 +5665,14 @@ async function boot(): Promise<void> {
 			visibleStateTabs:  visibleStateTabsMemo,
 			zoomLevel: zoomLevelSignal,
 			sourceSyncTooltip: sourceSyncTooltipSignal,
+			// Discover pulses while the feed fetches — a Refresh click or the
+			// background poll — or while this desktop's catalogue worker reads
+			// a check's follows, and turns orange once a source of that pass failed.
+			stateSyncTooltip: () => {
+				const s = feedRefresh.status();
+				const tooltip = statusTooltip(s, feedRefresh.worker());
+				return tooltip ? { discover: { tooltip, alert: s.pass?.steps.some((step) => step.state === 'error') ?? false } } : {};
+			},
 			userInitials: 'GB',
 			onSourceClick: (src) => {
 				// A tab switch: the tab's own history resumes where it was left;

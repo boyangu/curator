@@ -306,8 +306,8 @@ describe('protocol v5 kinds (analysis in the library)', () => {
 		const { deviceId, api } = await app.signIn();
 		const op = opsFor(deviceId);
 		const rec = randomUUID();
-		const ops = [op('library_track', 'set-analysis', rec, { analysis }), op('library_track', 'set-analysis', randomUUID(), { analysis: null })];
-		expect(ops.every((o) => o.schema_version === 5)).toBe(true);
+		// Stamped 5 as a v5 client would (the harness stamps the current version).
+		const ops = [op('library_track', 'set-analysis', rec, { analysis }), op('library_track', 'set-analysis', randomUUID(), { analysis: null })].map((o) => ({ ...o, schema_version: 5 }));
 		const res = await api.sync.push.mutate({ deviceId, ops });
 		expect(res).toMatchObject({ accepted: 2, rejected: [] });
 		expect(res.features).toContain('analysis_v5');
@@ -315,6 +315,19 @@ describe('protocol v5 kinds (analysis in the library)', () => {
 		expect(pulled.ops.map((o) => [o.kind, o.payload, o.schema_version])).toEqual(ops.map((o) => [o.kind, o.payload, 5]));
 		const state = applyOps(createLibraryState(), pulled.ops.map(({ seq: _s, user_id: _u, received_at: _r, ...o }) => o as Op)).state;
 		expect(Object.keys(state.libraryTracks.get(rec)!.fields)).toEqual([`analysis.${deviceId}`]);
+	});
+
+	it('advertises feed_lenses_v6 and takes the feed.lenses setting stamped 6, pulling it back as sent', async () => {
+		const { deviceId, api } = await app.signIn();
+		const op = opsFor(deviceId);
+		const value = [{ id: 'l1', label: 'artists I don’t have', rule: { kind: 'library-artist', has: false }, by: 'assistant', createdAt: 1 }];
+		const set = op('setting', 'set', 'feed.lenses', { value });
+		expect(set.schema_version).toBe(6);
+		const res = await api.sync.push.mutate({ deviceId, ops: [set] });
+		expect(res).toMatchObject({ accepted: 1, rejected: [] });
+		expect(res.features).toContain('feed_lenses_v6');
+		const pulled = await api.sync.pull.query({ afterSeq: 0 });
+		expect(pulled.ops.map((o) => [o.entity_id, o.payload, o.schema_version])).toEqual([['feed.lenses', { value }, 6]]);
 	});
 
 	it('refuses an old-scale brightness without power, and set-analysis stamped 4', async () => {

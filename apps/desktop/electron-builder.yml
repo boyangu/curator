@@ -45,6 +45,11 @@ extraResources:
   # the env itself is provisioned into userData on demand (getMirSpec).
   - from: resources/mir
     to: mir
+  # In-app assistant + KB research sidecar: one self-contained esbuild file,
+  # staged by build-sidecars.mjs; getAgentSpec()'s production branch resolves
+  # process.resourcesPath/agent/dist/main.js.
+  - from: resources/agent
+    to: agent
 
 win:
   # 'dir' target produces dist/win-unpacked/<exe> without making an installer.

@@ -52,6 +52,14 @@ const RULES = {
 		allowExact: ['@curator/shared/enums', '@curator/shared/sync'],
 		typeOnly: ['@curator/shared'],
 	},
+	// The Global Catalog's provider readers, run by the cloud worker and by a
+	// desktop reading for its user's follows: the contract, pure name folding
+	// and the one credit splitter, nothing with a runtime of its own.
+	'catalog-readers': {
+		dir: 'packages/catalog-readers/src',
+		allow: ['@curator/protocol', '@curator/library-logic'],
+		allowExact: ['@curator/shared/artist-credit'],
+	},
 	// The cloud API (plan D11): the shared contract packages and its own npm
 	// dependencies, never desktop code. apps/core is SQLite-bound end to end,
 	// so one import of it (or of a SQLite driver or dialect) would put the
@@ -62,7 +70,7 @@ const RULES = {
 	// entry of scripts/build.mjs, so never in the image).
 	cloud: {
 		dir: 'apps/cloud/src',
-		allow: ['@curator/protocol', '@curator/library-logic', '@curator/agent-core'],
+		allow: ['@curator/protocol', '@curator/library-logic', '@curator/agent-core', '@curator/catalog-readers'],
 		// artist-credit is the one credit splitter desktop and catalogue readers
 		// must agree on; like enums and sync it loads nothing at runtime (a
 		// pure fold helper and a type).

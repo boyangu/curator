@@ -18,7 +18,7 @@ import { KbExpansionQueue } from './expansion.js';
 import { resolveDraft } from './identity.js';
 import { ResearcherKbResolver } from './resolvers/researcher.js';
 import { SpotifyKbResolver } from './resolvers/spotify.js';
-import type { ResearchPort } from './researcher-sidecar.js';
+import type { ResearchPort } from './research.js';
 import type { KnowledgeStore } from './store.js';
 import type {
 	Journey,

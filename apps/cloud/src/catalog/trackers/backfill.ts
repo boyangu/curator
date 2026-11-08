@@ -16,7 +16,7 @@ import type { Db } from '../../db/db.js';
 import { withSystemTx } from '../../db/system-tx.js';
 import type { Logger } from '../../log.js';
 import { ingestClaims } from '../ingest.js';
-import { TrackerRateLimitedError, type TrackerAdapter } from './types.js';
+import { TrackerRateLimitedError, type TrackerAdapter } from '@curator/catalog-readers';
 
 export type BackfillDeps = { db: Db; log: Logger; adapters: readonly TrackerAdapter[]; holder: string; batch?: number; pollTimeoutMs?: number; sleep?: (ms: number) => Promise<void> };
 

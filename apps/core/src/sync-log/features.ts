@@ -28,6 +28,7 @@ type Raw = Database.Database;
 
 export const ZERO_LOSS_FEATURE: SyncFeature = 'zero_loss_v4';
 export const ANALYSIS_FEATURE: SyncFeature = 'analysis_v5';
+export const FEED_LENSES_FEATURE: SyncFeature = 'feed_lenses_v6';
 
 // Device-local (never an account key): '1' while the last answer named the
 // feature. Cleared when an answer stops naming it (a rolled-back server).
@@ -43,11 +44,16 @@ export function featuresReadV5(features: readonly SyncFeature[] | null | undefin
 	return featuresReadV4(features) && !!features?.includes(ANALYSIS_FEATURE);
 }
 
+// v6 (the `feed.lenses` setting) only on a server that reads v5 too.
+export function featuresReadV6(features: readonly SyncFeature[] | null | undefined): boolean {
+	return featuresReadV5(features) && !!features?.includes(FEED_LENSES_FEATURE);
+}
+
 // The highest op version the push loop may send: v4 only once the server
-// said it reads it, v5 likewise. v3 ops were always sent ungated (their
+// said it reads it, v5 and v6 likewise. v3 ops were always sent ungated (their
 // emitters wait for 'track_meta' themselves), so below v4 nothing changes.
 export function pushableSchemaVersion(features: readonly SyncFeature[] | null | undefined): number {
-	return featuresReadV5(features) ? 5 : featuresReadV4(features) ? 4 : 3;
+	return featuresReadV6(features) ? 6 : featuresReadV5(features) ? 5 : featuresReadV4(features) ? 4 : 3;
 }
 
 const STMTS = new WeakMap<Raw, { get: Database.Statement<[string], { value: string }> }>();

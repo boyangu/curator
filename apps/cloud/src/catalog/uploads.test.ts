@@ -8,13 +8,12 @@ import { withSystemTx } from '../db/system-tx.js';
 import { createLogger } from '../log.js';
 import { createTestApp, type TestApp } from '../test/harness.js';
 import { ingestClaims } from './ingest.js';
-import type { FetchLike } from './trackers/http.js';
-import { SoundCloudTracker } from './trackers/soundcloud.js';
+import type { FetchLike } from '@curator/catalog-readers';
+import { SoundCloudTracker } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
-import { parseUploadTitle, splitCatalogNumber, splitCredit, stripFormatWord } from './trackers/upload-title.js';
-import { YouTubeTracker } from './trackers/youtube.js';
-
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
+import { parseUploadTitle, splitCatalogNumber, splitCredit, stripFormatWord } from '@curator/catalog-readers';
+import { YouTubeTracker } from '@curator/catalog-readers';
 const quiet = createLogger(() => {});
 const DAY = 86400_000;
 const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { 'content-type': 'application/json' } });

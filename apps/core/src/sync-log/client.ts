@@ -187,6 +187,9 @@ export interface CloudTransport {
 	// their own (a local catalogue in development) rather than the sync
 	// server whose `features` say so. Absent: the sync server's word.
 	catalogOffered?: () => boolean;
+	// That server's whole feature list ('catalog_workers' and the rest),
+	// when it is one of its own; absent, the sync server's `features`.
+	catalogFeatures?: () => readonly string[];
 }
 
 // How a transport reports a failed call. Anything else thrown is treated as

@@ -37,7 +37,7 @@ const tracks = (source: 'spotify' | 'rekordbox', scope: TracksScope): NavLocatio
 const playlist = (id: string, source: 'spotify' | 'rekordbox' = 'spotify'): NavLocation => tracks(source, { type: 'playlist', id });
 const jit = (query: string, source: 'spotify' | 'rekordbox' = 'spotify'): NavLocation => tracks(source, { type: 'jit', jit: { name: query, query } });
 const all = (source: 'spotify' | 'rekordbox' = 'spotify'): NavLocation => tracks(source, { type: 'all' });
-const feed: NavLocation = { kind: 'discover', mode: 'feed', archived: false, genre: null, label: null };
+const feed: NavLocation = { kind: 'discover', mode: 'feed', archived: false };
 const pinned: NavLocation = { kind: 'tag', view: 'interested' };
 
 const keys = (s: HistoryState, tab: Parameters<typeof stackOf>[1]): string[] =>
@@ -57,10 +57,9 @@ describe('locationKey / tabOf', () => {
 	});
 
 	it('separates the Discover sub-states', () => {
-		const archived: NavLocation = { kind: 'discover', mode: 'feed', archived: true, genre: null, label: null };
-		const genre: NavLocation = { kind: 'discover', mode: 'feed', archived: false, genre: 'House', label: null };
+		const archived: NavLocation = { kind: 'discover', mode: 'feed', archived: true };
 		const node: NavLocation = { kind: 'discover', mode: 'journeys', journeyId: 'j1', nodeId: 'n2' };
-		expect(new Set([feed, archived, genre, node].map(locationKey)).size).toBe(4);
+		expect(new Set([feed, archived, node].map(locationKey)).size).toBe(3);
 	});
 
 	it('maps every location onto its top-strip tab', () => {

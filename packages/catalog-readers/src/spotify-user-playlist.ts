@@ -1,5 +1,6 @@
-// Spotify playlists, read with a watcher's own Spotify login (the grant the
-// Spotify gateway holds for them, src/spotify/gateway.ts).
+// Spotify playlists, read with a watcher's own Spotify login: the grant the
+// cloud's Spotify gateway holds for them (apps/cloud spotify/gateway.ts), or
+// the desktop's own token when the desktop is the reader.
 //
 // Why a user's login: since Spotify's February 2026 rules a playlist's items
 // are served only to its owner and collaborators, and an app token is nobody.
@@ -15,9 +16,6 @@
 // refreshed in place.
 
 import type { CatalogClaim, CatalogKind } from '@curator/protocol';
-import type { Db } from '../../db/db.js';
-import type { Logger } from '../../log.js';
-import { tokenForUser, type SpotifyGateway } from '../../spotify/gateway.js';
 import { getJson, type FetchLike } from './http.js';
 import { ProviderHttpError } from './http.js';
 import type { TrackerAdapter, TrackerPoll, TrackerTarget } from './types.js';
@@ -42,7 +40,12 @@ type SpEntry = { added_at?: string; is_local?: boolean; track?: SpTrack | null; 
 type SpPage = { items?: SpEntry[]; next: string | null; total?: number };
 type SpPlaylist = { snapshot_id: string; name: string; images?: { url: string }[] };
 
-export type SpotifyUserPlaylistDeps = { db: Db; log: Logger; gateway: SpotifyGateway };
+// `token`: a Spotify access token that may read this playlist (the catalogue
+// object's id), or a throw when there is none. The adapter knows the object,
+// not the user: the cloud looks a watcher up and vends from their grant
+// (apps/cloud catalog/spotify-app-token.ts watcherPlaylistToken); a desktop
+// answers with its own login whatever the id.
+export type SpotifyUserPlaylistDeps = { token: (objectId: string) => Promise<string> };
 
 export class SpotifyUserPlaylistTracker implements TrackerAdapter {
 	readonly provider = 'spotify' as const;
@@ -57,23 +60,6 @@ export class SpotifyUserPlaylistTracker implements TrackerAdapter {
 		private readonly now: () => number = Date.now,
 	) {}
 
-	// A token from a watcher who has connected Spotify, the longest-standing
-	// watcher first.
-	private async watcherToken(objectId: string): Promise<string> {
-		const watchers = await this.deps.db.query<{ user_id: string }>(
-			`select user_id from curator.catalog_watch where object_id = $1 and not muted order by created_at limit 5`,
-			[objectId],
-		);
-		for (const w of watchers) {
-			try {
-				return (await tokenForUser(this.deps, w.user_id)).accessToken;
-			} catch {
-				// Not connected, or reconnect needed: the next watcher.
-			}
-		}
-		throw new Error('no watcher of this playlist has Spotify connected');
-	}
-
 	private get<T>(token: string, path: string, signal: AbortSignal): Promise<T> {
 		return getJson<T>(this.fetchFn, 'spotify', path.startsWith('http') ? path : `${API}${path}`, {
 			headers: { authorization: `Bearer ${token}` },
@@ -85,7 +71,7 @@ export class SpotifyUserPlaylistTracker implements TrackerAdapter {
 	async poll(target: TrackerTarget, signal: AbortSignal): Promise<TrackerPoll> {
 		if (!target.representation) throw new Error('spotify playlist tracker needs a Spotify id');
 		const id = encodeURIComponent(target.representation.providerId);
-		const token = await this.watcherToken(target.object.id);
+		const token = await this.deps.token(target.object.id);
 		const meta = await this.get<SpPlaylist>(token, `/playlists/${id}?fields=snapshot_id,name,images`, signal);
 		let calls = 1;
 		const self: CatalogClaim = {

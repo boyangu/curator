@@ -74,6 +74,19 @@ export type ContextMenuItem =
 		disabled?: boolean;
 	}
 	| {
+		// An on/off choice that keeps the menu open: a click flips the mark
+		// in place and dispatches into the handlers map (the Refresh menu's
+		// sources: several are set in one visit). `chip` labels a row that
+		// needs saying (a source only the cloud reads).
+		kind: 'check';
+		id: string;
+		label: string;
+		checked: boolean;
+		disabled?: boolean;
+		chip?: string;
+		title?: string;
+	}
+	| {
 		// Compact color-swatch matrix (cue color picker). Cells dispatch
 		// into the same flat handlers map as leaf items — one handler per
 		// cell id. `hex: null` renders the outlined "no color" cell;
@@ -244,6 +257,37 @@ export function openContextMenu(
 				>
 					<span class="ctx-menu__label">{item.label}</span>
 					<Show when={item.checked}><span class="ctx-menu__dot" aria-hidden="true"></span></Show>
+				</button>
+			);
+		}
+		if (item.kind === 'check') {
+			// Its own state: the menu is rendered once from `items`, and this
+			// row changes without closing it (the outside-click guard already
+			// ignores clicks inside the host).
+			const [checked, setChecked] = createSignal(item.checked);
+			const toggle = async (): Promise<void> => {
+				setChecked((v) => !v);
+				try {
+					await handlers[item.id]?.();
+				} catch (err) {
+					slog.error(`ctx action "${item.id}" failed`, err);
+				}
+			};
+			return (
+				<button
+					class="ctx-menu__item ctx-menu__item--check"
+					type="button"
+					role="menuitemcheckbox"
+					aria-checked={checked() ? 'true' : 'false'}
+					disabled={item.disabled}
+					title={item.title}
+					onClick={() => { void toggle(); }}
+				>
+					<span class="ctx-menu__check">{checked() ? '✓' : ''}</span>
+					<span class="ctx-menu__label">{item.label}</span>
+					<Show when={item.chip}>
+						{(chip) => <span class="ctx-menu__chip">{chip()}</span>}
+					</Show>
 				</button>
 			);
 		}

@@ -11,6 +11,7 @@ apps/desktop/resources/rekordbox/
 apps/desktop/resources/audio/
 apps/desktop/resources/spotify-player/
 apps/desktop/resources/mir/
+apps/desktop/resources/agent/
 # Rust build output (cargo)
 target/
 # Python virtualenvs (incl. .venv-wsl, .venv-wsl-tf, .venv-research) + build artifacts

@@ -18,8 +18,8 @@ kill_timeout = "15s"
   # "off" (or removing the line) switches the catalogue off.
   CURATOR_CATALOGUE = "rhythm,key,structure,advanced,fingerprint,peaks:lo"
   # The Global Catalog's procedures (src/catalog). "1" only after migrations 0011 + 0012 and
-  # roles.sql have run on the database.
-  CURATOR_GLOBAL_CATALOG = "0"
+  # roles.sql have run on the database (`pnpm cloud:db-apply` does the whole set).
+  CURATOR_GLOBAL_CATALOG = "1"
   # Deezer's key-less catalogue for the worker's trackers (terms: non-commercial; registration
   # closed, so it runs behind this switch and nothing requires it).
   CURATOR_FEED_DEEZER = "0"

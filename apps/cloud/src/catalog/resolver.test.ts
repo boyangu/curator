@@ -10,9 +10,9 @@ import { createTestApp } from '../test/harness.js';
 import { raiseReleaseEvent } from './events.js';
 import { ingestClaims } from './ingest.js';
 import { runRecordingResolver } from './planner.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyAppTracker } from './trackers/spotify-app.js';
-
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyTracker } from '@curator/catalog-readers';
+import { appCredentialsToken } from './spotify-app-token.js';
 const quiet = createLogger(() => {});
 const today = new Date().toISOString().slice(0, 10);
 
@@ -85,7 +85,7 @@ describe('recording resolver', () => {
 		expect(handles(before.events[0]!.card as CatalogEventCardV1)).toEqual({ release: ['beatport'], track: ['beatport'] });
 
 		const { fetch, searches } = fakeSpotify({ GBAAA2600001: [{ id: 'st-wrong', duration_ms: 601_000 }, { id: 'st1', duration_ms: 401_500 }] });
-		const r = await runRecordingResolver({ db: app.db, log: quiet, spotify: new SpotifyAppTracker({ clientId: 'id', clientSecret: 'secret' }, fetch) });
+		const r = await runRecordingResolver({ db: app.db, log: quiet, spotify: new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 'secret' }, fetch) }, fetch) });
 		expect(r).toEqual({ attempted: 1, resolved: 1 });
 		expect(searches).toEqual(['GBAAA2600001']);
 		const reps = await app.db.query<{ object_id: string; provider_id: string }>(`select object_id, provider_id from curator.catalog_source_object where provider = 'spotify' order by kind`);
@@ -106,7 +106,7 @@ describe('recording resolver', () => {
 		const app = await createTestApp();
 		await seed(app);
 		const { fetch } = fakeSpotify({ GBAAA2600001: [{ id: 'st-long', duration_ms: 720_000 }] });
-		const r = await runRecordingResolver({ db: app.db, log: quiet, spotify: new SpotifyAppTracker({ clientId: 'id', clientSecret: 'secret' }, fetch) });
+		const r = await runRecordingResolver({ db: app.db, log: quiet, spotify: new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 'secret' }, fetch) }, fetch) });
 		expect(r).toEqual({ attempted: 1, resolved: 0 });
 		const [task] = await app.db.query<{ attempts: unknown; last_error: string; later: boolean }>(
 			`select attempts, last_error, next_due_at > now() as later from curator.catalog_enrich_task where need = 'representation' and provider = 'spotify'`,

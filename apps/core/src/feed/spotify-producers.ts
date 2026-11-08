@@ -12,7 +12,7 @@
 
 import { SpotifyClient, spotifyBackoffUntil } from '@curator/spotify';
 import type { SpotifyAlbum, SpotifyPlaylist, SpotifyTrack } from '@curator/spotify';
-import type { FeedAuthPort, FeedItemDraft, FeedProducer } from './types.js';
+import type { FeedAuthPort, FeedItemDraft, FeedProducer, FeedProducerContext, FeedProducerResult } from './types.js';
 import { log } from '../log.js';
 
 const flog = log.for('feed');
@@ -34,6 +34,15 @@ function cutoffIsoDaysBack(days: number): string {
 // mode where a poller's unpaced burst (one request per artist / per changed
 // playlist) ate the rolling rate limit and 429'd interactive calls landing
 // mid-pass. So these loops just iterate; the gate spaces the requests.
+
+// Why a producer did not look this pass, as the refresh status shows it
+// (FeedProducerResult.skipped). Silence here read as "nothing new".
+const NOT_CONNECTED = 'Spotify is not connected';
+const EMPTY_INDEX = 'Spotify returned an empty playlist list; the next refresh tries again';
+function rateLimitPause(): string | null {
+	const waitMs = spotifyBackoffUntil() - Date.now();
+	return waitMs > 0 ? `Spotify is rate-limiting Curator; paused for ${Math.ceil(waitMs / 60_000)} more min` : null;
+}
 
 function trackArtistNames(t: SpotifyTrack): string[] {
 	return (t.artists ?? []).map((a) => a.name);
@@ -67,6 +76,7 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 	readonly id = 'spotify-playlist-delta';
 	readonly source = 'spotify' as const;
 	readonly displayName = 'Spotify playlists';
+	readonly kinds = ['playlist'] as const;
 
 	constructor(
 		private readonly auth: FeedAuthPort,
@@ -76,13 +86,14 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		private readonly watchedPlaylists?: () => Promise<Set<string> | null>,
 	) {}
 
-	async poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+	async poll(cursor: unknown, ctx?: FeedProducerContext): Promise<FeedProducerResult> {
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
-		if (!token) return { drafts: [], nextCursor: cursor };
+		if (!token) return { drafts: [], nextCursor: cursor, skipped: NOT_CONNECTED };
 		// Quota ban active → skip the poll entirely. Poking a wall that's still
 		// up only re-arms the ban; the cursor is untouched so the next pass (or a
 		// user action that re-probes) resumes cleanly once it clears.
-		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };
+		const paused = rateLimitPause();
+		if (paused) return { drafts: [], nextCursor: cursor, skipped: paused };
 		const client = new SpotifyClient(token, 'feed:playlist-delta');
 
 		const prevCursor = cursor as PlaylistDeltaCursor | null;
@@ -91,6 +102,7 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		const drafts: FeedItemDraft[] = [];
 		const cutoffIso = cutoffIsoDaysBack(PLAYLIST_BACKFILL_DAYS);
 
+		ctx?.report('Listing your Spotify playlists');
 		const me = await client.getMe();
 		const playlists = await client.getUserPlaylists();
 		// Spotify intermittently serves /me/playlists pages with a correct
@@ -98,9 +110,9 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		// total=231). Advancing the cursor on such a response would wipe
 		// every watermark and re-baseline the world — bail without touching
 		// the cursor and let the next poll retry.
-		if (playlists.length === 0) return { drafts: [], nextCursor: cursor };
+		if (playlists.length === 0) return { drafts: [], nextCursor: cursor, skipped: EMPTY_INDEX };
 		const watched = (await this.watchedPlaylists?.().catch(() => null)) ?? null;
-		for (const pl of playlists) {
+		for (const [i, pl] of playlists.entries()) {
 			// Own playlists aren't a discovery source — the user put those
 			// tracks there themselves.
 			if (pl.owner?.id === me.id) continue;
@@ -126,6 +138,7 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 			const sinceIso = w ? w.lastAddedAt : cutoffIso;
 			let maxAdded = sinceIso;
 			try {
+				ctx?.report(`Playlist ${i + 1} of ${playlists.length}: ${pl.name}`);
 				const items = await client.getPlaylistTracks(pl.id);
 				for (const it of items) {
 					const t = it.track;
@@ -156,10 +169,11 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 	// "Load more": walk every followed playlist once and emit tracks whose
 	// added_at falls inside the newly-uncovered window. Expensive by nature
 	// (one /tracks fetch per playlist) — only runs on explicit user action.
-	async backfill(cursor: unknown, days: number): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+	async backfill(cursor: unknown, days: number, ctx?: FeedProducerContext): Promise<FeedProducerResult> {
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
-		if (!token) return { drafts: [], nextCursor: cursor };
-		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };
+		if (!token) return { drafts: [], nextCursor: cursor, skipped: NOT_CONNECTED };
+		const paused = rateLimitPause();
+		if (paused) return { drafts: [], nextCursor: cursor, skipped: paused };
 		const client = new SpotifyClient(token, 'feed:playlist-backfill');
 
 		const prevCursor = (cursor as PlaylistDeltaCursor | null) ?? { watermarks: {} };
@@ -167,16 +181,18 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 		const newHorizon = new Date(Date.parse(horizon) - days * 24 * 60 * 60 * 1000).toISOString();
 		const drafts: FeedItemDraft[] = [];
 
+		ctx?.report('Listing your Spotify playlists');
 		const me = await client.getMe();
 		const playlists = await client.getUserPlaylists();
 		// Same empty-index guard as poll() — don't move the horizon on a
 		// bogus response.
-		if (playlists.length === 0) return { drafts: [], nextCursor: cursor };
+		if (playlists.length === 0) return { drafts: [], nextCursor: cursor, skipped: EMPTY_INDEX };
 		const watched = (await this.watchedPlaylists?.().catch(() => null)) ?? null;
-		for (const pl of playlists) {
+		for (const [i, pl] of playlists.entries()) {
 			if (pl.owner?.id === me.id || pl.itemsWithheld) continue;
 			if (watched && !watched.has(pl.id)) continue;
 			try {
+				ctx?.report(`Playlist ${i + 1} of ${playlists.length}: ${pl.name}`);
 				const items = await client.getPlaylistTracks(pl.id);
 				for (const it of items) {
 					const t = it.track;
@@ -216,7 +232,7 @@ export class SpotifyPlaylistDeltaProducer implements FeedProducer {
 				url: `https://open.spotify.com/track/${t.id}`,
 				raw: t,
 			},
-			origin: { kind: 'playlist', id: pl.id, name: pl.name },
+			origin: { kind: 'playlist', id: pl.id, name: pl.name, ...(pl.owner ? { owner: { id: pl.owner.id, name: pl.owner.display_name } } : {}) },
 			publishedAt,
 			suppressKeys: ['source:spotify', `playlist:${pl.id}`, ...suppressKeysForArtists(t.artists ?? [])],
 		};
@@ -248,6 +264,7 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 	readonly id = 'spotify-new-releases';
 	readonly source = 'spotify' as const;
 	readonly displayName = 'Spotify new releases';
+	readonly kinds = ['artist'] as const;
 
 	constructor(
 		private readonly auth: FeedAuthPort,
@@ -264,16 +281,22 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 		private readonly retired?: () => boolean,
 	) {}
 
-	async poll(cursor: unknown): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+	// Stood down once the catalogue tracks the user's artists (`retired`).
+	active(): boolean {
+		return !this.retired?.();
+	}
+
+	async poll(cursor: unknown, ctx?: FeedProducerContext): Promise<FeedProducerResult> {
 		if (this.retired?.()) return { drafts: [], nextCursor: cursor };
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
-		if (!token) return { drafts: [], nextCursor: cursor };
-		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };
+		if (!token) return { drafts: [], nextCursor: cursor, skipped: NOT_CONNECTED };
+		const paused = rateLimitPause();
+		if (paused) return { drafts: [], nextCursor: cursor, skipped: paused };
 		const client = new SpotifyClient(token, 'feed:new-releases');
 
 		const cutoff = cutoffIsoDaysBack(RELEASE_WINDOW_DAYS).slice(0, 10);
 		const prevCursor = cursor as NewReleasesCursor | null;
-		const { drafts, resumeAt } = await this.collectReleases(client, cutoff, undefined, 20, prevCursor?.resumeAt ?? 0);
+		const { drafts, resumeAt } = await this.collectReleases(client, cutoff, undefined, 20, prevCursor?.resumeAt ?? 0, ctx);
 		return {
 			drafts,
 			nextCursor: { horizon: prevCursor?.horizon ?? cutoff, resumeAt } satisfies NewReleasesCursor,
@@ -283,11 +306,12 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 	// "Load more": extend the release-date horizon back by `days`. Uses a
 	// deeper per-artist page (50 vs 20) since older releases sit further
 	// down the newest-first listing.
-	async backfill(cursor: unknown, days: number): Promise<{ drafts: FeedItemDraft[]; nextCursor: unknown }> {
+	async backfill(cursor: unknown, days: number, ctx?: FeedProducerContext): Promise<FeedProducerResult> {
 		if (this.retired?.()) return { drafts: [], nextCursor: cursor };
 		const token = await this.auth.getSpotifyAccessToken().catch(() => null);
-		if (!token) return { drafts: [], nextCursor: cursor };
-		if (Date.now() < spotifyBackoffUntil()) return { drafts: [], nextCursor: cursor };
+		if (!token) return { drafts: [], nextCursor: cursor, skipped: NOT_CONNECTED };
+		const paused = rateLimitPause();
+		if (paused) return { drafts: [], nextCursor: cursor, skipped: paused };
 		const client = new SpotifyClient(token, 'feed:releases-backfill');
 
 		const prevCursor = (cursor as NewReleasesCursor | null) ?? {};
@@ -295,7 +319,7 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 		const newHorizon = new Date(Date.parse(horizon) - days * 24 * 60 * 60 * 1000)
 			.toISOString()
 			.slice(0, 10);
-		const { drafts } = await this.collectReleases(client, newHorizon, horizon, 50);
+		const { drafts } = await this.collectReleases(client, newHorizon, horizon, 50, 0, ctx);
 		return { drafts, nextCursor: { horizon: newHorizon } satisfies NewReleasesCursor };
 	}
 
@@ -311,8 +335,10 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 		toExclusive: string | undefined,
 		limit = 20,
 		startIndex = 0,
+		ctx?: FeedProducerContext,
 	): Promise<{ drafts: FeedItemDraft[]; resumeAt: number }> {
 		const drafts: FeedItemDraft[] = [];
+		ctx?.report('Listing the artists you follow on Spotify');
 		const artists = await client.getFollowedArtists();
 		// Muted artists are skipped before any albums call — don't search for new
 		// releases from someone the user silenced in the feed. Best-effort: a
@@ -328,6 +354,7 @@ export class SpotifyNewReleasesProducer implements FeedProducer {
 			if (muted.has(`artist:${artist.id}`)) continue;
 			let albums: SpotifyAlbum[];
 			try {
+				ctx?.report(`Artist ${i + 1} of ${n}: ${artist.name}`);
 				albums = await client.getArtistAlbums(artist.id, { limit });
 			} catch (err) {
 				// A 429 that survived the client's own retry budget means we've

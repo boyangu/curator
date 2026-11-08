@@ -33,6 +33,7 @@
 	},
 	"devDependencies": {
 		"@curator/agent-core": "workspace:*",
+		"@curator/catalog-readers": "workspace:*",
 		"@curator/library-logic": "workspace:*",
 		"@curator/protocol": "workspace:*",
 		"@curator/shared": "workspace:*",

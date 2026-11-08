@@ -1,6 +1,8 @@
-// Spotify through the app's own credentials (client-credentials grant: no
-// user, so Development Mode's five-user cap does not apply; the endpoint
-// limits do). CURATOR_SPOTIFY_APP_CLIENT_ID / _SECRET on the worker only.
+// Spotify's artist releases and a label's catalogue playlists, read with
+// whatever token the host hands in: the cloud's app credentials (a
+// client-credentials grant, apps/cloud catalog/spotify-app-token.ts — no user,
+// so Development Mode's five-user cap does not apply; the endpoint limits do)
+// or, on a desktop, the user's own login. The same endpoints answer both.
 //
 // artist: /artists/{id}/albums (album, single), newest first; a release not
 // expanded before costs one more call, /albums/{id}: its UPC (external_ids,
@@ -35,7 +37,13 @@ type SpAlbumRef = {
 type SpTrackRef = { id: string; name: string; duration_ms?: number; track_number?: number; disc_number?: number; artists?: SpArtistRef[]; external_urls?: { spotify?: string } };
 type SpAlbum = SpAlbumRef & { external_ids?: { upc?: string; ean?: string }; tracks?: { items: SpTrackRef[] }; genres?: string[]; label?: string };
 
-export type SpotifyAppCredentials = { clientId: string; clientSecret: string };
+// A bearer token for Spotify's API, good at the time of the call. The host
+// refreshes behind it (an app token a minute before expiry; a desktop's vended
+// user token through its own auth).
+export type SpotifyTokenSource = (signal?: AbortSignal) => Promise<string>;
+
+// What the enrichment steps need of a tracker: its authenticated GET.
+export type SpotifyReader = Pick<SpotifyTracker, 'get'>;
 
 const artistClaim = (a: SpArtistRef): CatalogClaim => ({
 	provider: 'spotify',
@@ -45,40 +53,21 @@ const artistClaim = (a: SpArtistRef): CatalogClaim => ({
 	url: a.external_urls?.spotify ?? `https://open.spotify.com/artist/${a.id}`,
 });
 
-export class SpotifyAppTracker implements TrackerAdapter {
+export class SpotifyTracker implements TrackerAdapter {
 	readonly provider = 'spotify' as const;
 	// label: through its catalogue playlists (profile/catalogue-playlists.ts),
 	// handed in as `target.related`.
 	readonly kinds: readonly CatalogKind[] = ['artist', 'label'];
 	readonly callsPerPoll = 1 + EXPAND_PER_POLL;
-	private token: { value: string; expiresAt: number } | null = null;
 
 	constructor(
-		private readonly creds: SpotifyAppCredentials,
+		private readonly deps: { token: SpotifyTokenSource },
 		private readonly fetchFn: FetchLike = (u, i) => fetch(u, i),
 		private readonly now: () => number = Date.now,
 	) {}
 
-	// An app token, refreshed a minute before Spotify's expiry.
-	async accessToken(signal?: AbortSignal): Promise<string> {
-		if (this.token && this.token.expiresAt - 60_000 > this.now()) return this.token.value;
-		const res = await this.fetchFn('https://accounts.spotify.com/api/token', {
-			method: 'POST',
-			headers: {
-				'content-type': 'application/x-www-form-urlencoded',
-				authorization: `Basic ${Buffer.from(`${this.creds.clientId}:${this.creds.clientSecret}`).toString('base64')}`,
-			},
-			body: 'grant_type=client_credentials',
-			signal,
-		});
-		if (!res.ok) throw new Error(`spotify token ${res.status}`);
-		const j = (await res.json()) as { access_token: string; expires_in: number };
-		this.token = { value: j.access_token, expiresAt: this.now() + j.expires_in * 1000 };
-		return j.access_token;
-	}
-
 	async get<T>(path: string, signal?: AbortSignal): Promise<T> {
-		const token = await this.accessToken(signal);
+		const token = await this.deps.token(signal);
 		return getJson<T>(this.fetchFn, 'spotify', `${API}${path}`, { headers: { authorization: `Bearer ${token}` }, signal, logPath: path.split('?')[0]! });
 	}
 
@@ -172,7 +161,7 @@ export class SpotifyAppTracker implements TrackerAdapter {
 // Albums in full (UPC, label, tracklist), twenty a call: the back office's
 // fill (release-fill.ts). An id Spotify no longer knows comes back null and
 // is left out.
-export async function fetchAlbums(app: SpotifyAppTracker, ids: readonly string[], signal: AbortSignal): Promise<{ claims: Map<string, CatalogClaim>; calls: number }> {
+export async function fetchAlbums(app: SpotifyReader, ids: readonly string[], signal: AbortSignal): Promise<{ claims: Map<string, CatalogClaim>; calls: number }> {
 	const claims = new Map<string, CatalogClaim>();
 	const distinct = [...new Set(ids)];
 	let calls = 0;
@@ -201,7 +190,7 @@ export type SpPlaylistEntry = { added_at?: string; is_local?: boolean; track?: S
 type SpPlaylistPage = { items?: SpPlaylistEntry[]; next?: string | null; total?: number };
 
 export async function readPlaylistItems(
-	app: SpotifyAppTracker,
+	app: SpotifyReader,
 	playlistId: string,
 	signal: AbortSignal,
 	opts: { maxPages?: number; offset?: number } = {},
@@ -229,7 +218,7 @@ export const trackOf = (e: SpPlaylistEntry): SpPlaylistTrack | null => {
 
 // A playlist's name and keeper: what a hand-linked catalogue playlist is
 // recorded as.
-export async function fetchPlaylistMeta(app: SpotifyAppTracker, playlistId: string, signal: AbortSignal): Promise<{ name: string; owner: string; ownerId: string | null; snapshotId: string | null }> {
+export async function fetchPlaylistMeta(app: SpotifyReader, playlistId: string, signal: AbortSignal): Promise<{ name: string; owner: string; ownerId: string | null; snapshotId: string | null }> {
 	const p = await app.get<{ name?: string; owner?: { display_name?: string; id?: string }; snapshot_id?: string }>(
 		`/playlists/${encodeURIComponent(playlistId)}?fields=name,owner(display_name,id),snapshot_id`,
 		signal,
@@ -239,7 +228,7 @@ export async function fetchPlaylistMeta(app: SpotifyAppTracker, playlistId: stri
 
 // The label each album names, Spotify's own `label` field: the playlist's
 // items carry the album without it, and /albums gives twenty a call.
-export async function fetchAlbumLabels(app: SpotifyAppTracker, ids: readonly string[], signal: AbortSignal): Promise<{ labels: Map<string, string>; calls: number }> {
+export async function fetchAlbumLabels(app: SpotifyReader, ids: readonly string[], signal: AbortSignal): Promise<{ labels: Map<string, string>; calls: number }> {
 	const labels = new Map<string, string>();
 	const distinct = [...new Set(ids)];
 	let calls = 0;

@@ -5,10 +5,9 @@ import { withSystemTx } from '../db/system-tx.js';
 import { asUser, createTestApp, createTestDb, errorReason, ROLES_SQL } from '../test/harness.js';
 import { createLogger } from '../log.js';
 import { ingestClaims } from './ingest.js';
-import { nextDueAt } from './trackers/cadence.js';
+import { nextDueAt, spreadOf } from './trackers/cadence.js';
 import { runTrackers } from './trackers/sweep.js';
-import type { TrackerAdapter, TrackerPoll, TrackerTarget } from './trackers/types.js';
-
+import type { TrackerAdapter, TrackerPoll, TrackerTarget } from '@curator/catalog-readers';
 const DAY = 86400_000;
 const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
@@ -98,6 +97,19 @@ describe('ingestion', () => {
 			where o.kind = 'artist' group by o.id order by reps`,
 		);
 		expect(artists.map((x) => x.reps)).toEqual(['deezer:da1,spotify:sa1', 'deezer:da9']);
+	});
+
+	it('joins a compilation one store credits to a duo and another to its two members: one act named, title and date agreeing', async () => {
+		const { db } = await createTestDb();
+		const date = '2026-11-13';
+		const bc = release('deezer', 'br1', 'Collapsed (Compiled by Frankey & Sandrino)', [artist('deezer', 'bb1', 'Frankey & Sandrino')], { date });
+		const bp = release('spotify', 'sr1', 'Collapsed (compiled by Frankey & Sandrino)', [artist('spotify', 'sa1', 'Frankey'), artist('spotify', 'sa2', 'Sandrino')], { date });
+		// Same title and day, no act in common: another release.
+		const other = release('spotify', 'sr2', 'Collapsed (compiled by Frankey & Sandrino)', [artist('spotify', 'sa3', 'Someone Else')], { date });
+		const a = await withSystemTx(db, (tx) => ingestClaims(tx, [bc], { reason: 'library_import' }));
+		const b = await withSystemTx(db, (tx) => ingestClaims(tx, [bp, other], { reason: 'library_import' }));
+		expect(b.outcomes[0]!.objectId).toBe(a.outcomes[0]!.objectId);
+		expect(b.outcomes[1]!.objectId).not.toBe(a.outcomes[0]!.objectId);
 	});
 
 	it("joins a track's credit to the release's namesake across stores, keeps a store's second id apart, and never mints a third copy", async () => {
@@ -215,6 +227,79 @@ describe('watches and tracking', () => {
 		const { api, deviceId } = await app.signIn();
 		expect((await errorReason(api.catalog.watch.mutate({ deviceId, claim: release('spotify', 'sr1', 'X', []), source: 'manual' }))).reason).toBe('catalog_claim_invalid');
 		expect((await errorReason(api.catalog.watch.mutate({ deviceId, objectId: randomUUID(), source: 'manual' }))).reason).toBe('catalog_not_found');
+	});
+
+	// A desktop's facts-up: what its Beatport lookup found for a card.
+	it('a device’s enrichment fills a known recording’s facts and genre by ISRC, creates nothing, raises nothing', async () => {
+		const app = await createTestApp();
+		const { api, deviceId } = await app.signIn();
+		const tracked = await api.catalog.watch.mutate({ deviceId, claim: artist('spotify', 'sa1', 'Northfold'), source: 'manual' });
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(tx, [release('spotify', 'sr1', 'Glass Rivers', [artist('spotify', 'sa1', 'Northfold')], { tracks: [{ id: 'st1', title: 'Glass Rivers', isrc: 'GBAAA2600001', dur: 400 }] })], { reason: 'tracker' }),
+		);
+		const beatport = (id: string, isrc: string, dur: number, title = 'Glass Rivers'): CatalogClaim => ({
+			provider: 'beatport',
+			kind: 'recording',
+			providerId: id,
+			name: title,
+			url: `https://www.beatport.com/track/x/${id}`,
+			identifiers: [{ namespace: 'isrc', value: isrc }],
+			artists: [{ provider: 'user', kind: 'artist', providerId: 'name:northfold', name: 'Northfold' }],
+			facts: { bpm: 124, key: 'A Minor', durationSec: dur, labelText: 'Northfold Records' },
+			genres: ['Melodic House & Techno'],
+		});
+		const r = await api.catalog.ingest.mutate({
+			deviceId,
+			reason: 'enrichment',
+			idempotencyKey: 'enrich-facts-0001',
+			// Known by ISRC; an ISRC nobody holds; a length too far from the recording's.
+			claims: [beatport('bp1', 'GBAAA2600001', 402), beatport('bp2', 'GBZZZ2699999', 300, 'Unknown Thing'), beatport('bp3', 'GBAAA2600001', 200)],
+		});
+		expect(r).toMatchObject({ created: 0, attached: 1, duplicate: false, results: [{ created: false }, { rejected: 'unknown' }, { rejected: 'unknown' }] });
+		const [rec] = await app.db.query<{ attrs: string; reps: string; genre: string | null }>(
+			`select o.attrs::text as attrs,
+				(select string_agg(so.provider || ':' || so.provider_id, ',' order by so.provider) from curator.catalog_source_object so where so.object_id = o.id) as reps,
+				(select g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = o.id and e.kind = 'object-genre') as genre
+			from curator.catalog_object o where o.kind = 'recording'`,
+		);
+		expect(rec!.reps).toBe('beatport:bp1,spotify:st1');
+		expect(JSON.parse(rec!.attrs)).toMatchObject({ bpm: 124, key: 'A Minor' });
+		expect(rec!.genre).toBe('Melodic House & Techno');
+		expect(await count(app.db, `select count(*) as n from curator.catalog_object where kind in ('recording', 'release', 'artist')`)).toBe(3);
+		expect(await count(app.db, `select count(*) as n from curator.catalog_event`)).toBe(0);
+
+		// The lazy Spotify match's handles: the release by title, artist and
+		// date, its track by ISRC; an unknown release stays unknown.
+		const spotifyRelease = (id: string, name: string, date: string): CatalogClaim => ({
+			provider: 'spotify',
+			kind: 'release',
+			providerId: id,
+			name,
+			url: `https://open.spotify.com/album/${id}`,
+			artists: [{ provider: 'user', kind: 'artist', providerId: 'name:northfold', name: 'Northfold' }],
+			facts: { releaseDate: date },
+		});
+		const r2 = await api.catalog.ingest.mutate({
+			deviceId,
+			reason: 'enrichment',
+			idempotencyKey: 'enrich-facts-0002',
+			claims: [
+				spotifyRelease('spal1', 'Glass Rivers', iso(Date.now())),
+				{ provider: 'spotify', kind: 'recording', providerId: 'sptr1', name: 'Glass Rivers', identifiers: [{ namespace: 'isrc', value: 'GBAAA2600001' }], facts: { durationSec: 400 } },
+				spotifyRelease('spal9', 'Nothing Like It', iso(Date.now())),
+			],
+		});
+		expect(r2.results).toMatchObject([{ created: false }, { created: false }, { rejected: 'unknown' }]);
+		const reps = await app.db.query<{ kind: string; reps: string }>(
+			`select o.kind, string_agg(so.provider || ':' || so.provider_id, ',' order by so.provider, so.provider_id) as reps
+			from curator.catalog_object o join curator.catalog_source_object so on so.object_id = o.id where o.kind in ('release', 'recording') group by o.kind order by o.kind`,
+		);
+		expect(reps).toEqual([
+			{ kind: 'recording', reps: 'beatport:bp1,spotify:sptr1,spotify:st1' },
+			{ kind: 'release', reps: 'spotify:spal1,spotify:sr1' },
+		]);
+		expect(await count(app.db, `select count(*) as n from curator.catalog_object where kind in ('recording', 'release', 'artist')`)).toBe(3);
+		void tracked;
 	});
 
 	it("a user cannot read another user's watches", async () => {
@@ -387,6 +472,13 @@ describe('quota and cadence', () => {
 		expect(new Date(nextDueAt(fridayTwo, cadence)).toISOString()).toBe('2026-10-23T04:00:00.000Z');
 		const saturday = Date.UTC(2026, 9, 24, 9);
 		expect(new Date(nextDueAt(saturday, cadence)).toISOString()).toBe('2026-10-25T09:00:00.000Z');
+		// A cursor's own spread: up to one Friday interval after the window
+		// opens, and 1 to 1.5 intervals between polls inside it.
+		expect(new Date(nextDueAt(thursdayNoon, cadence, 0.5)).toISOString()).toBe('2026-10-23T01:00:00.000Z');
+		expect(new Date(nextDueAt(fridayTwo, cadence, 0.5)).toISOString()).toBe('2026-10-23T04:30:00.000Z');
+		expect(spreadOf('a')).not.toBe(spreadOf('b'));
+		for (const id of ['a', 'b', '2f0c']) expect(spreadOf(id)).toBeGreaterThanOrEqual(0);
+		for (const id of ['a', 'b', '2f0c']) expect(spreadOf(id)).toBeLessThan(1);
 	});
 });
 

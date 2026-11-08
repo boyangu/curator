@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AgentSidecarManager } from './sidecar.js';
-import type { AgentDelta, RunParams } from '@curator/agent-core';
+import { AGENT_PROTOCOL, type AgentDelta, type RunParams } from '@curator/agent-core';
 
 // Scripted fake sidecar child (plain Node, CJS via -e): speaks the protocol
 // well enough to exercise handshake, configure, classify, and the
@@ -8,13 +8,17 @@ import type { AgentDelta, RunParams } from '@curator/agent-core';
 const FAKE_SIDECAR = `
 const rl = require('node:readline').createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
-send({ event: 'hello', name: 'curator-agent', version: '0.0.0-test', protocol: 1 });
+send({ event: 'hello', name: 'curator-agent', version: '0.0.0-test', protocol: ${AGENT_PROTOCOL} });
 let pendingRunId = null, pendingTurn = null;
 rl.on('line', (line) => {
 	if (!line.trim()) return;
 	let f; try { f = JSON.parse(line); } catch { return; }
 	if (f.method === 'configure') send({ id: f.id, result: { ok: true } });
 	if (f.method === 'classify') send({ id: f.id, result: { mode: 'quick' } });
+	if (f.method === 'research') send({ id: f.id, result: {
+		requestId: f.params.requestId, stopReason: 'structured', structured: { claims: [{ name: 'A' }], echoedPrompt: f.params.prompt },
+		usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, steps: 2 }, model: 'm', sources: [],
+	} });
 	if (f.method === 'run') {
 		pendingRunId = f.id; pendingTurn = f.params.turnId;
 		send({ event: 'delta', turnId: pendingTurn, delta: { type: 'text', text: 'hi ' } });
@@ -117,6 +121,15 @@ describe('AgentSidecarManager', () => {
 		await mgr.shutdown();
 	});
 
+	it('research round-trips in its own RPC', async () => {
+		const mgr = makeManager();
+		mgr.start();
+		await mgr.configure(CONFIG);
+		const r = await mgr.research({ requestId: 'r1', system: 's', prompt: 'similar to X', claimsSchema: { type: 'object' }, limits: { maxSteps: 4, maxToolResultBytes: 1024 } });
+		expect(r).toMatchObject({ requestId: 'r1', stopReason: 'structured', structured: { claims: [{ name: 'A' }], echoedPrompt: 'similar to X' } });
+		await mgr.shutdown();
+	});
+
 	it('disables itself on a handshake mismatch', async () => {
 		const mgr = makeManager(FAKE_SIDECAR.replace("name: 'curator-agent'", "name: 'imposter'"));
 		mgr.start();
@@ -134,7 +147,7 @@ describe('AgentSidecarManager', () => {
 		// Child that says hello then exits on any run request.
 		const mgr = makeManager(`
 			const rl = require('node:readline').createInterface({ input: process.stdin });
-			process.stdout.write(JSON.stringify({ event: 'hello', name: 'curator-agent', version: 'x', protocol: 1 }) + '\\n');
+			process.stdout.write(JSON.stringify({ event: 'hello', name: 'curator-agent', version: 'x', protocol: ${AGENT_PROTOCOL} }) + '\\n');
 			rl.on('line', (line) => {
 				const f = JSON.parse(line);
 				if (f.method === 'configure') process.stdout.write(JSON.stringify({ id: f.id, result: { ok: true } }) + '\\n');

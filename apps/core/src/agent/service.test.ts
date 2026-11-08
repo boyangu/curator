@@ -47,10 +47,10 @@ describe('describeViewContext', () => {
 			.toBe('Rekordbox tab, folder "Bangers"');
 	});
 
-	it('describes discover modes and filters', () => {
+	it('describes discover modes and standing lenses', () => {
 		expect(describeViewContext({ view: 'discover', discover: { mode: 'feed' } })).toBe('Discover feed');
-		expect(describeViewContext({ view: 'discover', discover: { mode: 'feed', genre: 'Techno', label: 'Afterlife' } }))
-			.toBe('Discover feed with genre filter "Techno" and label filter "Afterlife"');
+		expect(describeViewContext({ view: 'discover', discover: { mode: 'feed', lenses: [{ id: 'l1', label: 'artists I don’t have' }, { id: 'l2', label: 'Techno' }] } }))
+			.toBe('Discover feed with standing lenses "artists I don’t have" (lens l1), "Techno" (lens l2)');
 		expect(describeViewContext({ view: 'discover', discover: { mode: 'journeys' } })).toBe('Discover tab, Journeys view');
 		expect(describeViewContext({ view: 'discover', discover: { mode: 'agent-results' } })).toBe('Discover tab, viewing an agent result list');
 	});
@@ -72,6 +72,7 @@ describe('external tool API (MCP bridge)', () => {
 	const tools: AgentTool[] = [
 		{
 			name: 'find_hit',
+			annotations: { readOnly: true },
 			description: 'records a provider hit, like a search tool would',
 			parameters: SCHEMA,
 			async execute(_args, ctx) {
@@ -81,6 +82,7 @@ describe('external tool API (MCP bridge)', () => {
 		},
 		{
 			name: 'present',
+			annotations: { readOnly: true },
 			description: 'forwards to ctx.presentResultSet',
 			parameters: SCHEMA,
 			async execute(args, ctx) {
@@ -90,6 +92,7 @@ describe('external tool API (MCP bridge)', () => {
 		},
 		{
 			name: 'huge',
+			annotations: { readOnly: true },
 			description: 'oversized result',
 			parameters: SCHEMA,
 			async execute() {
@@ -98,6 +101,7 @@ describe('external tool API (MCP bridge)', () => {
 		},
 		{
 			name: 'slow',
+			annotations: { readOnly: true },
 			description: 'never resolves',
 			parameters: SCHEMA,
 			timeoutMs: 30,
@@ -119,7 +123,6 @@ describe('external tool API (MCP bridge)', () => {
 			store,
 			tools,
 			refs,
-			getFeedFilterOptions: async () => ({ genres: [], labels: [] }),
 		});
 		events = [];
 		service.subscribeEvents((e) => events.push(e));
@@ -132,6 +135,8 @@ describe('external tool API (MCP bridge)', () => {
 
 	it('exposes the registry specs and executes tools without a sidecar', async () => {
 		expect(service.externalToolSpecs().map((s) => s.name)).toEqual(['find_hit', 'present', 'huge', 'slow']);
+		// Outside models get each tool's hints; the in-app model's specs leave them out.
+		expect(service.externalToolSpecs().every((s) => s.annotations?.readOnly === true)).toBe(true);
 		const session = service.createExternalSession('Claude Desktop');
 		const result = await service.runExternalTool({ sessionId: session.id, name: 'find_hit', args: {} });
 		expect(result).toEqual({ found: true });

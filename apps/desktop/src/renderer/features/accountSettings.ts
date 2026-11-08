@@ -18,8 +18,9 @@
 // Signed in, a tick while one of this panel's inputs has focus only patches
 // the live lines in place, for the same reason (the check-cadence inputs).
 
-import type { CatalogueStatus, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings } from '@curator/core';
-import { accountApi, catalogueApi, cloudSyncApi } from '../data/api.js';
+import type { CatalogueStatus, CatalogWorkerStatus, CloudSyncStatusReport, SyncPollPolicy, SyncPollSettings } from '@curator/core';
+import { accountApi, catalogApi, catalogueApi, cloudSyncApi } from '../data/api.js';
+import { catalogWorkerLine } from './accountModel.js';
 import { log } from '../data/log.js';
 import { escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
@@ -46,6 +47,9 @@ const alog = log.for('account-settings');
 
 let unsubscribe: (() => void) | null = null;
 let unsubscribeCatalogue: (() => void) | null = null;
+let unsubscribeWorker: (() => void) | null = null;
+// This desktop as a catalogue worker (one line under the master device).
+let worker: CatalogWorkerStatus | null = null;
 let account: AccountStatus | null = null;
 let sync: CloudSyncStatusReport | null = null;
 let catalogue: CatalogueStatus | null = null;
@@ -319,6 +323,7 @@ function renderLibrarySection(): string {
 			</label>
 			<div class="settings-toggle__hint">${escapeHtml(info.metaSyncAvailable ? MASTER_HINT : MASTER_UNAVAILABLE)}</div>
 			${masterError ? `<div class="backup__banner backup__banner--error">${escapeHtml(masterError)}</div>` : ''}
+			<div class="settings-toggle__hint" data-ac-worker-line>${escapeHtml(catalogWorkerLine(worker))}</div>
 		</div>`;
 }
 
@@ -605,16 +610,18 @@ function render(host: HTMLElement): void {
 
 async function refresh(host: HTMLElement): Promise<void> {
 	try {
-		const [a, s, ps, cs] = await Promise.all([
+		const [a, s, ps, cs, ws] = await Promise.all([
 			accountApi.status(),
 			cloudSyncApi.status(),
 			cloudSyncApi.pollSettings().catch((err) => { alog.warn('poll settings failed', { err: String(err) }); return pollSettings; }),
 			catalogueApi.status().catch((err) => { alog.warn('catalogue status failed', { err: String(err) }); return catalogue; }),
+			catalogApi.workerStatus().catch((err) => { alog.warn('catalog worker status failed', { err: String(err) }); return worker; }),
 		]);
 		account = a;
 		sync = s;
 		pollSettings = ps;
 		catalogue = cs;
+		worker = ws;
 		render(host);
 		// A revoked computer is refused the list (and everything else).
 		if (a.signedIn && accountActions(a, s).manageDevices) {
@@ -633,6 +640,7 @@ async function refresh(host: HTMLElement): Promise<void> {
 export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribe?.();
 	unsubscribeCatalogue?.();
+	unsubscribeWorker?.();
 	unsubscribeLibrary?.();
 	if (clockTimer) clearInterval(clockTimer);
 	clockTimer = setInterval(() => {
@@ -644,6 +652,13 @@ export function mountAccountSettings(host: HTMLElement): void {
 	unsubscribeLibrary = onAccountLibraryInfo(() => {
 		if (!host.isConnected) { unsubscribeLibrary?.(); unsubscribeLibrary = null; return; }
 		paintLibrary(host);
+	});
+	// The catalogue worker's line, patched in place (a change a minute at most).
+	unsubscribeWorker = catalogApi.onWorkerStatus((w) => {
+		if (!host.isConnected) { unsubscribeWorker?.(); unsubscribeWorker = null; return; }
+		worker = w;
+		const line = host.querySelector<HTMLElement>('[data-ac-worker-line]');
+		if (line) line.textContent = catalogWorkerLine(w);
 	});
 	// Shared analysis ticks patch their own lines in place (they arrive
 	// during a hydrate or an upload, often while the user is in this panel).

@@ -4,13 +4,13 @@
 // compares them with the catalogue's own releases for the object.
 
 import type { ReviewCandidate } from './admin.js';
-import { fetchNextData, queryData, type BpPage, type BpReleaseRef } from './trackers/beatport-pages.js';
-import { getJson, type FetchLike } from './trackers/http.js';
-import type { SpotifyAppTracker } from './trackers/spotify-app.js';
+import { fetchNextData, queryData, type BpPage, type BpReleaseRef } from '@curator/catalog-readers';
+import { getJson, type FetchLike } from '@curator/catalog-readers';
+import type { SpotifyTracker } from '@curator/catalog-readers';
 import type { AppleLookup } from './trackers/apple.js';
 import type { TidalApp } from './trackers/tidal-app.js';
 
-export type EvidenceDeps = { fetch?: FetchLike; spotify?: SpotifyAppTracker | null; tidal?: TidalApp | null; apple?: AppleLookup | null };
+export type EvidenceDeps = { fetch?: FetchLike; spotify?: SpotifyTracker | null; tidal?: TidalApp | null; apple?: AppleLookup | null };
 
 const UA = 'curator-catalog/0.1 (+https://github.com/boyangu/curator)';
 

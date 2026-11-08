@@ -38,8 +38,8 @@ import { withSystemTx } from '../../db/system-tx.js';
 import type { Logger } from '../../log.js';
 import { objectReleases, openReview, type ReviewCandidate } from '../admin.js';
 import { addEdge, ingestClaims, linkReleasesToLabel } from '../ingest.js';
-import { fetchAlbumLabels, readPlaylistItems, releaseClaimFromTrack, trackOf, type SpotifyAppTracker, type SpPlaylistTrack } from '../trackers/spotify-app.js';
-import { TrackerRateLimitedError } from '../trackers/types.js';
+import { fetchAlbumLabels, readPlaylistItems, releaseClaimFromTrack, trackOf, type SpotifyTracker, type SpPlaylistTrack } from '@curator/catalog-readers';
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
 import { ensureCursors } from '../watches.js';
 
 const QUERIES = (name: string) => [...new Set([name, labelCore(name), `${labelCore(name)} recordings`, `${labelCore(name)} all releases`])];
@@ -130,7 +130,7 @@ export function labelCore(name: string): string {
 	return (core.length ? core : words).join(' ');
 }
 
-async function search(app: SpotifyAppTracker, name: string, signal: AbortSignal): Promise<{ candidates: Candidate[]; calls: number }> {
+async function search(app: SpotifyTracker, name: string, signal: AbortSignal): Promise<{ candidates: Candidate[]; calls: number }> {
 	const want = labelCore(name);
 	const out = new Map<string, Candidate>();
 	let calls = 0;
@@ -161,7 +161,7 @@ const newestOf = (pages: Page[]): string | null => pages.flatMap((p) => p.entrie
 
 // One candidate measured: its first page (and last, for the newest
 // addition), the sampled albums' labels, and the four signals.
-async function measure(app: SpotifyAppTracker, c: Candidate, label: { name: string }, known: Known, now: number, signal: AbortSignal): Promise<{ verdict: Verdict; first: Page; labels: Map<string, string> }> {
+async function measure(app: SpotifyTracker, c: Candidate, label: { name: string }, known: Known, now: number, signal: AbortSignal): Promise<{ verdict: Verdict; first: Page; labels: Map<string, string> }> {
 	const first = await readPlaylistItems(app, c.id, signal, { maxPages: 1 });
 	const tracks = first.entries.map(trackOf).filter((x): x is SpPlaylistTrack => !!x);
 	const albumIds = [...new Set(tracks.map((t) => t.album?.id).filter((id): id is string => !!id))].slice(0, SAMPLE_ALBUMS);
@@ -237,7 +237,7 @@ export async function queueCataloguePlaylists(tx: Queryable, labelId: string): P
 // Every track of a catalogue playlist as a Spotify release of the label,
 // each with the label Spotify files its album under.
 async function fill(
-	deps: { db: Db; app: SpotifyAppTracker },
+	deps: { db: Db; app: SpotifyTracker },
 	label: { id: string; name: string },
 	playlistSpotifyId: string,
 	signal: AbortSignal,
@@ -272,7 +272,7 @@ async function fill(
 	return { calls, releases: claims.length };
 }
 
-export type CatalogueDeps = { db: Db; log: Logger; spotify: SpotifyAppTracker | null; holder: string; batch?: number; now?: () => number };
+export type CatalogueDeps = { db: Db; log: Logger; spotify: SpotifyTracker | null; holder: string; batch?: number; now?: () => number };
 
 export async function runCataloguePlaylists(deps: CatalogueDeps): Promise<{ attempted: number; accepted: number; reviews: number; releases: number }> {
 	const stats = { attempted: 0, accepted: 0, reviews: 0, releases: 0 };

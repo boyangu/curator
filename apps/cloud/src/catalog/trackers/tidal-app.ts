@@ -13,7 +13,7 @@
 // few calls here do not need it.
 
 import type { CatalogClaim } from '@curator/protocol';
-import { getJson, type FetchLike } from './http.js';
+import { getJson, type FetchLike } from '@curator/catalog-readers';
 
 const API = 'https://openapi.tidal.com/v2';
 

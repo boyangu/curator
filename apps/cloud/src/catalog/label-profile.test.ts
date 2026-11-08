@@ -8,9 +8,9 @@ import { createLogger } from '../log.js';
 import { createTestApp, type TestApp } from '../test/harness.js';
 import { classifyUrl, websiteLink } from './profile/links.js';
 import { runLabelProfiler } from './profile/label-profiler.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyAppTracker } from './trackers/spotify-app.js';
-
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyTracker } from '@curator/catalog-readers';
+import { appCredentialsToken } from './spotify-app-token.js';
 const quiet = createLogger(() => {});
 
 type World = {
@@ -54,7 +54,7 @@ function fakeWorld(w: World): { fetch: FetchLike; calls: string[] } {
 }
 
 const run = (app: TestApp, fetch: FetchLike, spotify = true) =>
-	runLabelProfiler({ db: app.db, log: quiet, fetch, spotify: spotify ? new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fetch) : null, sleep: async () => {} });
+	runLabelProfiler({ db: app.db, log: quiet, fetch, spotify: spotify ? new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fetch) }, fetch) : null, sleep: async () => {} });
 
 const reps = async (app: TestApp, objectId: string) =>
 	(await app.db.query<{ provider: string; provider_id: string }>(`select provider, provider_id from curator.catalog_source_object where object_id = $1 order by provider`, [objectId])).map((r) => `${r.provider}:${r.provider_id}`);

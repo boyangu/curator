@@ -10,8 +10,8 @@ import { withSystemTx } from '../db/system-tx.js';
 import { createLogger } from '../log.js';
 import { createTestApp } from '../test/harness.js';
 import { ingestClaims } from './ingest.js';
-import { BandcampTracker } from './trackers/bandcamp.js';
-import type { FetchLike } from './trackers/http.js';
+import { BandcampTracker } from '@curator/catalog-readers';
+import type { FetchLike } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
 
 const quiet = createLogger(() => {});

@@ -105,7 +105,6 @@ describe('agent tools × workspace', () => {
 				presented.push({ title: input.title, accepted: accepted.length, rejected });
 				return { resultSetId: accepted.length > 0 ? 'rs1' : '', accepted: accepted.length, rejected };
 			},
-			async setFeedFilters() { return { ok: true }; },
 		};
 	});
 

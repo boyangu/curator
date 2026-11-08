@@ -38,13 +38,20 @@ import type {
 	FeedMembershipTier,
 	LibraryTier,
 	FeedPage,
+	FeedItemActivity,
 	FeedRefreshResult,
+	FeedRefreshScope,
+	FeedRefreshStatus,
 	FeedDecisionPort,
 	FeedRole,
+	FeedTrackRef,
 } from './types.js';
 import { resolveFeedMembership } from './types.js';
+import { spotifyIdOf, trackSpotifyIdOf } from './handles.js';
 import { log } from '../log.js';
 import { CLOUD_FEED_PRODUCER_ID, CloudFeedProducer, type CatalogFeedPort } from './cloud-producer.js';
+import { matchSpotify, needsMatch } from './spotify-match.js';
+import { hasArtistLens, itemArtists, passesArtistLenses, sqlFilterOf, type ArtistSignals, type FeedLens } from './lenses.js';
 
 const flog = log.for('feed');
 
@@ -92,6 +99,11 @@ export interface LibraryPort {
 	// interested tag, source links, memberships). Used by the 'uninterested'
 	// action's "remove from pinned and library" path.
 	unpromote(trackId: string): Promise<void>;
+	// Per-artist library facts for the artist lenses (feed/lenses.ts), keyed
+	// `id:<spotifyArtistId>` / `name:<artistKey>`: who the library holds (own
+	// local files) and how often each artist was played in rekordbox sets.
+	// Absent ⇒ every artist reads as unknown (no library, no plays).
+	artistSignals?(): Promise<Pick<ArtistSignals, 'library' | 'setPlays'>>;
 }
 
 export interface FeedServiceDeps {
@@ -115,6 +127,10 @@ export interface FeedServiceDeps {
 	// catalogue (catalog-client/follows-sync.ts): follows live there from
 	// then on, so unfollow and mute act on the watch, not on Spotify.
 	catalogFollows?: CatalogFollowsPort;
+	// The account's standing lenses (the `feed.lenses` setting, read through
+	// the host). Every page — the renderer's and the assistant's — passes
+	// through them. Absent ⇒ no lenses.
+	lenses?: () => readonly FeedLens[];
 }
 
 export interface CatalogFollowsPort {
@@ -128,6 +144,10 @@ export interface CatalogFollowsPort {
 	watchFor(kind: 'artist' | 'playlist', spotifyId: string): Promise<string | null>;
 	// Spotify ids of every watched artist / playlist.
 	watchedSpotifyIds(kind: 'artist' | 'playlist'): Promise<Set<string>>;
+	// Catalogue object ids of every watch of this kind: label and genre
+	// origins key on them, and artists the catalogue knows without a Spotify
+	// id (`catalog:<id>`).
+	watchedCatalogIds(kind: 'artist' | 'label' | 'genre' | 'playlist'): Promise<Set<string>>;
 	// Spotify ids of watched playlists the cloud is not (yet) reading: this
 	// device's playlist producer keeps reading those.
 	deviceTrackedPlaylists(): Promise<Set<string>>;
@@ -136,7 +156,12 @@ export interface CatalogFollowsPort {
 }
 
 export interface FeedService {
+	// The visible feed through the standing lenses. genre/label here narrow
+	// further (the assistant's query_feed); they AND with any genre/label lens.
 	getPage(req?: { cursor?: string | null; limit?: number } & FeedFilter): Promise<FeedPage>;
+	// Drop the cached library signals so the next lensed page rebuilds them
+	// (the host calls it when the lenses change).
+	invalidateLensSignals(): void;
 	getArchivedPage(req?: { cursor?: string | null; limit?: number }): Promise<FeedPage>;
 	// Distinct genre/label values across the visible feed — populates the
 	// renderer's filter dropdowns.
@@ -149,7 +174,17 @@ export interface FeedService {
 	// straight onto the card. One item at a time by design: fanning lookups out
 	// across every visible card would fire concurrent scrapes and trip Beatport's
 	// Cloudflare WAF.
-	enrichItem(itemId: string): Promise<FeedItem | null>;
+	//
+	// The lazy fill of a viewed card: first the Spotify match when the item has
+	// no Spotify id (spotify-match.ts; upgraded in place on a hit), then the
+	// enrichment. Both idempotent; repeat calls for one item coalesce.
+	// `enrich: false` (a page landing): the match alone — Beatport's per-track
+	// pacing would turn a page of cards into minutes of scraping; the expand
+	// path and the background drain enrich.
+	fillItem(itemId: string, opts?: { enrich?: boolean }): Promise<FeedItem | null>;
+	// What is being done to an item right now (the match, the enrichment), so
+	// a card on screen can say so. The desktop forwards it as 'feed:activity'.
+	subscribeActivity(cb: (a: FeedItemActivity) => void): () => void;
 	action(action: FeedAction): Promise<FeedActionResult>;
 	// Unfollow a source playlist: drop it at the source (so the delta
 	// producer stops seeing it), then hard-remove every feed item it
@@ -160,11 +195,22 @@ export interface FeedService {
 	// producer stops scanning them), then hard-remove every feed item they
 	// produced — release-origin items and any track/album they appear on.
 	unfollowArtist(artistId: string, catalogId?: string): Promise<FeedActionResult>;
-	refresh(): Promise<FeedRefreshResult>;
-	// Manual Refresh of one producer by id (see FEED_PRODUCER_IDS) — drives the
-	// temporary per-source Refresh buttons. Unknown id is a clean no-op.
-	refreshProducer(producerId: string): Promise<FeedRefreshResult>;
+	// Unfollow a catalogue label or genre (a watch, never a provider follow),
+	// then hard-remove the items it brought that no other followed label /
+	// genre also credits.
+	unfollowOrigin(kind: 'label' | 'genre', catalogId: string): Promise<FeedActionResult>;
+	// Manual Refresh: every producer (one kind's, with a scope), the scope's
+	// check first (types.ts FeedRefreshScope).
+	refresh(scope?: FeedRefreshScope): Promise<FeedRefreshResult>;
+	// The catalogue's stream alone, as a background pass: what the catalogue
+	// worker's new events ask for (host service.ts), so a check's releases
+	// reach Discover as they land instead of at the next timer.
+	pollCatalog(): Promise<FeedRefreshResult>;
 	loadMore(days: number): Promise<FeedRefreshResult>;
+	// What the scheduler is doing right now (the pass in flight, step by step),
+	// and every change of it: manual passes and background ones alike.
+	refreshStatus(): FeedRefreshStatus;
+	subscribeRefreshStatus(cb: (status: FeedRefreshStatus) => void): () => void;
 	// Subscribe to per-item enrichment completions (background drain + on-view).
 	// The desktop forwards these as a push event so a card's freshly landed
 	// genre/label/bpm chips appear live. Returns an unsubscribe fn.
@@ -191,13 +237,6 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 //   • new-releases   — one /artists/{id}/albums per followed artist
 const AUTO_POLL = false;
 
-// Producer ids, surfaced so the renderer's temp Refresh buttons can target one
-// producer each via refreshProducer().
-export const FEED_PRODUCER_IDS = {
-	playlists: 'spotify-playlist-delta',
-	artists: 'spotify-new-releases',
-} as const;
-
 export function createFeedService(deps: FeedServiceDeps): FeedService {
 	const { store, auth, library } = deps;
 	const decisions = deps.decisions ?? null;
@@ -222,6 +261,12 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 	// is cheap; listeners are wrapped at the queue boundary so a throw can't
 	// derail the drain.
 	const enrichedListeners = new Set<(item: FeedItem) => void>();
+	const activityListeners = new Set<(a: FeedItemActivity) => void>();
+	const activity = (a: FeedItemActivity): void => {
+		for (const l of activityListeners) {
+			try { l(a); } catch (err) { flog.warn('activity listener failed', undefined, err); }
+		}
+	};
 
 	// Enrichment runs post-bus/async (Beatport's ~1.5s/track WAF) so a deep
 	// backfill can't block the feed from populating.
@@ -230,7 +275,34 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 		[new BeatportEnricher(deps.beatportFetch), new TraxsourceEnricher(deps.beatportFetch)],
 		undefined,
 		(item) => { for (const l of enrichedListeners) l(item); },
+		activity,
 	);
+	// The lazy fill, one item at a time: a page's cards ask for it in turn and
+	// the Spotify gate is shared with the player; the same item asked twice
+	// (a page reload mid-lookup) shares one run.
+	const fills = new Map<string, Promise<FeedItem | null>>();
+	let fillTail: Promise<unknown> = Promise.resolve();
+	const fillItem = (itemId: string, opts: { enrich?: boolean } = {}): Promise<FeedItem | null> => {
+		const pending = fills.get(itemId);
+		if (pending) return pending;
+		const run = fillTail.then(
+			async () => {
+				let item = await store.getItem(itemId);
+				if (!item) return null;
+				if (needsMatch(item)) {
+					const matched = await matchSpotify({ store, client: () => spotifyClient('feed:match'), onActivity: activity }, item);
+					// The card gains its Spotify id live, like an enrichment landing.
+					if (matched.source !== item.source) for (const l of enrichedListeners) l(matched);
+					item = matched;
+				}
+				return opts.enrich === false ? item : enrichment.enrichItem(itemId);
+			},
+			() => null,
+		);
+		fillTail = run.then(() => undefined, () => undefined);
+		fills.set(itemId, run);
+		return run.finally(() => { fills.delete(itemId); });
+	};
 
 	// Pre-bus pipeline: cheap local filters first, expensive network last, so
 	// nothing is expanded that a filter would drop.
@@ -262,16 +334,23 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 	// Unfollow through the catalogue when the follow is a watch there: the
 	// watch goes, and the items it produced go unless another watched artist /
 	// playlist also credits them. Null when there is no such watch.
+	// `spotifyId` may be `catalog:<objectId>` — an artist / playlist the
+	// catalogue knows without a Spotify id (cloud-producer.ts).
 	const unfollowWatch = async (kind: 'artist' | 'playlist', spotifyId: string, catalogId?: string): Promise<FeedActionResult | null> => {
 		if (!followsReachable()) return null;
-		const objectId = catalogId ?? (await follows!.watchFor(kind, spotifyId));
+		const objectId = catalogId
+			?? (spotifyId.startsWith('catalog:') ? spotifyId.slice('catalog:'.length) : await follows!.watchFor(kind, spotifyId));
 		if (!objectId) return null;
 		try {
 			await follows!.unwatch(objectId);
 		} catch (err) {
 			return { ok: false, error: `unfollow failed: ${err instanceof Error ? err.message : String(err)}` };
 		}
-		const still = await follows!.watchedSpotifyIds(kind).catch(() => new Set<string>());
+		const [spotifyIds, catalogIds] = await Promise.all([
+			follows!.watchedSpotifyIds(kind).catch(() => new Set<string>()),
+			follows!.watchedCatalogIds(kind).catch(() => new Set<string>()),
+		]);
+		const still = new Set([...spotifyIds, ...[...catalogIds].map((id) => `catalog:${id}`)]);
 		still.delete(spotifyId);
 		return { ok: true, removed: await store.removeOriginItems(kind, spotifyId, still) };
 	};
@@ -292,7 +371,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 	const decorateTrackItems = async (page: FeedPage): Promise<FeedPage> => {
 		const trackItems = page.items.filter((i) => i.type === 'track');
 		if (trackItems.length === 0) return page;
-		const spotifyTrackIds = trackItems.filter((i) => i.source === 'spotify').map((i) => i.sourceId);
+		const spotifyTrackIds = trackItems.map(spotifyIdOf).filter((x): x is string => !!x);
 		const isrcs = trackItems.map((i) => i.payload.isrc).filter((x): x is string => !!x);
 		// `mem` (raw tier + pinned + source) drives the local-file DROP and the
 		// chip tier; `owned` (resolved curator ids, excludes followed) supplies the
@@ -305,28 +384,89 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 		]);
 		// Raw tier still drives the `local`-file drop; pinned + source resolve the
 		// display chip (a pinned non-local track survives and reads "In Library").
-		const rawOf = (i: FeedItem): LibraryTier | undefined =>
-			(i.source === 'spotify' ? mem.membershipBySpotifyId[i.sourceId] : undefined)
-			?? (i.payload.isrc ? mem.membershipByIsrc[i.payload.isrc] : undefined);
 		const items: FeedItem[] = [];
 		for (const i of page.items) {
 			if (i.type !== 'track') { items.push(i); continue; }
-			if (i.source === 'spotify' && deleted.spotify.has(i.sourceId)) continue;
+			const sid = spotifyIdOf(i);
+			if (sid && deleted.spotify.has(sid)) continue;
 			if (i.payload.isrc && deleted.isrc.has(i.payload.isrc)) continue;
-			const raw = rawOf(i);
+			const raw: LibraryTier | undefined = (sid ? mem.membershipBySpotifyId[sid] : undefined)
+				?? (i.payload.isrc ? mem.membershipByIsrc[i.payload.isrc] : undefined);
 			if (raw === 'local') continue;
-			const pinned = (i.source === 'spotify' && mem.pinnedBySpotifyId.has(i.sourceId))
+			const pinned = (!!sid && mem.pinnedBySpotifyId.has(sid))
 				|| (!!i.payload.isrc && mem.pinnedByIsrc.has(i.payload.isrc));
-			const src = (i.source === 'spotify' ? mem.sourceBySpotifyId[i.sourceId] : undefined)
+			const src = (sid ? mem.sourceBySpotifyId[sid] : undefined)
 				?? (i.payload.isrc ? mem.sourceByIsrc[i.payload.isrc] : undefined);
 			const tier = resolveFeedMembership(raw, pinned, src);
 			// Owned curator id (pinned / local / own playlist — never followed), so
 			// the card's curate menu can Tag / Add-to-playlist / un-pin in place.
-			const libraryTrackId = (i.source === 'spotify' ? owned.bySpotify[i.sourceId] : undefined)
+			const libraryTrackId = (sid ? owned.bySpotify[sid] : undefined)
 				?? (i.payload.isrc ? owned.byIsrc[i.payload.isrc] : undefined);
 			items.push(tier || libraryTrackId ? { ...i, membership: tier, libraryTrackId } : i);
 		}
 		return { ...page, items };
+	};
+
+	// Library signals for the artist lenses. curator.db has no "library
+	// changed" event, so the snapshot lives 10 minutes (and is dropped when the
+	// lenses change); it is two indexed scans, cheap once, not per page.
+	const LENS_SIGNALS_TTL_MS = 10 * 60 * 1000;
+	let librarySignals: { at: number; value: Promise<Pick<ArtistSignals, 'library' | 'setPlays'>> } | null = null;
+	const lensLibrarySignals = (): Promise<Pick<ArtistSignals, 'library' | 'setPlays'>> => {
+		const now = Date.now();
+		if (!librarySignals || now - librarySignals.at > LENS_SIGNALS_TTL_MS) {
+			const value = (library.artistSignals?.() ?? Promise.resolve({ library: new Set<string>(), setPlays: new Map<string, number>() }))
+				.catch((err: unknown) => {
+					flog.warn('lens library signals failed', { err: err instanceof Error ? err.message : String(err) });
+					librarySignals = null;
+					return { library: new Set<string>(), setPlays: new Map<string, number>() };
+				});
+			librarySignals = { at: now, value };
+		}
+		return librarySignals.value;
+	};
+
+	// The page through the lenses. genre/label lenses join the store's SQL
+	// filter; artist lenses filter the visible rows' projection in JS (feed.db
+	// can't see the library) and page over the survivors with the same
+	// "orderTs|id" keyset — full pages and an exact `total`, where an
+	// over-fetch loop would return short pages and a wrong count.
+	const lensedPage = async (req: ({ cursor?: string | null; limit?: number } & FeedFilter) | undefined, lenses: readonly FeedLens[]): Promise<FeedPage> => {
+		const lensSql = sqlFilterOf(lenses);
+		const pick = (a: string | null | undefined, b: string | undefined): string | undefined | false =>
+			a && b && a !== b ? false : (a ?? b ?? undefined);
+		const genre = pick(req?.genre, lensSql.genre);
+		const label = pick(req?.label, lensSql.label);
+		// A query for genre X under a genre-Y lens: nothing can pass both.
+		if (genre === false || label === false) return { items: [], nextCursor: null, total: 0 };
+		const filter: FeedFilter = { ...(genre ? { genre } : {}), ...(label ? { label } : {}) };
+		if (!hasArtistLens(lenses)) return decorateTrackItems(await store.getPage({ ...req, ...filter }));
+
+		const kinds = new Set(lenses.filter((l) => !l.inert).map((l) => l.rule.kind));
+		const [rows, lib, archives] = await Promise.all([
+			store.lensProjection(filter),
+			kinds.has('library-artist') || kinds.has('set-artist') ? lensLibrarySignals() : Promise.resolve({ library: new Set<string>(), setPlays: new Map<string, number>() }),
+			kinds.has('archived-artist') ? store.artistArchiveCounts() : Promise.resolve(new Map<string, number>()),
+		]);
+		const signals: ArtistSignals = { library: lib.library, setPlays: lib.setPlays, archives };
+		const passing = rows.filter((r) => passesArtistLenses(itemArtists(r), lenses, signals));
+		let start = 0;
+		const sep = req?.cursor ? req.cursor.indexOf('|') : -1;
+		if (req?.cursor && sep > 0) {
+			const ts = Number(req.cursor.slice(0, sep));
+			const id = req.cursor.slice(sep + 1);
+			start = passing.findIndex((r) => r.orderTs < ts || (r.orderTs === ts && r.id < id));
+			if (start < 0) start = passing.length;
+		}
+		const limit = Math.min(Math.max(req?.limit ?? 50, 1), 200);
+		const slice = passing.slice(start, start + limit);
+		const last = slice[slice.length - 1];
+		const items = await store.getItemsByIds(slice.map((r) => r.id));
+		return decorateTrackItems({
+			items,
+			nextCursor: last && start + limit < passing.length ? `${last.orderTs}|${last.id}` : null,
+			total: passing.length,
+		});
 	};
 
 	return {
@@ -337,7 +477,10 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			// — fanning a lookup out per visible card would fire concurrent scrapes
 			// and trip Beatport's Cloudflare WAF.
 			enrichment.kick();
-			return decorateTrackItems(await store.getPage(req));
+			return lensedPage(req, deps.lenses?.() ?? []);
+		},
+		invalidateLensSignals() {
+			librarySignals = null;
 		},
 		async getArchivedPage(req) {
 			return decorateTrackItems(await store.getArchivedPage(req));
@@ -356,7 +499,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			//   • ISRCs: never fetched at ingest (would double the per-client-ID
 			//     call volume for unseen albums). Filled here on first expand and
 			//     cached, guarded by payload.isrcResolved so a re-expand is free.
-			if (item.type === 'album' && item.source === 'spotify') {
+			// A catalogue card carries its own tracklist and ISRCs: no call.
+			if (item.type === 'album' && item.source === 'spotify' && !item.payload.catalogId) {
 				const needsTracks = !item.payload.tracks;
 				const needsIsrc = !needsTracks && !item.payload.isrcResolved && (item.payload.tracks?.length ?? 0) > 0;
 				if (needsTracks || needsIsrc) {
@@ -397,6 +541,12 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					}
 				}
 			}
+			// A catalogue release whose tracklist the catalogue has not read yet
+			// (a label channel's premiere, a store page without tracks): say so
+			// rather than guess — no Spotify album to fall back on.
+			if (item.type === 'album' && item.payload.catalogId && (item.payload.tracks?.length ?? 0) === 0) {
+				detail.tracksError = 'The catalogue has no tracklist for this release yet.';
+			}
 			// In-library marking — album rows can carry tracks you already own
 			// (the ingest LibraryFilter only drops track items, not albums).
 			// Reuse the same membership probe the filter uses; one batched
@@ -404,7 +554,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			const refs = item.payload.tracks ?? [];
 			if (refs.length > 0) {
 				const isrcs = refs.map((t) => t.isrc).filter((x): x is string => !!x);
-				const spotifyTrackIds = item.source === 'spotify' ? refs.map((t) => t.sourceTrackId) : [];
+				const sidOf = (t: FeedTrackRef) => trackSpotifyIdOf(t, item);
+				const spotifyTrackIds = refs.map(sidOf).filter((x): x is string => !!x);
 				// Resolve curator ids (not just presence) so the renderer can act on
 				// owned tracks. The sourceTrackId → trackId map drives both the chip
 				// (its keys) and the in-library menu branch (its values). The deleted
@@ -418,22 +569,23 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 				const tierMap: Record<string, FeedMembershipTier> = {};
 				const pinnedIds: string[] = [];
 				for (const t of refs) {
-					const id = (item.source === 'spotify' ? owned.bySpotify[t.sourceTrackId] : undefined)
+					const sid = sidOf(t);
+					const id = (sid ? owned.bySpotify[sid] : undefined)
 						?? (t.isrc ? owned.byIsrc[t.isrc] : undefined);
 					if (id) map[t.sourceTrackId] = id;
-					const tier = (item.source === 'spotify' ? owned.tierBySpotify[t.sourceTrackId] : undefined)
+					const tier = (sid ? owned.tierBySpotify[sid] : undefined)
 						?? (t.isrc ? owned.tierByIsrc[t.isrc] : undefined);
 					if (tier) tierMap[t.sourceTrackId] = tier;
 					// Pinned drives Not Interested (un-pin); owned-but-not-pinned (local
 					// file / own playlist) gets only the non-destructive Tag / Playlist.
-					if ((item.source === 'spotify' && owned.pinnedBySpotify.has(t.sourceTrackId)) || (t.isrc != null && owned.pinnedByIsrc.has(t.isrc)))
+					if ((sid && owned.pinnedBySpotify.has(sid)) || (t.isrc != null && owned.pinnedByIsrc.has(t.isrc)))
 						pinnedIds.push(t.sourceTrackId);
 				}
 				detail.inLibraryTrackIds = map;
 				detail.membershipBySourceTrackId = tierMap;
 				detail.pinnedSourceTrackIds = pinnedIds;
 				detail.deletedSourceTrackIds = refs
-					.filter((t) => (item.source === 'spotify' && deleted.spotify.has(t.sourceTrackId)) || (t.isrc != null && deleted.isrc.has(t.isrc)))
+					.filter((t) => { const sid = sidOf(t); return (!!sid && deleted.spotify.has(sid)) || (t.isrc != null && deleted.isrc.has(t.isrc)); })
 					.map((t) => t.sourceTrackId);
 			}
 			// "Muted" chip set — album tracks credited to a muted artist
@@ -461,8 +613,10 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			}
 			return detail;
 		},
-		async enrichItem(itemId) {
-			return enrichment.enrichItem(itemId);
+		fillItem,
+		subscribeActivity(cb) {
+			activityListeners.add(cb);
+			return () => { activityListeners.delete(cb); };
 		},
 		async action(action): Promise<FeedActionResult> {
 			// Suppress-only — no target row required (unlike every other action).
@@ -477,8 +631,16 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 					// A followed artist's watch is muted too, so the cloud's stream
 					// (and every device) stops bringing its releases.
 					if (s.scope === 'artist' && followsReachable() && s.key.startsWith('artist:')) {
-						const objectId = await follows!.watchFor('artist', s.key.slice('artist:'.length)).catch(() => null);
+						const id = s.key.slice('artist:'.length);
+						// `catalog:<objectId>`: the catalogue knows the artist without a
+						// Spotify id; its watch is that object.
+						const objectId = id.startsWith('catalog:') ? id.slice('catalog:'.length) : await follows!.watchFor('artist', id).catch(() => null);
 						if (objectId) await follows!.mute(objectId, true).catch((e: unknown) => flog.warn('watch mute failed', undefined, e));
+					}
+					// A followed label's items carry `label:<catalogue id>`: mute
+					// its watch so the stream stops bringing them.
+					if (s.scope === 'label' && followsReachable() && s.key.startsWith('label:')) {
+						await follows!.mute(s.key.slice('label:'.length), true).catch((e: unknown) => flog.warn('watch mute failed', undefined, e));
 					}
 				}
 				if (action.dismissItemId) {
@@ -564,11 +726,14 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 				case 'interested': {
 					// Promotion seam: resolve the Spotify track here (feed-side),
 					// then hand off to the LibraryPort for the curator.db writes.
-					if (item.source !== 'spotify') {
-						return { ok: false, error: `promotion not supported for source '${item.source}' yet` };
-					}
-					const sourceTrackId = action.sourceTrackId ?? (item.type === 'track' ? item.sourceId : null);
-					if (!sourceTrackId) return { ok: false, error: 'sourceTrackId required for album/playlist items' };
+					// Promotion ingests a Spotify track: an item (or album row) not on
+					// Spotify yet waits until the catalogue finds its Spotify id.
+					const ref = item.type === 'album' && action.sourceTrackId
+						? item.payload.tracks?.find((t) => t.sourceTrackId === action.sourceTrackId)
+						: undefined;
+					if (item.type !== 'track' && !action.sourceTrackId) return { ok: false, error: 'sourceTrackId required for album/playlist items' };
+					const sourceTrackId = item.type === 'track' ? spotifyIdOf(item) : ref ? trackSpotifyIdOf(ref, item) : item.source === 'spotify' ? action.sourceTrackId! : null;
+					if (!sourceTrackId) return { ok: false, error: 'Not on Spotify yet — promotion needs a Spotify track' };
 					// Producers stash the full SpotifyTrack on the payload when they
 					// had it (playlist deltas); album tracks need a refetch for ISRC.
 					let st: SpotifyTrack | null = null;
@@ -633,6 +798,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			// playlist producer reads watched playlists only).
 			const viaCatalog = await unfollowWatch('playlist', playlistId, catalogId);
 			if (viaCatalog) return viaCatalog;
+			if (playlistId.startsWith('catalog:')) return { ok: false, error: 'the catalogue is not reachable' };
 			// Remote write — gated. Off-product code (no policy) throws here before
 			// touching the live account.
 			remoteWriteGate({ source: 'spotify', op: 'unfollowPlaylist', remoteId: playlistId });
@@ -657,6 +823,8 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 		async unfollowArtist(artistId, catalogId): Promise<FeedActionResult> {
 			const viaCatalog = await unfollowWatch('artist', artistId, catalogId);
 			if (viaCatalog) return viaCatalog;
+			// Known only to the catalogue: there is no Spotify follow to drop.
+			if (artistId.startsWith('catalog:')) return { ok: false, error: 'the catalogue is not reachable' };
 			// Remote write — gated (see unfollowPlaylist).
 			remoteWriteGate({ source: 'spotify', op: 'unfollowArtist', remoteId: artistId });
 			// Source first, fail-closed — same contract as unfollowPlaylist.
@@ -676,19 +844,37 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 			const removed = await store.removeOriginItems('artist', artistId, new Set(followed.map((a) => a.id)));
 			return { ok: true, removed };
 		},
-		async refresh() {
+		async unfollowOrigin(kind, catalogId): Promise<FeedActionResult> {
+			if (!followsReachable()) return { ok: false, error: 'the catalogue is not reachable' };
+			try {
+				await follows!.unwatch(catalogId);
+			} catch (err) {
+				return { ok: false, error: `unfollow failed: ${err instanceof Error ? err.message : String(err)}` };
+			}
+			const still = await follows!.watchedCatalogIds(kind).catch(() => new Set<string>());
+			still.delete(catalogId);
+			return { ok: true, removed: await store.removeOriginItems(kind, catalogId, still) };
+		},
+		async refresh(scope) {
 			// A follower collects nothing itself, but it does read the cloud's stream.
 			if (followerSkip() && catalogFeed?.available()) return scheduler.refreshProducer(CLOUD_FEED_PRODUCER_ID);
-			return followerSkip() ?? scheduler.runAll();
+			return followerSkip() ?? scheduler.runAll(scope);
 		},
-		async refreshProducer(producerId) {
-			return followerSkip() ?? scheduler.refreshProducer(producerId);
+		async pollCatalog() {
+			if (!catalogFeed?.available()) return { producers: [] };
+			return scheduler.refreshProducer(CLOUD_FEED_PRODUCER_ID, { manual: false });
 		},
 		async loadMore(days) {
 			const skip = followerSkip();
 			if (skip) return skip;
 			const clamped = Math.min(Math.max(Math.round(days) || 7, 1), 60);
 			return scheduler.backfillAll(clamped);
+		},
+		refreshStatus() {
+			return scheduler.status();
+		},
+		subscribeRefreshStatus(cb) {
+			return scheduler.subscribeStatus(cb);
 		},
 		subscribeEnriched(cb) {
 			enrichedListeners.add(cb);

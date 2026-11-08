@@ -11,8 +11,7 @@ import { listReviews, mergeObjects, notSame, scanDuplicates } from './admin.js';
 import { ingestClaims } from './ingest.js';
 import { runLabelProfiler } from './profile/label-profiler.js';
 import { DeezerFinder, runPlanner } from './planner.js';
-import type { FetchLike } from './trackers/http.js';
-
+import type { FetchLike } from '@curator/catalog-readers';
 const quiet = createLogger(() => {});
 const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { 'content-type': 'application/json' } });
 

@@ -10,8 +10,10 @@
 // rather than a module-global deps object — no init step, nothing to wire in
 // boot().
 
-import type { FeedItem, FeedTrackRef } from '@curator/core';
+import type { FeedItem, FeedOrigin, FeedTrackRef } from '@curator/core';
 import type { ContextMenuItem, ContextMenuHandlers } from '../components/ContextMenu.jsx';
+import { allLinks, playableId } from './feedHandles.js';
+import { BRAND_ICONS } from './brandIcons.js';
 
 // The component-side action surface. DiscoverView implements this from its
 // existing closures (play / interested / dismiss / archive / …); the commands
@@ -34,6 +36,10 @@ export interface FeedActions {
 	// `catalogId`: the Global Catalog watch the item's origin names, if any.
 	unfollowArtist(artistId: string, name: string, catalogId?: string): void;
 	unfollowPlaylist(playlistId: string, name: string, catalogId?: string): void;
+	// A catalogue label / genre the item's origin names (a watch, never a
+	// provider follow).
+	unfollowOrigin(kind: 'label' | 'genre', catalogId: string, name: string): void;
+	muteOrigin(item: FeedItem, kind: 'label' | 'genre', catalogId: string, name: string): void;
 	openSpotifyUrl(url: string): void;
 	openSpotifyTrack(sourceTrackId: string): void;
 	openExternal(url: string): void;
@@ -87,10 +93,23 @@ interface FeedCommand {
 // ── predicates ───────────────────────────────────────────────────────────────
 // A card menu acts on the whole feed item; a nested-row menu acts on one track.
 const isCard = (c: FeedCommandContext): boolean => !c.track;
-// The source track an action targets: the nested track, else the track card's
-// own source id (album cards have none → track-scoped actions stay hidden).
+// One track is targeted: a nested row, or a track card (album cards have
+// none → track-scoped actions stay hidden).
+const hasTrack = (c: FeedCommandContext): boolean => !!c.track || c.item.type === 'track';
+// The Spotify track an action targets, when the targeted track is on Spotify
+// (feedHandles.ts) — what promotion, journeys and "open in Spotify" need. A
+// catalogue track no player can play has none.
 const targetStid = (c: FeedCommandContext): string | undefined =>
-	c.track?.sourceTrackId ?? (c.item.type === 'track' ? c.item.sourceId : undefined);
+	hasTrack(c) ? playableId(c.item, c.track) ?? undefined : undefined;
+// The store pages of the target: the row's own, else the release's.
+// Every page the target has, Spotify's left to "Open in Spotify" when that
+// item is offered (it opens the app, not the browser).
+const targetLinks = (c: FeedCommandContext) => {
+	const t = c.track;
+	const links = t ? allLinks(t.handles?.length ? t.handles : c.item.payload.handles, t.sourceLinks) : allLinks(c.item.payload.handles, c.item.payload.sourceLinks);
+	const spotifyOffered = c.track ? !!targetStid(c) : playableId(c.item) !== null;
+	return spotifyOffered ? links.filter((l) => l.provider !== 'spotify') : links;
+};
 
 // Browser-search query for a feed track — title + primary artist, from the
 // nested track when present, else the card payload. Feed items carry only a
@@ -107,10 +126,19 @@ const feedQuery = (c: FeedCommandContext): string => {
 // fall back to deriving from the source id; an album card without a url has
 // nothing to copy).
 const feedSpotifyUrl = (c: FeedCommandContext): string | null => {
-	if (c.track) return `https://open.spotify.com/track/${c.track.sourceTrackId}`;
-	if (c.item.payload.url) return c.item.payload.url;
-	return c.item.type === 'track' ? `https://open.spotify.com/track/${c.item.sourceId}` : null;
+	const stid = targetStid(c);
+	if (c.track) return stid ? `https://open.spotify.com/track/${stid}` : null;
+	if (!playableId(c.item)) return null;
+	if (c.item.payload.url?.includes('open.spotify.com')) return c.item.payload.url;
+	return stid ? `https://open.spotify.com/track/${stid}` : null;
 };
+
+// The Spotify playlist a card was raised from, when its origin is one — a
+// catalogue playlist origin the catalogue knows no Spotify id for
+// (`catalog:<id>`, cloud-producer.ts) is not. Shared with the card so the
+// PLAYLIST chip, the "New on … by …" line and this menu row agree.
+export const spotifyPlaylistOrigin = (item: FeedItem): FeedOrigin | null =>
+	item.origin?.kind === 'playlist' && !item.origin.id.startsWith('catalog:') ? item.origin : null;
 
 // Exported for the inline card buttons so their show/hide matches the menu.
 export const feedShow = {
@@ -118,7 +146,7 @@ export const feedShow = {
 	// already owns it (libraryTrackId set), since promoting an owned track is a
 	// no-op. A followed-only track has no libraryTrackId, so it still offers it.
 	quickInterested: (item: FeedItem, mode: FeedMode): boolean =>
-		mode === 'feed' && item.type === 'track' && !item.libraryTrackId,
+		mode === 'feed' && item.type === 'track' && !item.libraryTrackId && playableId(item) !== null,
 	archive: (mode: FeedMode): boolean => mode === 'feed',
 	restore: (mode: FeedMode): boolean => mode === 'archived',
 };
@@ -128,10 +156,10 @@ function leaf(
 	id: string,
 	label: string,
 	run: () => void,
-	opts?: { danger?: boolean; disabled?: boolean },
+	opts?: { danger?: boolean; disabled?: boolean; iconHtml?: string },
 ): { items: ContextMenuItem[]; handlers: ContextMenuHandlers } {
 	return {
-		items: [{ kind: 'item', id, label, danger: opts?.danger, disabled: opts?.disabled }],
+		items: [{ kind: 'item', id, label, danger: opts?.danger, disabled: opts?.disabled, iconHtml: opts?.iconHtml }],
 		handlers: { [id]: run },
 	};
 }
@@ -141,7 +169,7 @@ const FEED_COMMANDS: FeedCommand[] = [
 	// play — nested rows only (cards play via the cover / dedicated buttons).
 	{
 		id: 'play', group: 'play', isAvailable: (c) => !!c.track,
-		build: (c) => leaf('play', 'Play', () => c.actions.play(c.item, c.track), { disabled: c.actions.isUnavailable(c.track!.sourceTrackId) }),
+		build: (c) => leaf('play', 'Play', () => c.actions.play(c.item, c.track), { disabled: !targetStid(c) || c.actions.isUnavailable(c.track!.sourceTrackId) }),
 	},
 	// curate — two faces of the same group:
 	//   • not yet owned → Interested (pin) / Interested + Organize (pin, then the
@@ -224,6 +252,26 @@ const FEED_COMMANDS: FeedCommand[] = [
 		build: (c) => leaf('mute-playlist', `Mute playlist: ${c.item.origin!.name}`, () => c.actions.mutePlaylist(c.item, c.item.origin!.id, c.item.origin!.name)),
 	},
 	{
+		id: 'mute-label', group: 'mute',
+		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'label' && !!c.item.origin.catalogId,
+		build: (c) => leaf('mute-label', `Mute label: ${c.item.origin!.name}`, () => c.actions.muteOrigin(c.item, 'label', c.item.origin!.catalogId!, c.item.origin!.name)),
+	},
+	{
+		id: 'unfollow-label', group: 'mute',
+		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'label' && !!c.item.origin.catalogId,
+		build: (c) => leaf('unfollow-label', `Unfollow label: ${c.item.origin!.name}`, () => c.actions.unfollowOrigin('label', c.item.origin!.catalogId!, c.item.origin!.name), { danger: true }),
+	},
+	{
+		id: 'mute-genre', group: 'mute',
+		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'genre' && !!c.item.origin.catalogId,
+		build: (c) => leaf('mute-genre', `Mute genre: ${c.item.origin!.name}`, () => c.actions.muteOrigin(c.item, 'genre', c.item.origin!.catalogId!, c.item.origin!.name)),
+	},
+	{
+		id: 'unfollow-genre', group: 'mute',
+		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'genre' && !!c.item.origin.catalogId,
+		build: (c) => leaf('unfollow-genre', `Unfollow genre: ${c.item.origin!.name}`, () => c.actions.unfollowOrigin('genre', c.item.origin!.catalogId!, c.item.origin!.name), { danger: true }),
+	},
+	{
 		id: 'unfollow-playlist', group: 'mute',
 		isAvailable: (c) => isCard(c) && c.mode === 'feed' && c.item.origin?.kind === 'playlist',
 		build: (c) => leaf('unfollow-playlist', `Unfollow playlist: ${c.item.origin!.name}`, () => c.actions.unfollowPlaylist(c.item.origin!.id, c.item.origin!.name, c.item.origin!.catalogId), { danger: true }),
@@ -241,14 +289,34 @@ const FEED_COMMANDS: FeedCommand[] = [
 		build: (c) => leaf('start-journey', 'Start Journey', () => c.actions.startJourney(c.item, c.track)),
 	},
 	{
-		id: 'open-spotify', group: 'open', isAvailable: () => true,
+		id: 'open-spotify', group: 'open', isAvailable: (c) => (c.track ? !!targetStid(c) : playableId(c.item) !== null),
 		build: (c) => {
 			if (c.track) {
-				const stid = c.track.sourceTrackId;
+				const stid = targetStid(c)!;
 				return leaf('open-spotify', 'Open in Spotify', () => c.actions.openSpotifyTrack(stid));
 			}
-			const url = c.item.payload.url;
+			const url = feedSpotifyUrl(c) ?? c.item.payload.url;
 			return leaf('open-spotify', 'Open in Spotify', () => { if (url) c.actions.openSpotifyUrl(url); });
+		},
+	},
+	{
+		// The followed Spotify playlist this card came from, in the Spotify
+		// app. A catalogue playlist origin without a Spotify id has no page
+		// there to open.
+		id: 'open-spotify-playlist', group: 'open', isAvailable: (c) => isCard(c) && !!spotifyPlaylistOrigin(c.item),
+		build: (c) => leaf('open-spotify-playlist', 'Open Playlist on Spotify', () => c.actions.openSpotifyUrl(`spotify:playlist:${spotifyPlaylistOrigin(c.item)!.id}`), { iconHtml: BRAND_ICONS.spotify }),
+	},
+	{
+		// Every page the target has (Beatport, Bandcamp, SoundCloud, Deezer,
+		// Tidal, …, and the store the enrichment matched): the way to hear or
+		// buy it anywhere, not only what the player here can play.
+		id: 'open-store', group: 'open', isAvailable: (c) => targetLinks(c).length > 0,
+		build: (c) => {
+			const links = targetLinks(c);
+			return {
+				items: links.map((l) => ({ kind: 'item' as const, id: `open-store-${l.provider}`, label: `Open in ${l.label}` })),
+				handlers: Object.fromEntries(links.map((l) => [`open-store-${l.provider}`, () => c.actions.openExternal(l.url)])),
+			};
 		},
 	},
 	{
@@ -258,11 +326,11 @@ const FEED_COMMANDS: FeedCommand[] = [
 		build: (c) => leaf('copy-spotify-url', 'Copy Spotify URL', () => c.actions.copySpotifyUrl(feedSpotifyUrl(c)!)),
 	},
 	{
-		id: 'search-tidal', group: 'open', isAvailable: (c) => targetStid(c) !== undefined,
+		id: 'search-tidal', group: 'open', isAvailable: (c) => hasTrack(c) && !targetLinks(c).some((l) => l.provider === 'tidal'),
 		build: (c) => leaf('search-tidal', 'Search in Tidal', () => c.actions.openExternal(`https://tidal.com/search?q=${encodeURIComponent(feedQuery(c))}`)),
 	},
 	{
-		id: 'search-beatport', group: 'open', isAvailable: (c) => targetStid(c) !== undefined,
+		id: 'search-beatport', group: 'open', isAvailable: (c) => hasTrack(c) && !targetLinks(c).some((l) => l.provider === 'beatport'),
 		build: (c) => leaf('search-beatport', 'Search in Beatport', () => c.actions.openExternal(`https://www.beatport.com/search?q=${encodeURIComponent(feedQuery(c))}`)),
 	},
 ];

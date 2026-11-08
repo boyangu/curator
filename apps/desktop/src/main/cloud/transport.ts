@@ -71,6 +71,10 @@ import {
 	type CatalogObjectDetail,
 	type CatalogEnrichInput,
 	type CatalogEnrichResult,
+	type CatalogWorkerDueInput,
+	type CatalogWorkerDueResult,
+	type CatalogWorkerReportInput,
+	type CatalogWorkerReportResult,
 	type CatalogRefreshInput,
 	type CatalogRefreshResult,
 	type CatalogResolveInput,
@@ -139,6 +143,9 @@ const PROCS = {
 	catalogImport: { path: 'catalog.import', type: 'mutation' },
 	catalogRefreshNow: { path: 'catalog.refreshNow', type: 'mutation' },
 	catalogEnrich: { path: 'catalog.enrich', type: 'mutation' },
+	// Mutations: the providers and pauses ride in the body.
+	catalogWorkerDue: { path: 'catalog.workerDue', type: 'mutation' },
+	catalogWorkerReport: { path: 'catalog.workerReport', type: 'mutation' },
 	feedEvents: { path: 'feed.events', type: 'query' },
 	feedRecent: { path: 'feed.recent', type: 'query' },
 } as const;
@@ -410,6 +417,8 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			import: (input: CatalogImportInput) => call<CatalogImportResult>(PROCS.catalogImport, input),
 			refreshNow: (input: CatalogRefreshInput) => call<CatalogRefreshResult>(PROCS.catalogRefreshNow, input),
 			enrich: (input: CatalogEnrichInput) => call<CatalogEnrichResult>(PROCS.catalogEnrich, input),
+			workerDue: (input: CatalogWorkerDueInput) => call<CatalogWorkerDueResult>(PROCS.catalogWorkerDue, input),
+			workerReport: (input: CatalogWorkerReportInput) => call<CatalogWorkerReportResult>(PROCS.catalogWorkerReport, input),
 		},
 		feed: {
 			events: (input: FeedEventsInput) => call<FeedEventsResult>(PROCS.feedEvents, input),
@@ -429,13 +438,16 @@ export function withLocalCatalog(
 	localBaseUrl: string,
 	device: { name: string; platform: 'win32' | 'darwin' | 'linux' },
 ): CloudTransport {
+	let features: string[] = [];
 	let offered = false;
 	const probe = async (): Promise<void> => {
 		try {
 			const res = await fetch(`${localBaseUrl}/trpc/health`, { signal: AbortSignal.timeout(5_000) });
 			const body = (await res.json()) as { result?: { data?: { features?: string[] } } };
-			offered = body.result?.data?.features?.includes('global_catalog') ?? false;
+			features = body.result?.data?.features ?? [];
+			offered = features.includes('global_catalog');
 		} catch {
+			features = [];
 			offered = false;
 		}
 	};
@@ -457,5 +469,5 @@ export function withLocalCatalog(
 				},
 			]),
 		) as T;
-	return { ...main, catalog: routed(local.catalog!), feed: routed(local.feed!), catalogOffered: () => offered };
+	return { ...main, catalog: routed(local.catalog!), feed: routed(local.feed!), catalogOffered: () => offered, catalogFeatures: () => features };
 }

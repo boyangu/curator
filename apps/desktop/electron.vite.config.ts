@@ -62,7 +62,7 @@ export default defineConfig(({ mode, command }) => ({
 		// (better-sqlite3) + electron stay external.
 		plugins: [
 			externalizeDepsPlugin({
-				exclude: ['@curator/core', '@curator/shared', '@curator/protocol', '@curator/library-logic', '@curator/spotify', '@curator/tidal', '@curator/matcher', '@curator/musicbrainz', '@curator/beatport', '@curator/google-drive'],
+				exclude: ['@curator/core', '@curator/shared', '@curator/protocol', '@curator/library-logic', '@curator/catalog-readers', '@curator/spotify', '@curator/tidal', '@curator/matcher', '@curator/musicbrainz', '@curator/beatport', '@curator/google-drive'],
 			}),
 		],
 		define: bakedEnv(mode, command),

@@ -14,10 +14,11 @@ import { createTestApp, type TestApp } from '../test/harness.js';
 import { adminOps } from './admin-ops.js';
 import { ingestClaims } from './ingest.js';
 import { judge, labelCore, labelNames, runCataloguePlaylists, type Signals } from './profile/catalogue-playlists.js';
-import type { FetchLike } from './trackers/http.js';
-import { SpotifyAppTracker } from './trackers/spotify-app.js';
+import type { FetchLike } from '@curator/catalog-readers';
+import { SpotifyTracker } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
 
+import { appCredentialsToken } from './spotify-app-token.js';
 const quiet = createLogger(() => {});
 const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { 'content-type': 'application/json' } });
 const LABEL = 'Northfold Records';
@@ -109,7 +110,7 @@ function fakeSpotify(state: { playlists: Playlists }, calls: string[] = []): Fet
 }
 
 const pending = (app: TestApp, labelId: string) => app.db.query(`insert into curator.catalog_enrich_task (object_id, need, provider) values ($1, 'catalogue_playlists', 'spotify') on conflict do nothing`, [labelId]);
-const run = (app: TestApp, spotify: SpotifyAppTracker) => runCataloguePlaylists({ db: app.db, log: quiet, spotify, holder: 'test' });
+const run = (app: TestApp, spotify: SpotifyTracker) => runCataloguePlaylists({ db: app.db, log: quiet, spotify, holder: 'test' });
 // Spotify ids are 22 characters; `label link` reads them off the URL.
 const CAT = 'CAT000000000000000000a';
 const CAT2 = 'CAT000000000000000000b';
@@ -157,7 +158,7 @@ describe('catalogue playlists', () => {
 			},
 		};
 		const calls: string[] = [];
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls)) }, fakeSpotify(state, calls));
 		const r = await run(app, spotify);
 		expect(r).toMatchObject({ attempted: 1, accepted: 1, reviews: 0, releases: 13 });
 		const ops = adminOps(app.db, {});
@@ -185,7 +186,7 @@ describe('catalogue playlists', () => {
 		// Half the label's, half not: 6 of 12.
 		const half = [...catalogueEntries().slice(0, 6), ...mixEntries().slice(2, 8)];
 		const state = { playlists: { HLF0000000000000000000d: { name: 'Northfold Records Picks', owner: 'a fan', entries: half, snapshot: 'h1' } } };
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state)) }, fakeSpotify(state));
 		expect((await run(app, spotify)).attempted).toBe(0);
 		// A backfill parked hours away (a provider's challenge) is not waited for.
 		await app.db.query(`update curator.catalog_enrich_task set next_due_at = now() + interval '6 hours' where need = 'backfill'`);
@@ -211,7 +212,7 @@ describe('catalogue playlists', () => {
 				[CAT2]: { name: 'Northfold Records Complete', owner: 'Northfold', entries: catalogueEntries(20), snapshot: 's2' },
 			},
 		};
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state)) }, fakeSpotify(state));
 		expect(await run(app, spotify)).toMatchObject({ attempted: 1, accepted: 0, reviews: 1, releases: 0 });
 		const ops = adminOps(app.db, { spotify });
 		const [rv] = await ops.list({ kind: 'label_playlist' });
@@ -236,7 +237,7 @@ describe('catalogue playlists', () => {
 		const labelId = await seedLabel(app);
 		await pending(app, labelId);
 		const state = { playlists: { [CAT]: { name: 'NORTHFOLD RECORDINGS', owner: '-MK-', entries: catalogueEntries(400), snapshot: 's1' } } };
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state)) }, fakeSpotify(state));
 		expect(await run(app, spotify)).toMatchObject({ attempted: 1, accepted: 0, reviews: 1 });
 		const [rv] = await adminOps(app.db, {}).list({ kind: 'label_playlist' });
 		expect(rv!.candidates[0]!.evidence).toMatchObject({ labelShare: 1, artistShare: 1, fresh: false });
@@ -251,7 +252,7 @@ describe('catalogue playlists', () => {
 		const big: Entry[] = Array.from({ length: 150 }, (_, i) => ({ id: `big${i}`, title: `Big ${i}`, artist: 'Kaske', isrc: `GBNFR2601${String(i).padStart(3, '0')}`, added: ago(500 - i * 3) }));
 		const state = { playlists: { BIG0000000000000000000e: { name: 'Northfold Records', owner: 'Northfold', entries: big, snapshot: 'b1' } } };
 		const calls: string[] = [];
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls)) }, fakeSpotify(state, calls));
 		expect(await run(app, spotify)).toMatchObject({ attempted: 1, accepted: 1, releases: 150 });
 		expect(calls.filter((c) => c.startsWith('/v1/playlists/BIG0000000000000000000e/items'))).toEqual([
 			'/v1/playlists/BIG0000000000000000000e/items',
@@ -271,7 +272,7 @@ describe('catalogue playlists', () => {
 		await pending(app, labelId);
 		const state = { playlists: { [CAT]: { name: 'NORTHFOLD RECORDINGS', owner: '-MK-', entries: catalogueEntries(), snapshot: 's1' } } };
 		const calls: string[] = [];
-		const spotify = new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls));
+		const spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fakeSpotify(state, calls)) }, fakeSpotify(state, calls));
 		await run(app, spotify);
 		// The label now has a Spotify cursor (requires a catalogue playlist).
 		expect(await app.db.query(`select 1 from curator.catalog_cursor where object_id = $1 and provider = 'spotify'`, [labelId])).toHaveLength(1);

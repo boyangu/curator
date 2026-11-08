@@ -395,7 +395,7 @@ export function mountJourneyView(host: HTMLElement, props: JourneyViewProps): Jo
 							);
 						}}</For>
 						<Show when={detail()!.entity.kind === 'artist' && !detail()!.availableAspects.some((a) => a.aspect === 'similar-artists')}>
-							<span class="journey-aspect is-unavailable" title="Set ANTHROPIC_API_KEY and build apps/researcher to enable agent research">
+							<span class="journey-aspect is-unavailable" title="Add an AI provider key in the assistant panel to enable agent research">
 								Similar artists — research unavailable
 							</span>
 						</Show>

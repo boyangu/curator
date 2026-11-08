@@ -21,10 +21,9 @@ import { reannounceFor } from './events.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
 import { ensureCursors } from './watches.js';
-import { getJson, type FetchLike } from './trackers/http.js';
-import { releaseClaim as spotifyReleaseClaim, type SpotifyAppTracker } from './trackers/spotify-app.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
-
+import { getJson, type FetchLike } from '@curator/catalog-readers';
+import { spotifyReleaseClaim, type SpotifyTracker } from '@curator/catalog-readers';
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
 export type FindCandidate = { id: string; name: string; url: string; releases: string[] };
 // `candidates`: the namesakes a find could not choose between (reason
 // 'ambiguous' / 'no_overlap'), with the releases each lists — a review for
@@ -86,7 +85,7 @@ export class SpotifyFinder implements IdentityFinder {
 	readonly provider = 'spotify' as const;
 	readonly kinds: readonly CatalogKind[] = ['artist'];
 	readonly callsPerFind = 4;
-	constructor(private readonly app: SpotifyAppTracker) {}
+	constructor(private readonly app: SpotifyTracker) {}
 
 	async find(object: { name: string }, releaseTitles: Set<string>, signal: AbortSignal): Promise<FindResult> {
 		const want = nameFold(object.name);
@@ -193,7 +192,7 @@ export async function runPlanner(deps: PlannerDeps): Promise<{ attempted: number
 // Queued by ingestion for a tracker's new recordings (ingest.ts recordGaps)
 // and by the sweep for charted ones.
 
-export type ResolverDeps = { db: Db; log: Logger; spotify: SpotifyAppTracker; batch?: number; perDay?: number };
+export type ResolverDeps = { db: Db; log: Logger; spotify: SpotifyTracker; batch?: number; perDay?: number };
 
 type SpSearchTrack = {
 	id: string;

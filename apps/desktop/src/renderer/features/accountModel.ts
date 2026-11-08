@@ -3,7 +3,7 @@
 // confirm dialogs' wording. Pure (types-only imports), so it is tested
 // without a DOM; accountSettings.ts renders it.
 
-import type { CloudSyncStatusReport } from '@curator/core';
+import type { CatalogWorkerStatus, CloudSyncStatusReport } from '@curator/core';
 import type { accountApi } from '../data/api.js';
 
 export type AccountStatus = Awaited<ReturnType<typeof accountApi.status>>;
@@ -187,3 +187,32 @@ export function masterChoices(devices: readonly AccountDevice[], masterDeviceId:
 
 // Under the devices list: why removing a device is not the whole job.
 export const DEVICES_HINT = 'Removing a device stops its syncing at once. Its sign-in stays valid until it expires, so for a lost or stolen computer also sign out all other sessions; your own other computers then just sign in again.';
+
+// This desktop as a catalogue worker (core catalog-worker/service.ts): one
+// line under the master device, in the account's own words.
+export function catalogWorkerLine(s: CatalogWorkerStatus | null, now = Date.now()): string {
+	if (!s) return 'Catalogue reading: status unavailable.';
+	switch (s.reason) {
+		case 'signed_out': return 'Sign in to let this computer read the catalogue’s sources for your follows.';
+		case 'server_off': return 'Your sync server doesn’t hand out catalogue reads yet; the cloud reads for your follows.';
+		case 'inactive': return 'Another of your devices reads the catalogue for your follows this week; this one takes over if that one goes quiet for six hours.';
+		case 'stopped': return 'Catalogue reading is off.';
+		case 'ok': break;
+	}
+	const parts = [`This computer reads the catalogue’s sources for your follows this week (${s.providers.length ? s.providers.join(', ') : 'nothing it can read yet'})`];
+	// The user's choices (the Discover Refresh menu), by kind.
+	const byKind = new Map<string, string[]>();
+	for (const t of s.trackers) {
+		const [kind, provider] = t.split('/') as [string, string];
+		byKind.set(kind, [...(byKind.get(kind) ?? []), provider]);
+	}
+	if (s.trackers.length) parts.push(`checked: ${[...byKind].map(([kind, providers]) => `${kind}s on ${providers.join(', ')}`).join('; ')}`);
+	else parts.push('every source unchecked in the Discover Refresh menu, so nothing is read for you');
+	if (s.lastReportAt !== null) parts.push(`last report ${fmtAgo(s.lastReportAt, now)}`);
+	else if (s.lastAskedAt !== null) parts.push(`nothing due yet`);
+	if (s.check && s.check.queued > 0) parts.push(`reading ${Math.min(s.check.polled, s.check.queued)} of ${s.check.queued} you asked to check`);
+	if (s.polled) parts.push(`${s.polled} read, ${s.events} new ${s.events === 1 ? 'release' : 'releases'} this session`);
+	for (const p of s.paused) parts.push(`${p.provider} paused after a rate limit until ${new Date(p.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+	if (s.lastError) parts.push(`last error: ${s.lastError}`);
+	return `${parts.join(' · ')}.`;
+}

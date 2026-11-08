@@ -12,6 +12,7 @@ import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import { clearInbox, decideInbox, failInbox, getInbox, inboxCounts, listInbox, OPERATOR, raise, snoozeInbox, type InboxChoice, type InboxFilter, type InboxOp, type InboxRow } from './inbox.js';
 import { mergePolicy, objectFacts, reversiblePolicy } from './inbox-policy.js';
+import { artistTwinsOn } from './artist-twins.js';
 import { attachPage, decideReview, getReview, holdReview, listReviews, mergeObjects, mergeOverruling, objectReleases, renameObject, scanDuplicates, unlinkPage, type ReviewStatus, type ObjectRelease, type Review, type ReviewCandidate, type ReviewDecision, type ReviewKind } from './admin.js';
 import { candidateReleases, type EvidenceDeps } from './admin-evidence.js';
 import { agentImport, type AgentImport, type AgentImportReport } from './agent-import.js';
@@ -22,6 +23,7 @@ import { bucketCandidates, detectBuckets, detectCredits, type BucketCandidate } 
 import type { EvidencePack } from './agent/pack.js';
 import type { ModelCall } from './agent/model.js';
 import { reasonCase, runAgentReasoner, type ReasonerReport } from './agent/reasoner.js';
+import { checkNow, trackingOverview, type CheckReport, type CheckScope, type TrackingOverview } from './tracking.js';
 
 export type AgentAdvice = { inbox: number; kind: string; title: string; pairs: { i: number; keep: string; fold: string; verdict: string | null }[]; confidence: number | null; rationale: string | null; citations: string[]; searches: number; error: string | null };
 import { findRepresentation } from './identity.js';
@@ -38,11 +40,10 @@ import { recreditOn, repairCredits, type CreditRepairReport } from './repair-cre
 import { repairPreviews, type PreviewRepairReport } from './repair-previews.js';
 import { dedupeTracks, fillReleases, linkReleasePage, releaseStubs, type DedupeReport, type FillReport, type ReleaseStub } from './release-fill.js';
 import { AppleLookup } from './trackers/apple.js';
-import { BandcampTracker } from './trackers/bandcamp.js';
-import { BeatportTracker } from './trackers/beatport.js';
-import { DeezerTracker } from './trackers/deezer.js';
-import { fetchPlaylistMeta } from './trackers/spotify-app.js';
-
+import { BandcampTracker } from '@curator/catalog-readers';
+import { BeatportTracker } from '@curator/catalog-readers';
+import { DeezerTracker } from '@curator/catalog-readers';
+import { fetchPlaylistMeta } from '@curator/catalog-readers';
 export type ReviewView = Review & {
 	object: { name: string; kind: string; handles: { provider: string; id: string; url: string | null }[] } | null;
 	// The object's own releases, and per candidate the overlap with what the
@@ -126,6 +127,12 @@ export type AdminOps = {
 	// Runs the worker's pass now (profiler, backfill, trackers) instead of
 	// waiting for its minute; the local server only.
 	pass(args: Record<string, never>): Promise<{ ran: boolean }>;
+	// The trackers at a glance, per kind × provider (tracking.ts).
+	trackingOverview(args: Record<string, never>): Promise<TrackingOverview>;
+	// "Check now": one object, or everything followed (all, or of one kind),
+	// made due for the worker; what a provider's limits rule out is reported,
+	// not forced. `started`: this host began a pass for it at once.
+	trackingCheck(args: CheckScope): Promise<CheckReport>;
 	// Releases holding fewer tracks than their providers said, in a label's or
 	// an artist's catalogue (or everywhere), with the store ids a fill reads.
 	releaseStubs(args: { label?: string; artist?: string; limit?: number }): Promise<{ total: number; rows: ReleaseStub[] }>;
@@ -153,6 +160,12 @@ export type AdminOps = {
 	// One artist into another by hand (ids): held for the operator unless
 	// approved — the same apply a twins approval runs.
 	artistMerge(args: { from: string; into: string; note: string; by?: string; approved?: boolean }): Promise<{ moved?: Record<string, number>; held?: number | null }>;
+	// Two releases the operator knows are one (a twin the detector did not
+	// see): held for the operator unless `approved` — Guy said so in chat.
+	// Merged the way an approved twins item is (inbox.ts mergeReleases):
+	// the copy folds into the one to keep, then each store's artist on it
+	// is joined by the twins rule.
+	releaseMerge(args: { from: string; into: string; note: string; by?: string; approved?: boolean }): Promise<{ moved?: Record<string, number>; held?: number | null }>;
 	// An artist's credits on one release given to another (Guy's word: approved).
 	artistRecredit(args: { artist: string; release: string; to: string; note: string; by?: string; approved?: boolean }): Promise<{ credits: number }>;
 	// A library's labels and releases (with the owner's tracks), ≤ 100 claims
@@ -265,7 +278,7 @@ async function labelView(tx: Queryable, id: string): Promise<LabelView> {
 	};
 }
 
-export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void>; agent?: { model: ModelCall; cfg: AgentReasonerConfig } | null } = {}): AdminOps {
+export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void>; kick?: () => void; agent?: { model: ModelCall; cfg: AgentReasonerConfig } | null } = {}): AdminOps {
 	async function view(r: Review, withEvidence: boolean): Promise<ReviewView> {
 		return withSystemTx(db, async (tx) => {
 			const obj = (await summaries(tx, [r.objectId])).get(r.objectId) ?? null;
@@ -498,6 +511,24 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 				}
 				const r = await mergeObjects(tx, f.id, i.id, by, args.note, { manual: true });
 				await raise(tx, { kind: 'artist.merge', severity: 'audit', title: `Merged artist «${f.name}» into «${i.name}»`, subjects: [i.id], evidence: { note: args.note, from: f.id }, actor: by });
+				return { moved: r.moved };
+			});
+		},
+		async releaseMerge(args) {
+			if (!args.note?.trim()) throw new Error('release merge needs --note (why they are one)');
+			const by = args.by ?? 'claude-code';
+			return withSystemTx(db, async (tx) => {
+				const names = new Map((await tx.query<{ id: string; name: string; kind: string }>(`select id, name, kind from curator.catalog_object where id = any($1::uuid[]) and merged_into is null`, [`{${args.from},${args.into}}`])).map((r) => [r.id, r]));
+				const [f, i] = [names.get(args.from), names.get(args.into)];
+				if (!f || !i || f.kind !== 'release' || i.kind !== 'release') throw new Error('release merge takes the ids of two live releases');
+				const pairs = [{ keep: i.id, fold: f.id }];
+				if (!args.approved) {
+					const held = await raise(tx, { kind: 'release.twins', severity: 'approval', title: `Merge release «${f.name}» into «${i.name}»`, subjects: [i.id, f.id], evidence: { note: args.note, pairs: [{ keep: { id: i.id, title: i.name }, fold: { id: f.id, title: f.name } }] }, apply: { op: 'mergeReleases', args: { pairs } }, actor: by, key: `${f.id}>${i.id}` });
+					return { held };
+				}
+				const r = await mergeObjects(tx, f.id, i.id, by, args.note, { manual: true });
+				await artistTwinsOn(tx, [i.id], by);
+				await raise(tx, { kind: 'release.twins', severity: 'audit', title: `Merged release «${f.name}» into «${i.name}»`, subjects: [i.id], evidence: { note: args.note, from: f.id, pairs }, actor: by, approvedBy: OPERATOR });
 				return { moved: r.moved };
 			});
 		},
@@ -920,6 +951,15 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			if (!hooks.pass) return { ran: false };
 			await hooks.pass();
 			return { ran: true };
+		},
+		trackingOverview() {
+			return db.begin((tx) => trackingOverview(tx));
+		},
+		async trackingCheck(args) {
+			const report = await withSystemTx(db, (tx) => checkNow(tx, args));
+			// Not awaited: the page shows the pass working through them.
+			if (report.queued > 0) hooks.kick?.();
+			return { ...report, started: report.queued > 0 && !!hooks.kick };
 		},
 	};
 }

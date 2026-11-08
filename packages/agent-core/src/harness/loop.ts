@@ -144,11 +144,18 @@ export const defaultLoop: AgentLoop = {
 				continue;
 			}
 
+			// The terminal tool's call is the answer: never executed, it ends the
+			// run once the step's other calls have run (a model may fetch and
+			// record in one step). Its synthetic result keeps the history
+			// well-formed for anyone who replays it.
+			const terminal = params.terminalTool ? calls.find((c) => c.tool === params.terminalTool) : undefined;
+			const executable = terminal ? calls.filter((c) => c !== terminal) : calls;
+
 			// Execute client tool calls (host + local) concurrently. A failed
 			// tool becomes an error result the model can react to, never a
 			// failed turn.
 			const results = await Promise.all(
-				calls.map(async (c): Promise<WireToolResultPart> => {
+				executable.map(async (c): Promise<WireToolResultPart> => {
 					try {
 						const raw = c.local
 							? await deps.localTools[c.tool]!.execute(c.args, abort)
@@ -164,9 +171,11 @@ export const defaultLoop: AgentLoop = {
 				}),
 			);
 			if (abort.aborted) return { turnId: params.turnId, stopReason: 'cancelled', text, newMessages, usage };
+			if (terminal) results.push({ type: 'tool-result', toolCallId: terminal.callId, toolName: terminal.tool, output: { type: 'json', value: { recorded: true } } });
 			const toolMessage: WireMessage = { role: 'tool', content: results };
 			messages.push(toolMessage);
 			newMessages.push(toolMessage);
+			if (terminal) return { turnId: params.turnId, stopReason: 'structured', text, newMessages, usage, structured: terminal.args };
 		}
 
 		return { turnId: params.turnId, stopReason: 'max-steps', text, newMessages, usage };

@@ -356,6 +356,9 @@ body[data-kbd-focus="sidebar"] .playlist.active {
 }
 
 .tf-states .tf-tab svg { color: var(--fg-2); transition: color 0.08s linear; }
+/* A state tab's pulse (Discover while the feed refreshes) stands in for its
+   16px icon: same box, so the label does not shift when it starts or stops. */
+.tf-states .tf-src-mark { width: 16px; height: 16px; }
 .tf-states .tf-tab:not(.active):hover svg { color: var(--fg); }
 /* Active state icons — also white. The brand semantics (pinned=red,
    basket=green, downloads=cyan) still live on the inactive count chips
@@ -3360,7 +3363,20 @@ body[data-view="discover"] .app {
 .toast--error   { border-left-color: var(--hot); }
 .toast--info    { border-left-color: var(--accent); }
 .toast__title { font-weight: 500; color: var(--fg); }
-.toast__sub   { color: var(--fg-2); font-size: 12.5px; margin-top: 2px; }
+/* pre-line: a sub is often several lines (per-source results, error lists). */
+.toast__sub   { color: var(--fg-2); font-size: 12.5px; margin-top: 2px; white-space: pre-line; }
+/* Progress toast (ui/toast.ts showProgressToast): stays while work runs, its
+   lines rewritten in place. A fixed band of widths so it does not resize with
+   every progress line; the square is the tab pulse's (.tf-src-pulse). */
+.toast--progress { min-width: 300px; max-width: 460px; }
+.toast--progress .toast__sub { line-height: 1.5; overflow-wrap: anywhere; }
+.toast__pulse {
+	display: inline-block;
+	width: 9px; height: 9px; margin-right: 9px;
+	background: var(--accent);
+	border-radius: 1.5px;
+	animation: tf-src-breathe 1.4s ease-in-out infinite;
+}
 /* Inline action (Undo on bulk tag/playlist writes) — quiet accent button so
    the toast still reads as a notice first. */
 .toast__action {
@@ -4181,12 +4197,34 @@ body[data-view="discover"] .app {
 }
 .feed-toolbar__refresh:hover { background: var(--bg-3); color: var(--fg); }
 .feed-toolbar__refresh:disabled { opacity: 0.5; cursor: default; }
+.feed-toolbar__refresh-menu { padding-left: 5px; padding-right: 5px; margin-left: -6px; font-size: 10px; }
+/* The Refresh icon turns while any feed pass is in flight. */
+.feed-toolbar__icon--spin { animation: spin 0.9s linear infinite; }
 .feed-toolbar__filter {
 	font-size: 12px; color: var(--fg-1);
 	background: var(--bg-2); border: 1px solid var(--line);
 	padding: 4px 8px; cursor: pointer; max-width: 160px;
 }
 .feed-toolbar__filter:hover { background: var(--bg-3); color: var(--fg); }
+/* Standing lenses — one removable chip per filter, under the toolbar
+   (same chip shape as .artist-chip). */
+.feed-lenses {
+	display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+	padding: 8px 24px; border-bottom: 1px solid var(--line);
+}
+.feed-lens {
+	display: inline-flex; align-items: center; gap: 2px; max-width: 320px;
+	padding: 2px 2px 2px 8px; border-radius: 3px;
+	background: var(--bg-2); border: 1px solid var(--line);
+	color: var(--fg); font-size: 12px; line-height: 1.3; white-space: nowrap;
+}
+.feed-lens__label { overflow: hidden; text-overflow: ellipsis; }
+.feed-lens__x {
+	background: transparent; border: 0; cursor: pointer;
+	color: var(--fg-3); font: inherit; font-size: 14px; line-height: 1; padding: 2px 5px; border-radius: 3px;
+}
+.feed-lens__x:hover { color: var(--fg); background: var(--bg); }
+.feed-lens--inert { opacity: 0.55; border-style: dashed; }
 .feed-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 24px 80px; }
 
 /* ── Following drawer (FollowingPanel.tsx) ─────────────────────────────── */
@@ -4382,6 +4420,11 @@ body[data-view="discover"] .app {
 /* Pinned while the card is the loaded feed track — always visible, accent-
    filled, acting as the play/pause control (not hover-gated). */
 .feed-card__cover-play--active { opacity: 1; transform: none; background: var(--cool); color: #06181b; }
+/* Not on Spotify yet (a catalogue item): the disc is the first store page,
+   shown on hover like the audition disc but in the neutral key. */
+.feed-card__cover--offline img { filter: saturate(0.55); }
+.feed-card__cover-play--store { background: var(--bg-2); color: var(--fg); border: 1px solid var(--line); }
+.feed-card__cover-play--store:hover { background: var(--fg); color: var(--bg); }
 /* "Listened" tick in the cover corner — mirrors the dimmed card + LISTENED chip.
    On the cover (not the img), so the played-dimming of the artwork leaves it crisp. */
 .feed-card__cover-heard {
@@ -4434,6 +4477,8 @@ body[data-view="discover"] .app {
    tinted, the drain will retry). Mono + tiny so it reads as a status, not data. */
 .feed-meta-enrich { font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em; color: var(--fg-4); }
 .feed-meta-enrich--err { color: var(--warn); }
+.feed-meta-enrich--busy { color: var(--fg-3); display: inline-flex; align-items: center; gap: 5px; }
+.feed-meta-enrich--busy::before { content: ""; width: 8px; height: 8px; border: 1.5px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin 0.9s linear infinite; flex: none; }
 .feed-chip {
 	font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em;
 	padding: 1px 5px; line-height: 14px; flex: none;
@@ -4445,6 +4490,8 @@ body[data-view="discover"] .app {
 .feed-chip--played { color: var(--fg-3); }
 .feed-chip--playing { color: var(--cool); border-color: color-mix(in oklab, var(--cool) 55%, transparent); }
 .feed-chip--unavailable { color: var(--hot); border-color: color-mix(in oklab, var(--hot) 40%, transparent); }
+.feed-chip--offline { color: var(--fg-2); border-style: dashed; }
+.feed-card__catno { font-family: var(--mono); font-size: 11px; color: var(--fg-3); }
 /* Membership tiers on a track card. `library` (owned — a local file or pinned)
    reads strongest (green); `spotify`/`tidal` (in one of your own playlists on
    that source) next; `followed` (merely in a playlist you follow) weakest. */
@@ -4572,6 +4619,9 @@ body[data-view="discover"] .app {
 .feed-track--listened:not(.feed-track--playing) { opacity: 0.75; }
 .feed-track--unavailable .feed-track__title,
 .feed-track--unavailable .feed-track__artists { opacity: 0.36; text-decoration: line-through; }
+/* Not on Spotify yet: readable (the facts are real), marked, opens its store. */
+.feed-track--offline .feed-track__title-text { color: var(--fg-2); }
+.feed-track__offline { color: var(--fg-3); vertical-align: -1px; }
 /* "Muted" variant — an album row whose artist the user muted. The release
    stays put (a multi-artist album doesn't vanish over one credit); the row is
    flagged, dimmed, and skipped by autoplay, but still manually playable.
@@ -4961,3 +5011,39 @@ col.c-prodq { width: 56px; }
 .production-settings__row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .production-stat__v--pending { font-weight: 400; color: var(--fg-2, var(--fg-1)); font-size: 12px; }
 col.c-pq { width: 52px; }
+
+/* ── Discover: source strip, playlist chip, "New on … by …" ─────────────────
+   Source strip — a brand mark per service the item is known on (its own
+   source, the catalogue's handles, the store the enrichment matched). Right
+   end of the title row; Settings → Discover → Source logos hides it. */
+.feed-card__sources { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; flex: none; }
+.feed-card__src {
+	display: grid; place-items: center; width: 17px; height: 17px; padding: 0;
+	border: 0; background: none; border-radius: 4px; opacity: 0.78; cursor: default; color: inherit;
+}
+.feed-card__src[data-url] { cursor: pointer; }
+.feed-card__src:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+.feed-card__src svg { width: 13px; height: 13px; display: block; }
+/* A card raised by a followed Spotify playlist: the Spotify mark + PLAYLIST
+   in Spotify's green, in place of the generic TRACK chip. */
+.feed-chip--sp-playlist {
+	display: inline-flex; align-items: center; gap: 4px;
+	color: #1DB954; border-color: color-mix(in oklab, #1DB954 40%, transparent);
+}
+.feed-chip__brand { display: inline-grid; place-items: center; }
+.feed-chip__brand svg { width: 11px; height: 11px; display: block; }
+/* "New on <playlist> by <profile>" / "Added <when>, Released <date>" — the
+   bold parts are the facts; the playlist and profile names are clickable. */
+.feed-card__link { font-weight: 600; color: var(--fg-1); cursor: pointer; }
+.feed-card__link:hover { color: var(--fg); text-decoration: underline; }
+.feed-card__when { color: var(--fg-2); }
+.feed-card__when b { font-weight: 600; color: var(--fg-1); font-variant-numeric: tabular-nums; }
+
+/* Settings → Discover: the read sources per follow kind, side by side. */
+.settings-discover__sources { display: flex; flex-wrap: wrap; gap: 8px 32px; }
+.settings-discover__kind { min-width: 150px; }
+.settings-discover__kind-label { font-size: 12px; color: var(--fg-2); margin-bottom: 2px; }
+.settings-discover__cloud {
+	font-family: var(--mono); font-size: 9px; letter-spacing: 0.08em; vertical-align: 1px;
+	color: var(--fg-3); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-left: 6px;
+}

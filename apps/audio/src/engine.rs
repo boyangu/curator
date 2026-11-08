@@ -41,7 +41,7 @@
 use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, StreamConfig};
+use cpal::{BufferSize, SampleFormat, SampleRate, StreamConfig};
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::path::Path;
@@ -1170,6 +1170,9 @@ pub struct JumpOutcome {
 /// `preferred_source_rate` is just a hint for the exact-match fast path
 /// on the first call; subsequent track rates are handled by callback-side
 /// resampling.
+/// Default WASAPI output buffer, in ms. See the note in build_output_stream.
+const OUTPUT_BUFFER_MS: u32 = 30;
+
 fn build_output_stream(
     preferred_source_rate: u32,
     state: Arc<TransportState>,
@@ -1230,7 +1233,24 @@ fn build_output_stream(
         );
         cfg
     };
-    let config: StreamConfig = supported.into();
+    let mut config: StreamConfig = supported.into();
+    // Output buffer. cpal's Default asks WASAPI for its minimum — one engine
+    // period (10 ms) — so any late callback is an audible crack. This is a
+    // preview/cue player, not the rekordbox deck: ~30 ms of extra latency
+    // is below what jog/cue response exposes, and it absorbs the DPC and
+    // scheduling spikes a loaded laptop throws (see mmcss.rs). Shared mode
+    // only grows the ring buffer; the engine period is unchanged. Override
+    // with CURATOR_AUDIO_BUFFER_MS to find a device's floor without a rebuild.
+    let buffer_ms: u32 = std::env::var("CURATOR_AUDIO_BUFFER_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|ms| (0..=500).contains(ms))
+        .unwrap_or(OUTPUT_BUFFER_MS);
+    if buffer_ms > 0 {
+        let frames = config.sample_rate.0 * buffer_ms / 1000;
+        config.buffer_size = BufferSize::Fixed(frames);
+        tracing::info!(buffer_ms, frames, "requesting output buffer");
+    }
     state
         .stream_sample_rate
         .store(config.sample_rate.0, Ordering::Release);
@@ -1241,6 +1261,8 @@ fn build_output_stream(
     let stream = device.build_output_stream(
         &config,
         move |out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+            // Per-thread, no-op after the first call on this stream thread.
+            crate::mmcss::register_current_thread();
             let is_playing = state_clone.playing.load(Ordering::Acquire);
             let is_scrubbing = state_clone.scrub_mode.load(Ordering::Acquire);
             let volume = f32::from_bits(state_clone.volume_bits.load(Ordering::Acquire));

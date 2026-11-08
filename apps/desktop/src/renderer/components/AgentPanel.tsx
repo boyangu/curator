@@ -10,7 +10,7 @@
 
 import { For, Show, createSignal, onCleanup } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { AgentEvent, AgentResultSet, AgentRunUsage, AgentSessionSummary, AgentStatus, AgentProvider, AgentViewCommand, AgentViewContext } from '@curator/core';
+import type { AgentEvent, AgentResultSet, AgentRunUsage, AgentSessionSummary, AgentStatus, AgentProvider, AgentViewContext } from '@curator/core';
 import type { AgentConfigRedacted } from '../../ipc.js';
 import { shellApi } from '../data/api.js';
 import { agentApi } from '../data/agent.js';
@@ -21,7 +21,6 @@ export interface AgentPanelProps {
 	// Discover area should switch to the agent-results list.
 	onResultSet: (rs: AgentResultSet) => void;
 	// The agent asked to change the visible feed filters.
-	onViewCommand: (cmd: AgentViewCommand) => void;
 	// Snapshot of where the user is standing, captured at send time and
 	// attached to the turn so ambiguous asks scope to the current view.
 	getViewContext?: () => AgentViewContext | null;
@@ -54,7 +53,8 @@ const TOOL_LABELS: Record<string, string> = {
 	web_search: 'Searching the web',
 	web_fetch: 'Reading a page',
 	present_result_set: 'Building result list',
-	update_feed_filters: 'Updating feed filters',
+	add_feed_lens: 'Adding a feed lens',
+	remove_feed_lens: 'Removing a feed lens',
 };
 
 const PROVIDER_DEFAULTS: Record<AgentProvider, { routerModel: string; researchModel: string }> = {
@@ -274,9 +274,6 @@ export function mountAgentPanel(host: HTMLElement, props: AgentPanelProps): Agen
 			case 'result-set':
 				appendBlock({ type: 'result-set', id: e.resultSet.id, title: e.resultSet.title, itemCount: e.resultSet.items.length, rs: e.resultSet });
 				props.onResultSet(e.resultSet);
-				break;
-			case 'view-command':
-				props.onViewCommand(e.command);
 				break;
 			case 'turn-finished':
 				flushText();

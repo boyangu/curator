@@ -7,11 +7,10 @@ import { describe, expect, it } from 'vitest';
 import type { CatalogEventTrackCardV1 } from '@curator/protocol';
 import { createLogger } from '../log.js';
 import { createTestApp, type TestApp } from '../test/harness.js';
-import { BeatportTracker } from './trackers/beatport.js';
-import type { FetchLike } from './trackers/http.js';
+import { BeatportTracker } from '@curator/catalog-readers';
+import type { FetchLike } from '@curator/catalog-readers';
 import { runTrackers } from './trackers/sweep.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
-
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
 const quiet = createLogger(() => {});
 const today = new Date().toISOString().slice(0, 10);
 const DAY = 86400_000;

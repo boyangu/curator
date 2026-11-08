@@ -90,6 +90,41 @@ describe('defaultLoop', () => {
 		expect(emitted.some((d) => d.type === 'tool-start' && d.tool === 'echo')).toBe(true);
 	});
 
+	it('ends the run on the terminal tool: its arguments are the answer, it never reaches the tool port', async () => {
+		const record = { name: 'record_claims', description: 'the answer', parameters: { type: 'object' } };
+		const adapter = scriptedAdapter([
+			{
+				deltas: [{ type: 'tool-call', callId: 'c1', tool: 'echo', args: { q: 1 }, providerExecuted: false }, finish('tool-calls')],
+				messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'echo', input: { q: 1 } }] }],
+			},
+			{
+				// Fetch and record in one step: the other call still runs.
+				deltas: [
+					{ type: 'tool-call', callId: 'c2', tool: 'echo', args: { q: 2 }, providerExecuted: false },
+					{ type: 'tool-call', callId: 'c3', tool: 'record_claims', args: { claims: [{ name: 'A' }] }, providerExecuted: false },
+					finish('tool-calls'),
+				],
+				messages: [{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c2', toolName: 'echo', input: { q: 2 } }, { type: 'tool-call', toolCallId: 'c3', toolName: 'record_claims', input: { claims: [{ name: 'A' }] } }] }],
+			},
+		]);
+		const executed: string[] = [];
+		const result = await defaultLoop.run(
+			params({ tools: [params().tools[0]!, record], terminalTool: 'record_claims' }),
+			CONFIG,
+			{ model: adapter, tools: inlinePort((tool) => { executed.push(tool); return { ok: true }; }), localTools: {}, log: noopLog },
+			() => {},
+			new AbortController().signal,
+		);
+		expect(result.stopReason).toBe('structured');
+		expect(result.structured).toEqual({ claims: [{ name: 'A' }] });
+		expect(executed).toEqual(['echo', 'echo']);
+		expect(result.usage.steps).toBe(2);
+		// The terminal call gets a synthetic result so the trail stays well-formed.
+		const last = result.newMessages[result.newMessages.length - 1] as Extract<WireMessage, { role: 'tool' }>;
+		expect(last.content.map((c) => c.toolCallId)).toEqual(['c2', 'c3']);
+		expect(last.content[1]!.output).toEqual({ type: 'json', value: { recorded: true } });
+	});
+
 	it('stops at maxSteps when the model keeps calling tools', async () => {
 		const step: ScriptedStep = {
 			deltas: [

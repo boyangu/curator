@@ -22,7 +22,7 @@
 // table is consulted where two objects are compared (merges, src/catalog/admin).
 
 import type { CatalogClaim, CatalogIdNamespace, CatalogKind } from '@curator/protocol';
-import { normalizeIsrc } from '@curator/library-logic';
+import { normalizeIsrc, creditsShareAct } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { num } from '../db/db.js';
 
@@ -125,21 +125,26 @@ export async function recordingByKey(tx: Queryable, recKey: string, durationSec:
 // all three required. Names, not resolved artist objects: the claim's artists
 // are only matched through the release they arrive with, so the release has to
 // be found first; the three together are strong evidence where one alone
-// (a namesake) is not.
-export async function releaseByTitle(tx: Queryable, nameFold: string, artistFolds: string[], releaseAtMs: number | null): Promise<string | null> {
-	if (!artistFolds.length || releaseAtMs === null) return null;
-	const rows = await tx.query<{ id: string }>(
-		`select distinct r.id from curator.catalog_object r
-		join curator.catalog_edge e on e.dst = r.id and e.kind = 'artist-release'
-		join curator.catalog_object a on a.id = e.src
+// (a namesake) is not. A credit names an act when either side's compound
+// names it as a piece (creditsShareAct): one store credits a duo as one act,
+// another as two people, and they are the same release all the same.
+export async function releaseByTitle(tx: Queryable, nameFold: string, artistNames: string[], releaseAtMs: number | null): Promise<string | null> {
+	if (!artistNames.length || releaseAtMs === null) return null;
+	const rows = await tx.query<{ id: string; credits: string | null }>(
+		`select r.id, (
+				select string_agg(a.name, E'\\n' order by e.position)
+				from curator.catalog_edge e join curator.catalog_object a on a.id = e.src
+				where e.dst = r.id and e.kind = 'artist-release'
+			) as credits
+		from curator.catalog_object r
 		where r.kind = 'release' and r.merged_into is null and r.name_fold = $1
-			and a.name_fold = any($2::text[])
 			and r.release_at is not null
-			and abs(extract(epoch from r.release_at) - $3::float8 / 1000) <= 2 * 86400
-		limit 2`,
-		[nameFold, `{${artistFolds.map((f) => `"${f.replace(/["\\]/g, (m) => `\\${m}`)}"`).join(',')}}`, String(releaseAtMs)],
+			and abs(extract(epoch from r.release_at) - $2::float8 / 1000) <= 2 * 86400
+		limit 20`,
+		[nameFold, String(releaseAtMs)],
 	);
-	return rows.length === 1 ? rows[0]!.id : null;
+	const hits = rows.filter((r) => r.credits && creditsShareAct(artistNames, r.credits.split('\n')));
+	return hits.length === 1 ? hits[0]!.id : null;
 }
 
 // The release or recording a claim arrives with; a recording's claim within

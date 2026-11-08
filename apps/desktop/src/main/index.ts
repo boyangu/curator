@@ -32,6 +32,7 @@ import { LoadRecovery } from './load-recovery.js';
 import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport, withLocalCatalog } from './cloud/transport.js';
+import { shareSpotifyLogin } from './cloud/local-catalog-login.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
 import { createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
 import { catalogApiUrl, cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
@@ -255,41 +256,12 @@ function getRekordboxSpec(): { executable: string; args?: string[]; cwd?: string
 	return { executable: exe, cwd: bundleDir };
 }
 
-// Same shape as getAnalyzerSpec() but for the Node research sidecar
-// (apps/researcher/ — agent research over the Claude Agent SDK, powering the
-// KB's similar-artists aspect). Requires an ANTHROPIC_API_KEY in the
-// environment — absent key ⇒ null ⇒ the KB's agent tier is off (disabled is
-// a supported state). Runs on our own Electron binary with
-// ELECTRON_RUN_AS_NODE=1 (no separate Node install needed). Dev: the tsc
-// output at apps/researcher/dist; prod: the bundled copy at
-// resources/researcher/.
-function getResearcherSpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
-	const apiKey = process.env['ANTHROPIC_API_KEY'];
-	if (!apiKey) {
-		mainLog.for('researcher').info('no ANTHROPIC_API_KEY — research sidecar disabled');
-		return null;
-	}
-	const isDev = sidecarsFromSourceTree();
-	const entry = isDev
-		? join(__dirname, '..', '..', '..', 'researcher', 'dist', 'main.js')
-		: join(process.resourcesPath ?? __dirname, 'researcher', 'dist', 'main.js');
-	if (!existsSync(entry)) {
-		mainLog.for('researcher').warn('sidecar build not found; research disabled (run: pnpm --filter @curator/researcher build)', { entry });
-		return null;
-	}
-	return {
-		executable: process.execPath,
-		args: [entry],
-		cwd: dirname(entry),
-		env: { ELECTRON_RUN_AS_NODE: '1', ANTHROPIC_API_KEY: apiKey },
-	};
-}
-
 // Same shape for the Node agent sidecar (apps/agent — the in-app agent's
-// provider-generic harness). Unlike the researcher, no API key gates the
-// spawn: the sidecar boots unconfigured and is armed via the configure RPC
-// with the safeStorage-held BYOK key (agent-config.ts) — so key entry and
-// rotation never respawn the process. CURATOR_DISABLE_AGENT=1 disables.
+// provider-generic harness, and the KB's similar-artists research, which
+// runs in its research lane). No API key gates the spawn: the sidecar boots
+// unconfigured and is armed via the configure RPC with the safeStorage-held
+// BYOK key (agent-config.ts) — so key entry and rotation never respawn the
+// process. CURATOR_DISABLE_AGENT=1 disables the assistant and research.
 function getAgentSpec(): { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv } | null {
 	const isDev = sidecarsFromSourceTree();
 	const entry = isDev
@@ -853,6 +825,13 @@ function createWindow(): void {
 			} catch (err) {
 				mainLog.for('album-enrich').error('startAlbumEnrichment failed', err);
 			}
+			// This desktop as a catalogue worker: asks the master every minute
+			// for its user's due reads; idles while signed out.
+			try {
+				core?.startCatalogWorker();
+			} catch (err) {
+				mainLog.for('catalog-worker').error('startCatalogWorker failed', err);
+			}
 			// Backup scheduler: overdue check ~2 min after launch, then a
 			// coarse tick; yields to any heavy job (see heavyJobInFlight).
 			try {
@@ -961,6 +940,30 @@ function registerIpc(svc: CoreService): void {
 	svc.subscribeFeedEnriched((item) => {
 		broadcastEvent('feed:enriched', item);
 	});
+	// What is being done to a feed item right now (the lazy Spotify match, the
+	// enrichment): two events per item, so the card can say "Loading…".
+	svc.subscribeFeedActivity((a) => {
+		broadcastEvent('feed:activity', a);
+	});
+
+	// Standing lenses changed (a chip ×, the assistant, a pull from another
+	// device): the Discover view reloads its chips and the page.
+	svc.subscribeFeedLenses((lenses) => {
+		broadcastEvent('feed:lenses-changed', lenses);
+	});
+
+	// What the feed scheduler is fetching, step by step — a Refresh click and a
+	// background poll alike. Coalesced in core (≤ 4/s), so a long Spotify walk
+	// stays a trickle on the renderer's message pump.
+	svc.subscribeFeedRefreshStatus((status) => {
+		broadcastEvent('feed:refresh-status', status);
+	});
+
+	// This desktop reading the catalogue's sources for the account's follows:
+	// a few changes a minute at most (Settings → Account shows them).
+	svc.subscribeCatalogWorker((status) => {
+		broadcastEvent('catalog:worker-event', status);
+	});
 
 	// KB expansion progress — background provider pages + research results
 	// landing. The entity page appends the new rows live off this stream.
@@ -982,6 +985,13 @@ function registerIpc(svc: CoreService): void {
 	// Rekordbox EXPORT lifecycle — same broadcast pattern, separate
 	// channel. Consumed by the sync-to-rekordbox modal's progress strip.
 	svc.subscribeRekordboxExportEvents((evt) => {
+		// Progress ticks are chatty; lifecycle events are the forensic
+		// trail for a modal that never closes (2026-11-08).
+		if (evt.kind !== 'progress') {
+			mainLog.for('rb-export-ipc').info('broadcasting export event', {
+				kind: evt.kind, windows: BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed()).length,
+			});
+		}
 		broadcastEvent('rekordbox:export-event', evt);
 	});
 	// Convert to WAV lifecycle — progress is throttled core-side (≤4/s).
@@ -1103,13 +1113,9 @@ app.whenReady().then(async () => {
 	const rekordboxSpec = process.env['CURATOR_DISABLE_REKORDBOX'] === '1' || !rails.rekordbox ? null : getRekordboxSpec();
 	if (rekordboxSpec) bootLog.info('rekordbox sidecar', { executable: rekordboxSpec.executable, args: (rekordboxSpec.args ?? []).join(' ') });
 	else bootLog.info(rails.rekordbox ? 'rekordbox sidecar disabled (CURATOR_DISABLE_REKORDBOX or missing spec)' : 'rekordbox sidecar disabled (profile rail)');
-	// Research sidecar (KB agent tier). Needs ANTHROPIC_API_KEY + a built
-	// apps/researcher; either missing just disables similar-artists research.
-	const researcherSpec = process.env['CURATOR_DISABLE_RESEARCHER'] === '1' ? null : getResearcherSpec();
-	if (researcherSpec) bootLog.info('research sidecar', { entry: (researcherSpec.args ?? []).join(' ') });
-	// In-app agent sidecar (BYOK harness). Missing build / disable flag just
-	// disables the agent panel; BYOK config is loaded + pushed after core
-	// exists below.
+	// In-app agent sidecar (BYOK harness + KB research). Missing build /
+	// disable flag just disables the agent panel and similar-artists
+	// research; BYOK config is loaded + pushed after core exists below.
 	const agentSpec = process.env['CURATOR_DISABLE_AGENT'] === '1' ? null : getAgentSpec();
 	if (agentSpec) bootLog.info('agent sidecar', { entry: (agentSpec.args ?? []).join(' ') });
 	else bootLog.info('agent sidecar disabled (CURATOR_DISABLE_AGENT or missing build)');
@@ -1233,7 +1239,6 @@ app.whenReady().then(async () => {
 		rekordbox: rekordboxSpec ?? undefined,
 		mir: mirSpec?.spec,
 		mirProvision: mirSpec?.provision,
-		researcher: researcherSpec ?? undefined,
 		agent: agentSpec ?? undefined,
 		// Agent workspace runs in a kill-able utility process — agent-written
 		// SQL must never block the main loop (better-sqlite3 has no interrupt).
@@ -1305,6 +1310,14 @@ app.whenReady().then(async () => {
 	if (restoreApplied?.tokens) {
 		const r = await importRestoredTokens(restoreApplied.tokens, core);
 		bootLog.info('restored token sidecar', { result: r });
+	}
+
+	// Development: the local Global Catalog reads followed Spotify playlists
+	// with this login (local-catalog-login.ts). Reads only; the token never
+	// leaves loopback, and a packaged app has no local catalogue at all.
+	if (localCatalogUrl && cloudTransport) {
+		const coreForLogin = core;
+		shareSpotifyLogin(localCatalogUrl, () => coreForLogin.auth.getSpotifyAccessToken());
 	}
 
 	// Arm the agent sidecar with the persisted BYOK config (safeStorage key →

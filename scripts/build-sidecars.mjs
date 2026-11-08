@@ -35,6 +35,7 @@ const dirs = {
 	audio: join(resourcesDir, 'audio'),
 	spotify: join(resourcesDir, 'spotify-player'),
 	mir: join(resourcesDir, 'mir'),
+	agent: join(resourcesDir, 'agent'),
 };
 
 for (const d of Object.values(dirs)) mkdirSync(d, { recursive: true });
@@ -83,6 +84,20 @@ try {
 	console.log('[sidecars] spotify: staged (signed)');
 } catch (err) {
 	console.warn(`[sidecars] spotify: SKIPPED (${err.message?.split('\n')[0]}) — packaged app will run without Spotify playback. Needs castlabs_evs (VMP signing) + an EVS login; build apps/spotify-player to enable.`);
+}
+
+// ─── agent (Node / esbuild, one self-contained file) ──────────────────────────
+// The in-app assistant and the KB's web research. apps/agent/scripts/build.mjs
+// bundles every dependency into dist/main.js, so the staged copy needs no
+// node_modules; getAgentSpec()'s production branch runs
+// process.resourcesPath/agent/dist/main.js under ELECTRON_RUN_AS_NODE.
+try {
+	run('pnpm --filter @curator/agent build', root);
+	rmSync(dirs.agent, { recursive: true, force: true });
+	cpSync(join(root, 'apps', 'agent', 'dist'), join(dirs.agent, 'dist'), { recursive: true });
+	console.log('[sidecars] agent: staged');
+} catch (err) {
+	console.warn(`[sidecars] agent: SKIPPED (${err.message?.split('\n')[0]}) — packaged app will run without the assistant and research`);
 }
 
 // ─── mcp shim (Node / tsc + .mcpb bundle) ───────────────────────────────────

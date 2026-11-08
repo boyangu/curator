@@ -29,11 +29,11 @@
 import { hostname } from 'node:os';
 import { DeezerFinder, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
 import { runLabelProfiler } from '../catalog/profile/label-profiler.js';
-import { BandcampTracker } from '../catalog/trackers/bandcamp.js';
-import { BeatportTracker } from '../catalog/trackers/beatport.js';
-import { DeezerTracker } from '../catalog/trackers/deezer.js';
-import { SoundCloudTracker } from '../catalog/trackers/soundcloud.js';
-import { YouTubeTracker } from '../catalog/trackers/youtube.js';
+import { BandcampTracker } from '@curator/catalog-readers';
+import { BeatportTracker } from '@curator/catalog-readers';
+import { DeezerTracker } from '@curator/catalog-readers';
+import { SoundCloudTracker } from '@curator/catalog-readers';
+import { YouTubeTracker } from '@curator/catalog-readers';
 import { soundcloudCredentials, tidalCredentials } from '../config.js';
 import { runInboxDetectors } from '../catalog/inbox-detectors.js';
 import { runLabelDedupe } from '../catalog/label-related.js';
@@ -41,21 +41,23 @@ import { runReleaseFiller } from '../catalog/release-fill.js';
 import { runStoreLinker } from '../catalog/store-links.js';
 import { AppleLookup } from '../catalog/trackers/apple.js';
 import { TidalApp } from '../catalog/trackers/tidal-app.js';
-import { SpotifyAppTracker } from '../catalog/trackers/spotify-app.js';
+import { SpotifyTracker } from '@curator/catalog-readers';
 import { runCataloguePlaylists } from '../catalog/profile/catalogue-playlists.js';
 import { runBackfill } from '../catalog/trackers/backfill.js';
 import { runTrackers } from '../catalog/trackers/sweep.js';
-import type { TrackerAdapter } from '../catalog/trackers/types.js';
+import type { TrackerAdapter } from '@curator/catalog-readers';
 import { ConfigError, flagOf, loadSpotify } from '../config.js';
 import { agentReasonerConfig, reasonerModel } from '../catalog/agent/config.js';
 import { runAgentReasoner } from '../catalog/agent/reasoner.js';
-import { SpotifyUserPlaylistTracker } from '../catalog/trackers/spotify-user-playlist.js';
+import { SpotifyUserPlaylistTracker } from '@curator/catalog-readers';
 import { TokenCrypto } from '../spotify/crypto.js';
 import { SPOTIFY_TIMEOUT_MS } from '../spotify/gateway.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
 import { migrationGate } from '../db/migration-gate.js';
 import { createLogger } from '../log.js';
 
+import { appCredentialsToken, gatewayPlaylistToken } from '../catalog/spotify-app-token.js';
+import { createSpotifyPace } from '../catalog/spotify-pace.js';
 const PASS_EVERY_MS = 60_000;
 
 const log = createLogger();
@@ -73,9 +75,13 @@ const finders: IdentityFinder[] = [];
 const spotifyId = env('CURATOR_SPOTIFY_APP_CLIENT_ID');
 const spotifySecret = env('CURATOR_SPOTIFY_APP_CLIENT_SECRET');
 if ((spotifyId === null) !== (spotifySecret === null)) throw new ConfigError('set both CURATOR_SPOTIFY_APP_CLIENT_ID and CURATOR_SPOTIFY_APP_CLIENT_SECRET, or neither');
-let spotify: SpotifyAppTracker | null = null;
+let spotify: SpotifyTracker | null = null;
+// Every Spotify read this process makes goes through one pace
+// (catalog/spotify-pace.ts): the app's client id is shared with the desktops,
+// so a ban any of them met is ours, and our share of the window stays small.
+const spotifyPace = createSpotifyPace({ db: () => db });
 if (spotifyId && spotifySecret) {
-	spotify = new SpotifyAppTracker({ clientId: spotifyId, clientSecret: spotifySecret });
+	spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: spotifyId, clientSecret: spotifySecret }) }, spotifyPace.fetch);
 	adapters.push(spotify);
 	finders.push(new SpotifyFinder(spotify));
 }
@@ -108,10 +114,12 @@ const gateway = loadSpotify(process.env).spotify;
 if (gateway) {
 	adapters.push(
 		new SpotifyUserPlaylistTracker({
-			db,
-			log,
-			gateway: { clientId: gateway.clientId, crypto: new TokenCrypto(gateway.keys), fetch: (url, init) => fetch(url, init), timeoutMs: SPOTIFY_TIMEOUT_MS },
-		}),
+			token: gatewayPlaylistToken({
+				db,
+				log,
+				gateway: { clientId: gateway.clientId, crypto: new TokenCrypto(gateway.keys), fetch: (url, init) => fetch(url, init), timeoutMs: SPOTIFY_TIMEOUT_MS },
+			}),
+		}, spotifyPace.fetch),
 	);
 }
 // The catalogue reasoner (catalog/agent): on with CURATOR_ANTHROPIC_API_KEY.

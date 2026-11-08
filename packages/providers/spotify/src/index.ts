@@ -274,25 +274,76 @@ export async function refreshTokens(
 //     Retry-After), so the whole process backs off together instead of each
 //     caller independently burning its 3-attempt retry budget against a window
 //     that's already empty.
-// Only request *starts* are spaced — in-flight requests still overlap, so
-// throughput is interval-bound, not serialized end-to-end.
-const MIN_INTERVAL_MS = 333; // ~3 starts/sec (~180/min) — under the per-app ceiling
+// Only request *starts* are paced — in-flight requests still overlap, so
+// throughput is rate-bound, not serialized end-to-end.
+//
+// The pace is a token bucket: a short burst (a page of cards matching, an
+// album expand's handful of calls) goes out at once, and a long walk (the
+// catalogue worker's artist sweep) settles at the refill rate. The client id
+// is shared with the local master's own readers, which pace themselves
+// (apps/cloud catalog/spotify-pace.ts); the two together stay well under the
+// volume that earned the app a 3-hour ban on 2026-11-06 (~4,700 calls in 20
+// minutes, ~235/min).
+// Configurable (configureSpotifyPace, or CURATOR_SPOTIFY_BURST /
+// CURATOR_SPOTIFY_PER_SEC in the environment): `burst` is how many calls may
+// start at once from an idle gate, `perSec` the sustained ceiling after that.
+export interface SpotifyPace {
+	burst: number;
+	perSec: number;
+}
+const DEFAULT_PACE: SpotifyPace = { burst: 4, perSec: 1 }; // 4 at once, then 60 calls/min
+const envNum = (name: string): number | null => {
+	const n = Number(process.env[name]);
+	return Number.isFinite(n) && n > 0 ? n : null;
+};
+let pace: SpotifyPace = {
+	burst: envNum('CURATOR_SPOTIFY_BURST') ?? DEFAULT_PACE.burst,
+	perSec: envNum('CURATOR_SPOTIFY_PER_SEC') ?? DEFAULT_PACE.perSec,
+};
+export function configureSpotifyPace(next: Partial<SpotifyPace>): SpotifyPace {
+	pace = { ...pace, ...next };
+	tokens = Math.min(tokens, pace.burst);
+	return { ...pace };
+}
+export function spotifyPace(): SpotifyPace {
+	return { ...pace };
+}
 const MAX_COOLDOWN_MS = 10_000; // cap the gate camp-out; interactive callers wait behind this
 // When Spotify returns a Retry-After this long, it's not a rolling-window blip
 // — the app-wide quota is spent and it has been seen returning hours-long
-// values. Treat anything above this as a quota ban: fail calls fast and let
-// background pollers idle (see spotifyBackoffUntil) instead of hammering the
-// wall every 10s, which only reinforces the ban.
+// values. Treat anything above this as a quota ban: fail every call fast,
+// interactive ones included, until the deadline Spotify named.
 const QUOTA_BAN_RETRY_AFTER_SEC = 30;
-// Cap how long pollers idle on a ban — Spotify's hours-long Retry-After would
-// otherwise blank the feed for the whole window. Re-probe every 15 min; if
-// still banned the next 429 just re-arms this.
-const MAX_BACKOFF_MS = 15 * 60 * 1000;
+// The ban is honoured in full (Spotify's deadline is fixed; probing it earlier
+// only takes another 429 and, per its docs, can extend it), with a sanity cap
+// for a nonsense header.
+const MAX_BACKOFF_MS = 24 * 60 * 60 * 1000;
 let gateChain: Promise<void> = Promise.resolve();
-let nextAllowedAt = 0;
+let tokens = pace.burst;
+let lastRefillAt = Date.now();
 let cooldownUntil = 0;
-let backoffUntil = 0; // quota-ban horizon pollers honor — distinct from the gate's 10s cooldown
+let backoffUntil = 0; // quota-ban horizon every caller honours — distinct from the gate's 10s cooldown
 let gateQueued = 0; // callers currently waiting for a start slot — the saturation gauge
+
+// The ban deadline outlives the process: the desktop restarts (a dev loop, a
+// crash) and each fresh process used to re-probe the wall at once — four
+// restarts on 2026-11-06 meant four more 429s. Core wires an app_setting-
+// backed store on boot; tests and the CLI run without one.
+export interface SpotifyBackoffStore {
+	load(): number | null;
+	save(until: number): void;
+}
+let backoffStore: SpotifyBackoffStore | null = null;
+export function configureSpotifyBackoffStore(store: SpotifyBackoffStore | null): void {
+	backoffStore = store;
+	const stored = store?.load() ?? 0;
+	if (stored > backoffUntil) backoffUntil = stored;
+}
+
+function refillTokens(now: number): void {
+	tokens = Math.min(pace.burst, tokens + ((now - lastRefillAt) / 1000) * pace.perSec);
+	lastRefillAt = now;
+}
 
 // Returns the time spent waiting for a slot and how many other callers were
 // already queued ahead when this one arrived. Both are logged per call: a high
@@ -306,10 +357,16 @@ function rateGate(): Promise<{ waitedMs: number; queuedAhead: number }> {
 	// slots rather than all reading the same `now`. The chain only sequences
 	// the (short) wait-for-slot step, not the request itself.
 	const wait = gateChain.then(async () => {
-		const earliest = Math.max(Date.now(), nextAllowedAt, cooldownUntil);
-		const delay = earliest - Date.now();
-		if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-		nextAllowedAt = Math.max(earliest, Date.now()) + MIN_INTERVAL_MS;
+		// A cooldown (a 429 just seen) holds every start; then a token, or the
+		// wait until the bucket refills one.
+		const cool = cooldownUntil - Date.now();
+		if (cool > 0) await new Promise((r) => setTimeout(r, cool));
+		refillTokens(Date.now());
+		if (tokens < 1) {
+			await new Promise((r) => setTimeout(r, Math.ceil(((1 - tokens) / pace.perSec) * 1000)));
+			refillTokens(Date.now());
+		}
+		tokens = Math.max(0, tokens - 1);
 	});
 	gateChain = wait.catch(() => {}); // a future reject must not wedge the chain
 	return wait.then(
@@ -326,42 +383,81 @@ function rateGate(): Promise<{ waitedMs: number; queuedAhead: number }> {
 
 // Push the shared cooldown out whenever a 429 is seen, so every queued and
 // future call waits for the rolling window to recover. A short Retry-After only
-// arms the gate cooldown (≤10s); a long one (quota ban) additionally arms the
-// poller backoff so background sweeps stop instead of re-banning the app.
+// arms the gate cooldown (≤10s) and empties the bucket; a long one (quota ban)
+// arms the backoff every caller fails fast against until Spotify's deadline.
 function noteRateLimit(retryAfterSec: number): void {
 	const until = Date.now() + Math.min(Math.max(retryAfterSec, 1) * 1000, MAX_COOLDOWN_MS);
 	if (until > cooldownUntil) cooldownUntil = until;
+	tokens = 0;
+	lastRefillAt = Date.now();
 	if (retryAfterSec >= QUOTA_BAN_RETRY_AFTER_SEC) {
-		const backoff = Date.now() + MAX_BACKOFF_MS;
-		if (backoff > backoffUntil) backoffUntil = backoff;
+		const backoff = Date.now() + Math.min(retryAfterSec * 1000, MAX_BACKOFF_MS);
+		if (backoff > backoffUntil) {
+			backoffUntil = backoff;
+			try { backoffStore?.save(backoff); } catch { /* the deadline still holds for this process */ }
+		}
 		console.warn(
 			`[spotify] 429 quota ban — Spotify asked for ${retryAfterSec}s (~${Math.round((retryAfterSec / 3600) * 10) / 10}h). ` +
-				`Failing calls fast; pollers idle ${MAX_BACKOFF_MS / 60000}min. Reduce call volume (followed-artist sweep?).`,
+				`No Spotify call goes out until ${new Date(backoffUntil).toISOString()}.`,
 		);
 	} else {
 		console.warn(`[spotify] 429 cooldown ${Math.round((until - Date.now()) / 100) / 10}s (retry-after ${retryAfterSec}s)`);
 	}
 }
 
-// How long background pollers should stay idle after a quota ban (epoch ms; 0 =
-// clear). Producers check this and skip a poll entirely rather than poke a wall
-// that's still up.
+// The quota-ban deadline (epoch ms; 0 = clear). Producers and the catalogue
+// worker check this and skip a poll entirely rather than poke a wall that's
+// still up.
 export function spotifyBackoffUntil(): number {
-	return backoffUntil;
+	return backoffUntil > Date.now() ? backoffUntil : 0;
 }
 
 // A quota ban lives on Spotify's side keyed to the client-ID and clears on a
 // fixed deadline (observed: hours). Every request while it's active risks
-// topping the penalty up, so during our local backoff window we don't hit the
-// network AT ALL — interactive calls included. Returns a 429-tagged error to
-// throw (callers key off "429" for the rate-limit message), or null when clear.
-// The window is capped at MAX_BACKOFF_MS, so the first call after it lapses
-// re-probes; a still-active ban just re-arms it. This bounds real probes to
-// ~one per backoff window instead of one per user click.
+// topping the penalty up, so until then we don't hit the network AT ALL —
+// interactive calls included. Returns a 429-tagged error to throw (callers key
+// off "429" for the rate-limit message), or null when clear.
+const BAN_MESSAGE = 'Spotify 429 (quota ban';
 function bannedError(): Error | null {
 	const remaining = backoffUntil - Date.now();
 	if (remaining <= 0) return null;
-	return new Error(`Spotify 429 (quota ban — backing off locally, ~${Math.ceil(remaining / 60000)} min left)`);
+	return new Error(`${BAN_MESSAGE} — no calls until ${new Date(backoffUntil).toLocaleTimeString()}, ~${Math.ceil(remaining / 60000)} min left)`);
+}
+
+// Whether an error is the local ban refusal (no network was touched): callers
+// that would otherwise record a failed attempt leave the item untried instead.
+export function isSpotifyQuotaBackoff(err: unknown): boolean {
+	return err instanceof Error && err.message.startsWith(BAN_MESSAGE);
+}
+
+// The gate as a plain `fetch`, for code that builds its own Spotify requests
+// (the catalogue readers a desktop runs for its follows, @curator/catalog-
+// readers): every call takes a start slot behind the same gate as the
+// SpotifyClient instances, a 429 arms the shared cooldown, and the call is in
+// the same log. The caller handles the status; no retry (the readers'
+// getJson turns a 429 into their own rate-limit error).
+export async function gatedFetch(url: string, init?: RequestInit, tag = 'catalog:reader'): Promise<Response> {
+	const path = url.startsWith(API_BASE) ? url.slice(API_BASE.length) : url;
+	const method = init?.method ?? 'GET';
+	const banned = bannedError();
+	if (banned) {
+		seq++;
+		if (PER_CALL_LOG) console.log(`[spotify] #${seq} ${tag} ${method} ${logPath(path)} ban-skip — ${banned.message}`);
+		throw banned;
+	}
+	const { waitedMs, queuedAhead } = await rateGate();
+	seq++;
+	const netStart = Date.now();
+	let res: Response;
+	try {
+		res = await fetch(url, init);
+	} catch (err) {
+		recordCall(method, path, tag, 'neterr', 0, waitedMs, queuedAhead, Date.now() - netStart);
+		throw err;
+	}
+	recordCall(method, path, tag, res.status, 0, waitedMs, queuedAhead, Date.now() - netStart);
+	if (res.status === 429) noteRateLimit(Number(res.headers.get('retry-after') ?? '1'));
+	return res;
 }
 
 // ─── Call logging ────────────────────────────────────────────────────────────
@@ -856,9 +952,16 @@ export class SpotifyClient {
 		return body.tracks?.items ?? [];
 	}
 
+	// Album search — the feed's lazy Spotify match for a release that arrived
+	// from a store (core feed/spotify-match.ts): by `upc:` or by album + artist.
+	async searchAlbums(query: string, limit = 10): Promise<SpotifyAlbum[]> {
+		const body = await this.search<{ albums?: SpotifyPaginated<SpotifyAlbum> }>('album', query, limit);
+		return body.albums?.items ?? [];
+	}
+
 	// The 2026 rules cap `limit` at 10 (SPOTIFY_2026): a larger ask that comes
 	// back 400 is re-asked at 10, and later searches stay at 10.
-	private search<T>(type: 'artist' | 'track', query: string, limit: number): Promise<T> {
+	private search<T>(type: 'artist' | 'track' | 'album', query: string, limit: number): Promise<T> {
 		const at = (n: number) => () =>
 			this.request<T>(`/search?type=${type}&q=${encodeURIComponent(query)}&limit=${Math.min(Math.max(limit, 1), n)}`);
 		if (limit <= 10) return at(10)();

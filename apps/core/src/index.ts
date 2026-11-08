@@ -33,15 +33,22 @@ export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/i
 export * from './feed/types.js';
 export type { CatalogClientStatus, CatalogEnrichReport, CatalogFollowManyReport, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit } from './catalog-client/service.js';
 export type { FollowCandidate, FollowCandidateKind } from './catalog-client/library-candidates.js';
+export type { CatalogWorkerStatus } from './catalog-worker/service.js';
+export type { CatalogReadSources, CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 export type { CatalogObjectRef, TrackCatalogRefs } from './catalog-client/catalog-refs.js';
 export type { CatalogWatch, CatalogClaim, CatalogHandle, CatalogKind } from '@curator/protocol';
 export type { FeedStore } from './feed/store.js';
+export type { FeedLens, FeedLensRule, FeedLensKind } from './feed/lenses.js';
+export { FEED_LENSES_SETTING, defaultLabel as defaultFeedLensLabel } from './feed/lenses.js';
 export * from './knowledge/types.js';
 export type { KnowledgeStore } from './knowledge/store.js';
 export type { AgentConfig, AgentProvider, RunUsage as AgentRunUsage, WireToolSpec } from '@curator/agent-core';
+// The MCP bridge wire protocol (desktop host ↔ the Claude Desktop shim).
+export { MCP_BRIDGE_PROTOCOL } from '@curator/agent-core';
+export type { BridgeDiscovery, BridgeEventFrame, BridgeInitResult, BridgeMethod, BridgeRequestFrame, BridgeResponseFrame } from '@curator/agent-core';
 export type { AgentResultSet, AgentResultItem } from './agent/result-set.js';
 export type { AgentStore, AgentSessionSummary, AgentSessionDetail } from './agent/store.js';
-export type { AgentEvent, AgentStatus, AgentViewCommand, AgentViewContext } from './agent/service.js';
+export type { AgentEvent, AgentStatus, AgentViewContext } from './agent/service.js';
 export type { AgentSidecarSpec } from './agent/sidecar.js';
 export * from './mir/types.js';
 export type { ProductionProfile, ProductionPair, ProductionPairSide, ProductionWinner, ProductionStats, ProductionModelInfo, ProductionCohort, ProductionDeviation, ProductionAudiobox, ProductionLearned } from './production/types.js';

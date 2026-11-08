@@ -23,8 +23,10 @@ import {
 	FEED_EVENTS_MAX,
 	type CatalogEvent,
 	type CatalogEventCardV1,
+	type CatalogEventCardV2,
 	type CatalogEventKind,
 	type CatalogEventTrackCardV1,
+	type CatalogEventTrackCardV2,
 	type CatalogEventTrackContainerV1,
 	type CatalogHandle,
 	type CatalogKind,
@@ -55,11 +57,29 @@ async function handlesOf(tx: Queryable, ids: string[]): Promise<Map<string, Cata
 	return out;
 }
 
+// A recording's canonical genre names (its object-genre edges), '|'-joined
+// in one scalar subquery per row: the card's per-track genres.
+const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by g.name) from curator.catalog_edge ge join curator.catalog_object g on g.id = ge.dst
+	where ge.src = o.id and ge.kind = 'object-genre') as genres`;
+
+const splitNames = (v: string | null): string[] => (v ? v.split('|') : []);
+
+// The DJ facts folded onto a recording (fold.ts: Beatport first).
+function recordingFacts(attrs: Record<string, unknown>, genres: string | null): { bpm: number | null; key: string | null; genres: string[] } {
+	return {
+		bpm: typeof attrs.bpm === 'number' && Number.isFinite(attrs.bpm) ? attrs.bpm : null,
+		key: typeof attrs.key === 'string' && attrs.key.trim() ? attrs.key : null,
+		genres: splitNames(genres),
+	};
+}
+
 // The card a device renders without calling back: the release as the
 // catalogue knows it at the moment the event is raised.
-export async function releaseCard(tx: Queryable, releaseId: string): Promise<CatalogEventCardV1> {
-	const [rel] = await tx.query<{ name: string; attrs: string; release_type: string | null; label_text: string | null }>(
-		`select name, attrs::text as attrs, release_type, label_text from curator.catalog_object where id = $1`,
+export async function releaseCard(tx: Queryable, releaseId: string): Promise<CatalogEventCardV2> {
+	const [rel] = await tx.query<{ name: string; attrs: string; release_type: string | null; label_text: string | null; upc: string | null }>(
+		`select o.name, o.attrs::text as attrs, o.release_type, o.label_text,
+			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'upc' limit 1) as upc
+		from curator.catalog_object o where o.id = $1`,
 		[releaseId],
 	);
 	const attrs = JSON.parse(rel!.attrs) as Record<string, unknown>;
@@ -72,9 +92,10 @@ export async function releaseCard(tx: Queryable, releaseId: string): Promise<Cat
 		`select o.id, o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst where e.src = $1 and e.kind = 'release-label' limit 1`,
 		[releaseId],
 	);
-	const tracks = await tx.query<{ id: string; name: string; duration_sec: unknown; isrc: string | null; artists: string | null }>(
-		`select o.id, o.name, o.duration_sec,
+	const tracks = await tx.query<{ id: string; name: string; attrs: string; duration_sec: unknown; isrc: string | null; artists: string | null; genres: string | null }>(
+		`select o.id, o.name, o.attrs::text as attrs, o.duration_sec,
 			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc,
+			${RECORDING_GENRES_SQL},
 			(select string_agg(a.name, '|' order by ra.position) from curator.catalog_edge ra join curator.catalog_object a on a.id = ra.dst
 				where ra.src = o.id and ra.kind = 'recording-artist') as artists
 		from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst
@@ -88,7 +109,7 @@ export async function releaseCard(tx: Queryable, releaseId: string): Promise<Cat
 	const handles = await handlesOf(tx, [releaseId, ...artists.map((a) => a.id), ...tracks.map((t) => t.id)]);
 	return {
 		// CATALOG_EVENT_CARD_VERSION: bump with the shape.
-		version: 1,
+		version: 2,
 		kind: 'release',
 		title: rel!.name,
 		artists: artists.map((a) => ({ id: a.id, name: a.name, handles: handles.get(a.id) ?? [] })),
@@ -103,9 +124,12 @@ export async function releaseCard(tx: Queryable, releaseId: string): Promise<Cat
 			isrc: t.isrc,
 			durationSec: numOrNull(t.duration_sec),
 			handles: handles.get(t.id) ?? [],
+			...recordingFacts(JSON.parse(t.attrs) as Record<string, unknown>, t.genres),
 		})),
 		handles: handles.get(releaseId) ?? [],
 		genres: genres.map((g) => g.name),
+		catalogNumber: typeof attrs.catalogNumber === 'string' && attrs.catalogNumber.trim() ? attrs.catalogNumber : null,
+		upc: rel!.upc,
 	};
 }
 
@@ -133,7 +157,11 @@ export type ReleaseFind = { releaseId: string; trackedId: string; publishedAt: n
 
 // Raises the event for a release a tracker found, if it is due one; returns
 // its seq, or null when it is too old, too far ahead, or already announced.
-export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: { nowMs: number; windowDays: number }): Promise<number | null> {
+// `by`: who reported the poll the event comes from (the cloud's holder, or
+// `device:<id>`), kept on the event as `raised_by`.
+export type RaiseOpts = { nowMs: number; by?: string };
+
+export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: RaiseOpts & { windowDays: number }): Promise<number | null> {
 	const [rel] = await tx.query<{ kind: string; release_at_ms: unknown; discovered_at_ms: unknown }>(
 		`select kind, extract(epoch from release_at) * 1000 as release_at_ms, extract(epoch from discovered_at) * 1000 as discovered_at_ms
 		from curator.catalog_object where id = $1`,
@@ -150,7 +178,7 @@ export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: 
 	const subjects = await subjectsOf(tx, find.releaseId, find.trackedId);
 	if (existing) {
 		await insertSubjects(tx, num(existing.seq), subjects);
-		return reannounceIfNewProvider(tx, find.releaseId, num(existing.seq), subjects);
+		return reannounceIfNewProvider(tx, find.releaseId, num(existing.seq), subjects, opts.by);
 	}
 	const [counts] = await tx.query<{ total: unknown; fresh: unknown }>(
 		`select count(*) as total,
@@ -167,8 +195,8 @@ export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: 
 	const providers = await tx.query<{ provider: string }>(`select provider from curator.catalog_source_object where object_id = $1`, [find.releaseId]);
 	const card = await releaseCard(tx, find.releaseId);
 	const [ins] = await tx.query<{ seq: unknown }>(
-		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card)
-		values ($1, $2, $3, to_timestamp($4::float8 / 1000), to_timestamp($5::float8 / 1000), $6::int, $7::real, $8::text::jsonb)
+		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card, raised_by)
+		values ($1, $2, $3, to_timestamp($4::float8 / 1000), to_timestamp($5::float8 / 1000), $6::int, $7::real, $8::text::jsonb, $9)
 		on conflict (dedupe_key) do nothing
 		returning seq`,
 		[
@@ -180,6 +208,7 @@ export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: 
 			String(fresh),
 			String(confidenceOf(providers.map((p) => p.provider))),
 			JSON.stringify(card),
+			opts.by ?? null,
 		],
 	);
 	// A concurrent tracker raised it between the check and the insert.
@@ -196,31 +225,34 @@ export async function raiseReleaseEvent(tx: Queryable, find: ReleaseFind, opts: 
 // could not use the first card (Discover plays Spotify only, so a card that
 // had only Deezer was dropped) now gets the release. Once per provider: the
 // rebuilt card carries it.
-async function reannounceIfNewProvider(tx: Queryable, releaseId: string, seq: number, subjects: string[]): Promise<number | null> {
-	return reannounce(tx, seq, releaseId, subjects);
+async function reannounceIfNewProvider(tx: Queryable, releaseId: string, seq: number, subjects: string[], by?: string): Promise<number | null> {
+	return reannounce(tx, seq, releaseId, subjects, by);
 }
 
 // The same for any event whose subject gained a provider its card lacks: the
 // resolver (planner.ts) calls it after giving a recording or release its
 // Spotify id. Returns the new seq, or null when the card already had every
 // provider.
-export async function reannounce(tx: Queryable, seq: number, subjectId: string, subjects: string[] = []): Promise<number | null> {
+// `by`: the reporter of the poll that brought the new provider; the resolver
+// passes none and the event keeps its first reporter.
+export async function reannounce(tx: Queryable, seq: number, subjectId: string, subjects: string[] = [], by?: string): Promise<number | null> {
 	const [ev] = await tx.query<{ kind: CatalogEventKind; card: string }>(`select kind, card::text as card from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
 	if (!ev) return null;
-	const old = JSON.parse(ev.card) as CatalogEventCardV1 | CatalogEventTrackCardV1;
+	// A stored card of any version: only the fields v1 and v2 share are read.
+	const old = JSON.parse(ev.card) as CatalogEventCardV1 | CatalogEventCardV2 | CatalogEventTrackCardV1 | CatalogEventTrackCardV2;
 	const announced = new Set(old.handles.map((h) => h.provider));
 	const providers = await tx.query<{ provider: string }>(`select provider from curator.catalog_source_object where object_id = $1`, [subjectId]);
 	if (providers.every((p) => announced.has(p.provider as CatalogProvider))) return null;
 	const card = old.kind === 'track' ? await trackCard(tx, subjectId, old.container, old.rank, old.addedAt) : await releaseCard(tx, subjectId);
 	const kept = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_event_subject where seq = $1::bigint`, [String(seq)]);
-	const [gone] = await tx.query<{ kind: string; dedupe_key: string; release_at: unknown; source_published_at: unknown; recordings_new: unknown; confidence: unknown }>(
+	const [gone] = await tx.query<{ kind: string; dedupe_key: string; release_at: unknown; source_published_at: unknown; recordings_new: unknown; confidence: unknown; raised_by: string | null }>(
 		`delete from curator.catalog_event where seq = $1::bigint
-		returning kind, dedupe_key, release_at::text as release_at, source_published_at::text as source_published_at, recordings_new, confidence`,
+		returning kind, dedupe_key, release_at::text as release_at, source_published_at::text as source_published_at, recordings_new, confidence, raised_by`,
 		[String(seq)],
 	);
 	const [moved] = await tx.query<{ seq: unknown }>(
-		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card)
-		values ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6::int, $7::real, $8::text::jsonb)
+		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card, raised_by)
+		values ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6::int, $7::real, $8::text::jsonb, $9)
 		returning seq`,
 		[
 			gone!.kind,
@@ -231,6 +263,7 @@ export async function reannounce(tx: Queryable, seq: number, subjectId: string, 
 			String(num(gone!.recordings_new)),
 			String(old.kind === 'track' ? num(gone!.confidence) : confidenceOf(providers.map((p) => p.provider))),
 			JSON.stringify(card),
+			by ?? gone!.raised_by,
 		],
 	);
 	const next = num(moved!.seq);
@@ -252,7 +285,7 @@ export type ChartEntry = { genreId: string; recordingId: string; provider: Catal
 // A recording on a watched genre's chart: the membership row with its best
 // rank (kept for every entry the tracker sees), and, the first time the
 // chart carries it, one `chart_entry` event per (genre, recording).
-export async function raiseChartEntry(tx: Queryable, entry: ChartEntry, opts: { nowMs: number }): Promise<number | null> {
+export async function raiseChartEntry(tx: Queryable, entry: ChartEntry, opts: RaiseOpts): Promise<number | null> {
 	await tx.query(
 		`insert into curator.catalog_chart_entry (genre_id, provider, recording_id, rank, best_rank)
 		values ($1, $2, $3, $4::int, $4::int)
@@ -261,11 +294,11 @@ export async function raiseChartEntry(tx: Queryable, entry: ChartEntry, opts: { 
 	);
 	const card = await trackCard(tx, entry.recordingId, { kind: 'chart', id: entry.genreId }, entry.rank, opts.nowMs);
 	const [ins] = await tx.query<{ seq: unknown }>(
-		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card)
-		values ('chart_entry', $1, $2, null, to_timestamp($3::float8 / 1000), 0, 0.9, $4::text::jsonb)
+		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card, raised_by)
+		values ('chart_entry', $1, $2, null, to_timestamp($3::float8 / 1000), 0, 0.9, $4::text::jsonb, $5)
 		on conflict (dedupe_key) do nothing
 		returning seq`,
-		[entry.recordingId, `chart:${entry.genreId}:${entry.recordingId}`, String(opts.nowMs), JSON.stringify(card)],
+		[entry.recordingId, `chart:${entry.genreId}:${entry.recordingId}`, String(opts.nowMs), JSON.stringify(card), opts.by ?? null],
 	);
 	if (!ins) return null;
 	const seq = num(ins.seq);
@@ -278,7 +311,7 @@ export type PlaylistAdd ={ playlistId: string; recordingId: string; sourceObject
 // A track added to a watched playlist: its membership row (kept for every
 // addition the tracker sees) and, when recent, one `playlist_add` event per
 // (playlist, recording) ever.
-export async function raisePlaylistAdd(tx: Queryable, add: PlaylistAdd, opts: { nowMs: number; windowDays: number }): Promise<number | null> {
+export async function raisePlaylistAdd(tx: Queryable, add: PlaylistAdd, opts: RaiseOpts & { windowDays: number }): Promise<number | null> {
 	await tx.query(
 		`insert into curator.catalog_playlist_item (playlist_id, recording_id, position, added_at, source_object_id)
 		select $1, $2, $3::int, to_timestamp($4::float8 / 1000), $5
@@ -289,11 +322,11 @@ export async function raisePlaylistAdd(tx: Queryable, add: PlaylistAdd, opts: { 
 	if (when < opts.nowMs - opts.windowDays * 86400_000) return null;
 	const card = await trackCard(tx, add.recordingId, { kind: 'playlist', id: add.playlistId }, null, add.addedAt);
 	const [ins] = await tx.query<{ seq: unknown }>(
-		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card)
-		values ('playlist_add', $1, $2, null, to_timestamp($3::float8 / 1000), 0, 0.9, $4::text::jsonb)
+		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, source_published_at, recordings_new, confidence, card, raised_by)
+		values ('playlist_add', $1, $2, null, to_timestamp($3::float8 / 1000), 0, 0.9, $4::text::jsonb, $5)
 		on conflict (dedupe_key) do nothing
 		returning seq`,
-		[add.recordingId, `playlist_add:${add.playlistId}:${add.recordingId}`, add.addedAt === null ? null : String(add.addedAt), JSON.stringify(card)],
+		[add.recordingId, `playlist_add:${add.playlistId}:${add.recordingId}`, add.addedAt === null ? null : String(add.addedAt), JSON.stringify(card), opts.by ?? null],
 	);
 	if (!ins) return null;
 	const seq = num(ins.seq);
@@ -307,10 +340,11 @@ async function trackCard(
 	container: { kind: CatalogEventTrackContainerV1['kind']; id: string },
 	rank: number | null,
 	addedAt: number | null,
-): Promise<CatalogEventTrackCardV1> {
-	const [rec] = await tx.query<{ name: string; attrs: string; duration_sec: unknown; isrc: string | null }>(
+): Promise<CatalogEventTrackCardV2> {
+	const [rec] = await tx.query<{ name: string; attrs: string; duration_sec: unknown; isrc: string | null; genres: string | null }>(
 		`select o.name, o.attrs::text as attrs, o.duration_sec,
-			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc
+			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc,
+			${RECORDING_GENRES_SQL}
 		from curator.catalog_object o where o.id = $1`,
 		[recordingId],
 	);
@@ -321,11 +355,25 @@ async function trackCard(
 		[recordingId],
 	);
 	const [pl] = await tx.query<{ name: string }>(`select name from curator.catalog_object where id = $1`, [container.id]);
+	// The label of a release the recording sits on: the entity first, else
+	// the release's bare label string.
+	const [lab] = await tx.query<{ id: string | null; name: string }>(
+		`select id, name from (
+			select l.id, l.name, 0 as pri from curator.catalog_edge rr
+				join curator.catalog_edge rl on rl.src = rr.src and rl.kind = 'release-label'
+				join curator.catalog_object l on l.id = rl.dst
+			where rr.dst = $1 and rr.kind = 'release-recording'
+			union all
+			select null, r.label_text, 1 from curator.catalog_edge rr join curator.catalog_object r on r.id = rr.src
+			where rr.dst = $1 and rr.kind = 'release-recording' and r.label_text is not null
+		) x order by pri limit 1`,
+		[recordingId],
+	);
 	const handles = await handlesOf(tx, [recordingId, container.id, ...artists.map((a) => a.id)]);
 	const text = (k: string) => (typeof attrs[k] === 'string' ? (attrs[k] as string) : null);
 	return {
 		// CATALOG_EVENT_CARD_VERSION: bump with the shape.
-		version: 1,
+		version: 2,
 		kind: 'track',
 		title: rec!.name,
 		artists: artists.map((a) => ({ id: a.id, name: a.name, handles: handles.get(a.id) ?? [] })),
@@ -338,6 +386,8 @@ async function trackCard(
 		container: { kind: container.kind, id: container.id, name: pl?.name ?? '', handles: handles.get(container.id) ?? [] },
 		rank,
 		addedAt,
+		...recordingFacts(attrs, rec!.genres),
+		label: lab ? { id: lab.id, name: lab.name } : null,
 	};
 }
 

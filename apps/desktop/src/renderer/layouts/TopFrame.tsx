@@ -169,6 +169,10 @@ export interface TopFrameProps {
 	// source has hit connection trouble and is in the retry loop. Renderer
 	// owns clearing entries when sync ends.
 	sourceSyncTooltip: Accessor<Partial<Record<SourceTab, { tooltip: string; alert: boolean }>>>;
+	// The same indicator for a state tab whose content is being fetched right
+	// now: Discover while the feed refreshes (a Refresh click or the background
+	// poll). `alert` once a source of that pass has failed.
+	stateSyncTooltip: Accessor<Partial<Record<StateTab, { tooltip: string; alert: boolean }>>>;
 	// Static UI bits
 	userInitials: string;
 
@@ -321,19 +325,39 @@ export function TopFrame(props: TopFrameProps) {
 
 			<div class="tf-tabs tf-states">
 				<For each={STATE_TABS.filter((def) => props.visibleStateTabs().has(def.id))}>
-					{(def) => (
-						<button
-							class="tf-tab top-nav-item"
-							classList={{ active: props.activeTabId() === def.id }}
-							data-state={def.state}
-							title={def.label}
-							onClick={() => props.onViewClick(def.id)}
-						>
-							{def.iconSvg()}
-							<span>{def.label}</span>
-							<span class="ct">{fmtCount(props.tagCounts()[def.id])}</span>
-						</button>
-					)}
+					{(def) => {
+						// Same pulse + live popover as a syncing source tab above.
+						const syncStatus = () => props.stateSyncTooltip()[def.id] ?? null;
+						return (
+							<button
+								class="tf-tab top-nav-item"
+								classList={{
+									active: props.activeTabId() === def.id,
+									'tf-tab--has-popover': !!syncStatus(),
+								}}
+								data-state={def.state}
+								title={syncStatus() ? undefined : def.label}
+								onClick={() => props.onViewClick(def.id)}
+							>
+								{syncStatus()
+									? <span class="tf-src-mark">
+										<span
+											class="tf-src-pulse"
+											classList={{ 'tf-src-pulse--alert': syncStatus()!.alert }}
+											aria-label={`${def.label} refreshing`}
+										/>
+									</span>
+									: def.iconSvg()}
+								<span>{def.label}</span>
+								<span class="ct">{fmtCount(props.tagCounts()[def.id])}</span>
+								{syncStatus() && (
+									<div class="tf-src-tooltip" role="tooltip">
+										{syncStatus()!.tooltip}
+									</div>
+								)}
+							</button>
+						);
+					}}
 				</For>
 			</div>
 

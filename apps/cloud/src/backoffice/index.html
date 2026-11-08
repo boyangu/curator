@@ -118,6 +118,30 @@ button.ok { border-color: var(--accent); color: var(--accent); }
 button.no { border-color: var(--warn); color: var(--warn); }
 .item .state { color: var(--muted); font-size: 12.5px; margin-top: 8px; }
 .item .state .err { display: inline; padding: 2px 6px; }
+/* tracking */
+/* Below the sticky header when a click scrolls to it. */
+#tr-followed { scroll-margin-top: 64px; }
+.tr-line { color: var(--muted); margin: 10px 0; }
+.tr-sub { margin-top: 4px; font-size: 13px; }
+a.btn { display: inline-block; border: 1px solid var(--accent); color: var(--accent); border-radius: 6px; padding: 3px 10px; }
+a.btn:hover { text-decoration: none; background: var(--accent-soft); }
+.tr-sub .chips { display: inline-flex; vertical-align: middle; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
+.tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.tile .l { font-size: 13px; font-weight: 600; margin-top: 2px; }
+.tile .s { font-size: 12px; color: var(--muted); }
+.tile.warn { border-color: var(--warn); }
+.tile.warn .l { color: var(--warn); }
+.tr-line b { color: var(--text); font-weight: 600; }
+.tr-pause { border: 1px solid var(--warn); color: var(--warn); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; background: var(--panel); }
+.tr-pause .mono { color: var(--muted); }
+.tr-result { border-left: 3px solid var(--accent); padding: 4px 0 4px 10px; margin-bottom: 10px; }
+.tr-result.bad { border-left-color: var(--warn); color: var(--warn); }
+.chip.due { background: var(--accent-soft); color: var(--accent); }
+.chip.bad { background: transparent; box-shadow: inset 0 0 0 1px var(--warn); color: var(--warn); }
+.chip.now { background: var(--accent); color: var(--panel); }
+a.warn, span.warn { color: var(--warn); }
 nav a .badge { background: var(--warn); color: #fff; border-radius: 999px; padding: 0 6px; font-size: 11px; margin-left: 6px; font-weight: 600; }
 @media (max-width: 640px) { .hide-sm { display: none; } .head img { width: 64px; height: 64px; } }
 </style>
@@ -125,7 +149,7 @@ nav a .badge { background: var(--warn); color: #fff; border-radius: 999px; paddi
 <body>
 <header>
 	<div class="bar">
-		<div class="brand">Curator catalogue<small>back office · read-only</small></div>
+		<div class="brand">Curator catalogue<small>back office</small></div>
 		<nav id="nav"></nav>
 	</div>
 </header>
@@ -150,7 +174,8 @@ const setLibrary = (on) => { try { localStorage.setItem('libraryFilter', on ? 'o
 // What waits for the operator (inbox.ts): the nav badge is the notification.
 let inboxCounts = null;
 // The page's one write path: the host's loopback /admin (cli/local.ts serves
-// every op; cli/backoffice.ts the inbox ones). Absent, the inbox is read-only.
+// every op; cli/backoffice.ts the inbox ones and a check). Absent, the inbox
+// and Tracking are read-only.
 let writable = null;
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -179,6 +204,7 @@ function parseHash() {
 function renderNav(active) {
 	const waiting = inboxCounts ? inboxCounts.approval + inboxCounts.notice : null;
 	nav.innerHTML = `<a href="#/inbox" class="${active === 'inbox' ? 'on' : ''}">Inbox${waiting ? `<span class="badge">${fmtN(waiting)}</span>` : ''}</a>`
+		+ `<a href="#/tracking" class="${active === 'tracking' ? 'on' : ''}">Tracking</a>`
 		+ KINDS.map((k) => {
 			const n = libraryOn() ? stats.library.objects[k.kind] : stats[k.kind];
 			return `<a href="#/${k.path}" class="${k.kind === active ? 'on' : ''}">${k.title}<span class="n">${n != null ? fmtN(n) : ''}</span></a>`;
@@ -400,7 +426,8 @@ async function renderObject(id) {
 				<div class="chips" style="margin-top:8px">${sourceLinks}</div>
 				${stats.library && (o.kind === 'label' || o.kind === 'artist') ? `<label class="lib" style="margin-top:8px" title="Releases, tracks, artists and their counts only as far as your tracks with local files reach"><input type="checkbox" id="lib-o" ${libraryOn() ? 'checked' : ''}> My library</label>` : ''}
 			</div>
-		</div>`;
+		</div>
+		<div id="tracking-slot"></div>`;
 	// What the operator or the agent concluded about it (insights.ts).
 	if (o.insights?.length) {
 		html += section('Insights', `<div class="insights">${o.insights.map((i) => `<div><span class="chip">${esc(i.topic)}</span> ${esc(i.body)} <span class="dim">— ${esc(i.actor)}, ${fmtDate(i.createdAt)} · #${i.id}</span></div>`).join('')}</div>`, o.insights.length);
@@ -454,6 +481,7 @@ async function renderObject(id) {
 		void renderObject(id);
 	});
 	window.scrollTo(0, 0);
+	void fillObjectTracking(o);
 }
 
 // ---- inbox ----
@@ -617,15 +645,7 @@ async function renderInbox(params) {
 	const page = Math.max(Number(params.get('page') ?? 0) || 0, 0);
 	renderNav('inbox');
 	document.title = `Inbox${inboxCounts?.approval ? ` (${inboxCounts.approval})` : ''} · Catalogue`;
-	if (writable === null) {
-		// Probe once: a read-only host answers /admin with 404.
-		try {
-			await admin('inboxCounts', {});
-			writable = true;
-		} catch (e) {
-			writable = !/read-only|HTTP 404/.test(e.message);
-		}
-	}
+	await ensureWritable();
 	await refreshCounts();
 	renderNav('inbox');
 	app.innerHTML = '';
@@ -651,10 +671,425 @@ async function renderInbox(params) {
 	list.querySelector('#next')?.addEventListener('click', () => { location.hash = `#/inbox?f=${f.f}&page=${page + 1}`; });
 }
 
+// ---- tracking ----
+
+// What the trackers are doing and "check now" (catalog/tracking.ts). The page
+// polls while it is open, so a check is seen working through the queue.
+const TRACK_KINDS = [
+	{ kind: 'artist', title: 'Artists', word: 'artists' },
+	{ kind: 'label', title: 'Labels', word: 'labels' },
+	{ kind: 'playlist', title: 'Playlists', word: 'playlists' },
+	{ kind: 'genre', title: 'Genres', word: 'genres' },
+];
+const TRACK_STATES = [
+	['', 'Any state'],
+	['due', 'Due now'],
+	['reading', 'Being read'],
+	['failing', 'Failing'],
+	['never', 'Never checked'],
+	['untracked', 'Followed, nothing can read it'],
+];
+const TRACKING_POLL_MS = 5000;
+let trackingTimer = null;
+let trackingSeq = 0;
+let trackingPaint = null;
+// The kind, source and state the list last showed.
+let trackingList = '||';
+
+const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const stamp = (ms) => new Date(ms).toLocaleString();
+const dueIn = (ms) => {
+	const s = (ms - Date.now()) / 1000;
+	return s <= 0 ? 'now' : s < 90 ? 'in a minute' : s < 5400 ? `in ${Math.round(s / 60)} min` : s < 129600 ? `in ${Math.round(s / 3600)} h` : `in ${Math.round(s / 86400)} d`;
+};
+const whenChecked = (ms) => (ms ? `<span title="${esc(stamp(ms))}">${ago(ms)}</span>` : '<span class="dim">never</span>');
+const whenNext = (ms) => (ms ? `<span title="${esc(stamp(ms))}">${dueIn(ms)}</span>` : '<span class="dim">—</span>');
+const kindTitle = (k) => TRACK_KINDS.find((x) => x.kind === k)?.title ?? k;
+
+async function ensureWritable() {
+	if (writable !== null) return;
+	// Probe once: a read-only host answers /admin with 404.
+	try {
+		await admin('inboxCounts', {});
+		writable = true;
+	} catch (e) {
+		writable = !/read-only|HTTP 404/.test(e.message);
+	}
+}
+
+// A check button; its scope rides in data attributes, so one delegated click
+// handler serves it through every repaint.
+const checkButton = (text, scope, what, cls = '') => (writable === false ? '' : `<button class="${cls}" data-check="${esc(JSON.stringify(scope))}" data-what="${esc(what)}">${esc(text)}</button>`);
+
+function checkWords(what, r) {
+	const sum = (f) => r.byProvider.reduce((n, p) => n + p[f], 0);
+	const parts = [`<b>${esc(what)}</b>: ${r.queued ? `${fmtN(r.queued)} queued${r.started ? ', pass started' : ', the worker picks them up on its next pass'}` : 'nothing new to queue'}`];
+	if (sum('alreadyDue')) parts.push(`${fmtN(sum('alreadyDue'))} already due`);
+	if (sum('recent')) parts.push(`${fmtN(sum('recent'))} read within the hour, left alone`);
+	if (sum('reading')) parts.push(`${fmtN(sum('reading'))} being read now`);
+	for (const p of r.byProvider) {
+		if (!p.paused) continue;
+		const pause = r.pauses.find((x) => x.provider === p.provider);
+		parts.push(`${esc(p.provider)} paused${pause ? ` until ${clock(pause.until)}` : ''}: ${fmtN(p.paused)} left alone`);
+	}
+	if (!r.byProvider.length) parts.push('no tracker reads this');
+	return parts.join(' · ');
+}
+
+async function runCheck(btn, out, then) {
+	const text = btn.textContent;
+	btn.disabled = true;
+	btn.textContent = 'Queuing…';
+	out.hidden = false;
+	try {
+		out.innerHTML = checkWords(btn.dataset.what, await admin('trackingCheck', JSON.parse(btn.dataset.check)));
+		out.className = 'tr-result';
+	} catch (e) {
+		out.innerHTML = esc(e.message);
+		out.className = 'tr-result bad';
+	}
+	btn.disabled = false;
+	btn.textContent = text;
+	await then();
+}
+
+const trackingHash = (over) => {
+	const p = new URLSearchParams();
+	for (const [k, v] of Object.entries(over)) if (v) p.set(k, v);
+	return `#/tracking${p.toString() ? `?${p}` : ''}`;
+};
+
+const dur = (ms) => {
+	const s = Math.max(0, Math.round(ms / 1000));
+	// Seconds only while they still matter.
+	return s < 60 ? `${s} s` : s < 600 ? `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, '0')} s` : s < 3600 ? `${Math.floor(s / 60)} min` : `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+};
+const stepChips = (steps) => steps.map((s) => `<span class="chip" title="${esc(s.step)}: ${dur(s.ms)}">${esc(s.step)} ${dur(s.ms)}</span>`).join('');
+
+// The pass: each step it has done with its time, the one it is on, and the
+// last whole pass to compare with. A check is picked up when a pass starts.
+function workerLine(w) {
+	if (!w) return 'The worker runs in the cloud: its pass is not visible from here, and checks are read on its next pass.';
+	const last = w.lastPass ? `<div class="tr-sub">Last pass took <b>${dur(w.lastPass.ms)}</b>, finished ${ago(w.lastPass.startedAt + w.lastPass.ms)}: <span class="chips">${stepChips(w.lastPass.steps)}</span></div>` : '';
+	if (w.running) {
+		const now = w.step ? `<span class="chip now">${esc(w.step)} ${dur(Date.now() - w.stepStartedAt)}…</span>` : '';
+		return `<div>Worker: pass running for <b>${dur(Date.now() - w.startedAt)}</b>. Checks queued now start on the next pass.</div>
+			<div class="tr-sub"><span class="chips">${stepChips(w.steps)}${now}</span></div>${last}`;
+	}
+	return `<div>Worker: idle${w.finishedAt ? `, last pass finished ${ago(w.finishedAt)}` : ''}. The next pass starts within a minute.</div>${last}`;
+}
+
+// The desktops reading for their users this week (catalog_worker): the live
+// ones take the cursors of their users' follows on the providers they offer,
+// for the trackers their users checked in the Refresh menu (null: never
+// said, everything); a silent one is read around by the cloud after six hours.
+function workersLine(workers) {
+	if (!workers?.length) return '<div class="tr-sub">No desktop is reading for the catalogue: the cloud reads everything it has a key for.</div>';
+	const chosen = (w) => {
+		if (w.trackers === null) return 'every source';
+		const byKind = new Map();
+		for (const t of w.trackers) {
+			const [kind, provider] = t.split('/');
+			byKind.set(kind, [...(byKind.get(kind) ?? []), provider]);
+		}
+		return [...byKind].map(([kind, providers]) => `${esc(kindTitle(kind).toLowerCase())} on ${providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')}`).join(', ') || '<span class="warn">nothing (every source unchecked)</span>';
+	};
+	return workers.map((w) => `<div class="tr-sub">${w.live ? '<span class="chip now">reading</span>' : '<span class="chip">silent</span>'} <b>${esc(w.name)}</b> can read ${w.providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')} · its user checked ${chosen(w)} · checked in ${ago(w.checkedInAt)} · week of ${esc(w.weekOf)}</div>`).join('');
+}
+const workerReads = (w, kind, provider) => w.live && w.providers.includes(provider) && (w.trackers === null || w.trackers.includes(`${kind}/${provider}`));
+const readBy = (workers, kind, provider) => (workers ?? []).filter((w) => workerReads(w, kind, provider)).map((w) => w.name);
+
+const LANE_WORDS = {
+	tracker: (k) => `${kindTitle(k)}`,
+	task: (k) => ({ profile: 'Label profiles', backfill: 'Back catalogue', fill: 'Tracklist fill', representation: 'Store match', catalogue_playlists: 'Catalogue playlists', upc: 'UPC lookup', label: 'Label lookup' })[k] ?? k.replace(/_/g, ' '),
+	reasoner: (k) => k.replace(/_/g, ' '),
+};
+const LANE_TYPE = { tracker: 'Tracking', task: 'Enrichment', reasoner: 'Reasoner' };
+
+// Hero numbers first: how much waits, what is being worked on, what cannot move.
+function queueTiles(q) {
+	const t = q.totals;
+	// The slowest lane decides when tracking is through; one that waits with
+	// nothing read in the hour has no pace to go by.
+	const trackers = q.lanes.filter((l) => l.lane === 'tracker' && l.waiting > 0);
+	const etas = trackers.map((l) => l.etaMin);
+	const eta = !trackers.length ? '—' : etas.includes(null) ? 'unknown' : dur(Math.max(...etas) * 60_000);
+	const tile = (v, label, sub, cls = '') => `<div class="tile ${cls}"><div class="v">${v}</div><div class="l">${label}</div>${sub ? `<div class="s">${sub}</div>` : ''}</div>`;
+	return tile(fmtN(t.waiting), 'Waiting', 'due, ready for the worker')
+		+ tile(fmtN(t.processing), 'Processing now', 'leased by a pass')
+		+ tile(fmtN(t.blocked), 'Blocked', t.blocked ? `${q.lanes.filter((l) => l.blocked).length} lane(s): see below` : 'nothing stuck', t.blocked ? 'warn' : '')
+		+ tile(fmtN(t.failing), 'Failing', 'last attempt failed', t.failing ? 'warn' : '')
+		+ tile(fmtN(t.doneHour), 'Read, last hour', 'tracker reads')
+		+ tile(eta, 'Tracking clears in', 'slowest lane, at the last hour’s pace');
+}
+
+function queueLanes(q) {
+	if (!q.lanes.length) return '<div class="card"><div class="empty">The queue is empty.</div></div>';
+	return table([
+		['Queue', (l) => `<span class="dim">${LANE_TYPE[l.lane]}</span> · ${esc(LANE_WORDS[l.lane](l.kind))}`],
+		['Source', (l) => esc(l.provider), 'dim'],
+		['Waiting', (l) => (l.waiting ? (l.lane === 'tracker' ? `<a href="${trackingHash({ kind: l.kind, provider: l.provider, state: 'due' })}">${fmtN(l.waiting)}</a>` : fmtN(l.waiting)) : '<span class="dim">0</span>'), 'num'],
+		['Processing', (l) => (l.processing ? `<b>${fmtN(l.processing)}</b>` : '<span class="dim">0</span>'), 'num'],
+		['Blocked', (l) => (l.blocked ? `<span class="warn" title="${esc(l.blockedWhy ?? '')}">${fmtN(l.blocked)}</span>` : '<span class="dim">0</span>'), 'num'],
+		['Why blocked', (l) => (l.blockedWhy ? `<span class="warn">${esc(l.blockedWhy)}${l.blockedUntil ? ` until ${clock(l.blockedUntil)}` : ''}</span>` : ''), 'hide-sm'],
+		['Failing', (l) => (l.failing ? `<span class="warn">${fmtN(l.failing)}</span>` : '<span class="dim">0</span>'), 'num'],
+		['Oldest wait', (l) => (l.oldestDueAt ? `<span title="${esc(stamp(l.oldestDueAt))}">${dur(Date.now() - l.oldestDueAt)}</span>` : '<span class="dim">—</span>'), 'num nowrap'],
+		['Due next hour', (l) => fmtN(l.upcomingHour), 'num hide-sm'],
+		['Read, 1 h', (l) => (l.doneHour == null ? '<span class="dim">—</span>' : fmtN(l.doneHour)), 'num hide-sm'],
+		['Clears in', (l) => (l.etaMin == null ? '<span class="dim">—</span>' : dur(l.etaMin * 60_000)), 'num nowrap'],
+	], q.lanes);
+}
+
+function sourcesTable(o) {
+	const pausedUntil = new Map(o.pauses.map((p) => [p.provider, p.until]));
+	const count = (t, n, state, cls = '') => (n ? `<a class="${cls}" href="${trackingHash({ kind: t.kind, provider: t.provider, state })}">${fmtN(n)}</a>` : '<span class="dim">0</span>');
+	return table([
+		['Kind', (t) => esc(kindTitle(t.kind)), 'dim'],
+		['Source', (t) => `${esc(t.provider)}${readBy(o.workers, t.kind, t.provider).map((n) => ` <span class="chip now" title="A desktop checked in this week reads this source for its user’s follows">read by ${esc(n)}</span>`).join('')}${t.reader === false ? (t.readerNote ? ` <span class="chip bad" title="${esc(t.readerNote)}">waiting for the desktop’s login</span>` : ' <span class="chip bad" title="No key or reader for it in this process, so these stay due.">no reader here</span>') : ''}${pausedUntil.has(t.provider) ? ` <span class="chip bad">paused until ${clock(pausedUntil.get(t.provider))}</span>` : ''}`],
+		['Followed', (t) => `<a href="${trackingHash({ kind: t.kind, provider: t.provider })}">${fmtN(t.cursors)}</a>${t.unwanted ? ` <span class="chip" title="Every follower of these switched this source off in their Refresh menu: nobody reads them, the cloud included.">${fmtN(t.unwanted)} switched off</span>` : ''}`, 'num'],
+		['Read, 24 h', (t) => fmtN(t.checkedDay), 'num'],
+		['Due now', (t) => count(t, t.due, 'due'), 'num'],
+		['Reading', (t) => count(t, t.reading, 'reading'), 'num hide-sm'],
+		['Failing', (t) => count(t, t.failing, 'failing', 'warn'), 'num'],
+		['Never', (t) => count(t, t.never, 'never'), 'num hide-sm'],
+		['Last read', (t) => whenChecked(t.lastCheckedAt), 'nowrap'],
+		['Next', (t) => whenNext(t.nextDueAt), 'nowrap'],
+		['New events, 24 h', (t) => fmtN(t.events), 'num hide-sm'],
+		['Calls today', (t) => `${fmtN(t.callsToday)}${t.callsPerDay ? ` <span class="dim">/ ${fmtN(t.callsPerDay)}</span>` : ''}`, 'num hide-sm'],
+		['', (t) => checkButton('Check', { kind: t.kind, provider: t.provider }, `${kindTitle(t.kind)} on ${t.provider}`), 'nowrap'],
+	], o.trackers.filter((t) => t.cursors > 0));
+}
+
+function cursorChip(c) {
+	const bad = c.lastError;
+	const due = c.nextDueAt <= Date.now();
+	const cls = c.reading ? 'now' : bad ? 'bad' : due ? 'due' : '';
+	const title = `${c.provider}: read ${c.lastCheckedAt ? ago(c.lastCheckedAt) : 'never'}, next ${dueIn(c.nextDueAt)}${c.reading ? ', being read now' : ''}${bad ? ` — ${bad}` : ''}`;
+	return `<span class="chip ${cls}" title="${esc(title)}">${esc(c.provider)}</span>`;
+}
+
+function trackingRows(rows) {
+	const last = (r) => r.cursors.reduce((m, c) => Math.max(m, c.lastCheckedAt ?? 0), 0) || null;
+	const next = (r) => (r.cursors.length ? Math.min(...r.cursors.map((c) => c.nextDueAt)) : null);
+	return table([
+		['Name', (r) => objLink(r)],
+		['Kind', (r) => esc(r.kind), 'dim hide-sm'],
+		['Sources', (r) => (r.cursors.length ? `<span class="chips">${r.cursors.map(cursorChip).join('')}</span>` : '<span class="dim">nothing can read it yet</span>')],
+		['Last read', (r) => whenChecked(last(r)), 'nowrap'],
+		['Next', (r) => whenNext(next(r)), 'nowrap'],
+		['', (r) => (r.cursors.length ? checkButton('Check now', { id: r.id }, r.name) : ''), 'nowrap'],
+	], rows);
+}
+
+// The current filter is read from the hash on every refresh, so a poll or a
+// check always paints what the address says.
+function trackingFilter() {
+	const { params } = parseHash();
+	return {
+		kind: params.get('kind') ?? '',
+		provider: params.get('provider') ?? '',
+		state: params.get('state') ?? '',
+		q: params.get('q') ?? '',
+		page: Math.max(Number(params.get('page') ?? 0) || 0, 0),
+	};
+}
+
+async function refreshTracking() {
+	const f = trackingFilter();
+	const seq = ++trackingSeq;
+	let o, list, queue;
+	try {
+		const qs = new URLSearchParams({ offset: String(f.page * PAGE_SIZE), limit: String(PAGE_SIZE) });
+		for (const k of ['kind', 'provider', 'state', 'q']) if (f[k]) qs.set(k, f[k]);
+		[o, list, queue] = await Promise.all([api('tracking'), api(`tracking/objects?${qs}`), api('queue')]);
+	} catch (e) {
+		const line = app.querySelector('#tr-worker');
+		if (line) line.innerHTML = `<span class="warn">${esc(e.message)}</span>`;
+		return;
+	}
+	if (seq !== trackingSeq || !app.querySelector('[data-tracking]')) return;
+	// Only a changed answer repaints, not to redraw under the pointer. Relative
+	// times age, so at least once a minute.
+	// The worker's running step ticks by the second: it repaints on its own.
+	app.querySelector('#tr-worker').innerHTML = workerLine(queue.worker) + workersLine(o.workers);
+	// The local catalogue's own Spotify login (cli/local-spotify.ts); a host
+	// without a worker here (the cloud back office) has none to show.
+	if (queue.worker) {
+		const s = await fetch('/local/spotify/status').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+		const el = app.querySelector('#tr-spotify');
+		if (el && s) {
+			const want = (text) => `<a class="btn" href="/local/spotify/connect">${text}</a>`;
+			el.innerHTML = !s.configured
+				? 'Spotify login: not configured (CURATOR_SPOTIFY_CLIENT_ID is unset).'
+				: s.connected
+					? `Spotify login for this catalogue: <b>${esc(s.name ?? 'connected')}</b>, used to read followed playlists with nothing else running. <button data-spotify-disconnect>Disconnect</button>`
+					: `${s.needsReconnect ? '<span class="warn">Spotify refused this catalogue’s login.</span> ' : 'No Spotify login for this catalogue: playlists are read only while the dev desktop runs. '}${want(s.needsReconnect ? 'Reconnect Spotify' : 'Connect Spotify')}
+						<span class="dim" title="Spotify only returns to a callback registered in the app's dashboard">· the Spotify app needs <span class="mono">${esc(s.redirectUri)}</span> as a redirect URI</span>${s.error ? ` <span class="warn">Last try: ${esc(s.error)}</span>` : ''}`;
+		}
+	}
+	const key = JSON.stringify([{ ...o, at: 0, worker: 0 }, list, { ...queue, at: 0, worker: 0 }, Math.floor(Date.now() / 60000), writable, f]);
+	if (key === trackingPaint) return;
+	trackingPaint = key;
+	app.querySelector('#q-tiles').innerHTML = queueTiles(queue);
+	app.querySelector('#q-lanes').innerHTML = queueLanes(queue);
+	app.querySelector('#tr-pauses').innerHTML = o.pauses.map((p) => `<div class="tr-pause"><b>${esc(p.provider)}</b> asked us to wait: no calls until ${esc(stamp(p.until))} (${dueIn(p.until)}). <span class="mono">${esc(p.error)}</span></div>`).join('');
+	const followed = (k) => o.kinds.find((x) => x.kind === k)?.followed ?? 0;
+	const all = o.kinds.reduce((n, k) => n + k.followed, 0);
+	app.querySelector('#tr-bulk').innerHTML = writable === false
+		? '<span class="dim">Read-only here: checks need the local catalogue or the catalog CLI.</span>'
+		: checkButton(`Check all followed (${fmtN(all)})`, { all: true }, 'All followed', 'ok')
+			+ TRACK_KINDS.filter((k) => followed(k.kind)).map((k) => checkButton(`Check ${k.word} (${fmtN(followed(k.kind))})`, { kind: k.kind }, k.title)).join('');
+	app.querySelector('#tr-sources').innerHTML = sourcesTable(o);
+	const keep = { provider: f.provider, state: f.state, q: f.q };
+	app.querySelector('#tr-kinds').innerHTML = `<a href="${trackingHash(keep)}" class="${f.kind ? '' : 'on'}">All<span class="n">${fmtN(all)}</span></a>`
+		+ TRACK_KINDS.filter((k) => followed(k.kind)).map((k) => `<a href="${trackingHash({ kind: k.kind, ...keep })}" class="${f.kind === k.kind ? 'on' : ''}">${k.title}<span class="n">${fmtN(followed(k.kind))}</span></a>`).join('');
+	const to = Math.min((f.page + 1) * PAGE_SIZE, list.total);
+	app.querySelector('#tr-pager').innerHTML = `<span>${fmtN(list.total ? f.page * PAGE_SIZE + 1 : 0)}–${fmtN(to)} of ${fmtN(list.total)}</span>
+		<button data-page="${f.page - 1}" ${f.page === 0 ? 'disabled' : ''} aria-label="Previous page">‹</button>
+		<button data-page="${f.page + 1}" ${to >= list.total ? 'disabled' : ''} aria-label="Next page">›</button>`;
+	app.querySelector('#tr-rows').innerHTML = trackingRows(list.rows);
+}
+
+async function renderTracking() {
+	const f = trackingFilter();
+	renderNav('tracking');
+	document.title = 'Tracking · Catalogue';
+	await ensureWritable();
+	const firstPaint = !app.querySelector('[data-tracking]');
+	if (firstPaint) {
+		trackingPaint = null;
+		trackingList = '||';
+		app.innerHTML = `<div data-tracking>
+			<h2 style="margin-top:0">Queue</h2>
+			<div class="tiles" id="q-tiles"><div class="tile"><div class="v">…</div><div class="l">Loading</div></div></div>
+			<div class="tr-line" id="tr-worker"></div>
+			<div class="tr-line" id="tr-spotify"></div>
+			<div id="q-lanes"></div>
+			<div id="tr-pauses"></div>
+			<div class="tools" id="tr-bulk"></div>
+			<div class="tr-result" id="tr-result" hidden></div>
+			<h2>By source</h2>
+			<div id="tr-sources"></div>
+			<h2 id="tr-followed">Followed<span class="n" id="tr-caption"></span></h2>
+			<div class="filters" id="tr-kinds"></div>
+			<div class="tools">
+				<input type="search" id="tr-q" placeholder="Search followed…" autocomplete="off">
+				<select id="tr-state" aria-label="State">${TRACK_STATES.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join('')}</select>
+				<span id="tr-provider"></span>
+				<div class="pager" id="tr-pager"></div>
+			</div>
+			<div id="tr-rows"><div class="card"><div class="empty">Loading…</div></div></div>
+		</div>`;
+		const change = (over) => {
+			const cur = trackingFilter();
+			location.hash = trackingHash({ kind: cur.kind, provider: cur.provider, state: cur.state, q: cur.q, ...over });
+		};
+		let t;
+		app.querySelector('#tr-q').addEventListener('input', (e) => {
+			clearTimeout(t);
+			t = setTimeout(() => change({ q: e.target.value }), 200);
+		});
+		app.querySelector('#tr-state').addEventListener('change', (e) => change({ state: e.target.value }));
+		const root = app.querySelector('[data-tracking]');
+		root.addEventListener('click', (e) => {
+			const check = e.target.closest('button[data-check]');
+			if (check) return void runCheck(check, root.querySelector('#tr-result'), refreshTracking);
+			const page = e.target.closest('button[data-page]');
+			if (page) return change({ page: Number(page.dataset.page) ? page.dataset.page : '' });
+			if (e.target.closest('[data-clear-provider]')) change({ provider: '' });
+			const off = e.target.closest('[data-spotify-disconnect]');
+			if (off && confirm('Remove the local catalogue’s Spotify login? The real cloud’s login and the desktop are not touched.')) {
+				off.disabled = true;
+				void fetch('/local/spotify/disconnect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).then(() => refreshTracking());
+			}
+		});
+	}
+	const qInput = app.querySelector('#tr-q');
+	// Not while typing: the debounce would put back what was just deleted.
+	if (document.activeElement !== qInput) qInput.value = f.q;
+	app.querySelector('#tr-state').value = f.state;
+	app.querySelector('#tr-provider').innerHTML = f.provider ? `<button data-clear-provider title="Show every source">${esc(f.provider)} ×</button>` : '';
+	const state = TRACK_STATES.find(([v]) => v === f.state)?.[1];
+	app.querySelector('#tr-caption').textContent = [[f.kind ? kindTitle(f.kind) : '', f.provider ? `on ${f.provider}` : ''].filter(Boolean).join(' '), f.state ? state : ''].filter(Boolean).join(' · ');
+	// A number in the table above asks for this list, which sits below it: go
+	// there, or the click looks like it did nothing.
+	const list = [f.kind, f.provider, f.state].join('|');
+	const asked = list !== trackingList;
+	trackingList = list;
+	if (asked) {
+		trackingPaint = null;
+		if (!firstPaint) app.querySelector('#tr-rows').innerHTML = '<div class="card"><div class="empty">Loading…</div></div>';
+		app.querySelector('#tr-followed').scrollIntoView({ block: 'start' });
+	}
+	await refreshTracking();
+	// Again now the rows are in: a short page could not scroll all the way.
+	if (asked) app.querySelector('#tr-followed')?.scrollIntoView({ block: 'start' });
+	clearInterval(trackingTimer);
+	trackingTimer = setInterval(() => { if (!document.hidden) void refreshTracking(); }, TRACKING_POLL_MS);
+}
+
+// An object's own tracking, on its page: what reads it, and a check.
+async function fillObjectTracking(o) {
+	if (!TRACK_KINDS.some((k) => k.kind === o.kind)) return;
+	const slot = app.querySelector('#tracking-slot');
+	if (!slot) return;
+	const fill = async () => {
+		let row;
+		try {
+			await ensureWritable();
+			row = (await api(`tracking/objects?id=${encodeURIComponent(o.id)}`)).rows[0];
+		} catch (e) {
+			slot.innerHTML = section('Tracking', `<div class="err">${esc(e.message)}</div>`);
+			return;
+		}
+		if (!row) return;
+		const result = slot.querySelector('.tr-result')?.outerHTML ?? '';
+		// A label nobody follows has no cursors, but its pages can still be read once.
+		const readOnce = o.kind === 'label' && writable !== false ? '<button data-read-pages title="Queue a read of its pages, and a profile if it never had one">Read its pages now</button>' : '';
+		const body = row.cursors.length
+			? table([
+				['Source', (c) => cursorChip(c)],
+				['Last read', (c) => whenChecked(c.lastCheckedAt), 'nowrap'],
+				['Next', (c) => whenNext(c.nextDueAt), 'nowrap'],
+				['State', (c) => (c.reading ? 'being read now' : c.lastError ? `<span class="warn">${esc(c.lastError)}</span>` : c.nextDueAt <= Date.now() ? 'due' : '<span class="dim">ok</span>')],
+			], row.cursors)
+			: `<div class="dim">${row.watchers ? 'Followed, but no tracker can read it yet: it has no page on a tracked source.' : 'Nobody follows it, so no tracker reads it.'}</div>`;
+		slot.innerHTML = section('Tracking', `<div class="tools">${row.cursors.length ? checkButton('Check now', { id: o.id }, o.name, 'ok') : readOnce}</div>${result}${body}`);
+	};
+	slot.addEventListener('click', async (e) => {
+		const out = () => {
+			let el = slot.querySelector('.tr-result');
+			if (!el) {
+				el = document.createElement('div');
+				slot.querySelector('.tools').after(el);
+			}
+			return el;
+		};
+		const check = e.target.closest('button[data-check]');
+		if (check) return void runCheck(check, out(), fill);
+		const read = e.target.closest('button[data-read-pages]');
+		if (!read) return;
+		read.disabled = true;
+		const el = out();
+		try {
+			const r = await admin('labelRefresh', { q: o.id });
+			el.className = 'tr-result';
+			el.innerHTML = `<b>${esc(o.name)}</b>: ${fmtN(r.cursors + r.backfills)} read${r.cursors + r.backfills === 1 ? '' : 's'} queued${r.profile ? ', and its profile' : ''}`;
+		} catch (err) {
+			el.className = 'tr-result bad';
+			el.innerHTML = esc(err.message);
+		}
+		await fill();
+	});
+	await fill();
+}
+
 // ---- routing ----
 
 function route() {
 	const { parts, params } = parseHash();
+	clearInterval(trackingTimer);
+	if (parts[0] === 'tracking') return void renderTracking();
 	if (parts[0] === 'o' && parts[1]) return void renderObject(parts[1]);
 	if (parts[0] === 'inbox') return void renderInbox(params);
 	const kindDef = KINDS.find((k) => k.path === parts[0]);

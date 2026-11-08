@@ -18,6 +18,7 @@ import type {
 	FeedItemDraft,
 	FeedItemPayload,
 	FeedItemState,
+	MatchStatus,
 	FeedOrigin,
 	FeedPage,
 	FeedSignalInput,
@@ -27,6 +28,8 @@ import type {
 	SyncedFeedSuppression,
 } from './types.js';
 import { recordingKeysFor } from './recording.js';
+import { mergeFeedPayload } from './merge.js';
+import { itemArtists } from './lenses.js';
 
 // Ranking lift per EXTRA source (beyond the first) that surfaced an item —
 // a recording several followed playlists/artists independently picked is a
@@ -51,9 +54,31 @@ export interface FeedFilter {
 	label?: string | null;
 }
 
+// One visible row as the artist lenses see it: its keyset position and the
+// two artist arrays, nothing else (feed/lenses.ts; FeedService.getPage).
+export interface FeedLensRow {
+	id: string;
+	orderTs: number;
+	artists: string[];
+	artistIds: string[];
+}
+
 export interface FeedStore {
 	upsertItems(drafts: FeedItemDraft[]): Promise<{ inserted: number }>;
 	getPage(req?: { cursor?: string | null; limit?: number } & FeedFilter): Promise<FeedPage>;
+	// Every visible row (same predicate as getPage, genre/label included) as
+	// {id, orderTs, artists}, in page order. The artist lenses filter this in
+	// JS — feed.db can't see the library — and page over the survivors, so
+	// pages stay full and `total` stays exact.
+	lensProjection(filter?: FeedFilter): Promise<FeedLensRow[]>;
+	// Full items for ids, in the order given (missing ids skipped), sources
+	// hydrated like a page.
+	getItemsByIds(ids: readonly string[]): Promise<FeedItem[]>;
+	// How many archived/dismissed items credit each artist, keyed like
+	// ArtistSignals (`id:<spotifyId>`, `name:<artistKey>`). Counts the events
+	// (an item later restored still counts) plus items another device set
+	// aside (synced state, no local signal).
+	artistArchiveCounts(): Promise<ReadonlyMap<string, number>>;
 	// Distinct genre/label values across the currently-visible feed — populates
 	// the filter dropdowns. Sorted, non-null only.
 	filterOptions(): Promise<{ genres: string[]; labels: string[] }>;
@@ -107,7 +132,7 @@ export interface FeedStore {
 	// credited key (not origin), so it survives the dedup race and a later
 	// unfollow of the co-credit catches it without re-pointing the origin.
 	// Returns rows removed.
-	removeOriginItems(kind: 'artist' | 'playlist', id: string, stillFollowed: Set<string>): Promise<number>;
+	removeOriginItems(kind: Exclude<FeedOrigin['kind'], 'browse'>, id: string, stillFollowed: Set<string>): Promise<number>;
 	// Cross-source accrual for drafts whose dedupeKey is ALREADY stored: record
 	// each draft's suppress keys + named origin against the existing row (the
 	// "+N sources" set, unfollow/mute coverage) and re-rank it. Called by the
@@ -122,6 +147,16 @@ export interface FeedStore {
 	// outcome), and persist the merged payload when an enricher produced one.
 	// 'ok'/'na' are terminal; 'err' leaves the row eligible for the next drain.
 	markEnriched(itemId: string, status: EnrichStatus, payload?: FeedItemPayload): Promise<void>;
+	// Record a lazy Spotify match attempt's outcome (feed/spotify-match.ts);
+	// the upgrade itself lands through upsertItems (a draft keyed to the row).
+	markMatched(itemId: string, status: MatchStatus): Promise<void>;
+	// Items whose enrichment landed metadata after `sinceMs`, newest first:
+	// the facts-up sweep's worklist (catalog-client/facts-up.ts).
+	listEnrichedSince(sinceMs: number, limit: number): Promise<FeedItem[]>;
+	// Which of these facts-up keys ('beatport:<id>') were never sent, and
+	// marking them sent.
+	unsentFactKeys(keys: string[]): Promise<Set<string>>;
+	markFactsSent(keys: string[]): Promise<void>;
 	// Pre-bus filter probes (see pipeline.ts): the subset of `keys` already
 	// stored (feed-dedup filter), and every suppression key for a scope
 	// (artist-dismiss filter).
@@ -130,7 +165,7 @@ export interface FeedStore {
 	close(): void;
 }
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS feed_meta (
@@ -216,6 +251,19 @@ CREATE TABLE IF NOT EXISTS feed_item_recording (
 	PRIMARY KEY (item_id, rec_key)
 );
 CREATE INDEX IF NOT EXISTS idx_feed_item_recording_key ON feed_item_recording (rec_key);
+-- An item's other identities (v9): a catalogue item (dedupe_key
+-- catalog:release:<id> / catalog:recording:<id>) also answers to the Spotify
+-- and ISRC keys the local producers use, and an old Spotify-keyed row to the
+-- catalogue key once a card for it arrived — so one thing seen by both is one
+-- row, a re-announced event lands on it, and a decision synced under either
+-- key finds it. Kept apart from feed_item_key, which is the suppression-match
+-- set (joined in VISIBLE_WHERE, scanned by removeOriginItems): an identity is
+-- not a mute target. A key names one item (PK); the first holder keeps it.
+CREATE TABLE IF NOT EXISTS feed_item_alias (
+	key TEXT PRIMARY KEY,
+	item_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feed_item_alias_item ON feed_item_alias (item_id);
 CREATE TABLE IF NOT EXISTS feed_signal (
 	id TEXT PRIMARY KEY,
 	item_id TEXT NOT NULL,
@@ -224,6 +272,9 @@ CREATE TABLE IF NOT EXISTS feed_signal (
 	at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_feed_signal_item ON feed_signal (item_id);
+-- Archive/dismiss counts per artist (artistArchiveCounts) without scanning
+-- the impression rows, which are most of this table.
+CREATE INDEX IF NOT EXISTS idx_feed_signal_kind ON feed_signal (kind, item_id);
 CREATE TABLE IF NOT EXISTS feed_suppression (
 	id TEXT PRIMARY KEY,
 	scope TEXT NOT NULL,
@@ -242,6 +293,14 @@ CREATE TABLE IF NOT EXISTS feed_cursor (
 CREATE TABLE IF NOT EXISTS feed_unavailable (
 	source_track_id TEXT PRIMARY KEY,
 	at INTEGER NOT NULL
+);
+-- Enrichment findings already sent up to the Global Catalog (catalog-client
+-- /facts-up.ts), keyed by the store match ('beatport:<track id>'): a table, not
+-- a payload flag, because album payloads are rewritten whole by markEnriched
+-- and on-view enrichment. Plain CREATE-IF-NOT-EXISTS, no ALTER.
+CREATE TABLE IF NOT EXISTS feed_facts_sent (
+	key TEXT PRIMARY KEY,
+	sent_at INTEGER NOT NULL
 );
 `;
 
@@ -285,10 +344,31 @@ interface ItemRow {
 	archived_at: number | null;
 	enriched_at: number | null;
 	enrich_status: string | null;
+	match_status: string | null;
+	matched_at: number | null;
 	promoted_track_id: string | null;
 	// Computed (EXISTS subquery), not a stored column — present only on track
 	// items whose source_id is in feed_unavailable. 1 / 0 / undefined.
 	unavailable?: number;
+}
+
+// genre/label narrowing as bound predicates over the expression indexes.
+function filterClause(f?: FeedFilter): { sql: string[]; params: unknown[] } {
+	const sql: string[] = [];
+	const params: unknown[] = [];
+	if (f?.genre) { sql.push(`json_extract(payload_json, '$.genre') = ?`); params.push(f.genre); }
+	if (f?.label) { sql.push(`json_extract(payload_json, '$.label') = ?`); params.push(f.label); }
+	return { sql, params };
+}
+
+function jsonStrings(v: string | null): string[] {
+	if (!v) return [];
+	try {
+		const a = JSON.parse(v) as unknown;
+		return Array.isArray(a) ? a.map((x) => (typeof x === 'string' ? x : '')) : [];
+	} catch {
+		return [];
+	}
 }
 
 function rowToItem(r: ItemRow): FeedItem {
@@ -307,6 +387,8 @@ function rowToItem(r: ItemRow): FeedItem {
 		playedAt: r.played_at,
 		archivedAt: r.archived_at,
 		enrichedAt: r.enriched_at,
+		matchStatus: (r.match_status as FeedItem['matchStatus']) ?? null,
+		matchedAt: r.matched_at ?? null,
 		enrichStatus: r.enrich_status as EnrichStatus | null,
 		promotedTrackId: r.promoted_track_id,
 		unavailable: !!r.unavailable,
@@ -401,6 +483,14 @@ export class SqliteFeedStore implements FeedStore {
 		try {
 			this.db.exec(`ALTER TABLE feed_item ADD COLUMN covered_by TEXT`);
 		} catch { /* column exists */ }
+		// The lazy Spotify match's outcome and time (feed/spotify-match.ts).
+		// Tolerant ALTERs; NULL = never tried.
+		try {
+			this.db.exec(`ALTER TABLE feed_item ADD COLUMN match_status TEXT`);
+		} catch { /* column exists */ }
+		try {
+			this.db.exec(`ALTER TABLE feed_item ADD COLUMN matched_at INTEGER`);
+		} catch { /* column exists */ }
 		try {
 			this.db.exec(`ALTER TABLE feed_item_origin ADD COLUMN seen_at INTEGER`);
 		} catch { /* column exists */ }
@@ -455,9 +545,78 @@ export class SqliteFeedStore implements FeedStore {
 				this.reconcile(keys, rows.map((r) => r.id));
 			})();
 		}
+		// v8 → v9: seed every existing row's other identities from its own
+		// payload, so a catalogue card for something a local producer already
+		// stored (or a decision synced under the other key) finds the row.
+		if (priorVersion < 9) {
+			this.db.transaction(() => {
+				const rows = this.db.prepare(`SELECT id, type, source, source_id, dedupe_key, json_extract(payload_json, '$.isrc') AS isrc FROM feed_item`).all() as
+					{ id: string; type: string; source: string; source_id: string; dedupe_key: string; isrc: string | null }[];
+				const ins = this.db.prepare(`INSERT OR IGNORE INTO feed_item_alias (key, item_id) VALUES (?, ?)`);
+				for (const r of rows) {
+					const keys: string[] = [];
+					if (r.source === 'spotify' && r.type === 'track') keys.push(`spotify:track:${r.source_id}`);
+					if (r.source === 'spotify' && r.type === 'album') keys.push(`spotify:album:${r.source_id}`);
+					if (r.type === 'track' && r.isrc) keys.push(`isrc:${r.isrc}`);
+					for (const k of keys) if (k !== r.dedupe_key) ins.run(k, r.id);
+				}
+			})();
+		}
 		this.db
 			.prepare(`INSERT OR REPLACE INTO feed_meta (key, value) VALUES ('schema_version', ?)`)
 			.run(String(SCHEMA_VERSION));
+	}
+
+	// The item any of `keys` names — its dedupe_key or an alias. A draft's
+	// own key first, so a row is found by its primary identity when both hit.
+	private findByAnyKey(keys: readonly string[]): string | undefined {
+		const byKey = this.stmt(`SELECT id FROM feed_item WHERE dedupe_key = ?`);
+		const byAlias = this.stmt(`SELECT item_id AS id FROM feed_item_alias WHERE key = ?`);
+		for (const k of keys) {
+			const r = (byKey.get(k) ?? byAlias.get(k)) as { id: string } | undefined;
+			if (r) return r.id;
+		}
+		return undefined;
+	}
+
+	// Record `keys` as the item's other identities (all but its own
+	// dedupe_key). A key another item already holds stays with it.
+	private addAliases(itemId: string, keys: readonly string[]): void {
+		const own = (this.stmt(`SELECT dedupe_key FROM feed_item WHERE id = ?`).get(itemId) as { dedupe_key: string } | undefined)?.dedupe_key;
+		const ins = this.stmt(`INSERT OR IGNORE INTO feed_item_alias (key, item_id) VALUES (?, ?)`);
+		for (const k of keys) if (k && k !== own) ins.run(k, itemId);
+	}
+
+	// Fold a repeat sighting's facts onto the row (merge.ts, fill-only) and,
+	// when the row could not play and this draft can, move it to the draft's
+	// source — a catalogue release that gained a Spotify id becomes playable
+	// in place. Returns the recording keys to reconcile (none when the
+	// tracklist did not change).
+	private mergeFacts(itemId: string, d: FeedItemDraft): string[] {
+		const row = this.stmt(`SELECT type, source, payload_json FROM feed_item WHERE id = ?`).get(itemId) as
+			{ type: string; source: string; payload_json: string } | undefined;
+		if (!row || row.type !== d.type) return [];
+		const upgrade = row.source === 'catalog' && d.source !== 'catalog';
+		if (upgrade) this.stmt(`UPDATE feed_item SET source = ?, source_id = ? WHERE id = ?`).run(d.source, d.sourceId, itemId);
+		let current: FeedItemPayload;
+		try { current = JSON.parse(row.payload_json) as FeedItemPayload; } catch { return []; }
+		const next = mergeFeedPayload(current, d.payload, { upgrade });
+		if (!next) return [];
+		return this.writePayloadSync(itemId, row.type as FeedItem['type'], next);
+	}
+
+	// Write a payload and re-index its recordings; returns the keys that
+	// changed (before ∪ after) for the caller's reconcile, [] when the
+	// recording set is unchanged. Inside the caller's transaction.
+	private writePayloadSync(itemId: string, type: FeedItem['type'], payload: FeedItemPayload): string[] {
+		this.stmt(`UPDATE feed_item SET payload_json = ? WHERE id = ?`).run(JSON.stringify(payload), itemId);
+		const before = this.recordingKeysOf([itemId]);
+		const after = recordingKeysFor(type, payload);
+		if (before.length === after.length && after.every((k) => before.includes(k))) return [];
+		this.stmt(`DELETE FROM feed_item_recording WHERE item_id = ?`).run(itemId);
+		const ins = this.stmt(`INSERT OR IGNORE INTO feed_item_recording (item_id, rec_key) VALUES (?, ?)`);
+		for (const k of after) ins.run(itemId, k);
+		return [...before, ...after];
 	}
 
 	private decisionSource: ((dedupeKeys: readonly string[]) => SyncedFeedItem[]) | null = null;
@@ -485,6 +644,18 @@ export class SqliteFeedStore implements FeedStore {
 		const insertedKeys: string[] = [];
 		const txn = this.db.transaction(() => {
 			for (const d of drafts) {
+				const keys = [d.dedupeKey, ...(d.aliasKeys ?? [])];
+				// The same item under another identity (a catalogue card for a
+				// release a local producer stored, a re-announced event): fold
+				// onto that row instead of inserting a twin.
+				const held = this.findByAnyKey(keys);
+				if (held) {
+					for (const k of this.mergeFacts(held, d)) recKeys.add(k);
+					this.addAliases(held, keys);
+					this.accrueOnto(held, d, now);
+					touched.push(held);
+					continue;
+				}
 				const id = randomUUID();
 				const res = insertItem.run(
 					id,
@@ -511,12 +682,13 @@ export class SqliteFeedStore implements FeedStore {
 					itemId = existing.id;
 				} else {
 					inserted++;
-					insertedKeys.push(d.dedupeKey);
+					insertedKeys.push(...keys);
 					for (const k of recordingKeysFor(d.type, d.payload)) {
 						insertRecording.run(itemId, k);
 						recKeys.add(k);
 					}
 				}
+				this.addAliases(itemId, keys);
 				this.accrueOnto(itemId, d, now);
 				touched.push(itemId);
 			}
@@ -534,17 +706,20 @@ export class SqliteFeedStore implements FeedStore {
 
 	async accrueSources(drafts: FeedItemDraft[]): Promise<void> {
 		if (drafts.length === 0) return;
-		const findId = this.db.prepare(`SELECT id FROM feed_item WHERE dedupe_key = ?`);
 		const now = Date.now();
 		this.db.transaction(() => {
 			const touched: string[] = [];
+			const recKeys: string[] = [];
 			for (const d of drafts) {
-				const row = findId.get(d.dedupeKey) as { id: string } | undefined;
-				if (!row) continue;
-				this.accrueOnto(row.id, d, now);
-				touched.push(row.id);
+				const keys = [d.dedupeKey, ...(d.aliasKeys ?? [])];
+				const id = this.findByAnyKey(keys);
+				if (!id) continue;
+				recKeys.push(...this.mergeFacts(id, d));
+				this.addAliases(id, keys);
+				this.accrueOnto(id, d, now);
+				touched.push(id);
 			}
-			this.reconcile([], touched);
+			this.reconcile(recKeys, touched);
 		})();
 	}
 
@@ -690,7 +865,7 @@ export class SqliteFeedStore implements FeedStore {
 		for (const id of itemIds) {
 			for (const r of coveredBy.all(id) as { id: string }[]) released.push(r.id);
 		}
-		for (const table of ['feed_item_key', 'feed_item_origin', 'feed_item_recording', 'feed_signal']) {
+		for (const table of ['feed_item_key', 'feed_item_alias', 'feed_item_origin', 'feed_item_recording', 'feed_signal']) {
 			const del = this.db.prepare(`DELETE FROM ${table} WHERE item_id = ?`);
 			for (const id of itemIds) del.run(id);
 		}
@@ -705,6 +880,66 @@ export class SqliteFeedStore implements FeedStore {
 
 	async getPage(req?: { cursor?: string | null; limit?: number } & FeedFilter): Promise<FeedPage> {
 		return this.pageWhere(VISIBLE_WHERE, req);
+	}
+
+	async lensProjection(filter?: FeedFilter): Promise<FeedLensRow[]> {
+		const { sql, params } = filterClause(filter);
+		const rows = this.db.prepare(`
+			SELECT id, order_ts AS orderTs,
+				json_extract(payload_json, '$.artists') AS artists,
+				json_extract(payload_json, '$.artistIds') AS artistIds
+			FROM feed_item
+			WHERE ${[VISIBLE_WHERE, ...sql].join(' AND ')}
+			ORDER BY order_ts DESC, id DESC
+		`).all(...params) as { id: string; orderTs: number; artists: string | null; artistIds: string | null }[];
+		return rows.map((r) => ({ id: r.id, orderTs: r.orderTs, artists: jsonStrings(r.artists), artistIds: jsonStrings(r.artistIds) }));
+	}
+
+	async getItemsByIds(ids: readonly string[]): Promise<FeedItem[]> {
+		if (ids.length === 0) return [];
+		const byId = new Map<string, FeedItem>();
+		for (let i = 0; i < ids.length; i += 500) {
+			const chunk = ids.slice(i, i + 500);
+			const rows = this.db
+				.prepare(`SELECT ${ITEM_SELECT} FROM feed_item WHERE id IN (${chunk.map(() => '?').join(',')})`)
+				.all(...chunk) as ItemRow[];
+			for (const r of rows) byId.set(r.id, rowToItem(r));
+		}
+		const items = ids.map((id) => byId.get(id)).filter((i): i is FeedItem => !!i);
+		this.attachSources(items);
+		return items;
+	}
+
+	// Cached against a fingerprint of the two sources (signal count + newest
+	// signal, set-aside item count), so archives made here, restores, and
+	// decisions synced from another device all refresh it without a hook in
+	// every writer. Both counts are index-only.
+	private archiveCounts: { print: string; counts: ReadonlyMap<string, number> } | null = null;
+
+	async artistArchiveCounts(): Promise<ReadonlyMap<string, number>> {
+		const p = this.db.prepare(`
+			SELECT (SELECT COUNT(*) FROM feed_signal WHERE kind IN ('archive','dismiss')) AS n,
+				(SELECT MAX(at) FROM feed_signal WHERE kind IN ('archive','dismiss')) AS at,
+				(SELECT COUNT(*) FROM feed_item WHERE state IN ('archived','dismissed')) AS items
+		`).get() as { n: number; at: number | null; items: number };
+		const print = `${p.n}|${p.at ?? 0}|${p.items}`;
+		if (this.archiveCounts?.print === print) return this.archiveCounts.counts;
+		const rows = this.db.prepare(`
+			SELECT json_extract(payload_json, '$.artists') AS artists,
+				json_extract(payload_json, '$.artistIds') AS artistIds
+			FROM feed_item
+			WHERE state IN ('archived','dismissed')
+				OR id IN (SELECT item_id FROM feed_signal WHERE kind IN ('archive','dismiss'))
+		`).all() as { artists: string | null; artistIds: string | null }[];
+		const counts = new Map<string, number>();
+		for (const r of rows) {
+			// One count per item per key, even when a name and its id both match.
+			const keys = new Set<string>();
+			for (const a of itemArtists({ artists: jsonStrings(r.artists), artistIds: jsonStrings(r.artistIds) })) for (const k of a.keys) keys.add(k);
+			for (const k of keys) counts.set(k, (counts.get(k) ?? 0) + 1);
+		}
+		this.archiveCounts = { print, counts };
+		return counts;
 	}
 
 	async getArchivedPage(req?: { cursor?: string | null; limit?: number }): Promise<FeedPage> {
@@ -739,10 +974,7 @@ export class SqliteFeedStore implements FeedStore {
 		orderCol: 'order_ts' | 'archived_at' = 'order_ts',
 	): FeedPage {
 		const limit = Math.min(Math.max(req?.limit ?? 50, 1), 200);
-		const filterSql: string[] = [];
-		const filterParams: unknown[] = [];
-		if (req?.genre) { filterSql.push(`json_extract(payload_json, '$.genre') = ?`); filterParams.push(req.genre); }
-		if (req?.label) { filterSql.push(`json_extract(payload_json, '$.label') = ?`); filterParams.push(req.label); }
+		const { sql: filterSql, params: filterParams } = filterClause(req);
 		const fullWhere = [where, ...filterSql].join(' AND ');
 		// Keyset cursor "orderTs|id" — stable under concurrent inserts at the
 		// head, unlike offset pagination.
@@ -873,14 +1105,8 @@ export class SqliteFeedStore implements FeedStore {
 		this.db.transaction(() => {
 			const row = this.db.prepare(`SELECT type FROM feed_item WHERE id = ?`).get(itemId) as { type: string } | undefined;
 			if (!row) return;
-			this.db.prepare(`UPDATE feed_item SET payload_json = ? WHERE id = ?`).run(JSON.stringify(payload), itemId);
-			const before = this.recordingKeysOf([itemId]);
-			const after = recordingKeysFor(row.type as FeedItem['type'], payload);
-			if (before.length === after.length && after.every((k) => before.includes(k))) return;
-			this.db.prepare(`DELETE FROM feed_item_recording WHERE item_id = ?`).run(itemId);
-			const ins = this.stmt(`INSERT OR IGNORE INTO feed_item_recording (item_id, rec_key) VALUES (?, ?)`);
-			for (const k of after) ins.run(itemId, k);
-			this.reconcile([...before, ...after], [itemId]);
+			const keys = this.writePayloadSync(itemId, row.type as FeedItem['type'], payload);
+			if (keys.length > 0) this.reconcile(keys, [itemId]);
 		})();
 	}
 
@@ -973,7 +1199,11 @@ export class SqliteFeedStore implements FeedStore {
 
 	// Inside a transaction (the caller's). Writes only what differs.
 	private applyItemDecisions(items: readonly SyncedFeedItem[]): string[] {
-		const find = this.stmt(`SELECT id, state, promoted_track_id, played_at FROM feed_item WHERE dedupe_key = ?`);
+		// By the row's own key or one of its aliases: a decision another device
+		// stated under the Spotify key finds the catalogue row, and back.
+		const find = this.stmt(`SELECT id, state, promoted_track_id, played_at FROM feed_item WHERE dedupe_key = ?
+			UNION ALL SELECT f.id, f.state, f.promoted_track_id, f.played_at FROM feed_item_alias a JOIN feed_item f ON f.id = a.item_id WHERE a.key = ?
+			LIMIT 1`);
 		const setState = this.stmt(`UPDATE feed_item SET state = ?, promoted_track_id = ?,
 			archived_at = CASE WHEN ? = 'archived' THEN COALESCE(?, archived_at, ?) ELSE archived_at END WHERE id = ?`);
 		const setPlayed = this.stmt(`UPDATE feed_item SET played_at = ? WHERE id = ? AND played_at IS NULL`);
@@ -981,7 +1211,7 @@ export class SqliteFeedStore implements FeedStore {
 		const addListen = this.stmt(`INSERT INTO feed_signal (id, item_id, kind, value_json, at) VALUES (?, ?, 'listen', ?, ?)`);
 		const changed: string[] = [];
 		for (const d of items) {
-			const row = find.get(d.dedupeKey) as { id: string; state: string; promoted_track_id: string | null; played_at: number | null } | undefined;
+			const row = find.get(d.dedupeKey, d.dedupeKey) as { id: string; state: string; promoted_track_id: string | null; played_at: number | null } | undefined;
 			if (!row) continue;
 			let touched = false;
 			if (d.state && (d.state !== row.state || (d.state === 'promoted' && (d.promotedTrackId ?? null) !== row.promoted_track_id))) {
@@ -1047,7 +1277,7 @@ export class SqliteFeedStore implements FeedStore {
 		return txn();
 	}
 
-	async removeOriginItems(kind: 'artist' | 'playlist', id: string, stillFollowed: Set<string>): Promise<number> {
+	async removeOriginItems(kind: Exclude<FeedOrigin['kind'], 'browse'>, id: string, stillFollowed: Set<string>): Promise<number> {
 		const prefix = `${kind}:`;
 		const credited = this.db
 			.prepare(`SELECT item_id AS id FROM feed_item_key WHERE key = ?`)
@@ -1113,16 +1343,46 @@ export class SqliteFeedStore implements FeedStore {
 		}
 	}
 
+	async markMatched(itemId: string, status: MatchStatus): Promise<void> {
+		this.db.prepare(`UPDATE feed_item SET match_status = ?, matched_at = ? WHERE id = ?`).run(status, Date.now(), itemId);
+	}
+
+	async listEnrichedSince(sinceMs: number, limit: number): Promise<FeedItem[]> {
+		const rows = this.db
+			.prepare(`SELECT * FROM feed_item WHERE enrich_status = 'ok' AND enriched_at > ? ORDER BY enriched_at DESC LIMIT ?`)
+			.all(sinceMs, Math.max(1, limit)) as ItemRow[];
+		return rows.map(rowToItem);
+	}
+
+	async unsentFactKeys(keys: string[]): Promise<Set<string>> {
+		const unsent = new Set(keys);
+		for (let i = 0; i < keys.length; i += 500) {
+			const chunk = keys.slice(i, i + 500);
+			const rows = this.db.prepare(`SELECT key FROM feed_facts_sent WHERE key IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as { key: string }[];
+			for (const r of rows) unsent.delete(r.key);
+		}
+		return unsent;
+	}
+
+	async markFactsSent(keys: string[]): Promise<void> {
+		const stmt = this.db.prepare(`INSERT OR IGNORE INTO feed_facts_sent (key, sent_at) VALUES (?, ?)`);
+		const at = Date.now();
+		this.db.transaction(() => {
+			for (const k of keys) stmt.run(k, at);
+		})();
+	}
+
 	async existingDedupeKeys(keys: string[]): Promise<Set<string>> {
 		const found = new Set<string>();
 		if (keys.length === 0) return found;
 		// Chunked IN() to stay under SQLite's 999-variable limit.
 		for (let i = 0; i < keys.length; i += 500) {
 			const chunk = keys.slice(i, i + 500);
+			const marks = chunk.map(() => '?').join(',');
 			const rows = this.db
-				.prepare(`SELECT dedupe_key FROM feed_item WHERE dedupe_key IN (${chunk.map(() => '?').join(',')})`)
-				.all(...chunk) as { dedupe_key: string }[];
-			for (const r of rows) found.add(r.dedupe_key);
+				.prepare(`SELECT dedupe_key AS k FROM feed_item WHERE dedupe_key IN (${marks}) UNION SELECT key FROM feed_item_alias WHERE key IN (${marks})`)
+				.all(...chunk, ...chunk) as { k: string }[];
+			for (const r of rows) found.add(r.k);
 		}
 		return found;
 	}

@@ -11,7 +11,7 @@
 // linker's pace.
 
 import type { CatalogClaim } from '@curator/protocol';
-import { getJson, type FetchLike } from './http.js';
+import { getJson, type FetchLike } from '@curator/catalog-readers';
 
 const API = 'https://itunes.apple.com/lookup';
 

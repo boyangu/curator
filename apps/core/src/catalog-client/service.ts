@@ -12,7 +12,7 @@
 // works by name.
 
 import { createHash } from 'node:crypto';
-import type { CatalogBrowseResult, CatalogClaim, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogClaim, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { SpotifyClient } from '@curator/spotify';
 import { log } from '../log.js';
@@ -59,6 +59,9 @@ export interface CatalogClient {
 	// batch is answered from the cloud's record, not redone).
 	importClaims(claims: CatalogClaim[], source: CatalogWatchSource): Promise<CatalogImportReport>;
 	enrichLabels(names: string[]): Promise<CatalogEnrichReport>;
+	// Findings up (facts-up.ts): fill-only recording claims from this
+	// desktop's store lookups, under one idempotency key per batch.
+	reportEnrichment(claims: CatalogClaim[], idempotencyKey: string): Promise<CatalogIngestResult>;
 	// The catalogue's objects for provider refs, in order (null: none), at
 	// most 50 a call (catalog-refs.ts pages them).
 	resolve(refs: CatalogRef[]): Promise<(CatalogObjectSummary | null)[]>;
@@ -372,6 +375,11 @@ export function createCatalogClient(deps: CatalogClientDeps): CatalogClient {
 			}
 			clog.info('library labels sent to the catalogue', report);
 			return report;
+		},
+
+		reportEnrichment(claims, idempotencyKey) {
+			ready();
+			return deps.catalog.ingest({ deviceId: deviceId(), reason: 'enrichment', idempotencyKey, claims });
 		},
 	};
 

@@ -111,7 +111,10 @@ export function startSyncToRekordbox(
 	// emits 'failed' AND throws (so the IPC promise also rejects). Both
 	// signals can arrive on the renderer; we only show one toast.
 	let outcomeHandled = false;
-	syncToRekordboxExportUnsub = rekordboxApi.onExportEvent((evt) => {
+	// Named so the IPC outcome below can replay a 'completed' the event
+	// stream didn't deliver (2026-11-08: a zero-op push completed in core
+	// but the modal sat at "Resolving tracks…" with no way out).
+	const onExportEvent = (evt: Parameters<Parameters<typeof rekordboxApi.onExportEvent>[0]>[0]): void => {
 		if (evt.kind === 'started') {
 			syncToRekordboxModal?.setProgress('resolve', 0, 1);
 		} else if (evt.kind === 'progress') {
@@ -225,7 +228,8 @@ export function startSyncToRekordbox(
 				kind: 'error',
 			});
 		}
-	});
+	};
+	syncToRekordboxExportUnsub = rekordboxApi.onExportEvent(onExportEvent);
 
 	// Fire the IPC. Errors bubble through onSidecarEvent's 'failed' event
 	// above; we don't need to .catch() here — but we do clean up the
@@ -257,7 +261,11 @@ export function startSyncToRekordbox(
 	};
 	const call = resolutions
 		? syncApi.resolveConflicts({ provider: 'rekordbox', resolutions, ...wireArgs })
-			.then(() => { /* completion surfaced via the export 'completed' event */ })
+			.then((result) => {
+				// Normally surfaced via the export 'completed' event; the
+				// IPC result is the fallback when that event didn't land.
+				if (!outcomeHandled) onExportEvent({ kind: 'completed', result });
+			})
 		: rekordboxApi.sync(wireArgs).then((outcome) => {
 			if (outcome.status === 'conflicts') {
 				// Clean pause — nothing was pushed, conflicts are persisted
@@ -266,6 +274,12 @@ export function startSyncToRekordbox(
 				// re-created on the resume call.
 				outcomeHandled = true;
 				syncToRekordboxModal?.setConflicts(outcome.conflicts);
+			} else if (outcome.status === 'completed' && !outcomeHandled) {
+				// The push finished but its 'completed' event never reached
+				// this listener — without this the modal stays in-flight
+				// forever with no cancel.
+				log.for('sync-to-rb').warn('completed via IPC result; export event was not delivered');
+				onExportEvent({ kind: 'completed', result: outcome.result });
 			}
 		});
 	call.catch((err) => {

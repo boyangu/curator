@@ -9,10 +9,10 @@ import { createTestApp } from '../test/harness.js';
 import { adminOps } from './admin-ops.js';
 import { ingestClaims } from './ingest.js';
 import { releaseStubs } from './release-fill.js';
-import { releaseClaim, SpotifyAppTracker } from './trackers/spotify-app.js';
+import { spotifyReleaseClaim as releaseClaim, SpotifyTracker } from '@curator/catalog-readers';
 import { TidalApp } from './trackers/tidal-app.js';
-import type { FetchLike } from './trackers/http.js';
-
+import type { FetchLike } from '@curator/catalog-readers';
+import { appCredentialsToken } from './spotify-app-token.js';
 const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { 'content-type': 'application/json' } });
 const SP_ALBUM = 'A'.repeat(22);
 const artist = { id: 'B'.repeat(22), name: 'Glass Rivers' };
@@ -78,7 +78,7 @@ async function seeded(opts: { deezerUpc?: string } = {}) {
 	const [rel] = await app.db.query<{ id: string }>(`select object_id as id from curator.catalog_source_object where provider = 'spotify' and kind = 'release'`);
 	const calls: string[] = [];
 	const fetchFn = fakeFetch(calls, opts);
-	const ops = adminOps(app.db, { fetch: fetchFn, spotify: new SpotifyAppTracker({ clientId: 'id', clientSecret: 's' }, fetchFn), tidal: new TidalApp({ clientId: 't', clientSecret: 's' }, fetchFn) });
+	const ops = adminOps(app.db, { fetch: fetchFn, spotify: new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 's' }, fetchFn) }, fetchFn), tidal: new TidalApp({ clientId: 't', clientSecret: 's' }, fetchFn) });
 	return { app, ops, calls, releaseId: rel!.id };
 }
 

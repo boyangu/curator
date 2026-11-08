@@ -29,6 +29,7 @@ import { buildExactAttr, extractSqlPrefilter, parseQuery } from '../query.js';
 import { openTrackEditor } from './editTrack.js';
 import { anyRemoteRow, REMOTE_ONLY_REASON } from '../remoteRows.js';
 import { log } from '../data/log.js';
+import { BRAND_ICONS } from './brandIcons.js';
 
 // Well-known system tag ids — seeded in apps/core/src/db/migrate.ts. Owned here
 // (the curate commands are their only remaining consumers) and re-exported from
@@ -155,11 +156,9 @@ const ICON_PIN = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" st
 const ICON_BASKET = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 6h18l-2 12H5z"/><path d="M9 10v6M15 10v6"/></svg>';
 const ICON_TAG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4 12 22l-9-9V3h10z"/><circle cx="7.5" cy="7.5" r="1.5" fill="currentColor"/></svg>';
 const ICON_ANALYZE = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 14l4-7 4 4 4-7 4 5 2-2"/><path d="M3 20h18"/></svg>';
-// Brand marks in their own colours (not currentColor) so the service reads at a
-// glance — used for both Open-in and Search-in, linked or not.
-const ICON_BEATPORT = '<svg class="ctx-brand" width="13" height="13" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#01FF95"/><path d="M8.5 5v13" stroke="#000" stroke-width="2.4" stroke-linecap="round"/><circle cx="12.6" cy="14" r="3.9" fill="none" stroke="#000" stroke-width="2.4"/></svg>';
-const ICON_TIDAL = '<svg class="ctx-brand" width="13" height="13" viewBox="0 0 24 24" fill="#efeff2"><path d="M6 5l3.4 3.4L6 11.8 2.6 8.4z"/><path d="M12 5l3.4 3.4L12 11.8 8.6 8.4z"/><path d="M18 5l3.4 3.4L18 11.8l-3.4-3.4z"/><path d="M12 11.6l3.4 3.4-3.4 3.4-3.4-3.4z"/></svg>';
-const ICON_SPOTIFY = '<svg class="ctx-brand" width="13" height="13" viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#1DB954"/><g fill="none" stroke="#000" stroke-linecap="round"><path d="M6.3 9.4c3.7-1.2 8.2-.9 11.5 1" stroke-width="2.1"/><path d="M7 12.8c3-.9 6.6-.6 9.3.9" stroke-width="1.8"/><path d="M7.8 15.9c2.3-.6 4.8-.4 6.9.7" stroke-width="1.5"/></g></svg>';
+const ICON_BEATPORT = BRAND_ICONS.beatport!;
+const ICON_TIDAL = BRAND_ICONS.tidal!;
+const ICON_SPOTIFY = BRAND_ICONS.spotify!;
 const ICON_COPY = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
 const ICON_DOWNLOAD = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 4v12"/><path d="m6 10 6 6 6-6"/><path d="M5 20h14"/></svg>';
 const ICON_FOLDER = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7l-2-2H5a2 2 0 0 0-2 2z"/></svg>';

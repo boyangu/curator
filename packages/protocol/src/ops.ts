@@ -38,7 +38,14 @@ import { isRbGridValue } from './rb-grid.js';
 // analyzer's results as part of the library, not only the catalogue), stamped
 // 5; a v4 server answers it `server_outdated`, so a desktop emits none before
 // the server advertises 'analysis_v5'.
-export const SCHEMA_VERSION = 5;
+//
+// Version 6 (2026-11-04) adds one account setting key, `feed.lenses` (the
+// Discover feed's standing lenses), stamped 6 through SETTING_KEY_SINCE: a v5
+// client holds the op aside instead of failing the key, a v5 server answers
+// it `server_outdated`, so a desktop pushes none before the server
+// advertises 'feed_lenses_v6' (the op waits in the outbox; lenses work
+// locally meanwhile).
+export const SCHEMA_VERSION = 6;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
 export const MAX_OP_PAYLOAD_BYTES = 16 * 1024;
@@ -132,7 +139,7 @@ export const ZTrackArtist = z
 // incident), `wav.output_dir`, `library.id`, `device.id`, backup run stamps,
 // migration gates — must never ride an op, so the key is validated here and
 // the list is the allow-list, not a deny-list.
-export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed', 'library.master_device'] as const;
+export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed', 'library.master_device', 'feed.lenses'] as const;
 export function isAccountSettingKey(key: string): boolean {
 	return (ACCOUNT_SETTING_KEYS as readonly string[]).includes(key);
 }
@@ -997,7 +1004,7 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 // older client validates the key against its own allow-list and would stop
 // at one it does not know (invalid_payload) instead of holding it aside, so
 // the op carries the version that introduced its key.
-const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3]]);
+const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3], ['feed.lenses', 6]]);
 
 // Enum values added to a v1 kind's payload, by the same reasoning: a
 // `recording_claim.add` of kind traxsource, or a `set-rb-analysis` of unit

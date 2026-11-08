@@ -66,14 +66,17 @@ export class Ingester {
 
 	// Attaches a claim to the object it names only if the catalogue already has
 	// one (by representation, identifier or the identity rules); nothing is
-	// created and no relationship written. Null when it names nothing known.
-	async attachIfKnown(c: CatalogClaim): Promise<IngestOutcome | null> {
+	// created and no relationship written — except the claim's genres when
+	// asked (a device's facts-up: a store's genre is a fact about the
+	// recording, not a tie to another object). Null when it names nothing known.
+	async attachIfKnown(c: CatalogClaim, opts: { genres?: boolean } = {}): Promise<IngestOutcome | null> {
 		const objectId = (await findRepresentation(this.tx, c)) ?? (await this.candidate(c));
 		if (!objectId) return null;
 		const rep = await this.attachRepresentation(c, objectId);
 		if (rep.inserted) this.stats.attached++;
 		await this.attachIdentifiers(c, objectId, rep.id);
 		await this.attachFacts(c, objectId);
+		if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
 		return { objectId, kind: c.kind, created: false };
 	}
 
@@ -175,7 +178,7 @@ export class Ingester {
 				return releaseByTitle(
 					this.tx,
 					fold,
-					(c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean),
+					(c.artists ?? []).map((a) => a.name).filter((n) => !!nameFold(n)),
 					releaseAtOf(c.facts?.releaseDate),
 				);
 			case 'artist':

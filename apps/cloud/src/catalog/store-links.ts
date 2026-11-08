@@ -23,11 +23,10 @@ import { openReview } from './admin.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
 import type { AppleLookup } from './trackers/apple.js';
-import { fetchAlbums, type SpotifyAppTracker } from './trackers/spotify-app.js';
+import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
 import type { TidalApp } from './trackers/tidal-app.js';
-import { TrackerRateLimitedError } from './trackers/types.js';
-
-export type StoreReaders = { spotify?: SpotifyAppTracker | null; tidal?: TidalApp | null; apple?: AppleLookup | null };
+import { TrackerRateLimitedError } from '@curator/catalog-readers';
+export type StoreReaders = { spotify?: SpotifyTracker | null; tidal?: TidalApp | null; apple?: AppleLookup | null };
 export const STORE_PROVIDERS = ['spotify', 'tidal', 'apple'] as const;
 export type StoreProvider = (typeof STORE_PROVIDERS)[number];
 

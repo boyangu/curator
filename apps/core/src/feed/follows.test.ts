@@ -36,6 +36,7 @@ function follows(reachable = true) {
 		reachable: () => reachable,
 		watchFor: async (_kind, spotifyId) => watched.get(spotifyId) ?? null,
 		watchedSpotifyIds: async () => new Set(watched.keys()),
+		watchedCatalogIds: async () => new Set(watched.values()),
 		deviceTrackedPlaylists: async () => new Set(),
 		unwatch: async (id) => {
 			calls.push(`unwatch ${id}`);
@@ -65,6 +66,34 @@ describe('feed follows in the catalogue', () => {
 		const svc = createFeedService({ store, auth, library, catalogFollows: port });
 		await svc.action({ kind: 'mute', scopes: [{ scope: 'artist', key: 'artist:sa2' }] });
 		expect(calls).toEqual(['mute cat-sa2 true']);
+		svc.stop();
+	});
+
+	it('unfollowing a label removes its items unless another followed label also brought them', async () => {
+		const store = new SqliteFeedStore(':memory:');
+		const labelled = (id: string, label: string, also: string[] = []): FeedItemDraft => ({
+			...album(id, 'x', []),
+			dedupeKey: `catalog:release:${id}`,
+			origin: { kind: 'label', id: label, name: label, catalogId: label },
+			suppressKeys: [`label:${label}`, ...also.map((l) => `label:${l}`)],
+		});
+		await store.upsertItems([labelled('r1', 'lbl1'), labelled('r2', 'lbl1', ['lbl2'])]);
+		const { port, calls } = follows();
+		const svc = createFeedService({ store, auth, library, catalogFollows: { ...port, watchedCatalogIds: async () => new Set(['lbl2']) } });
+		expect(await svc.unfollowOrigin('label', 'lbl1')).toEqual({ ok: true, removed: 1 });
+		expect(calls).toEqual(['unwatch lbl1']);
+		expect((await store.getPage({ limit: 10 })).items.map((i) => i.sourceId)).toEqual(['r2']);
+		svc.stop();
+	});
+
+	it('an artist the catalogue knows without a Spotify id unfollows and mutes by its object', async () => {
+		const store = new SqliteFeedStore(':memory:');
+		await store.upsertItems([album('bc1', 'catalog:cat-bc', ['catalog:cat-bc'])]);
+		const { port, calls } = follows();
+		const svc = createFeedService({ store, auth, library, catalogFollows: port });
+		await svc.action({ kind: 'mute', scopes: [{ scope: 'artist', key: 'artist:catalog:cat-bc' }, { scope: 'label', key: 'label:lbl9' }] });
+		expect(await svc.unfollowArtist('catalog:cat-bc')).toEqual({ ok: true, removed: 1 });
+		expect(calls).toEqual(['mute cat-bc true', 'mute lbl9 true', 'unwatch cat-bc']);
 		svc.stop();
 	});
 

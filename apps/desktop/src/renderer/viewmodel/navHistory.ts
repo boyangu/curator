@@ -34,7 +34,8 @@ export type NavLocation =
 	| { kind: 'tag'; view: 'interested' | 'basket' }
 	| { kind: 'sync' }
 	| { kind: 'downloads' }
-	| { kind: 'discover'; mode: 'feed'; archived: boolean; genre: string | null; label: string | null }
+	// Standing lenses are settings, not navigation: Back must never revoke one.
+	| { kind: 'discover'; mode: 'feed'; archived: boolean }
 	// journeyId null ⇔ the journey list; nodeId is the journey node the user
 	// was standing on (traversal re-jumps there, moving the journey's pointer).
 	| { kind: 'discover'; mode: 'journeys'; journeyId: string | null; nodeId: string | null }
@@ -135,7 +136,7 @@ export function locationKey(loc: NavLocation): string {
 		case 'downloads': return 'downloads';
 		case 'discover':
 			switch (loc.mode) {
-				case 'feed': return `discover:feed:${loc.archived ? 'archived' : 'live'}:${loc.genre ?? ''}:${loc.label ?? ''}`;
+				case 'feed': return `discover:feed:${loc.archived ? 'archived' : 'live'}`;
 				case 'journeys': return `discover:journeys:${loc.journeyId ?? ''}:${loc.nodeId ?? ''}`;
 				case 'agent-results': return `discover:agent:${loc.resultSetId}`;
 			}

@@ -14,6 +14,7 @@ import type { SpotifyClient } from '@curator/spotify';
 import type { StreamingSource } from '@curator/shared';
 import type { FeedItemDraft, LibraryTier, FeedTrackRef } from './types.js';
 import type { FeedStore } from './store.js';
+import { spotifyIdOf } from './handles.js';
 import { log } from '../log.js';
 
 const flog = log.for('feed');
@@ -24,6 +25,8 @@ export interface FeedStageContext {
 	// Aborted when the scheduler stops mid-pass (process teardown). Slow
 	// network stages check it between items.
 	signal?: AbortSignal;
+	// A slow stage says what it is doing, for the refresh status.
+	report?: (detail: string) => void;
 }
 
 export interface FeedStage {
@@ -114,8 +117,10 @@ export class AlbumExpanderStage implements FeedStage {
 	constructor(private readonly getClient: () => Promise<SpotifyClient | null>) {}
 
 	async run(drafts: FeedItemDraft[], ctx: FeedStageContext): Promise<FeedItemDraft[]> {
+		// Catalogue cards carry their tracklist; only a local producer's bare
+		// Spotify album needs one fetched.
 		const pending = drafts.filter(
-			(d) => d.type === 'album' && d.source === 'spotify' && !d.payload.tracks,
+			(d) => d.type === 'album' && d.source === 'spotify' && !d.payload.tracks && !d.payload.catalogId,
 		);
 		if (pending.length === 0) return drafts;
 		const client = await this.getClient();
@@ -127,8 +132,9 @@ export class AlbumExpanderStage implements FeedStage {
 		// followed artists arrives as two drafts (the dedup filter keeps in-batch
 		// repeats so upsertItems can accrue both origins).
 		const resolved = new Map<string, FeedTrackRef[]>();
-		for (const d of pending) {
+		for (const [i, d] of pending.entries()) {
 			if (ctx.signal?.aborted) break;
+			ctx.report?.(`Reading album ${i + 1} of ${pending.length}`);
 			const cached = resolved.get(d.sourceId);
 			if (cached) { d.payload.tracks = cached; continue; }
 			try {
@@ -163,11 +169,16 @@ export class FeedDedupFilter implements FeedStage {
 
 	async run(drafts: FeedItemDraft[]): Promise<FeedItemDraft[]> {
 		if (drafts.length === 0) return drafts;
-		const existing = await this.store.existingDedupeKeys(drafts.map((d) => d.dedupeKey));
+		// A draft is a repeat when the store holds it under ANY of its keys: a
+		// catalogue card for a release a local producer stored (alias), or the
+		// reverse. accrueSources folds the repeat's facts onto that row.
+		const keysOf = (d: FeedItemDraft) => [d.dedupeKey, ...(d.aliasKeys ?? [])];
+		const existing = await this.store.existingDedupeKeys([...new Set(drafts.flatMap(keysOf))]);
 		if (existing.size === 0) return drafts;
-		const repeats = drafts.filter((d) => existing.has(d.dedupeKey));
+		const held = (d: FeedItemDraft) => keysOf(d).some((k) => existing.has(k));
+		const repeats = drafts.filter(held);
 		await this.store.accrueSources(repeats);
-		return drafts.filter((d) => !existing.has(d.dedupeKey));
+		return drafts.filter((d) => !held(d));
 	}
 }
 
@@ -216,12 +227,13 @@ export class LibraryFilter implements FeedStage {
 		const tracks = drafts.filter((d) => d.type === 'track');
 		if (tracks.length === 0) return drafts;
 		const isrcs = [...new Set(tracks.map((d) => d.payload.isrc).filter((x): x is string => !!x))];
-		const spotifyTrackIds = [...new Set(tracks.filter((d) => d.source === 'spotify').map((d) => d.sourceId))];
+		const spotifyTrackIds = [...new Set(tracks.map(spotifyIdOf).filter((x): x is string => !!x))];
 		const { membershipByIsrc, membershipBySpotifyId } = await this.lookup({ isrcs, spotifyTrackIds });
 		return drafts.filter((d) => {
 			if (d.type !== 'track') return true;
+			const sid = spotifyIdOf(d);
 			const tier = (d.payload.isrc ? membershipByIsrc[d.payload.isrc] : undefined)
-				?? (d.source === 'spotify' ? membershipBySpotifyId[d.sourceId] : undefined);
+				?? (sid ? membershipBySpotifyId[sid] : undefined);
 			return tier !== 'local';
 		});
 	}
