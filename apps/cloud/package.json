@@ -25,9 +25,9 @@
 		"typecheck": "tsc --noEmit && tsc -p evals && node ../../scripts/check-package-boundaries.mjs cloud"
 	},
 	"dependencies": {
-		"@anthropic-ai/sdk": "^1.4.0",
+		"@anthropic-ai/sdk": "^1.5.0",
 		"@trpc/server": "^11",
-		"jose": "^6.2.12",
+		"jose": "^6.2.15",
 		"postgres": "^3.4.9",
 		"zod": "^3.23.8"
 	},
@@ -37,12 +37,12 @@
 		"@curator/library-logic": "workspace:*",
 		"@curator/protocol": "workspace:*",
 		"@curator/shared": "workspace:*",
-		"@electric-sql/pglite": "^0.5.10",
+		"@electric-sql/pglite": "^0.5.15",
 		"@trpc/client": "^11",
 		"@types/node": "^22.10.0",
 		"esbuild": "^0.28.2",
-		"promptfoo": "0.120.27",
-		"tsx": "^4.19.2",
+		"promptfoo": "0.125.1",
+		"tsx": "^4.23.15",
 		"typescript": "^5.6.3",
 		"vitest": "^2.1.6"
 	}
