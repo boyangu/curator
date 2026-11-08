@@ -28,10 +28,11 @@ const REQUIRED_ENV = [
 	'CURATOR_SUPABASE_PUBLISHABLE_KEY',
 ] as const;
 const OPTIONAL_ENV = ['CURATOR_CLOUD_API_URL'] as const;
-// Development only, baked silently: CURATOR_CATALOG_API_URL sends the Global
+// Maintainer only, baked silently: CURATOR_CATALOG_API_URL sends the Global
 // Catalog's calls (catalog.*, feed.events) to a local server
 // (`pnpm --filter @curator/cloud local`) while library sync stays on the real
-// cloud. A packaged app ignores it (main/index.ts).
+// cloud. Dev and packaged builds both honour it (main/index.ts); a release
+// build must be made without the line.
 const DEV_ENV = ['CURATOR_CATALOG_API_URL'] as const;
 
 function bakedEnv(mode: string, command: 'build' | 'serve'): Record<string, string> {

@@ -1202,8 +1202,11 @@ app.whenReady().then(async () => {
 	}
 	const apiUrl = cloudApiUrl();
 	cloudTransport = cloudAccount && apiUrl ? createHttpCloudTransport(apiUrl, cloudAccount) : null;
-	// Development: the Global Catalog from a local server, sync unchanged.
-	const localCatalogUrl = app.isPackaged ? '' : catalogApiUrl();
+	// The Global Catalog from a local server, sync unchanged. Baked from
+	// CURATOR_CATALOG_API_URL at build time, so only a build made on a machine
+	// with that line in .env (the maintainer's, while the cloud catalogue is
+	// not deployed) does this; a packaged build honours it like dev does.
+	const localCatalogUrl = catalogApiUrl();
 	if (cloudTransport && cloudAccount && localCatalogUrl) {
 		cloudTransport = withLocalCatalog(cloudTransport, createHttpCloudTransport(localCatalogUrl, cloudAccount), localCatalogUrl, {
 			name: profileDeviceName(hostname(), PROFILE),
