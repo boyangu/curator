@@ -105,6 +105,8 @@ export const AUDIT_KINDS = [
 	'catalog_import',
 	'catalog_enrich_requested',
 	'catalog_refresh_requested',
+	// "Connect the dots" answers ({ answers, attached, waiting, conflicts, invalid }).
+	'catalog_connect_answered',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -155,6 +157,7 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	catalog_import: 'info',
 	catalog_enrich_requested: 'info',
 	catalog_refresh_requested: 'info',
+	catalog_connect_answered: 'info',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

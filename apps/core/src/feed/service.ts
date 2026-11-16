@@ -291,8 +291,9 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 				if (!item) return null;
 				if (needsMatch(item)) {
 					const matched = await matchSpotify({ store, client: () => spotifyClient('feed:match'), onActivity: activity }, item);
-					// The card gains its Spotify id live, like an enrichment landing.
-					if (matched.source !== item.source) for (const l of enrichedListeners) l(matched);
+					// The card gains its Spotify ids live, like an enrichment landing
+					// (the whole card, or rows of a Spotify album).
+					if (matched.source !== item.source || (matched.matchedAt !== item.matchedAt && matched.matchStatus !== 'err')) for (const l of enrichedListeners) l(matched);
 					item = matched;
 				}
 				return opts.enrich === false ? item : enrichment.enrichItem(itemId);

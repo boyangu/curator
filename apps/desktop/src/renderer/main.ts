@@ -1,7 +1,8 @@
 ﻿import type { Api } from '../ipc.js';
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, SegmentRecord } from '@curator/shared';
-import type { ArtistLink, ArtistScope, ArtistSummary } from '@curator/shared';
+import type { ArtistLink, ArtistPagesTarget, ArtistScope, ArtistSummary } from '@curator/shared';
 import { artistExternalLinks } from './features/artistLinks.js';
+import { artistOpenSubmenu, configureArtistOpen } from './features/artistOpenMenu.js';
 import type { ClearableTrackField } from '@curator/core';
 import type { SyncProgress, DownloadJob, QueueSummary, AuthStatus, ScanProgress, JourneySeed, AgentResultSet, AgentViewContext } from '@curator/core';
 import * as player from './player.js';
@@ -43,11 +44,14 @@ import { mountBackupProgressDialog, type BackupProgressDialogHandle } from './la
 import { mountBackupRestoreDialog, type BackupRestoreDialogHandle } from './layouts/BackupRestoreDialog.jsx';
 import { mountMergeTracksDialog, type MergeTracksHandle } from './layouts/MergeTracksDialog.jsx';
 import { mountArtistMergeReviewDialog, type ArtistMergeReviewHandle } from './layouts/ArtistMergeReviewDialog.jsx';
+import { mountConnectDotsDialog } from './layouts/ConnectDotsDialog.jsx';
+import { connectDots } from './features/connectDots.js';
+import { connectApi } from './data/api.js';
 import { mountMcpConfirmModal } from './layouts/McpConfirmModal.jsx';
 import { mountOrganizeDialog, type OrganizeDialogHandle, type OrganizeItem, type OrganizeSource } from './layouts/TagPlaylistPickerDialog.jsx';
 import { mountSyncToRekordboxModal, DEFAULT_SYNC_FLAGS, type SyncToRekordboxModalHandle, type SyncFlags, type SyncTarget } from './layouts/SyncToRekordboxModal.jsx';
 import { mountSyncFromRekordboxModal, DEFAULT_PULL_FLAGS, type SyncFromRekordboxModalHandle, type PullFlags, type PullTarget } from './layouts/SyncFromRekordboxModal.jsx';
-import { openContextMenu, dismissContextMenu, type ContextMenuItem } from './components/ContextMenu.jsx';
+import { openContextMenu, dismissContextMenu, type ContextMenuHandlers, type ContextMenuItem } from './components/ContextMenu.jsx';
 import * as analysisStore from './stores/analysisStore.js';
 import type { PeaksTier, CueData } from './stores/analysisStore.js';
 import { loadCuePalette, cueColor, cuePaletteEntries } from './cuePalette.js';
@@ -3729,7 +3733,6 @@ function mountDiscoverRegion(): void {
 		),
 	});
 	discoverView = mountDiscoverView(feedHost, {
-		onShowArtistInLibrary: (name) => { void showArtistInLibrary(name); },
 		// A followed playlist is synced into the library, so its name on a card
 		// opens it under the Spotify tab; before the first sync lands (no row
 		// yet) the Spotify app is the only place it exists.
@@ -4753,23 +4756,13 @@ async function renderArtistScopeLinks(titleEl: HTMLElement, artistId: string, na
 function showArtistContextMenu(evt: MouseEvent, id: string): void {
 	const a = artistsList().find((x) => x.id === id);
 	if (!a) return;
-	void (async () => {
-		let links: ArtistLink[] = [];
-		try { links = await window.api['artists:links'](id); } catch { /* optional */ }
-		const ext = artistExternalLinks(a.name, links);
-		const handlers: Record<string, () => void> = {};
-		const items: ContextMenuItem[] = [{ kind: 'header', label: a.name }];
-		for (const l of ext) {
-			items.push({ kind: 'item', id: `open-${l.id}`, label: l.direct ? `Open on ${l.label}` : `Search ${l.label}` });
-			handlers[`open-${l.id}`] = () => { void window.api['shell:open-external'](l.url); };
-		}
-		items.push({ kind: 'divider' }, { kind: 'item', id: 'rename', label: 'Rename…' }, { kind: 'item', id: 'merge', label: 'Merge into…' }, { kind: 'item', id: 'suggest', label: 'Suggested merges…' });
-		handlers['suggest'] = () => artistMergeReview?.open();
-		showArtistEditMenu(evt, a, items, handlers);
-	})();
+	const open = artistOpenSubmenu([{ name: a.name, artistId: a.id }]);
+	const items: ContextMenuItem[] = [{ kind: 'header', label: a.name }, ...(open ? [open.item] : [])];
+	items.push({ kind: 'divider' }, { kind: 'item', id: 'rename', label: 'Rename…' }, { kind: 'item', id: 'merge', label: 'Merge into…' }, { kind: 'item', id: 'suggest', label: 'Suggested merges…' });
+	showArtistEditMenu(evt, a, items, { ...open?.handlers, suggest: () => artistMergeReview?.open() });
 }
 
-function showArtistEditMenu(evt: MouseEvent, a: ArtistSummary, items: ContextMenuItem[], extra: Record<string, () => void>): void {
+function showArtistEditMenu(evt: MouseEvent, a: ArtistSummary, items: ContextMenuItem[], extra: ContextMenuHandlers): void {
 	openContextMenu(items, {
 		...extra,
 		rename: () => openNamePrompt({
@@ -5068,6 +5061,10 @@ async function boot(): Promise<void> {
 	};
 	initContextMenusFeature(menuDeps);
 	initTrackCommands(menuDeps);
+	configureArtistOpen({
+		connected: () => ({ spotify: !!library.auth()?.spotify.connected, tidal: !!library.auth()?.tidal.connected }),
+		openLocally: (target, libraryArtistId) => { void openArtistLocally(target, libraryArtistId); },
+	});
 	// Construct the AudioContext early so its ~50-100ms init cost doesn't
 	// land on the first user click. Context stays suspended until a play()
 	// call resumes it (Chromium autoplay policy is satisfied by that click).
@@ -5327,6 +5324,18 @@ async function boot(): Promise<void> {
 			},
 			dismiss: (aId, bId) => window.api['artists:dismiss-merge'](aId, bId),
 		});
+	}
+	// "Help us connect the dots" (features/connectDots.ts is its door).
+	const connectDotsHost = document.getElementById('connect-dots-host');
+	if (connectDotsHost) {
+		connectDots.attach(mountConnectDotsDialog(connectDotsHost, {
+			queue: (opts) => connectApi.queue(opts),
+			search: (subject, provider) => connectApi.search(subject, provider),
+			answer: (answers) => connectApi.answer(answers),
+			openExternal: (url) => { void shellApi.openExternal(url); },
+			toast: (title, kind, sub) => showToast(title, { kind, sub }),
+			onRemaining: (n) => connectDots.setRemaining(n),
+		}));
 	}
 
 	// MCP confirm modal — approval gate for Claude-initiated writes over the
@@ -6501,6 +6510,19 @@ async function showArtistInLibrary(name: string): Promise<void> {
 		// A click on an artist name is a drill-down from wherever it happened
 		// (Discover card, now-playing credit) — the breadcrumb leads back there.
 		await enterJitScope({ name: `Artist: ${a.name}`, query: buildExactAttr('artistid', a.id) }, undefined, { drill: true });
+	} catch (err) {
+		showToast('Artist lookup failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+	}
+}
+
+// "Open Artist in ▸ Open Locally" (features/artistOpenMenu.ts): the local
+// collection — the Rekordbox tab — scoped to the artist, from any tab. A
+// drill-down, so Back returns to where the menu was opened.
+async function openArtistLocally(target: ArtistPagesTarget, libraryArtistId: string | null): Promise<void> {
+	try {
+		const a = libraryArtistId ? await window.api['artists:get'](libraryArtistId) : await window.api['artists:resolve'](target.name);
+		if (!a) { showToast('Not in your library', { sub: target.name, kind: 'info' }); return; }
+		await navigate({ kind: 'tracks', source: 'rekordbox', scope: { type: 'jit', jit: { name: `Artist: ${a.name}`, query: buildExactAttr('artistid', a.id) } } }, { drill: true });
 	} catch (err) {
 		showToast('Artist lookup failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
 	}

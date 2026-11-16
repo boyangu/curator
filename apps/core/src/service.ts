@@ -46,7 +46,8 @@ import { log, setCoreLogger } from './log.js';
 import type { Logger } from '@curator/shared/log';
 import { parseInline } from './ingest/parser.js';
 import type { ParseFn } from './ingest/types.js';
-import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistMergeSuggestion, ArtistScope, AlbumSummary } from '@curator/shared';
+import { createArtistPages } from './library/artist-pages.js';
+import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, AlbumSummary } from '@curator/shared';
 import { DEFAULT_SOURCE_SYNC_SETTINGS, artistKey, asciify, asciifyArtists, searchFold, type ArtistCreditFormat } from '@curator/shared';
 import { loadArtistAliasMap, mapCredits, rederiveTrackCreditsRaw } from './library/artist-alias.js';
 import { lookupArtistRaw, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from './library/artists.js';
@@ -73,7 +74,7 @@ import { requestRestatement } from './sync-log/restate.js';
 import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
 import { getDeviceId as getSyncDeviceId } from './sync-log/device.js';
-import type { CatalogBrowseResult, CatalogWatch, DevicePlatform } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectQueueResult, CatalogProvider, CatalogWatch, DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
 
 export type SourceLinkError = {
@@ -180,6 +181,7 @@ import {
 	type CatalogImportReport,
 	type CatalogSearchHit,
 } from './catalog-client/service.js';
+import { createCatalogConnect, type CatalogConnect, type ConnectSearch, type ConnectSubject } from './catalog-client/connect.js';
 import {
 	artistCandidates,
 	genreCandidates,
@@ -275,10 +277,10 @@ import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import { AnalyzerSidecar } from './analyzer/sidecar.js';
 import { AnalysisQueue, formatAnalyzerTrackName, splitFileless, type AnalysisJobEvent } from './analyzer/queue.js';
-import { type AnalysisFlags, type AutoAnalyzeSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
+import { type AnalysisFlags, type AutoAnalyzeSettings, type AnalyzerResources, type AnalyzerResourcesSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, clampAnalyzerWorkers, defaultAnalyzerWorkers, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
 import { runModelsRepair } from './analyzer/models-repair.js';
 import { CutoffStore } from './analyzer/cutoffs.js';
-import { homedir, hostname } from 'node:os';
+import { availableParallelism, homedir, hostname } from 'node:os';
 import { WavConverter } from './wav/convert-run.js';
 import type { WavConverterSpec } from './wav/converter.js';
 import type { WavSettings, WavPreview, WavConvertEvent } from './wav/types.js';
@@ -875,6 +877,11 @@ export interface CoreService {
 	// Provider identities for an artist (Spotify/Tidal ids gathered from the
 	// synced track payloads) — the artist scope header's link row.
 	getArtistLinks(id: string): Promise<ArtistLink[]>;
+	// An artist's store pages for "Open Artist in ▸": the library's links
+	// (asked by artist id) joined with the Global Catalog's handles, reached
+	// through a catalogue id or a Spotify artist id (library/artist-pages.ts).
+	// The catalogue is optional — signed out or slow, the local links answer.
+	getArtistPages(target: ArtistPagesTarget): Promise<ArtistPages>;
 	// ─── Albums — library release entities (derived by library/albums.ts;
 	// see the ALBUM comment in schema.ts) ──────────────────────────────────
 	// Summaries for the track list's album group headers, one per requested
@@ -983,6 +990,12 @@ export interface CoreService {
 	// renderer pushes the full settings object from localStorage on boot
 	// and on every change.
 	setAutoAnalyzeSettings(settings: AutoAnalyzeSettings): Promise<void>;
+	// How many analyses run at once (= cores the analyzer may occupy; see
+	// AnalyzerResources). Persisted in app_setting; applied live to both the
+	// queue's in-flight gate and the sidecar's worker pool. The setter clamps
+	// to [1, cpuCount] and returns the applied state.
+	getAnalyzerResources(): Promise<AnalyzerResources>;
+	setAnalyzerResources(patch: Partial<AnalyzerResourcesSettings>): Promise<AnalyzerResources>;
 	cancelAnalysis(trackId: string): Promise<void>;
 	getAnalysisJob(trackId: string): Promise<AnalysisJob | null>;
 	getTrackAnalysis(trackId: string): Promise<TrackAnalysis | null>;
@@ -1240,6 +1253,20 @@ export interface CoreService {
 	// A catalogue object with what hangs off it: a label's or an artist's
 	// releases, a release's tracks, each with its store handles.
 	catalogBrowse(objectId: string): Promise<CatalogBrowseResult>;
+	// ─── Help us connect the dots (catalog-client/connect.ts) ───
+	// Whether the feature is there: signed in, and the server offers
+	// 'catalog_connect'.
+	getConnectStatus(): Promise<CatalogClientStatus>;
+	// What to ask the user: their follows that lack a store page (most
+	// followed first), or exactly `objectIds` — an artist, a label or an album
+	// the modal was opened on. Each with the stores it lacks and the
+	// candidates the catalogue itself could not choose between.
+	getConnectQueue(opts?: { limit?: number; objectIds?: string[] }): Promise<CatalogConnectQueueResult>;
+	// This device's search of one store for the object's page there.
+	searchConnectCandidates(subject: ConnectSubject, provider: CatalogProvider): Promise<ConnectSearch>;
+	// The user's answers. Each comes back attached, waiting for the catalogue's
+	// operator, already known, in conflict, noted or invalid.
+	submitConnectAnswers(answers: CatalogConnectAnswer[]): Promise<CatalogConnectAnswerResult>;
 	// The Manage following modal: one tab of the library's artists / labels /
 	// genres / followed playlists, by how often each appears in the library,
 	// each marked with the watch that already follows it.
@@ -2195,13 +2222,28 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// on every change to the Library settings checkboxes. Manual paths
 	// (Analyze modal, rb grid sync) bypass this object entirely.
 	let autoAnalyzeSettings: AutoAnalyzeSettings = { ...DEFAULT_AUTO_ANALYZE_SETTINGS };
+	// Worker-pool size, persisted in app_setting so dev and packaged builds
+	// share one value. The bound is the sidecar's CPU count once it has said
+	// hello (the WSL VM may have fewer cores than Windows); until then the
+	// host's count stands in.
+	const ANALYZER_RESOURCES_KEY = 'analyzer.resources';
+	const analyzerCpuCount = (): number => analyzerSidecar?.cpus ?? availableParallelism();
+	const analyzerResources = (): AnalyzerResources => {
+		const cpuCount = analyzerCpuCount();
+		const row = db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, ANALYZER_RESOURCES_KEY)).get();
+		const stored = row?.value && typeof row.value === 'object' ? (row.value as Partial<AnalyzerResourcesSettings>).workers : undefined;
+		return { workers: clampAnalyzerWorkers(stored ?? defaultAnalyzerWorkers(cpuCount), cpuCount), cpuCount };
+	};
 	if (opts.analyzer && opts.peaksDir) {
 		// Not started here: the desktop main calls startAnalyzer() once the
 		// window has loaded (on Windows the spawn boots WSL, and its network
 		// adapter appearing aborts the renderer's in-flight module loads).
 		// Jobs dispatched before then wait inside the sidecar wrapper.
 		analyzerSidecar = new AnalyzerSidecar(opts.analyzer);
-		analysisQueue = new AnalysisQueue(db, analyzerSidecar, { peaksDir: opts.peaksDir });
+		analysisQueue = new AnalysisQueue(db, analyzerSidecar, { peaksDir: opts.peaksDir, concurrency: analyzerResources().workers });
+		// The sidecar isn't running yet; configure() parks the value and
+		// sends it on hello (and again after every respawn).
+		analyzerSidecar.configure({ workers: analyzerResources().workers });
 		// Eager analysis: any time the scanner ingests a new (or re-matched)
 		// local file, queue it at low priority — but only when the user has
 		// opted in. AnalyzeOptions get built from the sub-flags so the
@@ -2557,6 +2599,31 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		ingest: () => (catalogClient?.status().available ? (claims, idempotencyKey) => catalogClient.reportEnrichment(claims, idempotencyKey) : null),
 		subscribe: (cb) => feedService.subscribeEnriched(cb),
 	});
+	const artistPages = createArtistPages({
+		artistById: (id) => lookupLiveArtist(db, id),
+		artistByName: (name) => lookupArtistRaw(rawOf(db), name),
+		links: (artistId) => db.select({ source: artistLink.source, sourceId: artistLink.sourceId, url: artistLink.url }).from(artistLink).where(eq(artistLink.artistId, artistId)).orderBy(asc(artistLink.source)).all(),
+		catalog: () => catalogClient,
+	});
+	const catalogConnect: CatalogConnect | null = cloudClient && catalogProcs && catalogClient
+		? createCatalogConnect({
+			catalog: catalogProcs,
+			status: () => catalogClient.status(),
+			offered: () => (opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? []).includes('catalog_connect'),
+			deviceId: () => cloudClient.deviceId(),
+			spotifyToken: () => auth.getSpotifyAccessToken(),
+			tidal: async () => {
+				const token = await auth.getTidalAccessToken();
+				return token ? new TidalApiClient(config.tidal.apiBase, async () => token, auth.getTidalCountryCode() ?? 'US') : null;
+			},
+			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
+			onAttached: () => artistPages.forget(),
+		})
+		: null;
+	const requireConnect = (): CatalogConnect => {
+		if (!catalogConnect) throw new CatalogUnavailableError('Sign in to Curator Cloud to help connect the dots.');
+		return catalogConnect;
+	};
 	const requireCatalog = (): CatalogClient => {
 		if (!catalogClient) throw new CatalogUnavailableError('Sign in to Curator Cloud to follow artists and labels.');
 		return catalogClient;
@@ -4763,6 +4830,18 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async catalogBrowse(objectId) {
 			return requireCatalog().browse(objectId);
 		},
+		async getConnectStatus() {
+			return catalogConnect?.status() ?? { available: false, reason: 'signed_out' };
+		},
+		async getConnectQueue(opts) {
+			return requireConnect().queue(opts);
+		},
+		async searchConnectCandidates(subject, provider) {
+			return requireConnect().search(subject, provider);
+		},
+		async submitConnectAnswers(answers) {
+			return requireConnect().answer(answers);
+		},
 		async catalogImportSpotifyFollows() {
 			return requireCatalog().importSpotifyFollows();
 		},
@@ -4991,6 +5070,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (!live) return [];
 			return db.select({ source: artistLink.source, sourceId: artistLink.sourceId, url: artistLink.url })
 				.from(artistLink).where(eq(artistLink.artistId, live.id)).orderBy(asc(artistLink.source)).all();
+		},
+		async getArtistPages(target) {
+			return artistPages(target);
 		},
 		async getAlbumsByIds(ids) {
 			return readAlbumSummaries(rawOf(db), ids);
@@ -5425,6 +5507,18 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// priority-0 jobs in 'queued' state without dispatching them
 			// until the user re-enables.
 			analysisQueue?.setAutoEnabled(settings.enabled);
+		},
+		async getAnalyzerResources() {
+			return analyzerResources();
+		},
+		async setAnalyzerResources(patch) {
+			if (patch.workers !== undefined) {
+				const workers = clampAnalyzerWorkers(patch.workers, analyzerCpuCount());
+				mut.setSetting(db, ANALYZER_RESOURCES_KEY, { workers } satisfies AnalyzerResourcesSettings);
+				analysisQueue?.setConcurrency(workers);
+				analyzerSidecar?.configure({ workers });
+			}
+			return analyzerResources();
 		},
 		async cancelAnalysis(trackId) {
 			if (!analysisQueue) return;

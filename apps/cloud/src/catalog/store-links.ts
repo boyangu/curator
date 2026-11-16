@@ -20,8 +20,10 @@ import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { openReview } from './admin.js';
+import { reannounceCard } from './events.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
+import { heldTracks, slotMatch } from './slots.js';
 import type { AppleLookup } from './trackers/apple.js';
 import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
 import type { TidalApp } from './trackers/tidal-app.js';
@@ -130,46 +132,20 @@ export async function applyReleaseClaims(tx: Queryable, releaseId: string, claim
 }
 
 // A store's tracks onto the ones the release already holds from another
-// store. Without ISRCs (Spotify's and Bandcamp's tracklists carry none) the
-// catalogue's title + artists rule misses whenever the stores credit
-// differently (Spotify names the featured artist, Deezer the main one only,
-// Bandcamp none), and one single becomes three recordings. Within one
-// release the evidence is stronger: the same title at the same position, or
-// with a length within three seconds, is the same track — and so is the same
-// position with a length within two, whatever the title (Bandcamp retitles:
-// "… (Featuring X)", a cut-short "Losing Someone"). One match only; anything
-// less clear is left to the identity rules.
+// store, by the slot rule (slots.ts) — here with its loose form too, the same
+// slot within two seconds whatever the title, because this store page was
+// keyed to the release by UPC and is known to be the same release. One match
+// only; anything less clear is left to the identity rules.
 export async function joinTracks(tx: Queryable, ingester: Ingester, releaseId: string, c: CatalogClaim): Promise<void> {
 	if (!c.recordings?.length) return;
-	const held = await tx.query<{ id: string; name: string; duration_sec: unknown; position: unknown }>(
-		`select o.id, o.name, o.duration_sec, e.position from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
-		where e.src = $1 and e.kind = 'release-recording'`,
-		[releaseId],
-	);
+	const held = await heldTracks(tx, releaseId);
 	if (!held.length) return;
 	const artists = (c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean);
 	for (const [i, r] of c.recordings.entries()) {
 		if (await findRepresentation(tx, r)) continue;
-		const title = trackFold(r.name, artists);
-		const pos = r.facts?.trackNumber ?? i + 1;
-		const len = r.facts?.durationSec;
-		const hits = held.filter((h) => {
-			const d = numOrNull(h.duration_sec);
-			const near = len != null && d !== null && Math.abs(d - len) <= 3;
-			const samePos = numOrNull(h.position) === pos;
-			if (samePos && len != null && d !== null && Math.abs(d - len) <= 2) return true;
-			return trackFold(h.name, artists) === title && (samePos || near);
-		});
-		if (hits.length === 1) await ingester.attachTo(hits[0]!.id, r);
+		const hit = slotMatch(held, { title: r.name, position: r.facts?.trackNumber ?? i + 1, durationSec: r.facts?.durationSec }, artists, { anyTitle: true });
+		if (hit) await ingester.attachTo(hit.id, r);
 	}
-}
-
-// A track title compared within a release: folded, without a leading
-// "Artist - " (a label's Bandcamp account titles its tracks that way).
-function trackFold(title: string, artists: string[]): string {
-	const m = /^(.+?)\s+[-–]\s+(.+)$/.exec(title);
-	if (m && artists.some((a) => nameFold(m[1]!).includes(a))) return nameFold(m[2]!);
-	return nameFold(title);
 }
 
 export type LinkerDeps = { db: Db; log: Logger; readers: StoreReaders; batch?: number; now?: () => number };
@@ -263,7 +239,12 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 			if (hit) report.linked[p] = (report.linked[p] ?? 0) + 1;
 		}
 		if (found.claims.length) {
-			const applied = await withSystemTx(deps.db, (tx) => applyReleaseClaims(tx, r.id, found.claims, (c) => `${c.provider} release ${c.providerId} is on the other one; the store linker found it for this one by UPC`));
+			const applied = await withSystemTx(deps.db, async (tx) => {
+				const a = await applyReleaseClaims(tx, r.id, found.claims, (c) => `${c.provider} release ${c.providerId} is on the other one; the store linker found it for this one by UPC`);
+				// Its tracks gained the stores' ids: devices holding the card re-read it.
+				await reannounceCard(tx, r.id);
+				return a;
+			});
 			for (const c of applied.conflicts) deps.log.warn('store_link_conflict', { release: r.id, ...c });
 		}
 		await sleep(Math.max(...Object.keys(readers).map((p) => BUDGET[p as StoreProvider].gapMs)));

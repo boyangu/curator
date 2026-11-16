@@ -284,6 +284,11 @@ export function AppShell() {
 				    same name with a country/city tag, merge or dismiss per pair. */}
 				<div id="artist-merge-host"></div>
 
+				{/* "Help us connect the dots" host — filled by mountConnectDotsDialog()
+				    in main.ts/boot() (layouts/ConnectDotsDialog.tsx). Store pages for
+				    the catalogue's artists, labels and albums, picked by the user. */}
+				<div id="connect-dots-host"></div>
+
 				{/* MCP confirm host — filled by mountMcpConfirmModal() in
 				    main.ts/boot() (layouts/McpConfirmModal.tsx). Approval gate
 				    for Claude-initiated writes arriving over the MCP bridge

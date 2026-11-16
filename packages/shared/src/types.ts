@@ -228,6 +228,24 @@ export interface ArtistLink {
 	sourceId: string;
 	url: string | null;
 }
+// Who "Open Artist in ▸" is about, by what the surface knows: a library
+// artist id (track rows, the Artists folder), or a name with the ids the feed
+// carries (a Spotify artist id, a catalogue object id).
+export interface ArtistPagesTarget {
+	name: string;
+	artistId?: string | null;
+	spotifyId?: string | null;
+	catalogId?: string | null;
+}
+// The artist's store pages (one per store, direct URLs) and the library
+// artist of that id or name, when the library holds one.
+export interface ArtistPages {
+	// The Global Catalog's object for the artist, when it answered: what
+	// "Help connect…" opens on.
+	catalogId: string | null;
+	libraryArtistId: string | null;
+	pages: ArtistLink[];
+}
 // ─── Albums (library release entities) ──────────────────────────────────────
 // Read shape for the track list's album group headers. Member-derived
 // fields (label fallback, genres, trackCount, coverTrackId) are computed

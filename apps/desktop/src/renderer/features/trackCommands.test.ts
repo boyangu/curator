@@ -6,6 +6,7 @@ import type { Track } from '@curator/shared';
 vi.mock('../data/api.js', async (importOriginal) => ({
 	...(await importOriginal<object>()),
 	mirApi: { similar: async () => ({ model: 'm', items: [], missingSeeds: [] }), analyzeNow: async () => ({ queued: 0 }) },
+	artistsApi: { pages: async () => ({ libraryArtistId: null, pages: [] }) },
 }));
 
 import { buildTrackMenu, initTrackCommands, runTrackCommand, trackCommandAvailable, type TrackCommandContext } from './trackCommands.js';
@@ -20,7 +21,7 @@ const shape = (ctx: TrackCommandContext): string[] =>
 	buildTrackMenu(ctx).items.map((i) => {
 		if (i.kind === 'divider') return '--';
 		if (i.kind === 'header') return `# ${i.label}`;
-		if (i.kind === 'submenu') return `${i.label} > ${i.items.map((c) => (c.kind === 'item' ? c.label : '?')).join(' | ')}`;
+		if (i.kind === 'submenu') return `${i.label} > ${i.items.filter((c) => c.kind !== 'late').map((c) => (c.kind === 'item' ? c.label : '?')).join(' | ')}`;
 		if (i.kind === 'item') return i.mnemonic ? `${i.label} [${i.mnemonic}]` : i.label;
 		return '?';
 	});
@@ -38,7 +39,7 @@ describe('track context menu', () => {
 			'--',
 			'Enhance with BPM, Key, Label, Genre', 'Enhance with Tidal',
 			'--',
-			'Find Similar', 'Production Profile…', 'Navigate to > Solee',
+			'Find Similar', 'Production Profile…', 'Navigate to > Solee', 'Open Artist in > Open Locally',
 			'--',
 			'Open in **Spotify**', 'Copy **Spotify** URL', 'Search in **Tidal**', 'Search in **Beatport**', 'Open File Location',
 			'--',

@@ -12,6 +12,7 @@ import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import { clearInbox, decideInbox, failInbox, getInbox, inboxCounts, listInbox, OPERATOR, raise, snoozeInbox, type InboxChoice, type InboxFilter, type InboxOp, type InboxRow } from './inbox.js';
 import { mergePolicy, objectFacts, reversiblePolicy } from './inbox-policy.js';
+import { splitArtistPage, type SplitArgs, type SplitResult } from './artist-split.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { attachPage, decideReview, getReview, holdReview, listReviews, mergeObjects, mergeOverruling, objectReleases, renameObject, scanDuplicates, unlinkPage, type ReviewStatus, type ObjectRelease, type Review, type ReviewCandidate, type ReviewDecision, type ReviewKind } from './admin.js';
 import { candidateReleases, type EvidenceDeps } from './admin-evidence.js';
@@ -38,11 +39,12 @@ import { openRelatedPair, queueLabelDedupe, scanRelatedLabels } from './label-re
 import { artistTwins, type ArtistTwinReport } from './artist-twins.js';
 import { recreditOn, repairCredits, type CreditRepairReport } from './repair-credits.js';
 import { repairPreviews, type PreviewRepairReport } from './repair-previews.js';
-import { dedupeTracks, fillReleases, linkReleasePage, releaseStubs, type DedupeReport, type FillReport, type ReleaseStub } from './release-fill.js';
+import { dedupeRelease, dedupeTracks, fillReleases, linkReleasePage, releaseStubs, type DedupeReport, type FillReport, type ReleaseScope, type ReleaseStub } from './release-fill.js';
 import { AppleLookup } from './trackers/apple.js';
 import { BandcampTracker } from '@curator/catalog-readers';
 import { BeatportTracker } from '@curator/catalog-readers';
 import { DeezerTracker } from '@curator/catalog-readers';
+import { getJson } from '@curator/catalog-readers';
 import { fetchPlaylistMeta } from '@curator/catalog-readers';
 export type ReviewView = Review & {
 	object: { name: string; kind: string; handles: { provider: string; id: string; url: string | null }[] } | null;
@@ -99,6 +101,11 @@ export type AdminOps = {
 	reviewOpen(args: { a: string; b: string }): Promise<{ id: number | null; keep: string }>;
 	// A wrong page taken off a label, and ruled not its page (admin.ts unlinkPage).
 	labelUnlink(args: { q: string; url: string; by?: string; note?: string | null; approved?: boolean }): Promise<{ provider: string; providerId: string; edges: number; identifiers: number; review: number | null }>;
+	// A store page taken off an artist and blocked — a namesake's own page, or a
+	// store's bucket of namesakes (agent/apply.ts runBlockSource: the releases and
+	// identifiers it alone brought go with it; no finder attaches it again). Held
+	// for the operator (`held`) unless `approved`.
+	artistUnlink(args: { id: string; source: string; by?: string; note: string; approved?: boolean; as?: 'namesake' | 'bucket' }): Promise<{ provider: string; providerId: string; name: string; releases: number; held: number | null; result: SplitResult | null }>;
 	// Two labels merged, overruling a "not the same": held for the operator
 	// (`held` = the inbox item) unless `approved` — the operator said so in chat.
 	labelMerge(args: { from: string; into: string; by?: string; note: string; approved?: boolean }): Promise<{ from: string; into: string; name: string; moved?: Record<string, number>; held?: number | null }>;
@@ -147,7 +154,9 @@ export type AdminOps = {
 	insightRetire(args: { id: number; by?: string; note?: string | null }): Promise<Insight>;
 	insightList(args: { q: string; retired?: boolean }): Promise<{ id: string; name: string; kind: string; insights: Insight[] }>;
 	// Tracks a release holds twice (one slot, two stores) merged into one.
-	releaseDedupe(args: { ids?: string[]; label?: string; artist?: string; dry?: boolean; by?: string }): Promise<DedupeReport>;
+	// `sharedSlots`: every release holding two recordings on one position
+	// (optionally those whose tracks arrived in the last `sinceDays`).
+	releaseDedupe(args: { ids?: string[]; label?: string; artist?: string; sharedSlots?: { sinceDays?: number }; dry?: boolean; by?: string }): Promise<DedupeReport>;
 	// SoundCloud preview copies (0:30, credited to the label) undone and
 	// merged into the store recording they are (repair-previews.ts).
 	repairPreviews(args: { label?: string; dry?: boolean; by?: string }): Promise<PreviewRepairReport>;
@@ -321,6 +330,34 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 	const audit = (title: string, kind: string, subjects: string[], ev: Record<string, unknown>, by?: string) =>
 		withSystemTx(db, (tx) => raise(tx, { kind, severity: 'audit', title, subjects, evidence: ev, actor: by ?? 'claude-code' }));
 	const fetchFn = evidence.fetch ?? ((u: string, i?: RequestInit) => fetch(u, i));
+	// A store artist page's name and the ids of the releases it lists: Deezer's
+	// public API, Spotify through the app token; other stores list nothing here
+	// (their releases are, near enough always, the same ones Deezer or Spotify
+	// hold, so the Deezer or Spotify page carries them off).
+	const artistPage = async (provider: CatalogProvider, id: string): Promise<{ name: string | null; releaseIds: string[] }> => {
+		const signal = AbortSignal.timeout(30_000);
+		const ids: string[] = [];
+		if (provider === 'deezer') {
+			const json = <T>(path: string) => getJson<T>(fetchFn, 'deezer', `https://api.deezer.com${path}`, { signal, logPath: path.split('?')[0]! });
+			const who = await json<{ name?: string }>(`/artist/${encodeURIComponent(id)}`);
+			for (let index = 0; index < 2000; index += 100) {
+				const l = await json<{ data?: { id: number }[]; next?: string }>(`/artist/${encodeURIComponent(id)}/albums?limit=100&index=${index}`);
+				for (const x of l.data ?? []) ids.push(String(x.id));
+				if (!l.next) break;
+			}
+			return { name: who.name ?? null, releaseIds: ids };
+		}
+		if (provider === 'spotify' && evidence.spotify) {
+			const who = await evidence.spotify.get<{ name?: string }>(`/artists/${encodeURIComponent(id)}`, signal);
+			for (let offset = 0; offset < 2000; offset += 50) {
+				const l = await evidence.spotify.get<{ items: { id: string }[]; next: string | null }>(`/artists/${encodeURIComponent(id)}/albums?include_groups=album,single,appears_on&limit=50&offset=${offset}`, signal);
+				for (const x of l.items) ids.push(x.id);
+				if (!l.next) break;
+			}
+			return { name: who.name ?? null, releaseIds: ids };
+		}
+		return { name: null, releaseIds: [] };
+	};
 	const fetchers = {
 		spotify: evidence.spotify ?? null,
 		tidal: evidence.tidal ?? null,
@@ -343,10 +380,10 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 		},
 		async releaseDedupe(args) {
 			for (const id of args.ids ?? []) if (!UUID_RE.test(id)) throw new Error(`"${id}" is not a release id`);
-			const s = await scope(args);
-			if (!s.ids && !s.labelId && !s.artistId) throw new Error('release dedupe needs release ids, --label or --artist');
+			const s: ReleaseScope = args.sharedSlots ? { sharedSlots: args.sharedSlots } : await scope(args);
+			if (!s.ids && !s.labelId && !s.artistId && !s.sharedSlots) throw new Error('release dedupe needs release ids, --label, --artist or --shared-slots');
 			const r = await dedupeTracks(db, s, { dry: args.dry, by: args.by });
-			if (!r.dry && r.merged.length) await audit(`Merged ${r.merged.length} duplicate track(s) across ${r.releases} release(s)`, 'release.dedupe', s.labelId ? [s.labelId] : [], { merged: r.merged.slice(0, 50) }, args.by);
+			if (!r.dry && r.merged.length) await audit(`Merged ${r.merged.length} duplicate track(s) across ${r.releases} release(s)`, 'release.dedupe', s.labelId ? [s.labelId] : [...new Set(r.merged.map((m) => m.releaseId))].slice(0, 50), { merged: r.merged.slice(0, 50) }, args.by);
 			return r;
 		},
 		async agentCases(args) {
@@ -514,6 +551,51 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 				return { moved: r.moved };
 			});
 		},
+		async artistUnlink(args) {
+			if (!args.note?.trim()) throw new Error('artist unlink needs --note (whose page it is)');
+			const m = /^([a-z]+):(.+)$/.exec(args.source.trim());
+			if (!m) throw new Error('artist unlink takes the page as provider:id, as `search` prints it');
+			const provider = m[1] as CatalogProvider;
+			const providerId = m[2]!;
+			const by = args.by ?? 'claude-code';
+			const as = args.as ?? 'namesake';
+			// The page's releases, read from the store before the transaction; for
+			// a bucket, the artist's other pages on that store too, so what they
+			// also list stays hers.
+			const page = await artistPage(provider, providerId);
+			const siblings = as === 'bucket'
+				? await db.query<{ provider_id: string }>(`select provider_id from curator.catalog_source_object where object_id = $1 and provider = $2 and kind = 'artist' and provider_id <> $3`, [args.id, provider, providerId])
+				: [];
+			const listedElsewhere = new Set<string>();
+			for (const sib of siblings) for (const id of (await artistPage(provider, sib.provider_id)).releaseIds) listedElsewhere.add(id);
+			return withSystemTx(db, async (tx) => {
+				const a = (await objectFacts(tx, [args.id])).get(args.id);
+				if (!a || a.kind !== 'artist') throw new Error('artist unlink takes the id of a live artist');
+				const [held] = await tx.query<{ url: string | null }>(`select url from curator.catalog_source_object where object_id = $1 and provider = $2 and kind = 'artist' and provider_id = $3`, [args.id, provider, providerId]);
+				if (!held) throw new Error(`«${a.name}» holds no ${provider}:${providerId}`);
+				const resolve = async (ids: string[]): Promise<string[]> =>
+					ids.length
+						? (await tx.query<{ object_id: string }>(
+								`select distinct so.object_id from curator.catalog_source_object so join curator.catalog_object o on o.id = so.object_id and o.merged_into is null
+								where so.provider = $1 and so.kind = 'release' and so.provider_id = any($2::text[])`,
+								[provider, `{${ids.map((x) => `"${x.replace(/"/g, '')}"`).join(',')}}`],
+							)).map((r) => r.object_id)
+						: [];
+				const releases = await resolve(page.releaseIds);
+				const keep = await resolve([...listedElsewhere]);
+				const split: SplitArgs = { objectId: args.id, provider, providerId, name: page.name ?? a.name, url: held.url, releases, keep, as, note: args.note };
+				const title = as === 'bucket'
+					? `Block ${provider}:${providerId} — a bucket of namesakes, not «${a.name}»`
+					: `Split ${provider}:${providerId} «${split.name}» off «${a.name}» with ${releases.length} release(s)`;
+				if (!args.approved) {
+					const id = await raise(tx, { kind: 'artist.unlink', severity: 'approval', title, subjects: [args.id], evidence: { note: args.note, as, releases: releases.length, listed: page.releaseIds.length }, apply: { op: 'splitArtist', args: { ...split } }, actor: by, key: `${args.id}:${provider}:${providerId}` });
+					return { provider, providerId, name: split.name, releases: releases.length, held: id, result: null };
+				}
+				const result = await splitArtistPage(tx, split, by);
+				await raise(tx, { kind: 'artist.unlink', severity: 'audit', title, subjects: [args.id, ...(result.into ? [result.into] : [])], evidence: { note: args.note, as, ...result }, actor: by, approvedBy: OPERATOR });
+				return { provider, providerId, name: split.name, releases: releases.length, held: null, result };
+			});
+		},
 		async releaseMerge(args) {
 			if (!args.note?.trim()) throw new Error('release merge needs --note (why they are one)');
 			const by = args.by ?? 'claude-code';
@@ -528,6 +610,7 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 				}
 				const r = await mergeObjects(tx, f.id, i.id, by, args.note, { manual: true });
 				await artistTwinsOn(tx, [i.id], by);
+				await dedupeRelease(tx, i.id, by);
 				await raise(tx, { kind: 'release.twins', severity: 'audit', title: `Merged release «${f.name}» into «${i.name}»`, subjects: [i.id], evidence: { note: args.note, from: f.id, pairs }, actor: by, approvedBy: OPERATOR });
 				return { moved: r.moved };
 			});

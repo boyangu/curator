@@ -291,6 +291,11 @@ const IMPORT_ERROR_PATTERNS = [
 	/ImportError: (.+)/,
 ];
 
+export interface SidecarConfig {
+	// Worker-process pool size; one analysis per worker, one core per worker.
+	workers: number;
+}
+
 export class AnalyzerSidecar extends EventEmitter {
 	private proc: ChildProcessWithoutNullStreams | null = null;
 	private nextId = 1;
@@ -311,6 +316,13 @@ export class AnalyzerSidecar extends EventEmitter {
 	private disabledReason: string | null = null;
 	private helloSeen = false;
 	private helloTimer: NodeJS.Timeout | null = null;
+	// Logical CPUs as the sidecar sees them (from the hello frame). Under
+	// WSL this is the VM's allowance, which .wslconfig can cap below the
+	// host's — so it, not os.cpus(), bounds the user's worker choice.
+	private cpuCount: number | null = null;
+	// Last configure() payload, re-sent after every (re)spawn so a crashed
+	// sidecar comes back with the user's pool size rather than the default.
+	private config: SidecarConfig | null = null;
 	// Until the first start(), analyze() parks requests here rather than
 	// rejecting them: the queue treats `sidecar_unavailable` as transient and
 	// would re-dispatch the same job in a loop for as long as the deferred
@@ -330,6 +342,24 @@ export class AnalyzerSidecar extends EventEmitter {
 
 	// Non-null once the sidecar has given up (no further respawns).
 	get disabled(): string | null { return this.disabledReason; }
+
+	get cpus(): number | null { return this.cpuCount; }
+
+	// Resize the sidecar's worker pool. Fire-and-forget (no reply frame): the
+	// sidecar swaps in a pool of the new size for new work and lets the old
+	// one finish what it holds, so nothing running is interrupted. Safe
+	// before start() — the value is sent on hello.
+	configure(cfg: SidecarConfig): void {
+		this.config = { ...cfg };
+		this.sendConfig();
+	}
+
+	private sendConfig(): void {
+		if (!this.config || !this.proc || !this.proc.stdin.writable) return;
+		try {
+			this.proc.stdin.write(JSON.stringify({ method: 'configure', params: this.config }) + '\n');
+		} catch { /* sidecar going away; the respawn re-sends */ }
+	}
 
 	// Idempotent — calling start() twice is a no-op while a process is alive.
 	start(): void {
@@ -456,7 +486,10 @@ export class AnalyzerSidecar extends EventEmitter {
 				try { this.proc?.kill(); } catch { /* already gone */ }
 				return;
 			}
-			alog.info('sidecar hello', { version: String(frame['version']), protocol: String(protocol) });
+			const cpus = frame['cpus'];
+			if (typeof cpus === 'number' && cpus >= 1) this.cpuCount = Math.floor(cpus);
+			alog.info('sidecar hello', { version: String(frame['version']), protocol: String(protocol), cpus: String(cpus) });
+			this.sendConfig();
 			return;
 		}
 

@@ -15,14 +15,16 @@ import { ingestClaims } from './ingest.js';
 
 const artist = (provider: 'spotify' | 'beatport' | 'user', id: string, name: string): CatalogClaim =>
 	({ provider, kind: 'artist', providerId: provider === 'user' ? `name:${id}` : id, name }) as CatalogClaim;
-const release = (provider: 'spotify' | 'beatport', id: string, title: string, tracks: { id: string; name: string; by: CatalogClaim }[]): CatalogClaim => ({
+// `longerBySec`: a store's extended mixes run longer than the originals, so
+// the slot rule (slots.ts) keeps them apart from the other store's tracks.
+const release = (provider: 'spotify' | 'beatport', id: string, title: string, tracks: { id: string; name: string; by: CatalogClaim }[], longerBySec = 0): CatalogClaim => ({
 	provider,
 	kind: 'release',
 	providerId: id,
 	name: title,
 	facts: { releaseDate: '2026-05-08' },
 	artists: [...new Map(tracks.map((t) => [t.by.providerId, t.by])).values()],
-	recordings: tracks.map((t, i) => ({ provider, kind: 'recording', providerId: t.id, name: t.name, facts: { durationSec: 200 + i * 7 }, artists: [t.by] })),
+	recordings: tracks.map((t, i) => ({ provider, kind: 'recording', providerId: t.id, name: t.name, facts: { durationSec: 200 + i * 7 + longerBySec }, artists: [t.by] })),
 });
 
 const idOf = async (app: TestApp, provider: string, kind: string, providerId: string) =>
@@ -103,7 +105,7 @@ describe('artist twins', () => {
 				tx,
 				[
 					release('spotify', 'al-1', 'Saltmarsh EP', [{ id: 'tr-1', name: 'Saltmarsh', by: artist('spotify', 'sp-rook', 'Rook') }, { id: 'tr-2', name: 'Reed', by: artist('spotify', 'sp-mara-a', 'Mara') }]),
-					release('beatport', 'bp-1', 'Saltmarsh', [{ id: 'bt-1', name: 'Saltmarsh (Extended Mix)', by: artist('beatport', 'bp-rook', 'Rook') }, { id: 'bt-2', name: 'Reed (Extended Mix)', by: artist('spotify', 'sp-mara-b', 'Mara') }]),
+					release('beatport', 'bp-1', 'Saltmarsh', [{ id: 'bt-1', name: 'Saltmarsh (Extended Mix)', by: artist('beatport', 'bp-rook', 'Rook') }, { id: 'bt-2', name: 'Reed (Extended Mix)', by: artist('spotify', 'sp-mara-b', 'Mara') }], 90),
 				],
 				{ reason: 'library_import' },
 			),
@@ -118,5 +120,26 @@ describe('artist twins', () => {
 		expect(await live(app, 'Mara')).toBe(2);
 		const asked = await withSystemTx(app.db, (tx) => listInbox(tx, { status: 'open', kind: 'artist.twins', limit: 10 }));
 		expect(asked.rows.map((r) => r.title)).toEqual(['«Mara» held 2 times on one release, by one store under two ids']);
+	});
+
+	it('pairs a copy a store tags as a namesake ("Elif (tr)") with the untagged one on the same track, keeping the untagged name', async () => {
+		const app = await createTestApp();
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(
+				tx,
+				[
+					release('spotify', 'al-e1', 'Praise The Sky', [{ id: 'tr-e1', name: 'Praise The Sky', by: artist('spotify', 'sp-elif', 'ELIF') }]),
+					release('beatport', 'bp-e2', 'Eos', [{ id: 'bt-e2', name: 'Eos', by: artist('beatport', 'bp-elif-tr', 'Elif (tr)') }]),
+				],
+				{ reason: 'tracker' },
+			),
+		);
+		// Beatport's copy of the first track credits its tagged artist — more
+		// credits than the Spotify copy, which still keeps the name.
+		await edge(app, await idOf(app, 'spotify', 'recording', 'tr-e1'), 'recording-artist', await idOf(app, 'beatport', 'artist', 'bp-elif-tr'));
+		const r = await adminOps(app.db, {}).repairArtistTwins({});
+		expect(r.merged.map((m) => [m.name, m.on])).toEqual([['ELIF', 'track']]);
+		expect(await live(app, 'ELIF')).toBe(1);
+		expect(await live(app, 'Elif (tr)')).toBe(0);
 	});
 });

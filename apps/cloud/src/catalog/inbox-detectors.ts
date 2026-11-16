@@ -14,8 +14,11 @@
 //                    sizeable: a namesake's page. Proposes the unlink.
 //   artist.twins     one artist held twice under one name on a release
 //                    (artist-twins.ts, over artists minted lately): merged
-//                    outright — the one thing this pass does itself — unless
-//                    one store holds both under two ids, then proposed.
+//                    outright — one of two things this pass does itself —
+//                    unless one store holds both under two ids, then proposed.
+//   release.dedupe   one track held twice on one slot of a release (two
+//                    stores' copies the slot rule did not join at ingest,
+//                    release-fill.ts dedupeRelease): merged outright, logged.
 //   tracker.failing  a tracker failing run after run for another reason.
 //
 // With the reasoner on, twins become cases (catalog/agent) instead, and two
@@ -31,8 +34,12 @@ import { enqueueCase } from './agent/cases.js';
 import { artistTwins, PLACEHOLDER } from './artist-twins.js';
 import { WEAK_SQL } from './identity.js';
 import { clearInbox, listInbox, raise, type InboxRow } from './inbox.js';
+import { dedupeTracks } from './release-fill.js';
 
 const TWINS_WINDOW_DAYS = 2;
+// Slot twins: a track can reach a release through a second store days after
+// the first (Deezer's weekly read after Spotify's), so the window is wider.
+const SLOTS_WINDOW_DAYS = 14;
 const TWINS_DATE_GAP_DAYS = 14;
 const LABELS_PER_PASS = 200;
 const FAILING_RUNS = 5;
@@ -45,14 +52,14 @@ type Log = { info: (m: string, f?: Record<string, unknown>) => void; warn?: (m: 
 // `agent`: the reasoner is on (catalog/agent) — twins go to it as cases
 // instead of straight to the operator.
 export type DetectorDeps = { db: Db; log?: Log; agent?: boolean; now?: number };
-export type DetectorReport = { twins: number; artists: number; pages: number; trackers: number; cleared: number; credits: number; buckets: number };
+export type DetectorReport = { twins: number; artists: number; slots: number; pages: number; trackers: number; cleared: number; credits: number; buckets: number };
 
 // A step slower than this is logged by name: PGlite has one connection, so a
 // slow detector stalls the whole local server, and the log should say which.
 const SLOW_STEP_MS = 3000;
 
 export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorReport> {
-	const report: DetectorReport = { twins: 0, artists: 0, pages: 0, trackers: 0, cleared: 0, credits: 0, buckets: 0 };
+	const report: DetectorReport = { twins: 0, artists: 0, slots: 0, pages: 0, trackers: 0, cleared: 0, credits: 0, buckets: 0 };
 	const timed = async <T>(step: string, run: () => Promise<T>): Promise<T> => {
 		const t0 = Date.now();
 		// CURATOR_DEBUG_PASS=1: name each step as it starts, so a stuck one shows.
@@ -81,6 +88,24 @@ export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorRep
 	}
 	const a = await timed('artist-twins', () => artistTwins(deps.db, { by: 'worker', recentDays: TWINS_WINDOW_DAYS, mergeLimit: 50, proposeLimit: 5, agent: deps.agent ?? false }));
 	report.artists = a.merged.reduce((n, m) => n + m.folds.length, 0) + a.proposed.filter((x) => x.item !== null).length;
+	// Two stores' copies of one track on one slot of a release whose tracks
+	// arrived lately (release-fill.ts dedupeRelease): merged outright, like
+	// artist twins — the rule is the slot rule ingestion applies, run again
+	// over what reached a release through two stores' own representations.
+	const s = await timed('slots', () => dedupeTracks(deps.db, { sharedSlots: { sinceDays: SLOTS_WINDOW_DAYS } }, { by: 'worker' }));
+	report.slots = s.merged.length;
+	if (s.merged.length) {
+		await withSystemTx(deps.db, (tx) =>
+			raise(tx, {
+				kind: 'release.dedupe',
+				severity: 'audit',
+				title: `Merged ${s.merged.length} track(s) held twice on one slot across ${new Set(s.merged.map((m) => m.releaseId)).size} release(s)`,
+				subjects: [...new Set(s.merged.map((m) => m.releaseId))].slice(0, 50),
+				evidence: { merged: s.merged.slice(0, 50) },
+				actor: 'worker',
+			}),
+		);
+	}
 	const p = await timed('pages', () => detectPages(deps.db));
 	report.pages = p.pages;
 	report.trackers = p.trackers;
@@ -161,6 +186,11 @@ const view = (r: TwinRelease) => ({ id: r.id, title: r.title, artists: r.artists
 // A later hook: artist-twins' split path (one store, two ids, one name) is the
 // same shape and could run these numbers on both ids.
 export const BUCKET_MIN = { releases: 12, labels: 6, sharedRatio: 0.25, others: 5, labelsElsewhere: 2, labelRatio: 0.2 };
+// A store holding two ids on one artist is its word that these are two people
+// (2026-11-09: ELIF held Deezer's pop singer and Deezer's own namesake bucket
+// beside her Spotify page, and the one-id rule never looked); each such id is
+// asked about over a lower floor.
+export const BUCKET_MIN_SIBLING = { releases: 3, labels: 2, others: 2, labelsElsewhere: 1 };
 const BUCKETS_PER_PASS = 20;
 const BUCKETS_EVERY_MS = 6 * 3600_000;
 // The window covers the gap between two bucket passes, with room to spare.
@@ -169,7 +199,8 @@ const bucketsDue = new WeakMap<Db, number>();
 
 // labelsShared: of this store's labels, how many the artist's other stores also
 // put it out on; labelsElsewhere: the labels of what other stores hold.
-export type BucketStats = { releases: number; labels: number; yearSpan: number; shared: number; others: number; labelsShared: number; labelsElsewhere: number };
+// siblings: how many ids of this store the artist holds, this one included.
+export type BucketStats = { releases: number; labels: number; yearSpan: number; shared: number; others: number; labelsShared: number; labelsElsewhere: number; siblings: number };
 export type BucketCandidate = { artist: string; provider: string; providerId: string; stats: BucketStats; suspect: boolean };
 
 // The rule that picks who to ask. Releases, labels and years alone describe a
@@ -180,8 +211,9 @@ export type BucketCandidate = { artist: string; provider: string; providerId: st
 // store whose releases the other stores do not hold, on labels they never
 // show the artist on.
 export function bucketSuspect(n: BucketStats): boolean {
-	if (n.releases < BUCKET_MIN.releases || n.labels < BUCKET_MIN.labels) return false;
-	if (n.others < BUCKET_MIN.others || n.labelsElsewhere < BUCKET_MIN.labelsElsewhere) return false;
+	const min = n.siblings > 1 ? { ...BUCKET_MIN, ...BUCKET_MIN_SIBLING } : BUCKET_MIN;
+	if (n.releases < min.releases || n.labels < min.labels) return false;
+	if (n.others < min.others || n.labelsElsewhere < min.labelsElsewhere) return false;
 	return n.shared / n.releases <= BUCKET_MIN.sharedRatio && n.labelsShared / n.labels <= BUCKET_MIN.labelRatio;
 }
 
@@ -194,7 +226,11 @@ export async function bucketCandidates(tx: Queryable, opts: { days?: number } = 
 	// the 1-day pass query ran for 10+ minutes holding PGlite (2026-11-03)
 	// while the 30-day one, planned with hashes, took under a minute.
 	await tx.query(`set local enable_nestloop = off`);
-	const rows = await tx.query<{ artist: string; provider: string; provider_id: string; releases: unknown; labels: unknown; year_span: unknown; shared: unknown; others: unknown; labels_shared: unknown; labels_elsewhere: unknown }>(
+	const rows = await tx.query<{ artist: string; provider: string; provider_id: string; siblings: unknown; releases: unknown; labels: unknown; year_span: unknown; shared: unknown; others: unknown; labels_shared: unknown; labels_elsewhere: unknown }>(
+		// Counts are per store, not per store id: an artist-release edge's evidence
+		// names the store's release page, never the artist page it was reached
+		// from, so two ids of one store share one set of numbers — each is asked
+		// about (siblings > 1), and the reasoner reads the pages.
 		// Linear by construction (2026-11-03: the first shape counted shared and
 		// other-store releases with a correlated rescan per row and held PGlite
 		// for minutes on a 30-day sweep): the artists touched lately, their
@@ -205,11 +241,11 @@ export async function bucketCandidates(tx: Queryable, opts: { days?: number } = 
 			join curator.catalog_edge e on e.dst = r.id and e.kind = 'artist-release'
 			where r.kind = 'release' and r.merged_into is null and r.discovered_at > now() - make_interval(days => $1::int)
 		), recent as (
-			select s.object_id as artist, s.provider, min(s.provider_id) as provider_id
+			select s.object_id as artist, s.provider, s.provider_id,
+				count(*) over (partition by s.object_id, s.provider) as siblings
 			from touched t
 			join curator.catalog_object a on a.id = t.artist and a.merged_into is null and a.name_fold <> all($4::text[])
 			join curator.catalog_source_object s on s.object_id = t.artist and s.kind = 'artist' and not ${WEAK_SQL}
-			group by s.object_id, s.provider having count(*) = 1
 		), fresh as (
 			select r.* from recent r
 			where not exists (select 1 from curator.catalog_source_block b where b.provider = r.provider and b.kind = 'artist' and b.provider_id = r.provider_id)
@@ -231,18 +267,20 @@ export async function bucketCandidates(tx: Queryable, opts: { days?: number } = 
 			select r.artist, r.rel, array_agg(distinct r.provider) as providers
 			from rel r join curator.catalog_object o on o.id = r.rel and o.merged_into is null
 			group by r.artist, r.rel
+		), stores as (
+			select distinct artist, provider from fresh
 		), counts as (
-			select f.artist, f.provider, f.provider_id,
+			select f.artist, f.provider,
 				count(*) filter (where f.provider = any(rp.providers)) as releases,
 				count(*) filter (where f.provider = any(rp.providers) and cardinality(array_remove(array_remove(rp.providers, f.provider), 'user')) > 0) as shared,
 				count(*) filter (where not f.provider = any(rp.providers) and cardinality(array_remove(rp.providers, 'user')) > 0) as others
-			from fresh f join rp on rp.artist = f.artist
-			group by f.artist, f.provider, f.provider_id
+			from stores f join rp on rp.artist = f.artist
+			group by f.artist, f.provider
 		), spread as (
 			select f.artist, f.provider,
 				count(distinct coalesce(rl.dst::text, nullif(o.label_text, ''))) as labels,
 				coalesce(max(extract(year from o.release_at)) - min(extract(year from o.release_at)), 0) as year_span
-			from fresh f
+			from stores f
 			join rp on rp.artist = f.artist and f.provider = any(rp.providers)
 			join curator.catalog_object o on o.id = rp.rel
 			left join curator.catalog_edge rl on rl.src = rp.rel and rl.kind = 'release-label'
@@ -251,7 +289,7 @@ export async function bucketCandidates(tx: Queryable, opts: { days?: number } = 
 			select f.artist, f.provider, coalesce(rl.dst::text, nullif(o.label_text, '')) as label,
 				bool_or(f.provider = any(rp.providers)) as here,
 				bool_or(cardinality(array_remove(array_remove(rp.providers, f.provider), 'user')) > 0) as elsewhere
-			from fresh f
+			from stores f
 			join rp on rp.artist = f.artist
 			join curator.catalog_object o on o.id = rp.rel
 			left join curator.catalog_edge rl on rl.src = rp.rel and rl.kind = 'release-label'
@@ -261,15 +299,17 @@ export async function bucketCandidates(tx: Queryable, opts: { days?: number } = 
 			select artist, provider, count(*) filter (where here and elsewhere) as labels_shared, count(*) filter (where elsewhere) as labels_elsewhere
 			from lab group by artist, provider
 		)
-		select c.artist, c.provider, c.provider_id, c.releases, s.labels, s.year_span, c.shared, c.others,
+		select f.artist, f.provider, f.provider_id, f.siblings, c.releases, s.labels, s.year_span, c.shared, c.others,
 			coalesce(l.labels_shared, 0) as labels_shared, coalesce(l.labels_elsewhere, 0) as labels_elsewhere
-		from counts c join spread s on s.artist = c.artist and s.provider = c.provider
-		left join labs l on l.artist = c.artist and l.provider = c.provider
-		where c.releases >= $2::int and s.labels >= $3::int`,
-		[String(opts.days ?? TWINS_WINDOW_DAYS), String(BUCKET_MIN.releases), String(BUCKET_MIN.labels), `{${[...PLACEHOLDER].map((n) => `"${n}"`).join(',')}}`],
+		from fresh f
+		join counts c on c.artist = f.artist and c.provider = f.provider
+		join spread s on s.artist = f.artist and s.provider = f.provider
+		left join labs l on l.artist = f.artist and l.provider = f.provider
+		where (c.releases >= $2::int and s.labels >= $3::int) or (f.siblings > 1 and c.releases >= $5::int and s.labels >= $6::int)`,
+		[String(opts.days ?? TWINS_WINDOW_DAYS), String(BUCKET_MIN.releases), String(BUCKET_MIN.labels), `{${[...PLACEHOLDER].map((n) => `"${n}"`).join(',')}}`, String(BUCKET_MIN_SIBLING.releases), String(BUCKET_MIN_SIBLING.labels)],
 	);
 	return rows.map((r) => {
-		const stats = { releases: num(r.releases), labels: num(r.labels), yearSpan: num(r.year_span), shared: num(r.shared), others: num(r.others), labelsShared: num(r.labels_shared), labelsElsewhere: num(r.labels_elsewhere) };
+		const stats = { releases: num(r.releases), labels: num(r.labels), yearSpan: num(r.year_span), shared: num(r.shared), others: num(r.others), labelsShared: num(r.labels_shared), labelsElsewhere: num(r.labels_elsewhere), siblings: num(r.siblings) };
 		return { artist: r.artist, provider: r.provider, providerId: r.provider_id, stats, suspect: bucketSuspect(stats) };
 	});
 }

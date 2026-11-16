@@ -75,6 +75,12 @@ import {
 	type CatalogWorkerDueResult,
 	type CatalogWorkerReportInput,
 	type CatalogWorkerReportResult,
+	type CatalogConnectAnswerInput,
+	type CatalogConnectAnswerResult,
+	type CatalogConnectQueueInput,
+	type CatalogConnectQueueResult,
+	type CatalogConnectSearchInput,
+	type CatalogConnectSearchResult,
 	type CatalogRefreshInput,
 	type CatalogRefreshResult,
 	type CatalogResolveInput,
@@ -146,6 +152,10 @@ const PROCS = {
 	// Mutations: the providers and pauses ride in the body.
 	catalogWorkerDue: { path: 'catalog.workerDue', type: 'mutation' },
 	catalogWorkerReport: { path: 'catalog.workerReport', type: 'mutation' },
+	// 'catalog_connect'.
+	catalogConnectQueue: { path: 'catalog.connectQueue', type: 'mutation' },
+	catalogConnectAnswer: { path: 'catalog.connectAnswer', type: 'mutation' },
+	catalogConnectSearch: { path: 'catalog.connectSearch', type: 'mutation' },
 	feedEvents: { path: 'feed.events', type: 'query' },
 	feedRecent: { path: 'feed.recent', type: 'query' },
 } as const;
@@ -419,6 +429,9 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			enrich: (input: CatalogEnrichInput) => call<CatalogEnrichResult>(PROCS.catalogEnrich, input),
 			workerDue: (input: CatalogWorkerDueInput) => call<CatalogWorkerDueResult>(PROCS.catalogWorkerDue, input),
 			workerReport: (input: CatalogWorkerReportInput) => call<CatalogWorkerReportResult>(PROCS.catalogWorkerReport, input),
+			connectQueue: (input: CatalogConnectQueueInput) => call<CatalogConnectQueueResult>(PROCS.catalogConnectQueue, input),
+			connectAnswer: (input: CatalogConnectAnswerInput) => call<CatalogConnectAnswerResult>(PROCS.catalogConnectAnswer, input),
+			connectSearch: (input: CatalogConnectSearchInput) => call<CatalogConnectSearchResult>(PROCS.catalogConnectSearch, input),
 		},
 		feed: {
 			events: (input: FeedEventsInput) => call<FeedEventsResult>(PROCS.feedEvents, input),

@@ -22,7 +22,7 @@
 // table is consulted where two objects are compared (merges, src/catalog/admin).
 
 import type { CatalogClaim, CatalogIdNamespace, CatalogKind } from '@curator/protocol';
-import { normalizeIsrc, creditsShareAct } from '@curator/library-logic';
+import { nameFold, normalizeIsrc, creditsShareAct } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { num } from '../db/db.js';
 
@@ -149,8 +149,9 @@ export async function releaseByTitle(tx: Queryable, nameFold: string, artistName
 
 // The release or recording a claim arrives with; a recording's claim within
 // a release also names that release, which is not yet linked to it while
-// its credits resolve.
-export type ClaimParent = { id: string; kind: CatalogKind; release?: string };
+// its credits resolve. A track's claim also carries its slot and the
+// release's credited names (folded), for the slot rule (slots.ts).
+export type ClaimParent = { id: string; kind: CatalogKind; release?: string; position?: number | null; artistFolds?: readonly string[] };
 
 // A namesake already credited on the release or recording the claim arrives
 // with: the only way an artist or label is matched without an id.
@@ -207,3 +208,9 @@ export async function corroborated(tx: Queryable, kind: 'artist' | 'label', name
 	const rows = await tx.query<{ id: string }>(sql, [nameFold, parent.id]);
 	return rows.length === 1 ? rows[0]!.id : null;
 }
+
+// A store's namesake tag — "Elif (tr)", "ELIF (TR)", "Ben (UK)" on Deezer,
+// Tidal and Beatport — set aside for comparison: it says the store knows a
+// namesake, not that this is another name (2026-11-09: the techno producer's
+// own Deezer and Tidal pages were "Elif (tr)" and never paired with "ELIF").
+export const storeTagless = (name: string): string => nameFold(name.replace(/\s*\([A-Za-z]{2,3}\)\s*$/, ''));

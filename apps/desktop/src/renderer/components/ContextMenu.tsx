@@ -30,6 +30,10 @@ const slog = log.for('context-menu');
 export type ContextMenuItem =
 	| { kind: 'header'; label: string }
 	| { kind: 'divider' }
+	// Entries that arrive after the menu opened (a read the menu must not wait
+	// for): nothing until `load` answers, then its items in this place, their
+	// handlers joining the menu's. A failed load stays nothing.
+	| { kind: 'late'; load: () => Promise<{ items: ContextMenuItem[]; handlers: ContextMenuHandlers }> }
 	| {
 		kind: 'item';
 		id: string;
@@ -243,6 +247,15 @@ export function openContextMenu(
 		}
 		if (item.kind === 'divider') {
 			return <div class="ctx-menu__divider"></div>;
+		}
+		if (item.kind === 'late') {
+			const [got, setGot] = createSignal<ContextMenuItem[]>([]);
+			void item.load().then((r) => {
+				if (isDismissed) return;
+				Object.assign(handlers, r.handlers);
+				setGot(r.items);
+			}).catch(() => { /* stays empty */ });
+			return <For each={got()}>{(child) => renderItem(child)}</For>;
 		}
 		if (item.kind === 'radio') {
 			return (

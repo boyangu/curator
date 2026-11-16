@@ -22,6 +22,15 @@ export function playableId(item: FeedItem, track?: FeedTrackRef): string | null 
 	return spotifyHandle(item.payload.handles) ?? (item.source === 'spotify' ? item.sourceId : null);
 }
 
+// Whether the core's lazy Spotify match has something to do for this item
+// (core feed/spotify-match.ts needsMatch decides for real, by time): a card
+// without a Spotify id, or a Spotify album with a row the player cannot play.
+export function needsSpotifyFill(item: FeedItem): boolean {
+	if (item.matchStatus === 'ok') return false;
+	if (item.source === 'catalog') return true;
+	return item.source === 'spotify' && item.type === 'album' && (item.payload.tracks ?? []).some((t) => playableId(item, t) === null);
+}
+
 // A card can start playback: a track it can play, or an album with at least
 // one such track (or a legacy Spotify album whose tracklist loads lazily).
 export function cardPlayable(item: FeedItem): boolean {

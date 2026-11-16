@@ -9,7 +9,8 @@ import { createServer } from 'node:http';
 import { createFetchHandler } from './app.js';
 import { AuditWriter, PRUNE_EVERY_MS, pruneRequestLog } from './audit.js';
 import { createTokenVerifier, remoteKeys } from './auth/jwt.js';
-import { loadConfig } from './config.js';
+import { SoundCloudTracker } from '@curator/catalog-readers';
+import { loadConfig, soundcloudCredentials } from './config.js';
 import { createPostgresDb } from './db/db.js';
 import { migrationGate } from './db/migration-gate.js';
 import { toNodeListener } from './http.js';
@@ -32,6 +33,9 @@ const COMPACT_FIRST_MS = 10 * 60 * 1000;
 
 const log = createLogger();
 const config = loadConfig();
+// The same SoundCloud app the worker reads labels with, here for the profiles
+// a user picks from in "Help us connect the dots" (optional).
+const soundcloud = soundcloudCredentials(process.env);
 const db = createPostgresDb(config.databaseUrl);
 
 // Exit non-zero rather than serve against an old schema: the new machine
@@ -63,6 +67,7 @@ const handler = createFetchHandler({
 		? { clientId: config.spotify.clientId, crypto: new TokenCrypto(config.spotify.keys), fetch: (url, init) => fetch(url, init), timeoutMs: SPOTIFY_TIMEOUT_MS }
 		: null,
 	catalog: config.catalog,
+	connectSoundcloud: soundcloud ? new SoundCloudTracker(soundcloud) : null,
 });
 log.info('global_catalog', { enabled: config.catalog });
 log.info('device_reads', { requireDeviceId: config.requireDeviceId });

@@ -22,12 +22,13 @@
 //   pnpm --filter @curator/cloud catalog release stubs [--label <q> | --artist <q>] [--limit 50]
 //   pnpm --filter @curator/cloud catalog release fill <release id…> | --label <q> | --artist <q> [--limit 20] [--dry]
 //   pnpm --filter @curator/cloud catalog release link <release id> <store release url>
-//   pnpm --filter @curator/cloud catalog release dedupe <release id…> | --label <q> | --artist <q> [--dry]
+//   pnpm --filter @curator/cloud catalog release dedupe <release id…> | --label <q> | --artist <q> | --shared-slots [--since-days N] [--dry]   (two recordings on one slot → one)
 //   pnpm --filter @curator/cloud catalog library import --file claims.json [--dry]   (a library's labels + releases; fills queued)
 //   pnpm --filter @curator/cloud catalog repair previews [--label <q>] [--dry]   (SoundCloud 0:30 preview copies → their store recordings)
 //   pnpm --filter @curator/cloud catalog repair credits [--dry]   (artists the SoundCloud/Bandcamp splitter cut out of a credit → the artists they were cut from)
 //   pnpm --filter @curator/cloud catalog repair artist-twins [--dry] [--all] [--merge-only]   (same-name artists on one release merged; one store holding both under two ids → an artist.twins inbox item)
 //   pnpm --filter @curator/cloud catalog artist merge <from id> <into id> --note "…" [--approved]   (held for the operator unless approved)
+//   pnpm --filter @curator/cloud catalog artist unlink <artist id> <provider:id> --note "…" [--as namesake|bucket] [--approved]   (a namesake's own page split off with its releases; a store's bucket of namesakes blocked)
 //   pnpm --filter @curator/cloud catalog release merge <from id> <into id> --note "…" [--approved]   (two copies of one release the twins detector did not pair; held unless approved)
 //   pnpm --filter @curator/cloud catalog artist recredit <artist id> <release id> <to artist id> --note "…" --approved   (an artist's credits on one release given to another)
 //   pnpm --filter @curator/cloud catalog agent cases [--status queued|decided|applied|proposed|failed|moot|live] [--kind …] [--limit 50]   (the reasoner's queue and log)
@@ -80,7 +81,7 @@ const arg = (name: string): string | undefined => {
 };
 const flag = (name: string): boolean => argv.includes(name);
 // Positional words: everything that is not a flag or a flag's value.
-const words = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1]!.startsWith('--') && !['--json', '--evidence', '--decided', '--watched', '--gaps', '--dry', '--related', '--approved', '--all', '--retired', '--merge-only'].includes(argv[i - 1]!)));
+const words = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1]!.startsWith('--') && !['--json', '--evidence', '--decided', '--watched', '--gaps', '--dry', '--related', '--approved', '--all', '--retired', '--merge-only', '--shared-slots'].includes(argv[i - 1]!)));
 
 async function ops(): Promise<AdminOps> {
 	const url = process.env.DATABASE_URL?.trim();
@@ -143,6 +144,7 @@ async function ops(): Promise<AdminOps> {
 		repairCredits: (a) => call('repairCredits', a),
 		repairArtistTwins: (a) => call('repairArtistTwins', a),
 		artistMerge: (a) => call('artistMerge', a),
+		artistUnlink: (a) => call('artistUnlink', a),
 		releaseMerge: (a) => call('releaseMerge', a),
 		artistRecredit: (a) => call('artistRecredit', a),
 		libraryImport: (a) => call('libraryImport', a),
@@ -414,7 +416,9 @@ try {
 		}
 	} else if (group === 'release' && sub === 'dedupe') {
 		const ids = rest.filter((w) => /^[0-9a-f-]{36}$/i.test(w));
-		const r = await api.releaseDedupe({ ids, label: arg('--label'), artist: arg('--artist'), dry: flag('--dry'), by: arg('--by') ?? 'claude-code' });
+		const since = arg('--since-days');
+		const sharedSlots = flag('--shared-slots') ? { sinceDays: since === undefined ? undefined : Number(since) } : undefined;
+		const r = await api.releaseDedupe({ ids, label: arg('--label'), artist: arg('--artist'), sharedSlots, dry: flag('--dry'), by: arg('--by') ?? 'claude-code' });
 		if (json) console.log(JSON.stringify(r, null, 2));
 		else {
 			console.log(`${r.dry ? '[dry run, nothing written] ' : ''}${r.merged.length} duplicate track(s) merged across ${r.releases} release(s)`);
@@ -439,6 +443,14 @@ try {
 		if (!Number.isInteger(id)) throw new Error('insight retire <insight id> [--note "…"]');
 		const i = await api.insightRetire({ id, by: arg('--by') ?? 'claude-code', note: arg('--note') ?? null });
 		console.log(`insight #${i.id} retired`);
+	} else if (group === 'artist' && sub === 'unlink') {
+		if (rest.length !== 2) throw new Error('artist unlink <artist id> <provider:id> --note "whose page it is" [--approved]');
+		const as = arg('--as') ?? 'namesake';
+		if (as !== 'namesake' && as !== 'bucket') throw new Error('--as takes namesake (their own page, split off with its releases) or bucket (a store page of several acts, blocked)');
+		const r = await api.artistUnlink({ id: rest[0]!, source: rest[1]!, by: arg('--by') ?? 'claude-code', note: arg('--note') ?? '', approved: flag('--approved'), as });
+		if (r.held !== null) console.log(`${r.provider}:${r.providerId} «${r.name}» lists ${r.releases} release(s) the catalogue holds — held for approval: inbox #${r.held}`);
+		else if (r.result?.into) console.log(`split ${r.provider}:${r.providerId} «${r.name}» off as ${r.result.into} with ${r.result.recredited} credit(s) on ${r.releases} release(s)`);
+		else console.log(`blocked ${r.provider}:${r.providerId} — ${r.result?.uncredited ?? 0} credit(s) taken off, ${r.result?.kept ?? 0} release(s) another store or page holds kept`);
 	} else if (group === 'release' && sub === 'link') {
 		const r = await api.releaseLink({ id: rest[0] ?? '', url: rest[1] ?? '' });
 		console.log(r.conflict ? `${r.provider}:${r.id} already belongs to ${r.conflict}: duplicate review opened` : `linked ${r.provider}:${r.id}; run release fill ${rest[0]}`);
@@ -589,7 +601,7 @@ try {
 			}
 		}
 	} else {
-		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe|merge | artist merge|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass | tracking [check]   (see the header of src/cli/catalog.ts)');
+		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe|merge | artist merge|unlink|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass | tracking [check]   (see the header of src/cli/catalog.ts)');
 	}
 } catch (e) {
 	log.error('catalog_cli_failed', { error: e instanceof Error ? e.message : String(e) });

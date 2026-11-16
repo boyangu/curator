@@ -12,8 +12,8 @@
 // pushes — so they stay on the preload's typed `window.api` surface. window.api
 // is allowed in this file (renderer/data/ is the boundary script's zone).
 
-import type { DownloadJob, QueueSummary, AutoAnalyzeSettings, RekordboxFlags, ClearableTrackField, RemovableTrackSource } from '@curator/core';
-import type { AlbumSummary, ArtistCreditFormat, ArtistLink, ArtistListOpts, ArtistMergeSuggestion, ArtistScope, ArtistSummary } from '@curator/shared';
+import type { DownloadJob, QueueSummary, AutoAnalyzeSettings, AnalyzerResourcesSettings, RekordboxFlags, ClearableTrackField, RemovableTrackSource } from '@curator/core';
+import type { AlbumSummary, ArtistCreditFormat, ArtistLink, ArtistListOpts, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, ArtistSummary } from '@curator/shared';
 import type { StreamingSource, SourceSyncSettings, PlayRecordUpsert } from '@curator/shared';
 import { trpc } from './trpc.js';
 
@@ -146,6 +146,7 @@ export const artistsApi = {
 	resolve: (name: string): Promise<ArtistSummary | null> =>
 		trpc.artists.resolve.mutate([name]) as unknown as Promise<ArtistSummary | null>,
 	links: (id: string): Promise<ArtistLink[]> => trpc.artists.links.mutate([id]) as unknown as Promise<ArtistLink[]>,
+	pages: (target: ArtistPagesTarget): Promise<ArtistPages> => trpc.artists.pages.mutate([target]) as unknown as Promise<ArtistPages>,
 	mergeSuggestions: (scope?: ArtistScope): Promise<ArtistMergeSuggestion[]> => trpc.artists.mergeSuggestions.mutate([scope]) as unknown as Promise<ArtistMergeSuggestion[]>,
 	dismissMerge: (aId: string, bId: string): Promise<void> => trpc.artists.dismissMerge.mutate([aId, bId]) as unknown as Promise<void>,
 	rename: (id: string, newName: string): Promise<{ artist: ArtistSummary; tracksRewritten: number }> =>
@@ -239,6 +240,15 @@ export const catalogApi = {
 	followMany: (...args: Parameters<typeof window.api['catalog:follow-many']>) => api()['catalog:follow-many'](...args),
 };
 
+// Help us connect the dots — store pages for the catalogue's artists, labels
+// and albums (features/connectDots.ts).
+export const connectApi = {
+	status: () => api()['catalog:connect-status'](),
+	queue: (...args: Parameters<typeof window.api['catalog:connect-queue']>) => api()['catalog:connect-queue'](...args),
+	search: (...args: Parameters<typeof window.api['catalog:connect-search']>) => api()['catalog:connect-search'](...args),
+	answer: (...args: Parameters<typeof window.api['catalog:connect-answer']>) => api()['catalog:connect-answer'](...args),
+};
+
 export const kbApi = {
 	entity: (entityId: string) => api()['kb:entity'](entityId),
 	expand: (...args: Parameters<typeof window.api['kb:expand']>) => api()['kb:expand'](...args),
@@ -308,6 +318,9 @@ export const analysisApi = {
 	// Authoritative running/queued snapshot (queued = dispatchable-now, gated by
 	// the queue's auto-analyze floor). One-way query, stays on window.api.
 	status: () => api()['analysis:status'](),
+	// Worker-pool size + the sidecar's core count (Settings → Library).
+	resources: () => api()['analysis:resources'](),
+	setResources: (patch: Partial<AnalyzerResourcesSettings>) => api()['analysis:set-resources'](patch),
 };
 
 // AI audio analysis engine. Similarity for the tracklist rides tracks:page

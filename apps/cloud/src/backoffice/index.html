@@ -534,11 +534,19 @@ function evidenceHtml(it) {
 		const said = Array.isArray(e.verdicts) ? e.verdicts : null;
 		parts.push(`<table><thead><tr>${pick ? '<th title="Merge this pair">Merge</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th>${said ? '<th>Agent</th>' : ''}</tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><input type="checkbox" data-pair="${i}" ${said?.[i] === 'unsure' ? '' : 'checked'} aria-label="Merge pair ${i}"></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td>${said ? `<td class="l">${esc(said[i] ?? '')}</td>` : ''}</tr>`).join('')}</tbody></table>`);
 	}
+	// A user's "connect the dots" answer (catalog/connect.ts): what the cloud read on the page, and what the device said it read.
+	if (it.kind.startsWith('connect.')) {
+		const list = (l, v) => Array.isArray(v) && v.length ? parts.push(`<div><span class="l">${l}</span> ${esc(v.slice(0, 12).join(' | '))}</div>`) : 0;
+		list('shared with the catalogue', e.shared);
+		list('the page lists (read by the cloud)', e.cloudRead);
+		list('the page lists (the device says)', e.deviceRead);
+		if (e.cloudRead === null && !e.trusted) parts.push('<div class="l">the cloud could not read this page itself</div>');
+	}
 	if (it.kind === 'page.mismatch') parts.push(`<div><span class="l">only on this page (${fmtN(e.onlyHere)})</span> ${esc(e.sampleHere ?? '')}</div><div><span class="l">only elsewhere (${fmtN(e.onlyElsewhere)})</span> ${esc(e.sampleElsewhere ?? '')}</div>`);
 	if (it.kind === 'page.dead' || it.kind === 'tracker.failing') parts.push(`<div><span class="l">${esc(e.provider)}</span> failed ${fmtN(e.failCount)}× · last run ${e.lastRunAt ? fmtDate(e.lastRunAt) : '—'} · <span class="mono">${esc(e.lastError ?? '')}</span>${(e.handles ?? []).map((h) => h.url ? ` <a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.id)} ↗</a>` : ` ${esc(h.id)}`).join('')}</div>`);
 	if (e.url && !['page.dead', 'tracker.failing'].includes(it.kind)) parts.push(`<div><a href="${esc(e.url)}" target="_blank" rel="noopener">${esc(e.url)} ↗</a></div>`);
 	if (e.note) parts.push(`<div><span class="l">agent's note</span> ${esc(e.note)}</div>`);
-	const rest = Object.fromEntries(Object.entries(e).filter(([k, v]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'url', 'note', 'handles', 'sampleHere', 'sampleElsewhere', 'lastError', 'from', 'into', 'rationale', 'citations', 'confidence', 'model', 'costUsd', 'case', 'verdicts', 'on', 'page'].includes(k) && v !== null && typeof v !== 'object'));
+	const rest = Object.fromEntries(Object.entries(e).filter(([k, v]) => !['candidate', 'candidates', 'pairs', 'reviewEvidence', 'url', 'note', 'handles', 'sampleHere', 'sampleElsewhere', 'lastError', 'from', 'into', 'rationale', 'citations', 'confidence', 'model', 'costUsd', 'case', 'verdicts', 'on', 'page', 'userId'].includes(k) && v !== null && typeof v !== 'object'));
 	if (Object.keys(rest).length) parts.push(`<div class="l mono">${esc(Object.entries(rest).map(([k, v]) => `${k}: ${v}`).join(' · '))}</div>`);
 	return parts.length ? `<div class="ev">${parts.join('')}</div>` : '';
 }
@@ -553,6 +561,7 @@ function actionWords(it) {
 		if (mergesPairs(it)) return ['Merge ticked', 'None are twins'];
 		if (it.kind.startsWith('page.')) return ['Unlink', 'Keep the page'];
 		if (it.apply.op === 'blockSource') return ['Block the id', 'Keep the id'];
+		if (it.apply.op === 'connectAttach') return ['Connect the page', 'Not their page'];
 		if (it.apply.op === 'recredit') return ['Recredit', 'Leave as is'];
 		if (it.apply.op === 'decideReview') return ['Attach', 'Not the label’s'];
 		return ['Approve', 'Reject'];

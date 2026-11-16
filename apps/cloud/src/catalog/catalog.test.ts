@@ -161,6 +161,44 @@ describe('ingestion', () => {
 		expect(await count(db, `select count(*) as n from curator.catalog_object where kind = 'recording'`)).toBe(2);
 	});
 
+	it('joins a track to the one already in its slot of the release whatever the stores credit, but not another title', async () => {
+		const { db } = await createTestDb();
+		const upc = { upc: '0123456789012' };
+		// Spotify's single: no ISRC (its tracklists carry none), the feature
+		// credited — Marsh "Run Away" (2026-11-09).
+		const sp: CatalogClaim = {
+			...release('spotify', 'sr1', 'Run Away', [artist('spotify', 'sa1', 'Marsh')], upc),
+			recordings: [
+				{ provider: 'spotify', kind: 'recording', providerId: 'st1', name: 'Run Away', facts: { durationSec: 267.2, trackNumber: 1 }, artists: [artist('spotify', 'sa1', 'Marsh'), artist('spotify', 'sa2', 'ALLKNIGHT')] },
+				{ provider: 'spotify', kind: 'recording', providerId: 'st2', name: 'Run Away (Dub)', facts: { durationSec: 267.2, trackNumber: 2 } },
+			],
+		};
+		// Deezer's: the ISRC, the main artist only, a different title in slot 2
+		// at the same length (a compilation's other disc).
+		const dz: CatalogClaim = {
+			...release('deezer', 'dr1', 'Run Away', [artist('deezer', 'da1', 'Marsh')], upc),
+			recordings: [
+				{ provider: 'deezer', kind: 'recording', providerId: 'dt1', name: 'Run Away', identifiers: [{ namespace: 'isrc', value: 'QMDA62691879' }], facts: { durationSec: 267, trackNumber: 1 } },
+				{ provider: 'deezer', kind: 'recording', providerId: 'dt2', name: 'Soma', facts: { durationSec: 267, trackNumber: 2 } },
+			],
+		};
+		await withSystemTx(db, (tx) => ingestClaims(tx, [sp], { reason: 'tracker' }));
+		await withSystemTx(db, (tx) => ingestClaims(tx, [dz], { reason: 'tracker' }));
+		const tracks = await db.query<{ name: string; reps: string; isrc: string | null; credits: string | null }>(
+			`select o.name,
+				(select string_agg(so.provider || ':' || so.provider_id, ',' order by so.provider) from curator.catalog_source_object so where so.object_id = o.id) as reps,
+				(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc') as isrc,
+				(select string_agg(a.name, ',' order by a.name) from curator.catalog_edge ra join curator.catalog_object a on a.id = ra.dst where ra.src = o.id and ra.kind = 'recording-artist') as credits
+			from curator.catalog_object o where o.kind = 'recording' and o.merged_into is null order by o.name`,
+		);
+		expect(tracks).toEqual([
+			{ name: 'Run Away', reps: 'deezer:dt1,spotify:st1', isrc: 'QMDA62691879', credits: 'ALLKNIGHT,Marsh' },
+			{ name: 'Run Away (Dub)', reps: 'spotify:st2', isrc: null, credits: 'Marsh' },
+			{ name: 'Soma', reps: 'deezer:dt2', isrc: null, credits: 'Marsh' },
+		]);
+		expect(await count(db, `select count(*) as n from curator.catalog_edge where kind = 'release-recording'`)).toBe(3);
+	});
+
 	it('keeps the first value of a static fact; a later source only fills empty fields', async () => {
 		const { db } = await createTestDb();
 		const a = [artist('spotify', 'sa1', 'Northfold')];

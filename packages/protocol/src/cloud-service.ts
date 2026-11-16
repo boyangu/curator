@@ -42,6 +42,7 @@ import type {
 import type { Op, RejectReason } from './ops.js';
 import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, SpotifyGrantStatus, SpotifyTokenInput, SpotifyTokenResult } from './spotify-gateway.js';
 import type { CatalogWorkerDueInput, CatalogWorkerDueResult, CatalogWorkerReportInput, CatalogWorkerReportResult } from './catalog-service.js';
+import type { CatalogConnectAnswerInput, CatalogConnectAnswerResult, CatalogConnectQueueInput, CatalogConnectQueueResult, CatalogConnectSearchInput, CatalogConnectSearchResult } from './catalog-service.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -135,7 +136,11 @@ export type PushInput = {
 //     a desktop may read the catalogue's providers for its user's follows
 //     and report the polls, the cloud applying them as its own
 //     (catalog-service.ts, workers section). With 'global_catalog' only.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers'] as const;
+//   - 'catalog_connect': `catalog.connectQueue` / `catalog.connectAnswer`
+//     exist ("Help us connect the dots", catalog-service.ts): a user maps
+//     store pages onto the catalogue's artists, labels and albums. With
+//     'global_catalog' only; a desktop hides the feature without it.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -497,6 +502,10 @@ export interface CloudService {
 		// 'catalog_workers'.
 		workerDue(input: CatalogWorkerDueInput): Promise<CatalogWorkerDueResult>;
 		workerReport(input: CatalogWorkerReportInput): Promise<CatalogWorkerReportResult>;
+		// 'catalog_connect'.
+		connectQueue(input: CatalogConnectQueueInput): Promise<CatalogConnectQueueResult>;
+		connectAnswer(input: CatalogConnectAnswerInput): Promise<CatalogConnectAnswerResult>;
+		connectSearch(input: CatalogConnectSearchInput): Promise<CatalogConnectSearchResult>;
 	};
 	feed: {
 		events(input: FeedEventsInput): Promise<FeedEventsResult>;

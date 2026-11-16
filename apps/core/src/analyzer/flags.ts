@@ -90,6 +90,35 @@ export const DEFAULT_AUTO_ANALYZE_SETTINGS: AutoAnalyzeSettings = {
 	flags: { ...DEFAULT_AUTO_FLAGS },
 };
 
+// How much of the machine the analyzer may take. `workers` is the number
+// of analyses running at once — and, because every worker is pinned to one
+// thread, also the number of cores the analyzer can occupy — the CPU ceiling.
+// (The sidecar is also niced, but under WSL that only orders work inside the
+// VM, so on Windows this count is the one real lever.)
+// `cpuCount` is read-only context for the UI: the sidecar's view of the
+// machine (the WSL VM's allowance on Windows).
+export interface AnalyzerResources {
+	workers: number;
+	cpuCount: number;
+}
+
+// Persisted part of AnalyzerResources (app_setting 'analyzer.resources').
+export interface AnalyzerResourcesSettings {
+	workers: number;
+}
+
+// Matches the sidecar's own default: one worker per core minus one for the
+// master + the app's main process, capped at 4 so a fresh install stays
+// subtle on big machines.
+export function defaultAnalyzerWorkers(cpuCount: number): number {
+	return Math.max(1, Math.min(cpuCount - 1, 4));
+}
+
+export function clampAnalyzerWorkers(workers: number, cpuCount: number): number {
+	if (!Number.isFinite(workers)) return defaultAnalyzerWorkers(cpuCount);
+	return Math.max(1, Math.min(Math.floor(workers), Math.max(1, cpuCount)));
+}
+
 // Translate the user-facing flags into the AnalyzeOptions payload shipped to
 // the sidecar for one enqueue:
 //   • A checked basic aspect computes fresh and writes the Curator slot —

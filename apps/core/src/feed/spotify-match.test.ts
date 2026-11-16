@@ -37,7 +37,12 @@ const item = (over: Partial<FeedItem> = {}): FeedItem => ({
 describe('needsMatch / titleKey', () => {
 	it('tries a catalogue item once, a miss again after three days, an error after an hour', () => {
 		expect(needsMatch(item(), NOW)).toBe(true);
-		expect(needsMatch(item({ source: 'spotify' }), NOW)).toBe(false);
+		expect(needsMatch(item({ source: 'spotify', payload: { ...item().payload, tracks: [] } }), NOW)).toBe(false);
+		// A Spotify album whose rows are not all playable is matched too; one whose rows all are is not.
+		const spotifyAlbum = (tracks: FeedTrackRef[]) => item({ source: 'spotify', sourceId: 'al1', payload: { ...item().payload, tracks } });
+		expect(needsMatch(spotifyAlbum([ref('One', 300, { sourceTrackId: 's1' }), ref('Two', 300)]), NOW)).toBe(true);
+		expect(needsMatch(spotifyAlbum([ref('One', 300, { sourceTrackId: 's1' }), ref('Two', 300, { handles: [{ provider: 'spotify', id: 's2', url: null }] })]), NOW)).toBe(false);
+		expect(needsMatch({ ...spotifyAlbum([ref('Two', 300)]), matchStatus: 'none', matchedAt: NOW - 86400_000 }, NOW)).toBe(false);
 		expect(needsMatch(item({ matchStatus: 'ok', matchedAt: NOW }), NOW)).toBe(false);
 		expect(needsMatch(item({ matchStatus: 'none', matchedAt: NOW - 86400_000 }), NOW)).toBe(false);
 		expect(needsMatch(item({ matchStatus: 'none', matchedAt: NOW - 4 * 86400_000 }), NOW)).toBe(true);
@@ -87,6 +92,33 @@ describe('matchSpotify', () => {
 		};
 		return { deps, calls, upserts, marks };
 	}
+
+	it('a Spotify album’s unplayable rows are paired with the album’s own tracks, the missing one asked again later', async () => {
+		const f = fake({ albumTracks: { al1: [sp('s1', 'Short Term', 342), sp('s2', 'Machine Language', 329), sp('s3', 'The Vibe', 314)] } });
+		const it0 = item({
+			source: 'spotify',
+			sourceId: 'al1',
+			payload: {
+				...item().payload,
+				catalogId: 'rel-1',
+				handles: [{ provider: 'spotify', id: 'al1', url: null }],
+				tracks: [ref('Short Term', 342, { sourceTrackId: 's1', handles: [{ provider: 'spotify', id: 's1', url: null }] }), ref('Machine Language', 329, { bpm: 124 }), ref('The Vibe', 314), ref('The Vibe (Remcord Remix)', 440)],
+			},
+		});
+		const out = await matchSpotify(f.deps, it0);
+		expect(f.calls).toEqual(['activity:spotify', 'tracks:al1', 'activity:null']);
+		// Three of four rows play; the remix is not on the Spotify album, so the item is asked again in days.
+		expect(f.marks).toEqual(['none']);
+		const d = f.upserts[0]!;
+		expect(d).toMatchObject({ source: 'spotify', sourceId: 'al1', dedupeKey: 'catalog:release:rel-1' });
+		expect(d.payload.tracks!.map((t) => [t.sourceTrackId, t.bpm ?? null, t.handles?.map((h) => h.id)])).toEqual([
+			['s1', null, ['s1']],
+			['s2', 124, ['s2']],
+			['s3', null, ['s3']],
+			['cat-The Vibe (Remcord Remix)', null, undefined],
+		]);
+		expect(out.source).toBe('spotify');
+	});
 
 	it('finds the album by a track’s ISRC, confirms the tracklist, and upgrades the row with every track’s Spotify id', async () => {
 		const t: SpotifyTrack = { id: 's1', name: 'Glass Rivers', duration_ms: 401_000, explicit: false, external_ids: { isrc: 'GBAAA2600001' }, artists: [{ id: 'a', name: 'Northfold' }], album: { id: 'al1', name: 'Glass Rivers', release_date: '2026-11-06', images: [] } };

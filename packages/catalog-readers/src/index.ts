@@ -20,8 +20,9 @@ export { DeezerTracker } from './deezer.js';
 export { BeatportTracker } from './beatport.js';
 export { BEATPORT, BROWSER_USER_AGENT, dateOf as beatportDateOf, fetchNextData, imageUrl as beatportImageUrl, isChallenge, publishedMs as beatportPublishedMs, queryData } from './beatport-pages.js';
 export type { BpArtist, BpImage, BpLabel, BpPage, BpReleaseRef, BpTrack, NextData, NextQuery } from './beatport-pages.js';
+export { beatportPageReleases, searchBeatport, type BeatportHit, type BeatportSearchKind } from './beatport-search.js';
 export { BandcampTracker } from './bandcamp.js';
-export { SoundCloudTracker, type SoundCloudCredentials } from './soundcloud.js';
+export { SoundCloudTracker, type ScUser, type SoundCloudCredentials } from './soundcloud.js';
 export { YouTubeTracker } from './youtube.js';
 export {
 	fetchAlbumLabels,

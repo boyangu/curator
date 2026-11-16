@@ -45,9 +45,18 @@ export type SpotifyMatchDeps = {
 	now?: () => number;
 };
 
-// Whether a view of this item should try a match now.
-export function needsMatch(item: Pick<FeedItem, 'source' | 'matchStatus' | 'matchedAt'>, now = Date.now()): boolean {
-	if (item.source !== 'catalog') return false;
+// An album row the player cannot play: a catalogue recording with no Spotify
+// id (feed/handles.ts — its sourceTrackId is its catalogue id).
+const unplayable = (r: FeedTrackRef): boolean => !!r.catalogId && r.sourceTrackId === r.catalogId && !r.handles?.some((h) => h.provider === 'spotify');
+
+// Whether a view of this item should try a match now: a card without a
+// Spotify id, or a Spotify album whose rows are not all playable (the
+// catalogue knew the album from one track's lookup and the other tracks are
+// still queued for theirs — 2026-11-09, Rummel "Machine Language").
+export function needsMatch(item: Pick<FeedItem, 'source' | 'matchStatus' | 'matchedAt'> & Partial<Pick<FeedItem, 'type' | 'payload'>>, now = Date.now()): boolean {
+	if (item.source === 'spotify') {
+		if (item.type !== 'album' || !(item.payload?.tracks ?? []).some(unplayable)) return false;
+	} else if (item.source !== 'catalog') return false;
 	if (item.matchStatus === null || item.matchStatus === 'ok') return item.matchStatus === null;
 	return (item.matchedAt ?? 0) + MATCH_RETRY_MS[item.matchStatus] <= now;
 }
@@ -181,6 +190,38 @@ async function findAlbum(client: SpotifyMatchClient, item: FeedItem): Promise<{ 
 	return null;
 }
 
+// A Spotify album's rows that cannot play, paired with the album's own
+// tracks: by title and length among the tracks no playable row holds, else
+// by position when the lists are the same length. `complete` when every
+// such row found its track; a miss (a remix the Spotify album lacks) is
+// asked again days later.
+export async function fillAlbumTracks(client: SpotifyMatchClient, item: FeedItem): Promise<{ album: { id: string }; pairs: Map<FeedTrackRef, SpotifySimplifiedTrack>; complete: boolean }> {
+	const albumId = item.payload.handles?.find((h) => h.provider === 'spotify')?.id ?? item.sourceId;
+	const ours = item.payload.tracks ?? [];
+	const missing = ours.filter(unplayable);
+	const theirs = await client.getAlbumTracks(albumId);
+	const taken = new Set(ours.filter((r) => !unplayable(r)).flatMap((r) => [r.sourceTrackId, ...(r.handles ?? []).filter((h) => h.provider === 'spotify').map((h) => h.id)]));
+	const pairs = new Map<FeedTrackRef, SpotifySimplifiedTrack>();
+	for (const r of missing) {
+		const key = titleKey(r.title);
+		const hit = theirs.find((t) => !taken.has(t.id) && titleKey(t.name) === key && closeSec(r.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC));
+		if (hit) {
+			pairs.set(r, hit);
+			taken.add(hit.id);
+		}
+	}
+	if (ours.length === theirs.length) {
+		for (const [i, r] of ours.entries()) {
+			const t = theirs[i]!;
+			if (unplayable(r) && !pairs.has(r) && !taken.has(t.id) && closeSec(r.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC)) {
+				pairs.set(r, t);
+				taken.add(t.id);
+			}
+		}
+	}
+	return { album: { id: albumId }, pairs, complete: pairs.size === missing.length };
+}
+
 async function findTrack(client: SpotifyMatchClient, item: FeedItem): Promise<SpotifyTrack | null> {
 	const p = item.payload;
 	if (p.isrc) {
@@ -202,6 +243,15 @@ export async function matchSpotify(deps: SpotifyMatchDeps, item: FeedItem): Prom
 	if (!client) return item;
 	deps.onActivity?.({ itemId: item.id, activity: 'spotify' });
 	try {
+		if (item.type === 'album' && item.source === 'spotify') {
+			const fill = await fillAlbumTracks(client, item);
+			if (fill.pairs.size) await deps.store.upsertItems([albumDraft(item, fill.album, fill.pairs)]);
+			const status: MatchStatus = fill.complete ? 'ok' : 'none';
+			await deps.store.markMatched(item.id, status);
+			if (fill.pairs.size) flog.info('feed album rows matched on Spotify', { itemId: item.id, rows: fill.pairs.size, complete: fill.complete });
+			const next = fill.pairs.size ? await deps.store.getItem(item.id) : null;
+			return next ?? { ...item, matchStatus: status, matchedAt: deps.now?.() ?? Date.now() };
+		}
 		const draft = item.type === 'album'
 			? await findAlbum(client, item).then((hit) => (hit ? albumDraft(item, hit.album, hit.pairs) : null))
 			: await findTrack(client, item).then((hit) => (hit ? trackDraft(item, hit) : null));

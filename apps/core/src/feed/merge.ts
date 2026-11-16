@@ -64,6 +64,47 @@ function mergeRef(have: FeedTrackRef, add: FeedTrackRef): boolean {
 	return changed;
 }
 
+// The fields a row's track keeps when the catalogue's card replaces the
+// tracklist: what this device found or chose for it.
+const REF_CARRY_FIELDS = [...REF_FILL_FIELDS, 'enrichStatus', 'sourceLinks'] as const satisfies readonly (keyof FeedTrackRef)[];
+
+// The draft is the catalogue's own card for the row's release: the same
+// catalogue id, and every track a catalogue recording.
+const catalogueCard = (current: FeedItemPayload, incoming: FeedItemPayload): boolean =>
+	!!incoming.catalogId && incoming.catalogId === current.catalogId && !!incoming.tracks?.length && incoming.tracks.every((t) => !!t.catalogId);
+
+// The row's track the card's track is, by the ids it carried: the catalogue
+// id, the ISRC, the source id, or a Spotify id the row played it by — a
+// recording merged away in the catalogue keeps its Spotify ids, which move
+// onto the survivor, so the row's enrichment finds its new home.
+function sameTrack(old: FeedTrackRef, next: FeedTrackRef): boolean {
+	if (old.catalogId && next.catalogId && old.catalogId === next.catalogId) return true;
+	if (old.isrc && next.isrc && old.isrc === next.isrc) return true;
+	if (old.sourceTrackId === next.sourceTrackId) return true;
+	const ids = new Set([next.sourceTrackId, ...(next.handles ?? []).map((h) => h.id)]);
+	return ids.has(old.sourceTrackId) || (old.handles ?? []).some((h) => ids.has(h.id));
+}
+
+// The catalogue's tracklist, in its order, each track carrying what the row's
+// matching track(s) had: the catalogue decides which recordings the release
+// holds (two stores' copies of one track merged into one, release-fill.ts
+// dedupeRelease), the device keeps what it found about them. A row track that
+// matches nothing is gone — that is the merge landing here.
+function replaceTracks(current: readonly FeedTrackRef[], incoming: readonly FeedTrackRef[]): FeedTrackRef[] {
+	return incoming.map((t) => {
+		const next: FeedTrackRef = { ...t };
+		for (const old of current) {
+			if (!sameTrack(old, t)) continue;
+			for (const f of REF_CARRY_FIELDS) {
+				if (empty(next[f]) && !empty(old[f])) (next as unknown as Record<string, unknown>)[f] = old[f];
+			}
+			next.handles = unionHandles(next.handles, old.handles);
+			if (!playable(next) && playable(old)) next.sourceTrackId = old.sourceTrackId;
+		}
+		return next;
+	});
+}
+
 // The row's payload with the draft's facts folded in, or null when nothing
 // changed. `upgrade`: the row moves from 'catalog' to a playable source with
 // this draft, so the draft's url (the Spotify page) replaces the store page.
@@ -89,6 +130,13 @@ export function mergeFeedPayload(current: FeedItemPayload, incoming: FeedItemPay
 		if (!current.tracks || current.tracks.length === 0) {
 			next.tracks = incoming.tracks.map((t) => ({ ...t }));
 			changed = true;
+		} else if (catalogueCard(current, incoming)) {
+			const tracks = replaceTracks(current.tracks, incoming.tracks);
+			if (JSON.stringify(tracks) !== JSON.stringify(current.tracks)) {
+				next.tracks = tracks;
+				if (incoming.trackCount !== undefined && incoming.trackCount !== null) next.trackCount = incoming.trackCount;
+				changed = true;
+			}
 		} else {
 			const refs = current.tracks.map((t) => ({ ...t }));
 			let refChanged = false;

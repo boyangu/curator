@@ -18,6 +18,7 @@
 
 import type { Playlist, Track } from '@curator/shared';
 import { artistNames } from '@curator/shared';
+import { artistOpenSubmenu } from './artistOpenMenu.js';
 import type { RemovableTrackSource } from '@curator/core';
 import type { ActiveView, JitPlaylist, SourceTab } from '../viewmodel/shell.js';
 import type { ContextMenusFeatureDeps } from './contextMenus.js';
@@ -548,6 +549,17 @@ const TRACK_COMMANDS: TrackCommand[] = [
 				},
 				handlers: Object.fromEntries(entries.map((d) => [d.id, d.activate])),
 			};
+		},
+	},
+	// navigate (cont.) — "Open Artist in ▸": the track's artists, each in the
+	// local collection or on a store (features/artistOpenMenu.ts).
+	{
+		id: 'open-artist-in', group: 'navigate',
+		isAvailable: (c) => single(c) && (c.tracks[0]!.artists ?? []).some((a) => !!a.name),
+		build: (c) => {
+			const t = c.tracks[0]!;
+			const targets = (t.artists ?? []).flatMap((a, i) => (a.name ? [{ name: a.name, artistId: t.artistIds?.[i] ?? null }] : []));
+			return artistOpenSubmenu(targets)!;
 		},
 	},
 	// sync ▸ ─────────────────────────────────────────────────────────────────────

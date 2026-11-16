@@ -6,7 +6,7 @@ export { AuthService, NOT_CONFIGURED, type AuthStatus, type AuthStatusEntry } fr
 export { SpotifySync, type SyncProgress, type ProgressFn } from './sync/spotify.js';
 export { LibraryScanner, normalizePath, isCloudSyncPath, type ScanProgress, type ScanProgressFn } from './local/scanner.js';
 export type { AnalysisJobEvent } from './analyzer/queue.js';
-export type { AnalysisFlags, AutoAnalyzeSettings } from './analyzer/flags.js';
+export type { AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings } from './analyzer/flags.js';
 export { DEFAULT_AUTO_ANALYZE_SETTINGS, DEFAULT_AUTO_FLAGS, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
 export type { ProgressEvent as AnalyzerProgressEvent, PartialEvent as AnalyzerPartialEvent, AnalyzeOptions, AdvancedFeature } from './analyzer/sidecar.js';
 export { ADVANCED_FEATURES } from './analyzer/sidecar.js';
@@ -33,6 +33,8 @@ export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/i
 export * from './feed/types.js';
 export type { CatalogClientStatus, CatalogEnrichReport, CatalogFollowManyReport, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit } from './catalog-client/service.js';
 export type { FollowCandidate, FollowCandidateKind } from './catalog-client/library-candidates.js';
+export type { ConnectSearch, ConnectSubject } from './catalog-client/connect.js';
+export type { CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectCandidate, CatalogConnectItem, CatalogConnectOutcome, CatalogConnectQueueResult, PageKind } from '@curator/protocol';
 export type { CatalogWorkerStatus } from './catalog-worker/service.js';
 export type { CatalogReadSources, CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 export type { CatalogObjectRef, TrackCatalogRefs } from './catalog-client/catalog-refs.js';

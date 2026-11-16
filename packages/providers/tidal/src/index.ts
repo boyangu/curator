@@ -370,6 +370,8 @@ function playlistFromResource(r: JsonApiResource): TidalPlaylist {
 	};
 }
 
+export interface TidalSearchHit { id: string; name: string; imageUrl: string | null; popularity: number | null; releaseDate: string | null }
+
 export class TidalApiClient {
 	constructor(
 		private readonly apiBase: string,
@@ -506,6 +508,35 @@ export class TidalApiClient {
 			// artists/albums aren't returned at this include level — the
 			// helper leaves them empty/null without linkage data.
 			out.push(trackFromResource(r));
+			if (out.length >= limit) break;
+		}
+		return out;
+	}
+
+	// Artists or albums matching a free-text query, through the same virtual
+	// search resource as searchTracks. Names and ids; a picture only when the
+	// resource carries its own image links (v2 files artwork as a relationship).
+	async searchCatalog(kind: 'artists' | 'albums', query: string, limit = 10): Promise<TidalSearchHit[]> {
+		const doc = await this.request<JsonApiDoc<JsonApiResource | JsonApiResource[]>>(
+			`searchResults/${encodeURIComponent(query)}/relationships/${kind}`,
+			{ include: kind }
+		).catch(() => null);
+		const out: TidalSearchHit[] = [];
+		const seen = new Set<string>();
+		for (const r of doc?.included ?? []) {
+			if (r.type !== kind || seen.has(r.id)) continue;
+			seen.add(r.id);
+			const a = (r.attributes ?? {}) as Record<string, unknown>;
+			const name = typeof a['name'] === 'string' ? a['name'] : typeof a['title'] === 'string' ? a['title'] : null;
+			if (!name) continue;
+			const links = Array.isArray(a['imageLinks']) ? (a['imageLinks'] as { href?: string }[]) : [];
+			out.push({
+				id: r.id,
+				name,
+				imageUrl: links.find((l) => typeof l.href === 'string')?.href ?? null,
+				popularity: typeof a['popularity'] === 'number' ? a['popularity'] : null,
+				releaseDate: typeof a['releaseDate'] === 'string' ? a['releaseDate'] : null,
+			});
 			if (out.length >= limit) break;
 		}
 		return out;

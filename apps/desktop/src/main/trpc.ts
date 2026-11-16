@@ -72,6 +72,7 @@ export function buildAppRouter(h: Handlers) {
 			get: proc('artists:get'),
 			resolve: proc('artists:resolve'),
 			links: proc('artists:links'),
+			pages: proc('artists:pages'),
 			mergeSuggestions: proc('artists:merge-suggestions'),
 			dismissMerge: proc('artists:dismiss-merge'),
 			rename: proc('artists:rename'),

@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest';
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
 import { adminOps } from './admin-ops.js';
+import { runInboxDetectors } from './inbox-detectors.js';
+import { listInbox } from './inbox.js';
 import { ingestClaims } from './ingest.js';
 import { releaseStubs } from './release-fill.js';
 import { spotifyReleaseClaim as releaseClaim, SpotifyTracker } from '@curator/catalog-readers';
@@ -198,13 +200,30 @@ describe('release fill', () => {
 		// A second disc's track 2 at the same length: another track, not a copy.
 		await extra('bc3', 'Breakwater');
 		const dry = await ops.releaseDedupe({ ids: [releaseId], dry: true });
-		expect(dry.merged).toEqual([{ release: 'Low Tide EP', from: 'Undertow (Featuring Northern Drift)', into: 'Undertow', title: 'Undertow' }]);
+		expect(dry.merged).toEqual([{ release: 'Low Tide EP', releaseId, from: 'Undertow (Featuring Northern Drift)', into: 'Undertow', title: 'Undertow' }]);
 		await ops.releaseDedupe({ ids: [releaseId] });
 		const left = await app.db.query<{ name: string }>(
 			`select o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst where e.src = $1 and e.kind = 'release-recording' and o.merged_into is null order by e.position, o.name`,
 			[releaseId],
 		);
 		expect(left.map((x) => x.name)).toEqual(['Low Tide', 'Low Tide (Radio Edit)', 'Breakwater', 'Undertow']);
+	});
+
+	it('the shared-slots scope finds the suspect releases on its own, and the worker’s pass merges them and logs it', async () => {
+		const { app, ops, releaseId } = await seeded();
+		await ops.releaseFill({ ids: [releaseId] });
+		// Deezer's copy of track 2 beside Spotify's (credits differ, no ISRC on
+		// Spotify's side), as a tracker read before the slot rule left it.
+		await withSystemTx(app.db, (tx) => ingestClaims(tx, [{ provider: 'bandcamp', kind: 'recording', providerId: 'bc2', name: 'Undertow', facts: { durationSec: 288 } }], { reason: 'enrichment' }));
+		const [o] = await app.db.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'bandcamp' and provider_id = 'bc2'`);
+		await app.db.query(`insert into curator.catalog_edge (src, kind, dst, position) values ($1, 'release-recording', $2, 2)`, [releaseId, o!.object_id]);
+		expect((await ops.releaseDedupe({ sharedSlots: {}, dry: true })).releases).toBe(1);
+		expect((await ops.releaseDedupe({ sharedSlots: { sinceDays: 0 }, dry: true })).releases).toBe(0);
+		const report = await runInboxDetectors({ db: app.db });
+		expect(report.slots).toBe(1);
+		const items = await withSystemTx(app.db, (tx) => listInbox(tx, { status: 'all', kind: 'release.dedupe', limit: 10 }));
+		expect(items.rows.map((i) => [i.severity, i.subjects])).toEqual([['audit', [releaseId]]]);
+		expect((await ops.releaseDedupe({ sharedSlots: {}, dry: true })).releases).toBe(0);
 	});
 
 	it('dedupe folds a SoundCloud preview clip into the store track of its slot, and nothing else', async () => {
@@ -220,7 +239,7 @@ describe('release fill', () => {
 		await clip('sc1', 'Low Tide ft. Ilka Rane [Northfold]', 1);
 		await clip('sc2', 'Sea Glass ft. Ilka Rane', 2);
 		const r = await ops.releaseDedupe({ ids: [releaseId] });
-		expect(r.merged).toEqual([{ release: 'Low Tide EP', from: 'Low Tide ft. Ilka Rane [Northfold]', into: 'Low Tide', title: 'Low Tide' }]);
+		expect(r.merged).toEqual([{ release: 'Low Tide EP', releaseId, from: 'Low Tide ft. Ilka Rane [Northfold]', into: 'Low Tide', title: 'Low Tide' }]);
 		const left = await app.db.query<{ name: string; duration_sec: unknown }>(
 			`select o.name, o.duration_sec from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst where e.src = $1 and e.kind = 'release-recording' and o.merged_into is null order by e.position, o.name`,
 			[releaseId],

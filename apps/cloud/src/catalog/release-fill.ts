@@ -21,19 +21,24 @@ import type { CatalogClaim } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
-import { withSystemTx } from '../db/system-tx.js';
+import { withSystemTx, type SystemTx } from '../db/system-tx.js';
 import { mergeObjects, openReview } from './admin.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { storeRef } from './agent-import.js';
+import { reannounceCard } from './events.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
+import { sameTrackTitle } from './slots.js';
 import { applyReleaseClaims, storeClaims, type StoreReaders } from './store-links.js';
 import type { BandcampTracker } from '@curator/catalog-readers';
 import type { BeatportTracker } from '@curator/catalog-readers';
 import type { DeezerTracker } from '@curator/catalog-readers';
 import { TrackerRateLimitedError } from '@curator/catalog-readers';
 import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
-export type ReleaseScope = { labelId?: string; artistId?: string; ids?: string[] };
+// `sharedSlots`: the releases holding two live recordings on one position —
+// the dedupe's suspects, found in one query instead of a scan of every
+// release; `sinceDays` keeps to releases whose tracklist changed lately.
+export type ReleaseScope = { labelId?: string; artistId?: string; ids?: string[]; sharedSlots?: { sinceDays?: number } };
 
 export type ReleaseStub = {
 	id: string;
@@ -82,6 +87,15 @@ function scopeSql(scope: ReleaseScope): { cond: string; params: string[] } {
 	if (scope.ids?.length) return { cond: 'r.id = any($1::uuid[])', params: [`{${scope.ids.join(',')}}`] };
 	if (scope.labelId) return { cond: `exists (select 1 from curator.catalog_edge e where e.kind = 'release-label' and e.src = r.id and e.dst = $1::uuid)`, params: [scope.labelId] };
 	if (scope.artistId) return { cond: `exists (select 1 from curator.catalog_edge e where e.kind = 'artist-release' and e.src = $1::uuid and e.dst = r.id)`, params: [scope.artistId] };
+	if (scope.sharedSlots) {
+		const since = scope.sharedSlots.sinceDays;
+		return {
+			cond: `exists (select 1 from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
+				where e.src = r.id and e.kind = 'release-recording'${since === undefined ? '' : ` and o.discovered_at > now() - make_interval(days => $1::int)`}
+				group by e.position having count(*) > 1)`,
+			params: since === undefined ? [] : [String(since)],
+		};
+	}
 	return { cond: 'true', params: [] };
 }
 
@@ -282,70 +296,70 @@ export async function fillReleases(db: Db, fetchers: FillFetchers, scope: Releas
 // (2026-10-31, Watergate "Tell Me More About You"). Same slot, SoundCloud its
 // only copy, no ISRC, shorter than the store track, and the same title once
 // credits and bracket tags are set aside: merged into the store track.
-export type DedupeReport = { dry: boolean; releases: number; merged: { release: string; from: string; into: string; title: string }[] };
+export type DedupeMerge = { release: string; releaseId: string; from: string; into: string; title: string };
+export type DedupeReport = { dry: boolean; releases: number; merged: DedupeMerge[] };
 
-// A title with its credits ("ft. JAW", "feat. …") and bracket tags ("[Heimlich
-// Musik]") set aside, and "Title - Mix" read as "Title (Mix)".
-export const coreTitle = (t: string): string =>
-	t.toLowerCase().normalize('NFKD').replace(/\[[^\]]*\]/g, ' ').replace(/\b(?:ft|feat|featuring)\.?\s+[^()[\]-]+/g, ' ').replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '');
-
-// One track's two titles: equal at their core, one holding the other ("Low
-// Tide" in "Low Tide (Radio Edit)"), or a typo apart ("Nostagia 92"). Two
-// different tracks in one slot — a compilation's discs both number from 1
-// (2026-10-31, Anjunadeep 07: "Glass Voices" and "Red Sky") — are none of these.
-export function sameTrackTitle(a: string, b: string): boolean {
-	const [x, y] = [coreTitle(a), coreTitle(b)];
-	if (!x || !y) return false;
-	if (x === y || x.includes(y) || y.includes(x)) return true;
-	let prev = Array.from({ length: y.length + 1 }, (_, j) => j);
-	for (let i = 1; i <= x.length; i++) {
-		const cur = [i];
-		for (let j = 1; j <= y.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (x[i - 1] === y[j - 1] ? 0 : 1));
-		prev = cur;
+// One release's slot twins merged, in the caller's transaction: two live
+// recordings on one position with the same core title (slots.ts
+// sameTrackTitle), lengths within two seconds and no two ISRCs that
+// disagree; the one with an ISRC, then the one more stores hold, survives.
+// Afterwards the stores' copies of the artists are joined by the twins rule,
+// and the release's event is re-announced with the shorter tracklist so the
+// devices that hold the card shrink it (events.ts reannounceCard).
+// Callers: the dedupe sweep below, a release twin merge (inbox.ts,
+// admin-ops.ts — merging two releases unions their edges by recording, so
+// both stores' copies of a track survive on the winner).
+export async function dedupeRelease(tx: SystemTx, releaseId: string, by: string): Promise<DedupeMerge[]> {
+	const [rel] = await tx.query<{ name: string }>(`select name from curator.catalog_object where id = $1`, [releaseId]);
+	if (!rel) return [];
+	const held = await tx.query<{ id: string; name: string; position: unknown; duration_sec: unknown; isrc: string | null; reps: unknown; providers: string | null }>(
+		`select o.id, o.name, e.position, o.duration_sec,
+			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc,
+			(select count(*) from curator.catalog_source_object so where so.object_id = o.id) as reps,
+			(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = o.id) as providers
+		from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
+		where e.src = $1 and e.kind = 'release-recording' order by e.position, o.id`,
+		[releaseId],
+	);
+	const merged: DedupeMerge[] = [];
+	const gone = new Set<string>();
+	for (const a of held) {
+		if (gone.has(a.id)) continue;
+		for (const b of held) {
+			if (b.id === a.id || gone.has(b.id) || gone.has(a.id)) continue;
+			const da = numOrNull(a.duration_sec);
+			const dbs = numOrNull(b.duration_sec);
+			if (numOrNull(a.position) !== numOrNull(b.position) || da === null || dbs === null) continue;
+			if (a.isrc && b.isrc && a.isrc !== b.isrc) continue;
+			if (!sameTrackTitle(a.name, b.name)) continue;
+			// b, a preview of a: SoundCloud only, no ISRC, shorter.
+			const preview = b.providers === 'soundcloud' && !b.isrc && a.providers !== 'soundcloud' && dbs < da - 2;
+			if (Math.abs(da - dbs) > 2 && !preview) continue;
+			const score = (x: typeof a) => (x.isrc ? 1000 : 0) + num(x.reps);
+			const [into, from] = preview ? [a, b] : score(a) >= score(b) ? [a, b] : [b, a];
+			await mergeObjects(tx, from.id, into.id, by, preview ? 'SoundCloud preview of the store track in its slot' : 'same slot on one release (position, length)', { release: releaseId, position: numOrNull(a.position), lengths: [da, dbs] });
+			gone.add(from.id);
+			merged.push({ release: rel.name, releaseId, from: from.name, into: into.name, title: into.name });
+		}
 	}
-	return prev[y.length]! <= Math.max(1, Math.floor(Math.max(x.length, y.length) * 0.15));
+	if (gone.size) {
+		// Two copies of a track made one credit each store's copy of its
+		// artist on one track: the twins rule joins them now.
+		await artistTwinsOn(tx, [releaseId], by);
+		await reannounceCard(tx, releaseId);
+	}
+	return merged;
 }
 
 export async function dedupeTracks(db: Db, scope: ReleaseScope, opts: { dry?: boolean; by?: string } = {}): Promise<DedupeReport> {
 	const { cond, params } = scopeSql(scope);
-	const releases = await withSystemTx(db, (tx) => tx.query<{ id: string; name: string }>(`select r.id, r.name from curator.catalog_object r where r.kind = 'release' and r.merged_into is null and ${cond} limit 2000`, params));
+	const releases = await withSystemTx(db, (tx) => tx.query<{ id: string }>(`select r.id from curator.catalog_object r where r.kind = 'release' and r.merged_into is null and ${cond} limit 2000`, params));
 	const report: DedupeReport = { dry: !!opts.dry, releases: releases.length, merged: [] };
 	for (const rel of releases) {
 		const rollback = new Error('dry run');
 		try {
 			await withSystemTx(db, async (tx) => {
-				const held = await tx.query<{ id: string; name: string; position: unknown; duration_sec: unknown; isrc: string | null; reps: unknown; providers: string | null }>(
-					`select o.id, o.name, e.position, o.duration_sec,
-						(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc,
-						(select count(*) from curator.catalog_source_object so where so.object_id = o.id) as reps,
-						(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = o.id) as providers
-					from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
-					where e.src = $1 and e.kind = 'release-recording' order by e.position, o.id`,
-					[rel.id],
-				);
-				const gone = new Set<string>();
-				for (const a of held) {
-					if (gone.has(a.id)) continue;
-					for (const b of held) {
-						if (b.id === a.id || gone.has(b.id) || gone.has(a.id)) continue;
-						const da = numOrNull(a.duration_sec);
-						const dbs = numOrNull(b.duration_sec);
-						if (numOrNull(a.position) !== numOrNull(b.position) || da === null || dbs === null) continue;
-						if (a.isrc && b.isrc && a.isrc !== b.isrc) continue;
-						if (!sameTrackTitle(a.name, b.name)) continue;
-						// b, a preview of a: SoundCloud only, no ISRC, shorter.
-						const preview = b.providers === 'soundcloud' && !b.isrc && a.providers !== 'soundcloud' && dbs < da - 2;
-						if (Math.abs(da - dbs) > 2 && !preview) continue;
-						const score = (x: typeof a) => (x.isrc ? 1000 : 0) + num(x.reps);
-						const [into, from] = preview ? [a, b] : score(a) >= score(b) ? [a, b] : [b, a];
-						await mergeObjects(tx, from.id, into.id, opts.by ?? 'claude-code', preview ? 'SoundCloud preview of the store track in its slot' : 'same slot on one release (position, length)', { release: rel.id, position: numOrNull(a.position), lengths: [da, dbs] });
-						gone.add(from.id);
-						report.merged.push({ release: rel.name, from: from.name, into: into.name, title: into.name });
-					}
-				}
-				// Two copies of a track made one credit each store's copy of its
-				// artist on one track: the twins rule joins them now.
-				if (gone.size) await artistTwinsOn(tx, [rel.id], opts.by ?? 'claude-code');
+				report.merged.push(...(await dedupeRelease(tx, rel.id, opts.by ?? 'claude-code')));
 				if (opts.dry) throw rollback;
 			});
 		} catch (e) {

@@ -27,7 +27,7 @@
 // A tracker row whose provider has no adapter here is skipped, not failed.
 
 import { hostname } from 'node:os';
-import { DeezerFinder, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
+import { DeezerFinder, runIsrcFill, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
 import { runLabelProfiler } from '../catalog/profile/label-profiler.js';
 import { BandcampTracker } from '@curator/catalog-readers';
 import { BeatportTracker } from '@curator/catalog-readers';
@@ -142,6 +142,7 @@ async function pass(): Promise<void> {
 		await runTrackers({ db, log, adapters, holder }).catch((e: unknown) => log.error('tracker_pass_failed', { error: e }));
 		await runPlanner({ db, log, finders }).catch((e: unknown) => log.error('identity_pass_failed', { error: e }));
 		if (spotify) await runRecordingResolver({ db, log, spotify }).catch((e: unknown) => log.error('recording_resolve_failed', { error: e }));
+		if (spotify) await runIsrcFill({ db, log, spotify }).catch((e: unknown) => log.error('isrc_fill_failed', { error: e }));
 		await runStoreLinker({ db, log, readers: stores }).catch((e: unknown) => log.error('store_link_pass_failed', { error: e }));
 		await runReleaseFiller({ db, log, fetchers: fillFetchers, holder }).catch((e: unknown) => log.error('release_fill_pass_failed', { error: e }));
 		await runLabelProfiler({ db, log, spotify, providers: { beatport, bandcamp } }).catch((e: unknown) => log.error('label_profile_pass_failed', { error: e }));

@@ -68,7 +68,9 @@ import { z } from 'zod';
 import { DeviceRevokedError, type Caller } from './account/device-gate.js';
 import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './account/devices.js';
 import * as catalog from './catalog/catalog.js';
+import * as connect from './catalog/connect.js';
 import * as workers from './catalog/workers.js';
+import { ZCatalogConnectAnswerInput, ZCatalogConnectQueueInput, ZCatalogConnectSearchInput, type CatalogConnectAnswerResult, type CatalogConnectQueueResult, type CatalogConnectSearchResult } from '@curator/protocol';
 import { ZCatalogWorkerDueInput, ZCatalogWorkerReportInput, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
@@ -92,7 +94,7 @@ export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'ca
 		(f) =>
 			(f !== 'catalogue' || deps.catalogue !== null) &&
 			(f !== 'spotify_gateway' || deps.spotify !== null) &&
-			((f !== 'global_catalog' && f !== 'catalog_workers') || deps.catalog),
+			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect') || deps.catalog),
 	);
 }
 
@@ -406,6 +408,17 @@ export const appRouter = router({
 		workerReport: authedProcedure.input(ZCatalogWorkerReportInput).mutation(({ ctx, input }): Promise<CatalogWorkerReportResult> => {
 			ctx.call.opsIn = input.results.length;
 			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workers.workerReport({ ...d, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), input));
+		}),
+		// 'catalog_connect' (src/catalog/connect.ts): "Help us connect the dots".
+		connectQueue: authedProcedure.input(ZCatalogConnectQueueInput).mutation(({ ctx, input }): Promise<CatalogConnectQueueResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => connect.connectQueue(d, ctx.user.id, callerOf(ctx), input)),
+		),
+		connectSearch: authedProcedure.input(ZCatalogConnectSearchInput).mutation(({ ctx, input }): Promise<CatalogConnectSearchResult> =>
+			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => connect.connectSearch({ ...d, soundcloud: ctx.deps.connectSoundcloud ?? null }, ctx.user.id, callerOf(ctx), input)),
+		),
+		connectAnswer: authedProcedure.input(ZCatalogConnectAnswerInput).mutation(({ ctx, input }): Promise<CatalogConnectAnswerResult> => {
+			ctx.call.opsIn = input.answers.length;
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => connect.connectAnswer({ ...d, fetch: ctx.deps.connectFetch }, ctx.user.id, callerOf(ctx), input));
 		}),
 	}),
 

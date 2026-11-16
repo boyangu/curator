@@ -14,6 +14,7 @@ import type { FeedItem, FeedOrigin, FeedTrackRef } from '@curator/core';
 import type { ContextMenuItem, ContextMenuHandlers } from '../components/ContextMenu.jsx';
 import { allLinks, playableId } from './feedHandles.js';
 import { BRAND_ICONS } from './brandIcons.js';
+import { connectDots } from './connectDots.js';
 
 // The component-side action surface. DiscoverView implements this from its
 // existing closures (play / interested / dismiss / archive / …); the commands
@@ -324,6 +325,13 @@ const FEED_COMMANDS: FeedCommand[] = [
 		// URI) — the feed peer of the library menu's copy-spotify-url.
 		id: 'copy-spotify-url', group: 'open', isAvailable: (c) => feedSpotifyUrl(c) !== null,
 		build: (c) => leaf('copy-spotify-url', 'Copy Spotify URL', () => c.actions.copySpotifyUrl(feedSpotifyUrl(c)!)),
+	},
+	// "Help us connect the dots" for the album a card is: its catalogue
+	// release, on the stores the catalogue has no page of it for.
+	{
+		id: 'connect-release', group: 'open',
+		isAvailable: (c) => isCard(c) && c.item.type !== 'track' && !!c.item.payload.catalogId && connectDots.available(),
+		build: (c) => leaf('connect-release', 'Help connect this release…', () => connectDots.openFor([c.item.payload.catalogId!])),
 	},
 	{
 		id: 'search-tidal', group: 'open', isAvailable: (c) => hasTrack(c) && !targetLinks(c).some((l) => l.provider === 'tidal'),

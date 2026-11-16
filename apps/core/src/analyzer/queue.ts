@@ -143,8 +143,10 @@ export interface AnalysisQueueOptions {
 	// directory instead of 20k mixed — easier on file-managers + on NTFS,
 	// and lets the user wipe one tier independently.
 	peaksDir: string;
-	// Max in-flight dispatches at once. Defaults to the sidecar pool size
-	// (4) but you can lower it if the analyzer is starving other workloads.
+	// Max in-flight dispatches at once — the user's "parallel analyses"
+	// setting. Mirrors the sidecar's pool size (service.ts sends the same
+	// number via AnalyzerSidecar.configure); adjustable live via
+	// setConcurrency.
 	concurrency?: number;
 	// Fallback re-check while the sidecar is down and hasn't said 'ready'
 	// (tests shorten it). The normal resume is the 'ready' event itself.
@@ -211,7 +213,7 @@ export type CataloguePrepared = { options: AnalyzeOptions | undefined; done: boo
 const AUTO_PRIORITY_GATE = 100;
 
 export class AnalysisQueue extends EventEmitter {
-	private readonly concurrency: number;
+	private concurrency: number;
 	private inflight = new Set<string>();
 
 	// True while any analysis is running — other heavy background lanes (the
@@ -254,6 +256,16 @@ export class AnalysisQueue extends EventEmitter {
 		this.concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
 		this.hydrate();
 		this.wireSidecarEvents();
+	}
+
+	// Live resize of the in-flight gate. Lowering it never interrupts a
+	// running job — the queue simply stops dispatching until enough finish;
+	// raising it fills the new slots right away.
+	setConcurrency(n: number): void {
+		const next = Math.max(1, Math.floor(n));
+		if (next === this.concurrency) return;
+		this.concurrency = next;
+		this.drain();
 	}
 
 	// The catalogue layer is built after the queue (it needs the cloud

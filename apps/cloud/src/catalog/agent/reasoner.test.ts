@@ -182,7 +182,7 @@ describe('catalogue reasoner', () => {
 		const c = (await withSystemTx(app.db, (tx) => listCases(tx, { kind: 'artist_bucket' })))!;
 		expect(c).toHaveLength(1);
 		// The numbers behind the question ride along: Deezer's 14 releases share nothing with Spotify's 6.
-		expect(c[0]!.input).toEqual({ artist: spNova, source: { provider: 'deezer', providerId: 'dz-nova' }, stats: { releases: 14, labels: 8, yearSpan: 26, shared: 0, others: 6, labelsShared: 0, labelsElsewhere: 2 } });
+		expect(c[0]!.input).toEqual({ artist: spNova, source: { provider: 'deezer', providerId: 'dz-nova' }, stats: { releases: 14, labels: 8, yearSpan: 26, shared: 0, others: 6, labelsShared: 0, labelsElsewhere: 2, siblings: 1 } });
 		// Asked once: the next pass does not ask again, whatever the verdict.
 		expect((await runInboxDetectors({ db: app.db, agent: true })).buckets).toBe(0);
 

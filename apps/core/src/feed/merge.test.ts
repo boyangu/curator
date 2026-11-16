@@ -40,6 +40,50 @@ describe('mergeFeedPayload', () => {
 		]);
 	});
 
+	it('the catalogue’s own card replaces the tracklist, each track keeping what the row found about it', () => {
+		// The row: the catalogue's release with "Run Away" held twice (two
+		// recordings on one slot), one matched on Spotify and enriched, the
+		// other Deezer-only; "Soma" enriched too.
+		const row: FeedItemPayload = {
+			title: 'Home',
+			artists: ['Marsh'],
+			catalogId: 'rel-1',
+			trackCount: 3,
+			tracks: [
+				{ sourceTrackId: 'st1', catalogId: 'r-sp', title: 'Run Away', artists: ['Marsh', 'ALLKNIGHT'], durationSec: 267.2, bpm: 124, keyCamelot: '4A', enrichStatus: 'ok', handles: [{ provider: 'spotify', id: 'st1', url: null }] },
+				{ sourceTrackId: 'r-dz', catalogId: 'r-dz', title: 'Run Away', artists: ['Marsh'], durationSec: 267, isrc: 'QMDA62691879', handles: [{ provider: 'deezer', id: 'dz1', url: null }] },
+				{ sourceTrackId: 'r-soma', catalogId: 'r-soma', title: 'Soma', artists: ['Marsh'], durationSec: 352, bpm: 91, enrichStatus: 'ok' },
+			],
+		};
+		// The catalogue merged the Spotify copy into the Deezer one (the ISRC's
+		// holder), whose handles now carry the Spotify id.
+		const card: FeedItemPayload = {
+			title: 'Home',
+			artists: ['Marsh'],
+			catalogId: 'rel-1',
+			trackCount: 2,
+			tracks: [
+				{ sourceTrackId: 'st1', catalogId: 'r-dz', title: 'Run Away', artists: ['Marsh', 'ALLKNIGHT'], durationSec: 267, isrc: 'QMDA62691879', trackNumber: 1, handles: [{ provider: 'deezer', id: 'dz1', url: null }, { provider: 'spotify', id: 'st1', url: null }] },
+				{ sourceTrackId: 'r-soma', catalogId: 'r-soma', title: 'Soma', artists: ['Marsh'], durationSec: 352, trackNumber: 2 },
+			],
+		};
+		const next = mergeFeedPayload(row, card)!;
+		expect(next.trackCount).toBe(2);
+		expect(next.tracks!.map((t) => [t.sourceTrackId, t.catalogId, t.bpm ?? null, t.keyCamelot ?? null, t.enrichStatus ?? null, t.handles?.map((h) => h.provider)])).toEqual([
+			['st1', 'r-dz', 124, '4A', 'ok', ['deezer', 'spotify']],
+			['r-soma', 'r-soma', 91, null, 'ok', undefined],
+		]);
+		// The same card again changes nothing.
+		expect(mergeFeedPayload(next, card)).toBeNull();
+	});
+
+	it('a draft that is not the catalogue’s card for the row stays fill-only', () => {
+		const row: FeedItemPayload = { title: 't', artists: [], catalogId: 'rel-1', tracks: [{ sourceTrackId: 'r1', catalogId: 'r1', title: 'One', artists: [], durationSec: 1 }, { sourceTrackId: 'r2', catalogId: 'r2', title: 'Two', artists: [], durationSec: 1 }] };
+		// Another release's card, and a local producer's draft without catalogue ids.
+		expect(mergeFeedPayload(row, { title: 't', artists: [], catalogId: 'rel-2', tracks: [{ sourceTrackId: 'r1', catalogId: 'r1', title: 'One', artists: [], durationSec: 1 }] })).toBeNull();
+		expect(mergeFeedPayload(row, { title: 't', artists: [], catalogId: 'rel-1', tracks: [{ sourceTrackId: 'st1', title: 'One', artists: [], durationSec: 1 }] })).toBeNull();
+	});
+
 	it('takes the draft’s url when the row moves to a playable source', () => {
 		const row: FeedItemPayload = { title: 't', artists: [], url: 'https://x.bandcamp.com/album/t' };
 		expect(mergeFeedPayload(row, { title: 't', artists: [], url: 'https://open.spotify.com/album/al1' }, { upgrade: true })?.url).toBe('https://open.spotify.com/album/al1');

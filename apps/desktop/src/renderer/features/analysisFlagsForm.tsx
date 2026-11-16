@@ -7,10 +7,11 @@
 // The per-flag copy below is the canonical user-facing description for each
 // flag — edit it here and both surfaces update.
 
-import { createSignal, For, type JSX } from 'solid-js';
+import { createSignal, For, onMount, Show, type JSX } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { AnalysisFlags, AutoAnalyzeSettings } from '@curator/core';
+import type { AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources } from '@curator/core';
 import { loadAutoAnalyzeSettings, saveAutoAnalyzeSettings, pushAutoAnalyzeToCore } from './analysisFlags.js';
+import { analysisApi } from '../data/api.js';
 
 interface FlagDef {
 	key: keyof AnalysisFlags;
@@ -106,6 +107,43 @@ export function mountAutoAnalyzeSettings(host: HTMLElement): () => void {
 				dimmed={!settings().enabled}
 				onChange={(flags) => persist({ ...settings(), flags })}
 			/>
+			<AnalyzerResourcesRow />
 		</div>
 	), host);
+}
+
+// "Parallel analyses" — the one knob over how much machine the analyzer may
+// take. Core owns the value (app_setting) and clamps it to the sidecar's core
+// count, so this row only reflects what core returns. Not dimmed with the
+// auto toggle: it governs manual analyses too.
+function AnalyzerResourcesRow(): JSX.Element {
+	const [res, setRes] = createSignal<AnalyzerResources | null>(null);
+	onMount(() => { void analysisApi.resources().then(setRes).catch(() => setRes(null)); });
+	const apply = (raw: string): void => {
+		const workers = Number.parseInt(raw, 10);
+		if (!Number.isFinite(workers)) return;
+		void analysisApi.setResources({ workers }).then(setRes).catch(() => { /* row keeps the last applied state */ });
+	};
+	return (
+		<Show when={res()}>{(r) => {
+			const pct = (): number => Math.round((r().workers / Math.max(1, r().cpuCount)) * 100);
+			return (
+				<label class="settings-toggle analyzer-resources">
+					<input
+						type="number"
+						class="settings-ui__number"
+						min="1"
+						max={r().cpuCount}
+						step="1"
+						value={r().workers}
+						onChange={(e) => apply(e.currentTarget.value)}
+					/>
+					<span class="settings-toggle__label">Parallel analyses</span>
+					<span class="settings-toggle__hint">
+						{r().workers} of {r().cpuCount} cores — at most ~{pct()}% of the CPU. Each analysis uses one core, so this is the analyzer's CPU ceiling. Changes apply right away; analyses already running finish first.
+					</span>
+				</label>
+			);
+		}}</Show>
+	);
 }

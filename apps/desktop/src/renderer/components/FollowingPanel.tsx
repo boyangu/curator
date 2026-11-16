@@ -14,6 +14,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMou
 import type { CatalogClientStatus, CatalogSearchHit, CatalogWatch } from '@curator/core';
 import { catalogApi, shellApi } from '../data/api.js';
 import { providerLabel } from '../features/feedHandles.js';
+import { connectDots } from '../features/connectDots.js';
 
 export interface FollowingPanelProps {
 	onClose: () => void;
@@ -380,7 +381,12 @@ export function FollowingPanel(props: FollowingPanelProps) {
 																</button>
 															)}
 														</Show>
-														<button class="following-icon" title="Check for new releases now" onClick={() => void refresh(w)}>
+														<Show when={connectDots.available() && (w.object.kind === 'artist' || w.object.kind === 'label')}>
+														<button class="following-icon" title="Help connect its pages on other stores" onClick={() => connectDots.openFor([w.object.id])}>
+															<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.2" /><circle cx="19" cy="6" r="2.2" /><circle cx="12" cy="18" r="2.2" /><path d="M7 7.2l3.8 8.8M17 7.2l-3.8 8.8M7.2 6h9.6" /></svg>
+														</button>
+													</Show>
+													<button class="following-icon" title="Check for new releases now" onClick={() => void refresh(w)}>
 															<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>
 														</button>
 														<button class="following-icon" title={w.muted ? 'Unmute: show its releases again' : 'Mute: hide its releases without unfollowing'} onClick={() => void toggleMute(w)}>

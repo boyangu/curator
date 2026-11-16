@@ -24,6 +24,7 @@
 // contract for that: claim and event shapes, the procedure inputs, results.
 
 import { z } from 'zod';
+import { PAGE_KINDS, type PageKind } from './page-ref.js';
 import { ZDeviceId } from './sync-input.js';
 
 export const CATALOG_KINDS = ['artist', 'label', 'release', 'recording', 'playlist', 'genre', 'chart'] as const;
@@ -459,6 +460,121 @@ export const ZCatalogRefreshInput = z.object({ deviceId: ZDeviceId, objectId: ZO
 export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.array(ZObjectId).min(1).max(200) }).strict();
 export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional() }).strict();
 export const ZFeedRecentInput = z.object({ deviceId: ZDeviceId, days: z.number().int().min(1).max(FEED_RECENT_MAX_DAYS) }).strict();
+
+// ── connect the dots ('catalog_connect') ────────────────────────────────────
+//
+// "Help us connect the dots": a user says which store page is an artist's, a
+// label's or an album's on a store the catalogue has not mapped. The cloud
+// keeps the queue (what the caller follows that lacks a store, and the
+// candidates its own finders could not choose between); the device searches
+// the store for the rest and sends the user's answer. An answer is a vote:
+// the page is attached at once only when the cloud can back it — a trusted
+// account, or the page's own releases overlapping the object's, read by the
+// cloud — and otherwise waits for the operator. What a device says the page
+// lists is evidence for the operator, never the reason to attach.
+
+// Which stores each kind is asked about.
+export const CATALOG_CONNECT_STORES = {
+	artist: ['beatport', 'soundcloud', 'bandcamp', 'spotify', 'deezer', 'tidal'],
+	label: ['beatport', 'soundcloud', 'bandcamp'],
+	release: ['beatport', 'spotify', 'deezer', 'tidal'],
+} as const satisfies Record<PageKind, readonly CatalogProvider[]>;
+export const isConnectKind = (k: CatalogKind): k is PageKind => (PAGE_KINDS as readonly string[]).includes(k);
+
+export const CATALOG_CONNECT_SOURCES = ['cloud', 'search', 'pasted'] as const;
+export type CatalogConnectSource = (typeof CATALOG_CONNECT_SOURCES)[number];
+
+// One page offered for one store. `releases`: a few titles the page lists;
+// `shared`: those the object holds too (the device's own comparison).
+export type CatalogConnectCandidate = {
+	provider: CatalogProvider;
+	providerId: string;
+	name: string;
+	url: string;
+	imageUrl?: string | null;
+	// How many follow the page on that store (Spotify followers, Deezer fans,
+	// SoundCloud followers), where the store says.
+	followers?: number | null;
+	// An album's credit, label and date; a profile's place.
+	detail?: string | null;
+	releases?: string[];
+	shared?: string[];
+	source: CatalogConnectSource;
+};
+
+export type CatalogConnectItem = {
+	object: CatalogObjectSummary;
+	// artist / label: its newest release titles; release: its tracklist.
+	titles: string[];
+	// release: "Ivo Lark · 2026-03-01".
+	detail: string | null;
+	missing: { provider: CatalogProvider; candidates: CatalogConnectCandidate[] }[];
+};
+
+export const CATALOG_CONNECT_QUEUE_MAX = 50;
+// `objectIds`: exactly these (the modal opened on one artist, label or
+// album); absent: the caller's follows that lack a store, most followed first.
+export type CatalogConnectQueueInput = { deviceId: string; limit?: number; objectIds?: string[] };
+export type CatalogConnectQueueResult = { items: CatalogConnectItem[]; total: number };
+
+// 'is': this page is the object's; 'not': this page is not; 'none': no page
+// offered for this store is (asked again after a while).
+export const CATALOG_CONNECT_VERDICTS = ['is', 'not', 'none'] as const;
+export type CatalogConnectVerdict = (typeof CATALOG_CONNECT_VERDICTS)[number];
+export type CatalogConnectAnswer = {
+	objectId: string;
+	provider: CatalogProvider;
+	verdict: CatalogConnectVerdict;
+	// 'is' / 'not': the page, as a link (the cloud keys it itself).
+	url?: string;
+	name?: string;
+	source?: CatalogConnectSource;
+	// What the device read on the page, for the operator.
+	releases?: string[];
+};
+// attached: on the object now. waiting: with the operator. already: the
+// object had it. conflict: the page is another object's, or was ruled out.
+// noted: a 'not' / 'none' kept. invalid: not a page of that store and kind.
+export const CATALOG_CONNECT_OUTCOMES = ['attached', 'waiting', 'already', 'conflict', 'noted', 'invalid'] as const;
+export type CatalogConnectOutcome = (typeof CATALOG_CONNECT_OUTCOMES)[number];
+export const CATALOG_CONNECT_ANSWERS_MAX = 20;
+export type CatalogConnectAnswerInput = { deviceId: string; answers: CatalogConnectAnswer[] };
+export type CatalogConnectAnswerResult = { results: { outcome: CatalogConnectOutcome; reason?: string }[] };
+
+// catalog.connectSearch: a store only the cloud can search (SoundCloud: the
+// app's credentials). Profiles by name, for an artist or a label.
+export const CATALOG_CONNECT_CLOUD_SEARCH = ['soundcloud'] as const satisfies readonly CatalogProvider[];
+export type CatalogConnectSearchInput = { deviceId: string; provider: (typeof CATALOG_CONNECT_CLOUD_SEARCH)[number]; kind: 'artist' | 'label'; name: string };
+// `searched` false: this server holds no credentials for that store.
+export type CatalogConnectSearchResult = { candidates: CatalogConnectCandidate[]; searched: boolean };
+export const ZCatalogConnectSearchInput = z
+	.object({ deviceId: ZDeviceId, provider: z.enum(CATALOG_CONNECT_CLOUD_SEARCH), kind: z.enum(['artist', 'label']), name: z.string().trim().min(1).max(200) })
+	.strict();
+
+export const ZCatalogConnectQueueInput = z
+	.object({ deviceId: ZDeviceId, limit: z.number().int().min(1).max(CATALOG_CONNECT_QUEUE_MAX).optional(), objectIds: z.array(ZObjectId).min(1).max(CATALOG_CONNECT_QUEUE_MAX).optional() })
+	.strict();
+export const ZCatalogConnectAnswerInput = z
+	.object({
+		deviceId: ZDeviceId,
+		answers: z
+			.array(
+				z
+					.object({
+						objectId: ZObjectId,
+						provider: ZProvider,
+						verdict: z.enum(CATALOG_CONNECT_VERDICTS),
+						url: z.string().trim().min(1).max(1000).optional(),
+						name: z.string().trim().max(500).optional(),
+						source: z.enum(CATALOG_CONNECT_SOURCES).optional(),
+						releases: z.array(z.string().max(500)).max(30).optional(),
+					})
+					.strict(),
+			)
+			.min(1)
+			.max(CATALOG_CONNECT_ANSWERS_MAX),
+	})
+	.strict();
 
 // ── workers ('catalog_workers') ─────────────────────────────────────────────
 //

@@ -37,6 +37,7 @@ import {
 	recordingByKey,
 	releaseByTitle,
 } from './identity.js';
+import { heldTracks, slotMatch, type HeldTrack } from './slots.js';
 import { ensureCursors } from './watches.js';
 
 export type IngestContext = { reason: CatalogIngestReason };
@@ -62,6 +63,14 @@ export class Ingester {
 		const rep = await this.attachRepresentation(c, objectId);
 		await this.attachIdentifiers(c, objectId, rep.id);
 		await this.attachFacts(c, objectId);
+	}
+
+	// A claim's identifiers onto an object the claim's representation already
+	// sits on (the ISRC fill, planner.ts): nothing else of the claim is read.
+	async attachIdentifiersOnly(objectId: string, c: CatalogClaim): Promise<void> {
+		const [rep] = await this.tx.query<{ id: string }>(`select id from curator.catalog_source_object where provider = $1 and kind = $2 and provider_id = $3`, [c.provider, c.kind, c.providerId]);
+		if (!rep) return;
+		await this.attachIdentifiers(c, objectId, rep.id);
 	}
 
 	// Attaches a claim to the object it names only if the catalogue already has
@@ -139,6 +148,19 @@ export class Ingester {
 		return out;
 	}
 
+	// The tracks a release held before this ingest, read once per release; a
+	// held track one incoming track took is struck, so a tracklist cannot
+	// land twice on one recording.
+	private readonly heldMemo = new Map<string, HeldTrack[]>();
+	private async held(releaseId: string): Promise<HeldTrack[]> {
+		let h = this.heldMemo.get(releaseId);
+		if (!h) {
+			h = await heldTracks(this.tx, releaseId);
+			this.heldMemo.set(releaseId, h);
+		}
+		return h;
+	}
+
 	private async resolve(c: CatalogClaim, parent?: ClaimParent): Promise<IngestOutcome> {
 		let objectId = await findRepresentation(this.tx, c);
 		let created = false;
@@ -170,8 +192,19 @@ export class Ingester {
 		}
 		const fold = nameFold(c.name);
 		switch (c.kind) {
-			case 'recording':
+			case 'recording': {
+				// Inside a release the catalogue holds, the slot rule first
+				// (slots.ts): the same title in the same slot or within three
+				// seconds is the same track whatever each store's credits say.
+				if (parent?.kind === 'release') {
+					const hit = slotMatch(await this.held(parent.id), { title: c.name, position: parent.position, durationSec: c.facts?.durationSec }, parent.artistFolds ?? []);
+					if (hit) {
+						this.heldMemo.set(parent.id, (await this.held(parent.id)).filter((h) => h.id !== hit.id));
+						return hit.id;
+					}
+				}
 				return recordingByKey(this.tx, recordingKey(c.name, (c.artists ?? []).map((a) => a.name)), c.facts?.durationSec);
+			}
 			case 'release':
 				// By credited names, before any artist is resolved: the artists
 				// then corroborate through the release found (attachRelationships).
@@ -297,10 +330,12 @@ export class Ingester {
 				const artist = await this.claim(a, self);
 				if (artist.kind === 'artist') await this.edge(artist.objectId, 'artist-release', objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
 			}
+			const artistFolds = (c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean);
 			for (const [i, r] of (c.recordings ?? []).entries()) {
 				// A tracklist entry without its own credits carries the release's.
-				const rec = await this.claim({ ...r, artists: r.artists?.length ? r.artists : c.artists }, self);
-				if (rec.kind === 'recording') await this.edge(objectId, 'release-recording', rec.objectId, sourceObjectId, null, r.facts?.trackNumber ?? i + 1);
+				const position = r.facts?.trackNumber ?? i + 1;
+				const rec = await this.claim({ ...r, artists: r.artists?.length ? r.artists : c.artists }, { ...self, position, artistFolds });
+				if (rec.kind === 'recording') await this.edge(objectId, 'release-recording', rec.objectId, sourceObjectId, null, position);
 			}
 			if (c.label) {
 				const label = await this.claim(c.label, self);

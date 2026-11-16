@@ -29,6 +29,7 @@ const ANNOUNCE_WITHIN_DAYS = 60;
 const ALBUM_TYPES = new Set(['album', 'ep', 'single', 'compilation']);
 
 export type SoundCloudCredentials = { clientId: string; clientSecret: string };
+export type ScUser = { id: number; username: string; permalink?: string; permalink_url?: string; avatar_url?: string | null; followers_count?: number; track_count?: number; city?: string | null; country?: string | null };
 
 type ScTrack = {
 	id: number;
@@ -155,6 +156,13 @@ export class SoundCloudTracker implements TrackerAdapter {
 	async get<T>(path: string, signal: AbortSignal): Promise<T> {
 		const token = await this.accessToken(signal);
 		return getJson<T>(this.fetchFn, 'soundcloud', `${API}${path}`, { headers: { authorization: `OAuth ${token}` }, signal, logPath: path.split('?')[0]!.replace(/\d+/g, '<id>') });
+	}
+
+	// Profiles by name ("Help us connect the dots": the candidates for an
+	// artist's or a label's SoundCloud page). One call.
+	async searchUsers(q: string, signal: AbortSignal, limit = 10): Promise<ScUser[]> {
+		const r = await this.get<{ collection?: ScUser[] } | ScUser[]>(`/users?q=${encodeURIComponent(q)}&limit=${limit}`, signal);
+		return Array.isArray(r) ? r : r.collection ?? [];
 	}
 
 	async poll(target: TrackerTarget, signal: AbortSignal): Promise<TrackerPoll> {

@@ -37,7 +37,7 @@ import { createFetchHandler } from '../app.js';
 import { createBackofficeHandler, type WorkerStatus } from '../backoffice/handler.js';
 import { AuditWriter } from '../audit.js';
 import { createTokenVerifier, remoteKeys } from '../auth/jwt.js';
-import { DeezerFinder, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
+import { DeezerFinder, runIsrcFill, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { runLabelProfiler } from '../catalog/profile/label-profiler.js';
 import { runCataloguePlaylists } from '../catalog/profile/catalogue-playlists.js';
@@ -189,6 +189,7 @@ const handler = createFetchHandler({
 	batch: DEFAULT_BATCH_OPTIONS,
 	spotify: null,
 	catalog: true,
+	connectSoundcloud: soundcloudCredentials(process.env) ? new SoundCloudTracker(soundcloudCredentials(process.env)!) : null,
 });
 
 // Beatport's pages (labels, genre charts) and Bandcamp too, unless switched off.
@@ -336,6 +337,9 @@ const withUser = async (req: Request): Promise<Response> => {
 			const sub = (JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: string }).sub;
 			if (sub && /^[0-9a-f-]{36}$/i.test(sub) && !seen.has(sub)) {
 				await pg.query('insert into auth.users (id) values ($1) on conflict do nothing', [sub]);
+				// Whoever reaches the local catalogue is its operator: their
+				// "connect the dots" answers stand without a second check (connect.ts).
+				await pg.query('insert into curator.admin_user (user_id) values ($1) on conflict do nothing', [sub]);
 				seen.add(sub);
 			}
 		} catch {
@@ -381,6 +385,8 @@ function pass(): Promise<void> {
 		await runPlanner({ db, log, finders }).catch((e: unknown) => log.error('identity_pass_failed', { error: e }));
 		stepTo('recording resolver');
 		if (spotify) await runRecordingResolver({ db, log, spotify }).catch((e: unknown) => log.error('recording_resolve_failed', { error: e }));
+		stepTo('isrc fill');
+		if (spotify) await runIsrcFill({ db, log, spotify }).catch((e: unknown) => log.error('isrc_fill_failed', { error: e }));
 		stepTo('store links');
 		await runStoreLinker({ db, log, readers: { spotify, tidal, apple } }).catch((e: unknown) => log.error('store_link_pass_failed', { error: e }));
 		stepTo('release fill');

@@ -309,3 +309,44 @@ describe('sidecar outage', () => {
 		q.clearPending();
 	});
 });
+
+describe('setConcurrency', () => {
+	// Holds every analyze() open until released, so the test can count how
+	// many jobs are in flight at once.
+	class GatedSidecar extends FakeSidecar {
+		open = 0;
+		peak = 0;
+		private waiting: Array<() => void> = [];
+		override analyze(p: AnalyzeParams): Promise<AnalyzeResult> {
+			this.open++;
+			this.peak = Math.max(this.peak, this.open);
+			return new Promise<void>((r) => this.waiting.push(r))
+				.then(() => { this.open--; return super.analyze(p); });
+		}
+		releaseAll(): void { for (const r of this.waiting.splice(0)) r(); }
+	}
+
+	it('caps in-flight work and fills new slots when raised', async () => {
+		const gated = new GatedSidecar();
+		const q = new AnalysisQueue(db, gated as unknown as AnalyzerSidecar, { peaksDir: join(dir, 'peaks'), concurrency: 1 });
+		const ids = ['a', 'b', 'c', 'd'];
+		for (const id of ids) { seedTrack(id); seedLocalLink(id); }
+		q.enqueue(ids, { priority: 100 });
+		await waitFor(() => gated.open === 1, 'first dispatch');
+		await new Promise((r) => setTimeout(r, 50));
+		expect(gated.open).toBe(1);
+
+		q.setConcurrency(3);
+		await waitFor(() => gated.open === 3, 'raised to 3');
+
+		// Lowering never interrupts running work; it only stops new dispatch.
+		q.setConcurrency(1);
+		gated.releaseAll();
+		await waitFor(() => gated.open === 1, 'one more after lowering');
+		await new Promise((r) => setTimeout(r, 50));
+		expect(gated.open).toBe(1);
+		expect(gated.peak).toBe(3);
+		gated.releaseAll();
+		await waitFor(() => pendingJobs() === 0, 'drained');
+	});
+});

@@ -58,6 +58,13 @@ export const PLACEHOLDER = new Set(['various artists', 'various', 'va', 'v a', '
 // a temp table the pair queries start from. Passed as an array of thousands
 // of names instead, every artist was compared with each: 8 minutes of PGlite
 // on 2026-11-01's catalogue.
+// A store's namesake tag ("Elif (tr)" on Deezer and Tidal, "ELIF (TR)" on
+// Beatport) is no part of the name for pairing: it says the store knows a
+// namesake; which copy this one is, the shared release decides (identity.ts
+// storeTagless, the same rule for the finders). Only a name that ends in the
+// tag is cut, so "Tale Of Us" keeps its last word.
+const TWIN_FOLD = (o: string) => `case when ${o}.name ~ '\\s\\([A-Za-z]{2,3}\\)\\s*$' then regexp_replace(${o}.name_fold, '\\s[a-z0-9]+$', '') else ${o}.name_fold end`;
+
 async function loadSuspects(tx: Queryable, scope: SweepScope): Promise<number> {
 	await tx.query(`create temp table if not exists artist_twin (id uuid primary key, fold text not null)`);
 	await tx.query(`truncate pg_temp.artist_twin`);
@@ -66,9 +73,9 @@ async function loadSuspects(tx: Queryable, scope: SweepScope): Promise<number> {
 		if (!scope.releases.length) return 0;
 		await tx.query(
 			`insert into pg_temp.artist_twin (id, fold)
-			select o.id, o.name_fold from curator.catalog_object o
+			select o.id, ${TWIN_FOLD('o')} from curator.catalog_object o
 			join (
-				select o.name_fold from curator.catalog_object o
+				select ${TWIN_FOLD('o')} as fold from curator.catalog_object o
 				join (
 					select e.src as id from curator.catalog_edge e where e.kind = 'artist-release' and e.dst = any($1::uuid[])
 					union
@@ -76,21 +83,21 @@ async function loadSuspects(tx: Queryable, scope: SweepScope): Promise<number> {
 					where rr.kind = 'release-recording' and rr.src = any($1::uuid[])
 				) c on c.id = o.id
 				where o.kind = 'artist' and o.merged_into is null and o.name_fold <> '' and not (o.name_fold = any($2::text[]))
-				group by o.name_fold having count(*) > 1
-			) s on s.name_fold = o.name_fold
+				group by 1 having count(*) > 1
+			) s on s.fold = ${TWIN_FOLD('o')}
 			where o.kind = 'artist' and o.merged_into is null`,
 			[`{${scope.releases.join(',')}}`, placeholders],
 		);
 	} else {
 		await tx.query(
 			`insert into pg_temp.artist_twin (id, fold)
-			select o.id, o.name_fold from curator.catalog_object o
+			select o.id, ${TWIN_FOLD('o')} from curator.catalog_object o
 			join (
-				select name_fold from curator.catalog_object
-				where kind = 'artist' and merged_into is null and name_fold <> '' and not (name_fold = any($2::text[]))
-				group by name_fold having count(*) > 1
-					and ($1::int is null or max(discovered_at) > now() - make_interval(days => $1::int))
-			) s on s.name_fold = o.name_fold
+				select ${TWIN_FOLD('o')} as fold from curator.catalog_object o
+				where o.kind = 'artist' and o.merged_into is null and o.name_fold <> '' and not (o.name_fold = any($2::text[]))
+				group by 1 having count(*) > 1
+					and ($1::int is null or max(o.discovered_at) > now() - make_interval(days => $1::int))
+			) s on s.fold = ${TWIN_FOLD('o')}
 			where o.kind = 'artist' and o.merged_into is null`,
 			[scope.recentDays === null ? null : String(scope.recentDays), placeholders],
 		);
@@ -111,7 +118,11 @@ async function twinsOf(tx: Queryable, ids: string[]): Promise<Map<string, Twin>>
 	return new Map(rows.map((r) => [r.id, { ...r, stores: r.stores ? r.stores.split('|') : [], credits: num(r.credits), discovered: num(r.discovered) }]));
 }
 
-const better = (a: Twin, b: Twin) => Number(b.stores.length > 0) - Number(a.stores.length > 0) || b.credits - a.credits || a.discovered - b.discovered || a.id.localeCompare(b.id);
+// Of two copies, the kept one: a store's over a reader's, the one named
+// without a store's namesake tag ("ELIF" over "Elif (tr)" — the tag is the
+// store's, not the artist's), the one with more credits, the older.
+const tagged = (name: string): boolean => /\s\([A-Za-z]{2,3}\)\s*$/.test(name);
+const better = (a: Twin, b: Twin) => Number(b.stores.length > 0) - Number(a.stores.length > 0) || Number(tagged(a.name)) - Number(tagged(b.name)) || b.credits - a.credits || a.discovered - b.discovered || a.id.localeCompare(b.id);
 
 // Pairs into groups (one name's copies connected by the pairs).
 function groups(pairs: { a: string; b: string }[]): string[][] {

@@ -51,6 +51,8 @@ export interface SpotifyArtist {
 	id: string;
 	name: string;
 	images?: { url: string }[];
+	// Full artist objects only (search, /artists): absent on a track's credit.
+	followers?: { total: number };
 	genres?: string[];
 	external_urls?: { spotify: string };
 }

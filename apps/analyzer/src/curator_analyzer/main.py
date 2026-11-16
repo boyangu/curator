@@ -12,6 +12,7 @@ Protocol (one JSON object per line, both directions):
         "outPeaksHiPath": "<peaksDir>/hi/<uuid>.cpk"   # 100 Hz detail
       }}
       {"id": 43, "method": "cancel", "params": {"trackId": "uuid"}}
+      {"method": "configure", "params": {"workers": 3}}   (no reply)
       {"id": 44, "method": "shutdown"}
 
     sidecar → Node:
@@ -28,8 +29,23 @@ dispatches (not mid-Essentia). For most workloads that's fine — a single
 track is ~10-20s, so a cancel propagates within seconds. Mid-stage cancel
 would require Essentia signal handling we don't have.
 
-Concurrency: workers = min(cpus - 1, 4). One worker per CPU core minus one
-for the master + the Node main process; cap at 4 to keep things subtle.
+Concurrency: the pool starts at min(cpus - 1, 4) workers (one per core,
+minus one for the master + the Node main process) and the host resizes it
+with `configure` — the user's Settings → Library "parallel analyses" value.
+A resize swaps in a fresh pool for new work; the old one finishes what it
+already holds and exits, so running jobs are never killed. The host's queue
+caps in-flight requests at the same number, which bounds the total running
+across both pools during the hand-over.
+
+CPU budget: there is no hard CPU-percentage governor available to us
+(the workers live inside the WSL VM on Windows; cgroups need root), so the
+budget is made honest a different way — every BLAS/OpenMP runtime in a worker
+is pinned to ONE thread, so N workers ≈ N cores — the worker count IS the
+CPU ceiling. The pool also runs niced, which yields to other processes in the
+same kernel; under WSL that is only the VM's own processes (Windows schedules
+the VM's vCPU threads at normal priority), so on Windows the worker count is
+the only real lever. The hello frame reports `cpus` so the host can offer the
+user "N of C cores".
 """
 
 from __future__ import annotations
@@ -86,18 +102,42 @@ def _worker_count() -> int:
     return max(1, min(cpus - 1, 4))
 
 
+# How far below normal the pool is scheduled. 10 is the conventional
+# "background batch" value: the analyzer still gets the whole machine when it
+# is otherwise idle, but yields immediately to anything interactive.
+BACKGROUND_NICE = 10
+
+
+def _apply_resource_policy() -> None:
+    # Spawned workers inherit both the environment and the nice value, so this
+    # runs once in the master before the pool exists. The thread pins make a
+    # worker cost one core (numpy's OpenBLAS/MKL would otherwise fan each
+    # matmul across every core, and N workers × C threads thrashes).
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    if hasattr(os, "nice"):
+        try:
+            os.nice(BACKGROUND_NICE)
+        except OSError:
+            pass
+
+
 class Sidecar:
     def __init__(self) -> None:
-        # `spawn` start method everywhere — `fork` is unsafe with Essentia's
-        # native threads on Linux and unsupported on Windows.
-        ctx = mp.get_context("spawn")
-        self._pool = ProcessPoolExecutor(max_workers=_worker_count(), mp_context=ctx)
+        self._workers = _worker_count()
+        self._pool = self._make_pool(self._workers)
         # Track in-flight futures by request id so cancel can find them.
         self._inflight: dict[int, Future] = {}
         self._inflight_lock = threading.Lock()
         # Tracks the user has asked to cancel before we even dispatched.
         # We check on submit and silently skip them.
         self._cancelled_ids: set[str] = set()
+
+    @staticmethod
+    def _make_pool(workers: int) -> ProcessPoolExecutor:
+        # `spawn` start method everywhere — `fork` is unsafe with Essentia's
+        # native threads on Linux and unsupported on Windows.
+        return ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"))
 
     def handle(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
@@ -106,6 +146,8 @@ class Sidecar:
             self._analyze(req_id, msg.get("params") or {})
         elif method == "cancel":
             self._cancel(msg.get("params") or {})
+        elif method == "configure":
+            self._configure(msg.get("params") or {})
         elif method == "shutdown":
             self.shutdown()
             sys.exit(0)
@@ -165,6 +207,26 @@ class Sidecar:
 
         future.add_done_callback(on_done)
 
+    def _configure(self, params: dict[str, Any]) -> None:
+        workers = params.get("workers")
+        if not isinstance(workers, int) or workers < 1:
+            return
+        workers = min(workers, os.cpu_count() or workers)
+        if workers == self._workers:
+            return
+        # ProcessPoolExecutor can't resize, so swap. configure and analyze are
+        # both handled on the stdin thread, so no submit can race the swap.
+        # shutdown(wait=False) without cancel_futures lets the old pool finish
+        # its running + already-queued jobs (their done-callbacks still fire),
+        # then its workers exit and return their Essentia-loaded memory.
+        old = self._pool
+        self._pool = self._make_pool(workers)
+        self._workers = workers
+        try:
+            old.shutdown(wait=False)
+        except Exception:
+            pass
+
     def _cancel(self, params: dict[str, Any]) -> None:
         track_id = params.get("trackId")
         if not track_id:
@@ -197,7 +259,9 @@ def main() -> None:
         "name": "curator-analyzer",
         "version": ANALYZER_VERSION,
         "protocol": PROTOCOL_VERSION,
+        "cpus": os.cpu_count(),
     })
+    _apply_resource_policy()
     sidecar = Sidecar()
     try:
         for line in sys.stdin:

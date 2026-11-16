@@ -7,8 +7,9 @@ import { describe, expect, it } from 'vitest';
 import type { CatalogEventCardV2, CatalogEventTrackCardV2 } from '@curator/protocol';
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
-import { raisePlaylistAdd, raiseReleaseEvent, reannounce, releaseCard } from './events.js';
-import { ingestClaims } from './ingest.js';
+import { mergeObjects } from './admin.js';
+import { raisePlaylistAdd, raiseReleaseEvent, reannounce, reannounceCard, releaseCard } from './events.js';
+import { ingestClaims, Ingester } from './ingest.js';
 
 const today = new Date().toISOString().slice(0, 10);
 
@@ -75,6 +76,46 @@ describe('event cards v2', () => {
 		expect(card).toMatchObject({ version: 2, kind: 'track', bpm: 122, key: 'A Minor', genres: ['Melodic House & Techno', 'Progressive House'], label: { id: labelId, name: 'Northfold Records' } });
 	});
 
+	it('a release whose tracklist shrank is re-announced with the shorter card, once', async () => {
+		const { app, releaseId, labelId, recordingId } = await seed();
+		const r = await withSystemTx(app.db, async (tx) => {
+			const seq = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
+			expect(await reannounceCard(tx, releaseId)).toEqual([]);
+			const [other] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'beatport' and kind = 'recording' and provider_id = '12'`);
+			await mergeObjects(tx, other!.object_id, recordingId, 'test', 'same slot');
+			const moved = await reannounceCard(tx, releaseId);
+			const [gone] = await tx.query(`select 1 from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
+			const [ev] = await tx.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
+			const again = await reannounceCard(tx, releaseId);
+			return { moved, again, gone, oldSeq: seq!, newSeq: Number(ev!.seq), card: JSON.parse(ev!.card) as CatalogEventCardV2 };
+		});
+		expect(r.moved).toEqual([r.newSeq]);
+		expect(r.again).toEqual([]);
+		expect(r.gone).toBeUndefined();
+		expect(r.newSeq).toBeGreaterThan(r.oldSeq);
+		expect(r.card.tracks.map((t) => t.title)).toEqual(['Glass Rivers']);
+	});
+
+	it('a track that gained a provider re-announces its release, through the tracker’s own path too', async () => {
+		const { app, releaseId, labelId, recordingId } = await seed();
+		const r = await withSystemTx(app.db, async (tx) => {
+			const seq = (await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 }))!;
+			// The release has Spotify already (card rebuilt), then a track gains it.
+			await ingestClaims(tx, [{ provider: 'spotify', kind: 'release', providerId: 'al1', name: 'Glass Rivers', identifiers: [{ namespace: 'upc', value: '0123456789012' }], artists: [] }], { reason: 'enrichment' });
+			const seq2 = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
+			await new Ingester(tx, { reason: 'enrichment' }).attachTo(recordingId, { provider: 'spotify', kind: 'recording', providerId: 'st1', name: 'Glass Rivers' });
+			expect(await reannounceCard(tx, releaseId)).toHaveLength(1);
+			// The same again through the tracker's path: another second tracker
+			// reaching the release moves it only while something changed.
+			const seq3 = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
+			const [ev] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
+			return { seq, seq2, seq3, card: JSON.parse(ev!.card) as CatalogEventCardV2 };
+		});
+		expect(r.seq2).toBeGreaterThan(r.seq);
+		expect(r.seq3).toBeNull();
+		expect(r.card.tracks[0]!.handles.map((h) => h.provider).sort()).toEqual(['beatport', 'spotify']);
+	});
+
 	it('a stored v1 card is rebuilt as v2 when the release gains a provider', async () => {
 		const { app, releaseId, labelId } = await seed();
 		const card = await withSystemTx(app.db, async (tx) => {
@@ -91,5 +132,45 @@ describe('event cards v2', () => {
 		expect(card.version).toBe(2);
 		expect(card.catalogNumber).toBe('NFR042');
 		expect(card.tracks[0]!.bpm).toBe(122);
+	});
+
+	it('two credits merged into one re-announce the release with one name', async () => {
+		const { app, releaseId, labelId } = await seed();
+		const r = await withSystemTx(app.db, async (tx) => {
+			// A second store credits the artist under another spelling, on the
+			// release and on its first track.
+			const credit = { provider: 'deezer', kind: 'artist', providerId: 'd77', name: 'North Fold' } as const;
+			await ingestClaims(
+				tx,
+				[
+					{
+						provider: 'deezer',
+						kind: 'release',
+						providerId: 'dz1',
+						name: 'Glass Rivers',
+						identifiers: [{ namespace: 'upc', value: '0123456789012' }],
+						artists: [credit],
+						recordings: [{ provider: 'deezer', kind: 'recording', providerId: 'dt1', name: 'Glass Rivers', identifiers: [{ namespace: 'isrc', value: 'GBAAA2600001' }], facts: { durationSec: 401 }, artists: [credit] }],
+					},
+				],
+				{ reason: 'tracker' },
+			);
+			const seq = (await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 }))!;
+			const names = async () => {
+				const [ev] = await tx.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
+				const c = JSON.parse(ev!.card) as CatalogEventCardV2;
+				return { seq: Number(ev!.seq), artists: c.artists.map((a) => a.name).sort(), track: c.tracks[0]!.artists };
+			};
+			const before = await names();
+			const [fold] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'deezer' and kind = 'artist' and provider_id = 'd77'`);
+			const [keep] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'beatport' and kind = 'artist' and provider_id = '77'`);
+			await mergeObjects(tx, fold!.object_id, keep!.object_id, 'test', 'twins');
+			return { seq, before, after: await names() };
+		});
+		expect(r.before.seq).toBe(r.seq);
+		expect(r.before.artists).toEqual(['North Fold', 'Northfold']);
+		expect(r.after.seq).toBeGreaterThan(r.before.seq);
+		expect(r.after.artists).toEqual(['Northfold']);
+		expect(r.after.track).toEqual(['Northfold']);
 	});
 });

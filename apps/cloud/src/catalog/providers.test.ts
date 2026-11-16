@@ -210,4 +210,25 @@ describe('identity planner', () => {
 		);
 		expect(await runPlanner({ db: app.db, log: quiet, finders: [new SpotifyFinder(spotify)] })).toEqual({ attempted: 1, linked: 1 });
 	});
+
+	it('of two namesakes listing our releases, links the one listing clearly more — a store-tagged namesake counting too', async () => {
+		const { app, fan } = await watchedSpotifyArtist();
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(
+				tx,
+				['Glass Rivers', 'Low Tide'].map((name, i) => ({ provider: 'spotify' as const, kind: 'release' as const, providerId: `al${i + 1}`, name, facts: { releaseDate: today }, artists: [{ provider: 'spotify' as const, kind: 'artist' as const, providerId: 'sa1', name: 'Northfold' }] })),
+				{ reason: 'tracker' },
+			),
+		);
+		// Deezer's namesake bucket lists one of ours among others; the artist's
+		// own page, tagged "(UK)" by the store, lists both (2026-11-09, ELIF).
+		const routes = {
+			'/search/artist': { data: [{ id: 77, name: 'Northfold' }, { id: 78, name: 'Northfold (UK)' }] },
+			'/artist/77/albums': { data: ['Glass Rivers', 'Pop Song', 'Another'].map((t, i) => ({ id: i, title: t })) },
+			'/artist/78/albums': { data: ['Glass Rivers', 'Low Tide'].map((t, i) => ({ id: i, title: t })) },
+		};
+		expect(await runPlanner({ db: app.db, log: quiet, finders: [new DeezerFinder(fakeFetch(routes))] })).toEqual({ attempted: 1, linked: 1 });
+		const [w] = await fan.api.catalog.listWatches.query({ deviceId: fan.deviceId });
+		expect(w!.object.handles.map((h) => `${h.provider}:${h.id}`).sort()).toEqual(['deezer:78', 'spotify:sa1']);
+	});
 });

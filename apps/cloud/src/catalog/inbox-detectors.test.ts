@@ -5,8 +5,10 @@
 import { describe, expect, it } from 'vitest';
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
+import type { FetchLike } from '@curator/catalog-readers';
+import { mergeObjects } from './admin.js';
 import { adminOps } from './admin-ops.js';
-import { runInboxDetectors, titleKeys, twinGroups } from './inbox-detectors.js';
+import { bucketCandidates, runInboxDetectors, titleKeys, twinGroups } from './inbox-detectors.js';
 import { ingestClaims, linkReleasesToLabel } from './ingest.js';
 
 const labelClaim = (name: string) => ({ provider: 'user' as const, kind: 'label' as const, providerId: `name:${name.toLowerCase()}`, name });
@@ -123,5 +125,63 @@ describe('detectors', () => {
 		expect(await ops.inboxCounts({})).toEqual({ approval: 0, notice: 0, snoozed: 0 });
 		const cleared = (await ops.inboxList({ status: 'all' })).rows.filter((i) => i.status === 'cleared');
 		expect(cleared.map((i) => i.resolution).sort()).toEqual(['nothing is parked any more', 'the tracker recovered']);
+	});
+
+	it('suspects each id of a store an artist holds twice, over a lower floor; the operator splits a namesake off and blocks a bucket', async () => {
+		const app = await createTestApp();
+		const by = (provider: 'spotify' | 'deezer', id: string) => [{ provider, kind: 'artist' as const, providerId: id, name: 'Ivo Lark' }];
+		const rel = (provider: 'spotify' | 'deezer', id: string, title: string, labelText: string, artistId: string, upc?: string) => ({
+			provider,
+			kind: 'release' as const,
+			providerId: id,
+			name: title,
+			facts: { releaseDate: '2026-03-01', labelText },
+			identifiers: upc ? [{ namespace: 'upc' as const, value: upc }] : [],
+			artists: by(provider, artistId),
+		});
+		const ids = await withSystemTx(app.db, async (tx) => {
+			await ingestClaims(tx, [rel('spotify', 's1', 'Glass Rivers', 'Northfold', 'sa1'), rel('spotify', 's2', 'Low Tide', 'Northfold', 'sa1'), rel('spotify', 's3', 'Drift', 'Marram', 'sa1'), rel('spotify', 's4', 'Eos', 'Kiosk', 'sa1', '0123456789012')], { reason: 'tracker' });
+			// Deezer's bucket under her name — hers "Eos" (joined by UPC, so the
+			// page lands on her through it) beside a stranger's — and a namesake's
+			// own Deezer page, minted apart and merged in as a twin (2026-11-09, ELIF).
+			await ingestClaims(tx, [rel('deezer', '701', 'Eos', 'Kiosk', 'dzA', '0123456789012'), rel('deezer', '702', 'Depresiyon', 'Turkish Pop', 'dzA')], { reason: 'tracker' });
+			await ingestClaims(tx, [rel('deezer', '801', 'Nacht', 'Pop Haus', 'dzB'), rel('deezer', '802', 'Alaska', 'Pop Haus', 'dzB'), rel('deezer', '803', 'Freunde', 'Universal', 'dzB'), rel('deezer', '804', 'Freunde II', 'Polydor', 'dzB')], { reason: 'tracker' });
+			const own = async (provider: string, id: string) => (await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = $1 and kind = 'artist' and provider_id = $2`, [provider, id]))[0]!.object_id;
+			const [a, dzA, dzB] = [await own('spotify', 'sa1'), await own('deezer', 'dzA'), await own('deezer', 'dzB')];
+			expect(dzA).toBe(a);
+			expect(dzB).not.toBe(a);
+			await mergeObjects(tx, dzB, a, 'test', 'twins');
+			return { artist: a };
+		});
+		const c = await withSystemTx(app.db, (tx) => bucketCandidates(tx, { days: 30 }));
+		const byId = Object.fromEntries(c.map((x) => [`${x.provider}:${x.providerId}`, x]));
+		expect(byId['deezer:dzA']).toMatchObject({ artist: ids.artist, suspect: true, stats: { siblings: 2, releases: 6, labels: 5, shared: 1, others: 3, labelsShared: 1, labelsElsewhere: 3 } });
+		expect(byId['deezer:dzB']).toMatchObject({ suspect: true, stats: { siblings: 2 } });
+		expect(byId['spotify:sa1']).toBeUndefined();
+
+		// The operator answers. dzB is the pop singer's own page: split off with
+		// its releases, held until approved. dzA is Deezer's bucket: blocked, the
+		// release only it brought loses the credit, hers on Spotify too stays.
+		const fetch: FetchLike = async (input) => {
+			const path = new URL(input).pathname;
+			const m = /^\/artist\/(dz[AB])(\/albums)?$/.exec(path);
+			const albums: Record<string, number[]> = { dzA: [701, 702], dzB: [801, 802, 803, 804] };
+			const body = !m ? { error: { code: 800 } } : m[2] ? { data: albums[m[1]!]!.map((id) => ({ id })) } : { id: m[1], name: m[1] === 'dzB' ? 'IVO LARK' : 'Ivo Lark' };
+			return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+		};
+		const ops = adminOps(app.db, { fetch });
+		const held = await ops.artistUnlink({ id: ids.artist, source: 'deezer:dzB', note: 'the pop singer' });
+		expect(held).toMatchObject({ name: 'IVO LARK', releases: 4, held: expect.any(Number), result: null });
+		await ops.inboxDecide({ id: held.held!, action: 'approve', note: 'yes' });
+		const pop = (await app.db.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'deezer' and provider_id = 'dzB'`))[0]!.object_id;
+		expect(pop).not.toBe(ids.artist);
+		const credited = async (artist: string) => (await app.db.query<{ name: string }>(`select r.name from curator.catalog_edge e join curator.catalog_object r on r.id = e.dst where e.src = $1 and e.kind = 'artist-release' order by r.name`, [artist])).map((r) => r.name);
+		expect(await credited(pop)).toEqual(['Alaska', 'Freunde', 'Freunde II', 'Nacht']);
+		expect(await credited(ids.artist)).toEqual(['Depresiyon', 'Drift', 'Eos', 'Glass Rivers', 'Low Tide']);
+		const direct = await ops.artistUnlink({ id: ids.artist, source: 'deezer:dzA', note: "Deezer's bucket", as: 'bucket', approved: true });
+		expect(direct.result).toMatchObject({ into: null, uncredited: 1, kept: 1 });
+		expect(await credited(ids.artist)).toEqual(['Drift', 'Eos', 'Glass Rivers', 'Low Tide']);
+		expect(await app.db.query(`select 1 from curator.catalog_source_block where provider = 'deezer' and kind = 'artist' and provider_id = 'dzA'`)).toHaveLength(1);
+		expect((await ops.inboxList({ status: 'all', kind: 'artist.unlink' })).rows.map((r) => r.severity).sort()).toEqual(['approval', 'audit']);
 	});
 });

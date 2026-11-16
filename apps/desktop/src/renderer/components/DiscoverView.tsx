@@ -16,6 +16,8 @@ import { render } from 'solid-js/web';
 import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, JourneySeed, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
 import { openContextMenu, type ContextMenuItem } from './ContextMenu.jsx';
 import { ArtistCredits } from './ArtistCredits.jsx';
+import { artistOpenSubmenu } from '../features/artistOpenMenu.js';
+import { connectDots } from '../features/connectDots.js';
 import { searchFold } from '@curator/shared';
 import { buildFeedMenu, feedShow, spotifyPlaylistOrigin, type FeedActions } from '../features/feedCommands.js';
 import { BRAND_ICONS, BRAND_ORDER, brandIcon } from '../features/brandIcons.js';
@@ -26,7 +28,7 @@ import { catalogApi, shellApi } from '../data/api.js';
 import { FollowingPanel } from './FollowingPanel.jsx';
 import { ManageFollowingModal } from './ManageFollowingModal.jsx';
 import { registerModalOpenSignal } from '../modalGate.js';
-import { cardPlayable, isSpotifyArtistId, playableId, providerLabel, storeLinks } from '../features/feedHandles.js';
+import { cardPlayable, isSpotifyArtistId, needsSpotifyFill, playableId, providerLabel, storeLinks } from '../features/feedHandles.js';
 
 // The Refresh menu's words for the follow kinds.
 const KIND_TITLES: Record<FeedRefreshKind, string> = { artist: 'Artists', label: 'Labels', playlist: 'Playlists', genre: 'Genres' };
@@ -80,9 +82,6 @@ export interface DiscoverViewProps {
 	// Start a discovery journey from a feed track — main.ts flips Discover
 	// into Journeys mode and creates the journey from the seed.
 	onStartJourney: (seed: JourneySeed) => void;
-	// "Show in library" on an artist name — main.ts resolves the name against
-	// the library's artist table and opens the "Artist: X" scope.
-	onShowArtistInLibrary: (name: string) => void;
 	// The playlist name on a "New on <playlist> by <profile>" line — main.ts
 	// opens the followed playlist under the Spotify tab (it is synced into
 	// the library), or the Spotify app when the library has no row for it yet.
@@ -330,6 +329,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			setCatalogAvailable(s.available);
 			if (s.available) void catalogApi.watches().then((w) => setFollowCount(w.length)).catch(() => {});
 		}).catch(() => setCatalogAvailable(false));
+		// What the follows lack on the stores ("Connect the dots"): a change
+		// of follows changes it, so it is counted afresh with them.
+		void connectDots.refresh({ force: true });
 	};
 	loadCatalog();
 	// itemId → detail for expanded album cards (null while loading).
@@ -415,7 +417,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			// The lazy fill: a card without a Spotify id is matched on Spotify as
 			// the page lands (core feed:fill, one at a time; a settled item spends
 			// nothing). The expand path fills the rest.
-			queueFills(page.items.filter((i) => i.source === 'catalog' && (i.matchStatus === null || i.matchStatus !== 'ok')).map((i) => i.id));
+			queueFills(page.items.filter(needsSpotifyFill).map((i) => i.id));
 			noteUnavailable(page.items.filter((i) => i.type === 'track' && i.unavailable).map((i) => i.sourceId));
 			setNextCursor(page.nextCursor);
 			setTotal(page.total);
@@ -925,14 +927,17 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// catalogue knows without one (mutable all the same, never a Spotify ref).
 	function showArtistMenu(evt: MouseEvent, item: FeedItem, name: string, artistId: string | undefined): void {
 		const spotifyId = isSpotifyArtistId(artistId) ? artistId : undefined;
+		// Open Artist in ▸ — the feed's ids name the artist (a Spotify id, or
+		// the catalogue's own); "Open Locally" is the old "Show in library".
+		const open = artistOpenSubmenu([{ name, spotifyId: spotifyId ?? null, catalogId: artistId?.startsWith('catalog:') ? artistId.slice('catalog:'.length) : null }]);
 		const items: Parameters<typeof openContextMenu>[0] = [
 			{ kind: 'header', label: name },
-			{ kind: 'item', id: 'library', label: 'Show in library' },
+			...(open ? [open.item] : []),
 			{ kind: 'item', id: 'journey', label: 'Start journey' },
 		];
 		if (artistId) items.push({ kind: 'divider' }, { kind: 'item', id: 'mute', label: `Mute artist: ${name}`, danger: true });
 		openContextMenu(items, {
-			library: () => props.onShowArtistInLibrary(name),
+			...open?.handlers,
 			// Same seed identities the KB already mints: a Spotify artist ref
 			// when the feed knows the id, else the name-keyed local ref that
 			// library seeding uses — so the journey lands on the existing stub.
@@ -959,13 +964,13 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				unfollow: () => { void unfollowPlaylist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
 		} else if (origin.kind === 'artist') {
-			const onSpotify = isSpotifyArtistId(origin.id);
+			const open = artistOpenSubmenu([{ name: origin.name, spotifyId: isSpotifyArtistId(origin.id) ? origin.id : null, catalogId: origin.catalogId ?? null }]);
 			openContextMenu([
 				{ kind: 'header', label: origin.name },
-				...(onSpotify ? [{ kind: 'item' as const, id: 'open', label: 'Open artist in Spotify' }, { kind: 'divider' as const }] : []),
+				...(open ? [open.item, { kind: 'divider' as const }] : []),
 				{ kind: 'item', id: 'unfollow', label: 'Unfollow artist', danger: true },
 			], {
-				open: () => { void shellApi.openSpotify(`spotify:artist:${origin.id}`); },
+				...open?.handlers,
 				unfollow: () => { void unfollowArtist(origin.id, origin.name, origin.catalogId); },
 			}, { at: evt });
 		} else if ((origin.kind === 'label' || origin.kind === 'genre') && origin.catalogId) {
@@ -973,10 +978,12 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 			const catalogId = origin.catalogId;
 			openContextMenu([
 				{ kind: 'header', label: origin.name },
+				...(kind === 'label' && connectDots.available() ? [{ kind: 'item' as const, id: 'connect', label: 'Help connect this label…' }] : []),
 				{ kind: 'item', id: 'mute', label: `Mute ${kind}` },
 				{ kind: 'divider' },
 				{ kind: 'item', id: 'unfollow', label: `Unfollow ${kind}`, danger: true },
 			], {
+				connect: () => connectDots.openFor([catalogId]),
 				mute: () => { void muteOrigin(item, kind, catalogId, origin.name); },
 				unfollow: () => { void unfollowOrigin(kind, catalogId, origin.name); },
 			}, { at: evt });
@@ -1212,7 +1219,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 				// re-expand of a settled album spends nothing. Fire while the item
 				// is unattempted (null) or last errored — an 'err' album retries
 				// its failed rows on expand; 'ok'/'na' are terminal.
-				if (detail.item.enrichStatus == null || detail.item.enrichStatus === 'err' || detail.item.source === 'catalog') void fillExpanded(item.id);
+				if (detail.item.enrichStatus == null || detail.item.enrichStatus === 'err' || needsSpotifyFill(detail.item)) void fillExpanded(item.id);
 				return detail;
 			}
 			after.delete(item.id);
@@ -1966,6 +1973,15 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0M17 8v6M14 11h6" /></svg>
 					Following{followCount() !== null ? ` ${followCount()}` : ''}
 				</button>
+				{/* Shown only where the catalogue offers it and something is missing. */}
+				<Show when={connectDots.available() && (connectDots.remaining() ?? 0) > 0}>
+					<button class="feed-toolbar__refresh"
+						title="Help us connect the dots: tell the catalogue which store pages belong to the artists and labels you follow"
+						onClick={() => connectDots.open()}>
+						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="6" r="2.2" /><circle cx="19" cy="6" r="2.2" /><circle cx="12" cy="18" r="2.2" /><path d="M7 7.2l3.8 8.8M17 7.2l-3.8 8.8M7.2 6h9.6" /></svg>
+						Connect the dots {connectDots.remaining()!.toLocaleString()}
+					</button>
+				</Show>
 			</div>
 			{/* Standing lenses: each chip is one filter the feed obeys until ×.
 			    The label is the user's own words (or the assistant's quote of

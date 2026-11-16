@@ -185,6 +185,10 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'catalog:browse': async (objectId) => svc.catalogBrowse(objectId),
 		'catalog:candidates': async (kind) => svc.catalogFollowCandidates(kind),
 		'catalog:follow-many': async (targets) => svc.catalogFollowMany(targets),
+		'catalog:connect-status': async () => svc.getConnectStatus(),
+		'catalog:connect-queue': async (opts) => svc.getConnectQueue(opts),
+		'catalog:connect-search': async (subject, provider) => svc.searchConnectCandidates(subject, provider),
+		'catalog:connect-answer': async (answers) => svc.submitConnectAnswers(answers),
 		// Journeys + knowledge base — in-process like the feed (user-paced
 		// reads; the expansion queue already backgrounds provider crawls).
 		'journey:create': async (seed, opts) => svc.createJourney(seed, opts),
@@ -275,6 +279,8 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'artists:get': readViaSidecar('artists:get', async (id) => svc.getArtist(id)),
 		'artists:resolve': readViaSidecar('artists:resolve', async (name) => svc.resolveArtistByName(name)),
 		'artists:links': readViaSidecar('artists:links', async (id) => svc.getArtistLinks(id)),
+		// In-process: it calls the catalogue client, which the read sidecar does not host.
+		'artists:pages': async (target) => svc.getArtistPages(target),
 		'albums:by-ids': readViaSidecar('albums:by-ids', async (ids) => svc.getAlbumsByIds(ids)),
 		'artists:merge-suggestions': readViaSidecar('artists:merge-suggestions', async (scope) => svc.listArtistMergeSuggestions(scope)),
 		'artists:dismiss-merge': async (aId, bId) => svc.dismissArtistMergeSuggestion(aId, bId),
@@ -470,6 +476,8 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'cue:delete':                async (cueId)          => svc.deleteCue(cueId),
 		'analysis:status':           async ()               => svc.getAnalysisStatus(),
 		'analysis:set-auto-enqueue': async (settings)       => svc.setAutoAnalyzeSettings(settings),
+		'analysis:resources':        async ()               => svc.getAnalyzerResources(),
+		'analysis:set-resources':    async (patch)          => svc.setAnalyzerResources(patch),
 
 		// ─── AI audio analysis engine ───────────────────────────────────────
 		// In-process (not readViaSidecar): only the main process's core owns

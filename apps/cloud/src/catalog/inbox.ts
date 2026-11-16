@@ -22,8 +22,11 @@ import { num, numOrNull } from '../db/db.js';
 import type { SystemTx } from '../db/system-tx.js';
 import { decideReview, mergeObjects, mergeOverruling, notSame, relinkPage, renameObject, reopenReview, unlinkPage, type ReviewDecision, type UnlinkResult } from './admin.js';
 import { runBlockSource, runRecredit, runUnblockSource } from './agent/apply.js';
+import { splitArtistPage, type SplitArgs } from './artist-split.js';
+import { attachConnected, ruleOutPage, type ConnectAttachArgs } from './connect-apply.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { restoreInsight, retireInsight } from './insights.js';
+import { dedupeRelease } from './release-fill.js';
 import type { Severity } from './inbox-policy.js';
 import { summaries } from './objects.js';
 
@@ -251,8 +254,13 @@ async function runApply(tx: SystemTx, item: InboxItem, d: InboxDecision): Promis
 				merged.push(p.keep);
 			}
 			// Two releases made one put each store's copy of the artist on one
-			// release: joined now by the twins rule, not left for a sweep.
-			if (item.apply!.op === 'mergeReleases' && merged.length) await artistTwinsOn(tx, [...new Set(merged)], d.by);
+			// release: joined now by the twins rule, not left for a sweep — and
+			// each store's copy of a track on one slot (release-fill.ts).
+			if (item.apply!.op === 'mergeReleases' && merged.length) {
+				const winners = [...new Set(merged)];
+				await artistTwinsOn(tx, winners, d.by);
+				for (const id of winners) await dedupeRelease(tx, id, d.by);
+			}
 			return;
 		}
 		case 'unlinkPage': {
@@ -268,8 +276,15 @@ async function runApply(tx: SystemTx, item: InboxItem, d: InboxDecision): Promis
 		case 'blockSource':
 			await runBlockSource(tx, { ...a, note: d.note ?? a.note }, d.by);
 			return;
+		case 'splitArtist':
+			await splitArtistPage(tx, a as unknown as SplitArgs, d.by);
+			return;
 		case 'recredit':
 			await runRecredit(tx, a, d.by);
+			return;
+		// A user's "connect the dots" answer the cloud could not back (connect.ts).
+		case 'connectAttach':
+			await attachConnected(tx, a as unknown as ConnectAttachArgs);
 			return;
 		default:
 			throw new Error(`inbox: no apply for ${item.apply!.op}`);
@@ -294,10 +309,15 @@ async function runDiscard(tx: SystemTx, item: InboxItem, d: InboxDecision): Prom
 			for (const p of a.pairs as Pair[]) await notSame(tx, p.keep, p.fold, d.by, d.note ?? 'not twins (inbox)');
 			return;
 		}
+		// Not their page: ruled out, so no finder and no later answer attaches it.
+		case 'connectAttach':
+			await ruleOutPage(tx, a as unknown as ConnectAttachArgs, d.by, d.note ?? 'not their page (inbox)');
+			return;
 		case 'mergeLabels':
 		case 'unlinkPage':
 		case 'notSame':
 		case 'blockSource':
+		case 'splitArtist':
 		case 'recredit':
 			return;
 		default:
@@ -321,7 +341,7 @@ async function runUndo(tx: SystemTx, item: InboxItem, d: InboxDecision): Promise
 			return;
 		}
 		case 'unlinkPage':
-			await unlinkPage(tx, str(a.objectId), a.page as Page, d.by, d.note ?? 'undone in the inbox');
+			await unlinkPage(tx, str(a.objectId), a.page as Page, d.by, d.note ?? 'undone in the inbox', a.kind === 'artist' ? { kind: 'artist' } : {});
 			return;
 		case 'retireInsight':
 			await retireInsight(tx, num(a.id), d.by);

@@ -7,6 +7,7 @@
 // error's message is replaced, because a Postgres error text names tables,
 // columns and constraint internals.
 
+import type { FetchLike, SoundCloudTracker } from '@curator/catalog-readers';
 import type { CataloguePolicy } from '@curator/protocol';
 import { initTRPC, TRPCError } from '@trpc/server';
 import type { AuditWriter } from './audit.js';
@@ -42,6 +43,12 @@ export type AppDeps = {
 	// 'global_catalog' (src/catalog): on or off (config.ts CURATOR_GLOBAL_CATALOG).
 	// Off refuses the catalog.* and feed.* procedures and drops the feature.
 	catalog: boolean;
+	// 'catalog_connect' (src/catalog/connect.ts): the fetch a user's answer is
+	// checked against the store with. Absent: the global one.
+	connectFetch?: FetchLike;
+	// SoundCloud by the app's credentials, for the profiles a user picks
+	// from (catalog.connectSearch). Absent: this server cannot search it.
+	connectSoundcloud?: Pick<SoundCloudTracker, 'searchUsers'> | null;
 };
 
 export type AppContext = {
