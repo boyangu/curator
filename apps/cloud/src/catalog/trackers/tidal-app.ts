@@ -69,6 +69,20 @@ export class TidalApp {
 		return getJson<Doc>(this.fetchFn, 'tidal', `${API}${path}?${qs}`, { headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.api+json' }, signal, logPath: path });
 	}
 
+	// How many followers each artist has (the Reach score), many ids a call.
+	// The app token gets `numberOfFollowers` (and a 0–1 `popularity`, which the
+	// count makes unneeded); an id Tidal does not know is left out.
+	async artistFollowers(ids: readonly string[], signal?: AbortSignal): Promise<Map<string, number>> {
+		const out = new Map<string, number>();
+		if (!ids.length) return out;
+		const doc = await this.get('/artists', { 'filter[id]': ids.join(',') }, signal);
+		for (const r of Array.isArray(doc.data) ? doc.data : doc.data ? [doc.data] : []) {
+			const n = r.attributes?.numberOfFollowers;
+			if (r.type === 'artists' && typeof n === 'number') out.set(r.id, n);
+		}
+		return out;
+	}
+
 	// The album with that barcode, with its tracks (ISRCs, lengths) and artists.
 	async albumByUpc(upc: string, signal?: AbortSignal): Promise<CatalogClaim | null> {
 		const doc = await this.get('/albums', { 'filter[barcodeId]': upc, include: 'items,artists' }, signal);

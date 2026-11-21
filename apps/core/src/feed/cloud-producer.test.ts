@@ -73,6 +73,17 @@ describe('eventToDraft', () => {
 		expect(d.suppressKeys).toEqual(['artist:sa1', 'artist:catalog:cat-a2', 'source:spotify']);
 	});
 
+	it("carries the catalogue's own artist and label ids beside the mute keys, per credit", () => {
+		const d = eventToDraft(event(1, { card: card({ label: { id: 'cat-lbl', name: 'Northfold Records' } }) }), new Set(['cat-a1']))!;
+		// `artistIds` stays the Spotify id where there is one (the mute key).
+		expect(d.payload).toMatchObject({ artistIds: ['sa1', 'catalog:cat-a2'], artistCatalogIds: ['cat-a1', 'cat-a2'], labelCatalogId: 'cat-lbl' });
+		expect(d.payload.tracks?.map((t) => t.artistCatalogIds)).toEqual([['cat-a1', 'cat-a2'], ['cat-a1']]);
+		// A credit the card's own artists do not name has no id to give.
+		const guest = eventToDraft(event(2, { card: card({ tracks: [{ ...card().tracks[0]!, artists: ['Northfold', 'A Remixer'] }] }) }))!;
+		expect(guest.payload.tracks![0]!.artistCatalogIds).toEqual(['cat-a1', null]);
+		expect(guest.payload.labelCatalogId).toBeNull();
+	});
+
 	it('keeps every track, Spotify ids where the player can play them and catalogue ids where not', () => {
 		const d = eventToDraft(event(1), new Set(['cat-a1']))!;
 		expect(d.payload.tracks?.map((t) => [t.sourceTrackId, t.catalogId, t.artistIds, t.genre, t.label])).toEqual([

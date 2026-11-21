@@ -98,7 +98,7 @@ export function AppShell() {
 						<div class="omnibar__view" id="omnibar-view-search">
 							<div class="omnibar__search">
 								<svg class="omnibar__search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-								<input id="omnibar-input" type="text" spellcheck={false} autocomplete="off" placeholder="Search tracks, playlists, folders…  Try s/, l/, r/, zen/uplifting/, artist:foo bpm<124" />
+								<input id="omnibar-input" type="text" spellcheck={false} autocomplete="off" placeholder="Search tracks, playlists, folders…  Try s/, r/, w/ for the world, zen/uplifting/, artist:foo bpm<124" />
 								<span class="omnibar__scope-chip" id="omnibar-scope-chip" hidden></span>
 							</div>
 							<div class="omnibar__results" id="omnibar-results" role="listbox"></div>

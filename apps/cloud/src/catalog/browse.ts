@@ -4,7 +4,7 @@
 // read-only transaction. Nothing here is per-user; watch counts are the only
 // trace of who follows what.
 
-import { CATALOG_BROWSE_MAX, type CatalogBrowseResult, type CatalogProvider } from '@curator/protocol';
+import { CATALOG_BROWSE_MAX, CATALOG_COLLABS_MAX, type CatalogBrowseResult, type CatalogProvider, type CatalogReach } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
@@ -94,18 +94,18 @@ const like = (s: string) => s.replace(/[\\%_]/g, (m) => `\\${m}`);
 const split = (s: string | null) => (s ? s.split('|') : []);
 // `id<US>name` pairs joined by <RS> (chr 31 / 30, never in a name): one
 // aggregate per relation instead of a query per row.
-const refs = (s: string | null): Ref[] =>
+export const refs = (s: string | null): Ref[] =>
 	s
 		? s.split('\u001e').map((p) => {
 				const [id, name] = p.split('\u001f');
 				return { id: id!, name: name ?? '' };
 			})
 		: [];
-const REF_AGG = (alias: string, order: string) => `string_agg(${alias}.id || chr(31) || ${alias}.name, chr(30) order by ${order})`;
+export const REF_AGG = (alias: string, order: string) => `string_agg(${alias}.id || chr(31) || ${alias}.name, chr(30) order by ${order})`;
 // `provider<US>id<US>url` triples joined by <RS>, the object's representations.
-const HANDLE_AGG = (object: string) =>
+export const HANDLE_AGG = (object: string) =>
 	`(select string_agg(so.provider || chr(31) || so.provider_id || chr(31) || coalesce(so.url, ''), chr(30) order by so.provider, so.first_seen_at) from curator.catalog_source_object so where so.object_id = ${object})`;
-const handlesOf = (s: string | null): Handle[] =>
+export const handlesOf = (s: string | null): Handle[] =>
 	s
 		? s.split('\u001e').map((p) => {
 				const [provider, id, url] = p.split('\u001f');
@@ -258,9 +258,13 @@ const DETAIL_LIMIT = CATALOG_BROWSE_MAX;
 
 // `library`: a label's and an artist's releases, tracks, artists and counts
 // only as far as the owner's library reaches (local-library.ts); a release's
-// own tracklist stays whole.
-export async function browseObject(tx: Queryable, id: string, opts: { library?: boolean } = {}): Promise<ObjectView | null> {
+// own tracklist stays whole. `lean`: without an artist's credited recordings,
+// which a device never reads (browseForClient) and a prolific artist makes
+// the dearest query of the view. `brief`: without any release or track list
+// at all — the object, its counts and who it relates to (a page header).
+export async function browseObject(tx: Queryable, id: string, opts: { library?: boolean; lean?: boolean; brief?: boolean } = {}): Promise<ObjectView | null> {
 	const lib = opts.library;
+	const lists = !opts.brief;
 	// Follow a merge chain to the live object, as identity.follow does.
 	let live = id;
 	for (let i = 0; i < 10; i++) {
@@ -327,7 +331,7 @@ export async function browseObject(tx: Queryable, id: string, opts: { library?: 
 
 	if (o.kind === 'label') {
 		const cond = `exists (select 1 from curator.catalog_edge e where e.kind = 'release-label' and e.src = r.id and e.dst = $1)`;
-		view.releases = await releases(tx, cond, [live], DETAIL_LIMIT, lib);
+		if (lists) view.releases = await releases(tx, cond, [live], DETAIL_LIMIT, lib);
 		view.releaseCount = await count(`select count(*) as n from curator.catalog_edge e where kind = 'release-label' and dst = $1${inLibrary(lib, 'e.src')}`);
 		view.roster = await refList(`select a.id, a.name from curator.catalog_edge e join curator.catalog_object a on a.id = e.dst where e.src = $1 and e.kind = 'label-artist'${inLibrary(lib, 'a.id')} order by e.position nulls last, a.name`);
 		// Who actually releases on it, by count: the roster is only what a page lists.
@@ -345,18 +349,19 @@ export async function browseObject(tx: Queryable, id: string, opts: { library?: 
 		view.playlists = await refList(`select p.id, p.name from curator.catalog_edge e join curator.catalog_object p on p.id = e.dst where e.src = $1 and e.kind = 'label-playlist' order by p.name`);
 	} else if (o.kind === 'artist') {
 		const cond = `exists (select 1 from curator.catalog_edge e where e.kind = 'artist-release' and e.src = $1 and e.dst = r.id)`;
-		view.releases = await releases(tx, cond, [live], DETAIL_LIMIT, lib);
+		if (lists) view.releases = await releases(tx, cond, [live], DETAIL_LIMIT, lib);
 		view.releaseCount = await count(`select count(*) as n from curator.catalog_edge e where kind = 'artist-release' and src = $1${inLibrary(lib, 'e.dst')}`);
-		view.tracks = await tracks(
-			tx,
-			{
-				from: `from curator.catalog_edge ra join curator.catalog_object o on o.id = ra.src and o.merged_into is null where ra.dst = $1 and ra.kind = 'recording-artist'${inLibrary(lib, 'o.id')}`,
-				pos: 'null::int',
-				order: 'o.name_fold',
-			},
-			[live],
-			DETAIL_LIMIT,
-		);
+		if (!opts.lean && lists)
+			view.tracks = await tracks(
+				tx,
+				{
+					from: `from curator.catalog_edge ra join curator.catalog_object o on o.id = ra.src and o.merged_into is null where ra.dst = $1 and ra.kind = 'recording-artist'${inLibrary(lib, 'o.id')}`,
+					pos: 'null::int',
+					order: 'o.name_fold',
+				},
+				[live],
+				DETAIL_LIMIT,
+			);
 		view.trackCount = await count(`select count(*) as n from curator.catalog_edge e where kind = 'recording-artist' and dst = $1${inLibrary(lib, 'e.src')}`);
 		view.labels = (
 			await tx.query<{ id: string; name: string; n: unknown }>(
@@ -377,16 +382,18 @@ export async function browseObject(tx: Queryable, id: string, opts: { library?: 
 			await tx.query<Ref & { role: string | null }>(`select a.id, a.name, e.role from curator.catalog_edge e join curator.catalog_object a on a.id = e.src where e.dst = $1 and e.kind = 'artist-release' order by e.position`, [live])
 		).map((a) => ({ id: a.id, name: a.name, role: a.role }));
 		view.labels = (await refList(`select l.id, l.name from curator.catalog_edge e join curator.catalog_object l on l.id = e.dst where e.src = $1 and e.kind = 'release-label' order by l.name`)).map((l) => ({ ...l, releases: 1 }));
-		view.tracks = await tracks(
-			tx,
-			{
-				from: `from curator.catalog_edge rr join curator.catalog_object o on o.id = rr.dst and o.merged_into is null where rr.src = $1 and rr.kind = 'release-recording'`,
-				pos: 'rr.position',
-				order: 'rr.position nulls last, o.name_fold',
-			},
-			[live],
-			DETAIL_LIMIT,
-		);
+		if (lists)
+			view.tracks = await tracks(
+				tx,
+				{
+					from: `from curator.catalog_edge rr join curator.catalog_object o on o.id = rr.dst and o.merged_into is null where rr.src = $1 and rr.kind = 'release-recording'`,
+					pos: 'rr.position',
+					order: 'rr.position nulls last, o.name_fold',
+				},
+				[live],
+				DETAIL_LIMIT,
+			);
+		view.trackCount = await count(`select count(*) as n from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null where e.src = $1 and e.kind = 'release-recording'`);
 		view.genres = await refList(`select g.id, g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = $1 and e.kind = 'object-genre' order by g.name`);
 	} else if (o.kind === 'recording') {
 		view.durationSec = numOrNull(o.duration_sec);
@@ -412,11 +419,17 @@ export async function browseObject(tx: Queryable, id: string, opts: { library?: 
 // What a device reads (catalog.browse): the same view, with the back office's
 // own fields (facts, sources, merge history, charts) left out and each row's
 // store handles kept.
-export async function browseForClient(tx: Queryable, id: string): Promise<CatalogBrowseResult | null> {
-	const v = await browseObject(tx, id);
+export async function browseForClient(tx: Queryable, id: string, opts: { brief?: boolean } = {}): Promise<CatalogBrowseResult | null> {
+	const v = await browseObject(tx, id, { lean: true, brief: opts.brief });
 	if (!v) return null;
 	const object = (await summaries(tx, [v.id])).get(v.id);
 	if (!object) return null;
+	const genres = v.kind === 'artist' || v.kind === 'label' ? await topGenres(tx, v.kind, v.id) : v.genres;
+	const byText = v.kind === 'artist' ? await labelsByText(tx, v.id, v.labels ?? []) : null;
+	if (byText) v.labels = byText.labels;
+	const collabs = v.kind === 'artist' ? await collabsOf(tx, v.id) : null;
+	const activity = v.kind === 'artist' ? await activityOf(tx, v.id) : null;
+	const reach = v.kind === 'artist' ? await reachOf(tx, v.id) : null;
 	const release = (r: ReleaseRow) => ({ id: r.id, title: r.title, date: r.date, type: r.type, labelText: r.labelText, artists: r.artists, labels: r.labels, trackCount: r.tracks, handles: r.handles });
 	const track = (t: TrackRow) => ({ id: t.id, title: t.title, position: t.position, durationSec: t.durationSec, isrc: t.isrc, artists: t.artists, handles: t.handles });
 	return {
@@ -430,6 +443,139 @@ export async function browseForClient(tx: Queryable, id: string): Promise<Catalo
 		...(v.release ? { release: v.release } : {}),
 		...(v.artists ? { artists: v.artists } : {}),
 		...(v.labels ? { labels: v.labels } : {}),
+		...(byText ? { labelTexts: byText.texts } : {}),
 		...(v.roster ? { roster: v.roster } : {}),
+		...(genres ? { genres } : {}),
+		...(v.similar ? { similar: v.similar } : {}),
+		...(collabs ? { collabs } : {}),
+		...(activity ? { activity } : {}),
+		...(reach ? { reach } : {}),
+		...(v.trackCount !== undefined ? { trackCount: v.trackCount } : {}),
 	};
+}
+
+// Who an artist makes tracks with: every other artist credited on its
+// recordings, by how many recordings they share. Read from the artist's own
+// credit edges outward, like labelsByText.
+async function collabsOf(tx: Queryable, artistId: string): Promise<(Ref & { tracks: number })[]> {
+	const rows = await tx.query<{ id: string; name: string; n: unknown }>(
+		`select a.id, a.name, count(*) as n
+		from curator.catalog_edge ra
+		join curator.catalog_object rec on rec.id = ra.src and rec.merged_into is null
+		join curator.catalog_edge co on co.src = ra.src and co.kind = 'recording-artist' and co.dst <> ra.dst
+		join curator.catalog_object a on a.id = co.dst and a.merged_into is null
+		where ra.dst = $1 and ra.kind = 'recording-artist'
+		group by a.id, a.name order by n desc, a.name limit ${CATALOG_COLLABS_MAX}`,
+		[artistId],
+	);
+	return rows.map((a) => ({ id: a.id, name: a.name, tracks: num(a.n) }));
+}
+
+// The artist's Reach score, as the last scoring pass wrote it (reach.ts).
+async function reachOf(tx: Queryable, artistId: string): Promise<CatalogReach | null> {
+	const [f] = await tx.query<{ value: string }>(`select value::text as value from curator.catalog_fact where object_id = $1 and field = 'reach' and source = 'curator'`, [artistId]);
+	return f ? (JSON.parse(f.value) as CatalogReach) : null;
+}
+
+// The window an artist's recent output is counted over: long enough that one
+// busy month is not a habit.
+const RECENT_DAYS = 730;
+
+// When an artist has been releasing, and how much lately. A track is counted
+// at its first release only: a compilation or a reissue carrying it again
+// is not a new track.
+async function activityOf(tx: Queryable, artistId: string): Promise<NonNullable<CatalogBrowseResult['activity']>> {
+	const since = new Date(Date.now() - RECENT_DAYS * 86_400_000).toISOString();
+	const [span] = await tx.query<{ first: string | null; last: string | null; recent: unknown }>(
+		`select to_char(min(r.release_at), 'YYYY-MM-DD') as first, to_char(max(r.release_at), 'YYYY-MM-DD') as last,
+			count(*) filter (where r.release_at >= $2::timestamptz) as recent
+		from curator.catalog_edge e join curator.catalog_object r on r.id = e.dst and r.merged_into is null
+		where e.src = $1 and e.kind = 'artist-release' and r.release_at is not null`,
+		[artistId, since],
+	);
+	const [tracks] = await tx.query<{ n: unknown }>(
+		`select count(*) as n from (
+			select min(r.release_at) as first_at
+			from curator.catalog_edge ra
+			join curator.catalog_object rec on rec.id = ra.src and rec.merged_into is null
+			join curator.catalog_edge rr on rr.dst = ra.src and rr.kind = 'release-recording'
+			join curator.catalog_object r on r.id = rr.src and r.merged_into is null
+			where ra.dst = $1 and ra.kind = 'recording-artist'
+			group by ra.src
+		) t where t.first_at >= $2::timestamptz`,
+		[artistId, since],
+	);
+	return { firstRelease: span?.first ?? null, lastRelease: span?.last ?? null, recentDays: RECENT_DAYS, recentReleases: num(span?.recent ?? 0), recentTracks: num(tracks?.n ?? 0) };
+}
+
+// An artist's releases that name their label in text only. A `release-label`
+// edge exists where a store named the label by its own page (Beatport,
+// Bandcamp); Spotify and Deezer state it as a string on the release, so an
+// artist the catalogue first read there is on no label at all by its edges.
+// Those releases count too: under the label object of that name where the
+// artist is tied to one (`labels`, counts raised), else as a label known by
+// name alone (`texts`, most releases first, in the spelling most releases
+// use). Read from the artist's edges, behind the same fence as pages.ts: the
+// planner must not walk every release with a label text.
+async function labelsByText(tx: Queryable, artistId: string, tied: (Ref & { releases: number })[]): Promise<{ labels: (Ref & { releases: number })[]; texts: { name: string; releases: number }[] }> {
+	const rows = await tx.query<{ name: string; n: unknown }>(
+		`select o.label_text as name, count(*) as n
+		from (select e.dst as id from curator.catalog_edge e where e.src = $1 and e.kind = 'artist-release') s
+		cross join lateral (
+			select x.kind, x.merged_into, x.label_text from curator.catalog_object x where x.id = s.id offset 0
+		) o
+		where o.kind = 'release' and o.merged_into is null and o.label_text is not null
+			and not exists (select 1 from curator.catalog_edge rl where rl.src = s.id and rl.kind = 'release-label')
+		group by o.label_text`,
+		[artistId],
+	);
+	const labels = tied.map((l) => ({ ...l }));
+	const tiedByFold = new Map(labels.map((l) => [nameFold(l.name), l]));
+	const texts = new Map<string, { releases: number; spellings: Map<string, number> }>();
+	for (const r of rows) {
+		const fold = nameFold(r.name);
+		if (!fold) continue;
+		const n = num(r.n);
+		const label = tiedByFold.get(fold);
+		if (label) {
+			label.releases += n;
+			continue;
+		}
+		const t = texts.get(fold) ?? { releases: 0, spellings: new Map<string, number>() };
+		t.releases += n;
+		t.spellings.set(r.name.trim(), (t.spellings.get(r.name.trim()) ?? 0) + n);
+		texts.set(fold, t);
+	}
+	const byCount = <T extends { name: string; releases: number }>(a: T, b: T): number => b.releases - a.releases || a.name.localeCompare(b.name);
+	return {
+		labels: labels.sort(byCount),
+		texts: [...texts.values()].map((t) => ({ name: [...t.spellings].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]![0], releases: t.releases })).sort(byCount),
+	};
+}
+
+const GENRE_RELEASES = 200;
+const GENRE_TOP = 12;
+
+// An artist's or a label's genres: nobody states them, so they are read off
+// its newest releases and their tracks, most frequent first. Newest only: a
+// label that moved on reads as what it releases now, and the count stays a
+// bounded scan however long the back catalogue.
+async function topGenres(tx: Queryable, kind: 'artist' | 'label', id: string): Promise<(Ref & { count: number })[]> {
+	const edge = kind === 'artist' ? `e.src = $1 and e.kind = 'artist-release' and r.id = e.dst` : `e.dst = $1 and e.kind = 'release-label' and r.id = e.src`;
+	const rows = await tx.query<{ id: string; name: string; n: unknown }>(
+		`with rel as (
+			select r.id from curator.catalog_edge e join curator.catalog_object r on ${edge} and r.merged_into is null
+			order by r.release_at desc nulls last limit ${GENRE_RELEASES}
+		), src as (
+			select id from rel
+			union
+			select rr.dst from curator.catalog_edge rr join rel on rel.id = rr.src where rr.kind = 'release-recording'
+		)
+		select g.id, g.name, count(*) as n
+		from src join curator.catalog_edge ge on ge.src = src.id and ge.kind = 'object-genre'
+		join curator.catalog_object g on g.id = ge.dst
+		group by g.id, g.name order by n desc, g.name limit ${GENRE_TOP}`,
+		[id],
+	);
+	return rows.map((g) => ({ id: g.id, name: g.name, count: num(g.n) }));
 }

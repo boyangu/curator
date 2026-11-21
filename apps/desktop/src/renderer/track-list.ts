@@ -29,7 +29,7 @@
 // on a row keeps meaning "index in getTracks()".
 
 import type { AlbumSummary, Track } from '@curator/shared';
-import { artistCreditParts, formatTrackTitle } from '@curator/shared';
+import { artistCreditParts, formatTrackTitle, releaseKind, RELEASE_KIND_LABEL } from '@curator/shared';
 import { artistCreditFormat } from './features/uiSettings.js';
 import { Virtualizer, observeElementRect, observeElementOffset, elementScroll } from '@tanstack/virtual-core';
 import { getNowPlayingTrackId } from './now-playing.js';
@@ -38,6 +38,7 @@ import { keyChipHtml, formatBpmInt } from './music-utils.js';
 import { similarLevelsFor, type SimilarityDim } from './features/similarity.js';
 import { setTrackDragPayload } from './dnd.js';
 import { isRemoteRow, remoteMarkSource, remoteRowTitle } from './remoteRows.js';
+import { isCatalogRow } from './catalogRows.js';
 import { fmtReleaseLabel } from './ui/format.js';
 import { productionFlags, worstProductionSeverity } from '@curator/library-logic';
 import {
@@ -57,6 +58,10 @@ export type SortDir = 'asc' | 'desc';
 
 export interface TrackRowOptions {
 	index?: number;                       // shown in `#` column when >= 0 AND the track has no playlistPosition
+	// The row's place in its group, from 1: what `#` shows in a grouped list,
+	// before the playlist position and the list index (each group counts
+	// from 1, like the tracklist of the release it is).
+	number?: number;
 	columns?: LayoutColumn[];             // subset of columns to render
 	// Row layout (default 1). In two-line rows every cell is a `.l1` / `.l2`
 	// stack and `fields` decides which of a paired column's fields show.
@@ -87,6 +92,15 @@ export interface TrackListOptions {
 	// Collapsed group keys. Owned by the caller (session-only memory that
 	// survives a remount); the list mutates it on toggle.
 	collapsedGroups?: Set<string>;
+	// Room left and right of the whole list (px), and how much further in a
+	// group's rows sit than its header. Both default to 0 — edge to edge. The
+	// owner of the list decides (listProfile.ts).
+	gutter?: number;
+	groupIndent?: number;
+	// Source marks set against the index: the marks at the end of their cell,
+	// the number at the start of its own, so the two read as one pair however
+	// wide the columns are. Default: marks at the row's edge, number centred.
+	sourcesByIndex?: boolean;
 	// Album group headers: the release details by album id (undefined =
 	// not loaded yet), and the hook that asks for the ones the list shows.
 	// The caller calls refreshGroupHeaders() when answers land.
@@ -120,10 +134,20 @@ export interface TrackListOptions {
 	// Plain left-click on an artist chip that carries a Curator artist id
 	// (`Track.artistIds`, attached by decorated reads). Caller opens the
 	// artist scope. Modifier clicks keep their selection meaning instead.
-	onArtistClick?: (artistId: string, name: string, t: Track) => void;
+	// A middle-click reports the same link with `newTab` (the caller opens it
+	// in a new tab) — Ctrl+click stays a selection gesture inside the list.
+	onArtistClick?: (artistId: string, name: string, t: Track, gesture?: LinkGesture) => void;
 	// Plain left-click on a label / genre value or a tag chip — same drill
 	// semantics as the artist chip (caller opens a scope for that value).
-	onDrillClick?: (kind: 'label' | 'genre' | 'tag', value: string, t: Track) => void;
+	onDrillClick?: (kind: 'label' | 'genre' | 'tag', value: string, t: Track, gesture?: LinkGesture) => void;
+	// Click on a group header's TITLE (the rest of the header collapses /
+	// expands): the caller opens what the group is — an album's page. Absent,
+	// the title toggles like the rest.
+	// Returns false when the group opens nothing (the header then toggles).
+	onGroupOpen?: (group: GroupInfo, gesture?: LinkGesture) => boolean;
+	// The window reached the last rows: a caller that pages its data loads
+	// the next page. Fires on every paint near the end — the caller dedupes.
+	onNearEnd?: () => void;
 	// SRC header right-click — caller decides what menu to show. Component
 	// just dispatches the event with no opinion on the contents.
 	onSrcHeaderContextMenu?: (evt: MouseEvent) => void;
@@ -168,6 +192,11 @@ export interface TrackListOptions {
 	inLibraryChip?: () => boolean;
 }
 
+export interface LinkGesture { newTab?: boolean }
+
+// How close to the end (in rows) counts as near it for onNearEnd.
+const NEAR_END_ROWS = 40;
+
 export interface TrackListHandle {
 	update(tracks: Track[]): void;
 	patchOne(track: Track): void;
@@ -186,6 +215,14 @@ export interface TrackListHandle {
 	scrollToTrack(id: string, align?: 'auto' | 'start'): boolean;
 	getScrollTop(): number;
 	setScrollTop(n: number): void;
+	// Room at the top of the scroll content for something laid over the list
+	// (an entity page's header, features/entityHeaderCollapse.ts). `inset` is
+	// how tall that room is; `lead` is how far the list scrolls before its
+	// rows start to move — the header collapsing by that much, the column
+	// header then sticking `inset - lead` below the top. Scroll offsets
+	// (getScrollTop / setScrollTop) stay the scroll host's own. Virtualized
+	// lists only; (0, 0) is a plain list.
+	setTopInset(inset: number, lead: number): void;
 	/// Index of the first row whose top edge is at or below the viewport
 	/// top — the topmost fully-visible row. Returns -1 when the list is
 	/// empty. Used by the global Tab handler to anchor "return focus to
@@ -235,8 +272,11 @@ const SOURCE_NAMES: Record<(typeof SOURCE_ORDER)[number], string> = {
 // Claim-derived providers (Track.claimSources), in the same order.
 const DERIVED_ORDER = ['spotify', 'tidal', 'beatport', 'traxsource'] as const;
 const DERIVED_NOTE = '(from your account — linked on another device)';
-function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: readonly (typeof DERIVED_ORDER)[number][]): string {
-	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${DERIVED_NOTE}`)];
+const CATALOG_NOTE = '(in the catalogue — not in your library)';
+// A remote image URL inside a CSS url("…"): nothing that could end the string.
+const cssUrl = (u: string): string => u.replace(/["\\\n\r]/g, '');
+function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: readonly (typeof DERIVED_ORDER)[number][], note = DERIVED_NOTE): string {
+	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${note}`)];
 	return parts.length ? `Sources: ${parts.join(', ')}` : '';
 }
 export const ALL_COLUMNS: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'loud', 'plr', 'prodq', 'pq', 'tags', 'added'];
@@ -258,6 +298,12 @@ export function twoLineColumns(visible: (c: Column) => boolean, opts: { groupBy:
 	if (visible('added')) out.push('added');
 	return out;
 }
+// The one-line layout's columns: the user's order, each field by its
+// visibility. Match is there only inside a similarity scope; the cover drops
+// out in album grouping, as in the two-line layout.
+export function oneLineColumns(order: readonly Column[], visible: (c: Column) => boolean, opts: { groupBy: GroupBy; match: boolean }): Column[] {
+	return order.filter((c) => (c === 'match' ? opts.match : c === 'art' ? opts.groupBy !== 'album' : visible(c)));
+}
 const VIRT_BUFFER = 16;
 const MIN_COL_W = 32;
 // Tag chip cap in the row's "tags" cell. Tracks can carry 8+ tags; squeezing
@@ -277,7 +323,12 @@ const fmtTotal = (sec: number): string => {
 const initials = (name: string): string => name.split(/\s+/).filter(Boolean).map((w) => w[0]!).join('').slice(0, 2);
 const drillSpan = (kind: 'label' | 'genre', v: string | null | undefined): string =>
 	v ? `<span class="tl-drill" data-drill="${kind}" data-v="${escapeHtml(v)}">${escapeHtml(v)}</span>` : '';
-const fmtTime = (sec: number | null | undefined): string => sec ? `${fmt2(Math.floor(sec / 60))}:${fmt2(sec % 60)}` : '—';
+// To the second — a store's length can carry a fraction (rounded before the
+// split, so 59.6 s reads 01:00, never 00:60).
+const fmtTime = (sec: number | null | undefined): string => {
+	const s = sec ? Math.round(sec) : 0;
+	return s > 0 ? `${fmt2(Math.floor(s / 60))}:${fmt2(s % 60)}` : '—';
+};
 const fmtFixed = (n: number | null | undefined, d: number): string =>
 	n == null || !Number.isFinite(n) ? '—' : n.toFixed(d);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -399,9 +450,17 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// holds this", and a pip per provider on 30k remote rows reads as noise.
 	const derivedSet = remote ? null : new Set(t.claimSources ?? []);
 	const derived = derivedSet ? DERIVED_ORDER.filter((s) => derivedSet.has(s) && !present.has(s)) : [];
-	const coverBg = opts.covers !== false
-		? `url(curator-cover://${encodeURIComponent(t.id)}), ${coverGradient(i)}`
-		: coverGradient(i);
+	// A catalogue row (an entity page's World side) is no library track: its
+	// hollow pips say where the catalogue has it, its cover is the release's
+	// own remote image (the cover protocol is keyed by library track id, and
+	// would cost a miss on main per row), and it cannot be dragged anywhere.
+	const catalogRow = isCatalogRow(t);
+	const derivedNote = catalogRow ? CATALOG_NOTE : DERIVED_NOTE;
+	const coverBg = opts.covers === false
+		? coverGradient(i)
+		: catalogRow
+			? (t.coverUrl ? `url(&quot;${escapeHtml(cssUrl(t.coverUrl))}&quot;), ${coverGradient(i)}` : coverGradient(i))
+			: `url(curator-cover://${encodeURIComponent(t.id)}), ${coverGradient(i)}`;
 	const isNowPlaying = getNowPlayingTrackId() === t.id;
 	// `#` cell prefers the canonical playlist position over the visible-array
 	// index. Stable across sort + client-side filter — the track's identity
@@ -409,9 +468,11 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// looking at it. Falls back to the array index outside a playlist (where
 	// playlistPosition is absent).
 	const stablePos = t.playlistPosition;
-	const idxLabel = stablePos != null
-		? fmt2(stablePos)
-		: (opts.index != null && opts.index >= 0 ? fmt2(i + 1) : '');
+	const idxLabel = opts.number != null
+		? fmt2(opts.number)
+		: stablePos != null
+			? fmt2(stablePos)
+			: (opts.index != null && opts.index >= 0 ? fmt2(i + 1) : '');
 	// Number AND meter in every index cell — CSS shows the meter on the
 	// playing row (now-playing.ts only toggles `row-playing`).
 	const eq = (cls: string): string => `<span class="now-playing-eq ${cls}" aria-label="now playing"><i></i><i></i><i></i><i></i></span>`;
@@ -469,15 +530,20 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// library that still surface here because a FOLLOWED playlist (one they
 	// don't own) keeps the membership. The chip marks them so the row isn't
 	// mistaken for a live library track.
-	const titleChips = `${t.deletedAt ? '<span class="tl-deleted" title="Deleted from your library">deleted</span>' : ''}${opts.inLibraryChip && present.has('local') ? '<span class="feed-track__lib-chip feed-track__lib-chip--library tl-lib-chip">In Library</span>' : ''}`;
+	// On a catalogue page every row of a recording the library holds says so:
+	// the library's own row, and a catalogue row repeating it on another
+	// release (waterfall singles, a compilation) — one track, owned once.
+	const libChip = t.catalog ? !t.catalog.synthetic || !!t.catalog.libraryTrackId : !!opts.inLibraryChip && present.has('local');
+	const titleChips = `${t.deletedAt ? '<span class="tl-deleted" title="Deleted from your library">deleted</span>' : ''}${libChip ? '<span class="feed-track__lib-chip feed-track__lib-chip--library tl-lib-chip">In Library</span>' : ''}`;
 
 	let cells: Partial<Record<LayoutColumn, string>>;
 	if (lines === 2) {
 		const marks = srcs.map((s) => `<i data-src="${s}"></i>`).join('')
 			+ derived.map((s) => `<i class="src-derived" data-src="${s}"></i>`).join('')
 			+ (remote ? `<i class="src-remote" data-remote="${remoteMarkSource(t)}"></i>` : '');
-		const srcTitle = remote ? remoteTip : sourcesTitle(srcs, derived);
+		const srcTitle = remote ? remoteTip : sourcesTitle(srcs, derived, derivedNote);
 		const [base, version] = splitTitleVersion(title);
+		const kfxOne = keyfxIsNarrow(fields);
 		// Line 2 of the title column never repeats the grouped field.
 		const showArtist = fields.has('artist') && groupBy !== 'artist';
 		const showAlbum = fields.has('album') && groupBy !== 'album';
@@ -504,18 +570,18 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 				? `<td class="labelrel"><div class="l1">${labelLine}</div><div class="l2">${relHtml}</div></td>`
 				: `<td class="labelrel"><div class="l1">${relHtml}</div><div class="l2"></div></td>`,
 			genretags: `<td class="genretags"><div class="l1">${fields.has('genre') ? drillSpan('genre', t.genre) : ''}</div><div class="l2 l2--tags">${fields.has('tags') ? tagsHtml() : ''}</div></td>`,
-			keyfx: `<td class="keyfx"><div class="kfx">${
+			keyfx: `<td class="keyfx"><div class="kfx${kfxOne ? ' kfx--1' : ''}">${
 				kfx(fields.has('key'), simCls('key'), keyCell)
-				+ kfx(fields.has('power'), simCls('power'), fmtFixed(t.power, 2), 'Power')
+				+ (kfxOne ? '' : kfx(fields.has('power'), simCls('power'), fmtFixed(t.power, 2), 'Power'))
 				+ kfx(fields.has('bpm'), simCls('bpm'), formatBpmInt(t.bpm))
-				+ kfx(fields.has('bright'), simCls('brightness'), fmtFixed(t.brightness, 2), 'Brightness')
+				+ (kfxOne ? '' : kfx(fields.has('bright'), simCls('brightness'), fmtFixed(t.brightness, 2), 'Brightness'))
 			}</div></td>`,
 			timerating: `<td class="timerating"><div class="l1">${fields.has('time') ? fmtTime(t.duration) : ''}</div><div class="l2">${fields.has('rating') ? ratingCell(t.rating) : ''}</div></td>`,
 			added: addedCell,
 		};
 	} else {
 		const pips = srcs.map((s) => `<span class="src-pip" data-src="${s}" title="${SOURCE_NAMES[s]}"></span>`).join('')
-			+ derived.map((s) => `<span class="src-pip src-pip--derived" data-src="${s}" title="${SOURCE_NAMES[s]} ${DERIVED_NOTE}"></span>`).join('')
+			+ derived.map((s) => `<span class="src-pip src-pip--derived" data-src="${s}" title="${SOURCE_NAMES[s]} ${derivedNote}"></span>`).join('')
 			+ (remote ? `<span class="src-pip src-pip--remote" data-remote="${remoteMarkSource(t)}" title="${remoteTip}"></span>` : '');
 		cells = {
 			src: `<td class="sources"><span class="src-pips">${pips}</span></td>`,
@@ -577,7 +643,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// Every row is a drag source — dragging out to the sidebar's playlist
 	// drop targets works from any view. Whether the drag ALSO reorders
 	// in-list is gated separately in onDragStart (reorderable + data-pos).
-	const dragAttr = ' draggable="true"';
+	const dragAttr = catalogRow ? '' : ' draggable="true"';
 	// data-pos exposes the canonical playlist position (when present) so the
 	// drop handler can reconstruct newOrder without re-walking the tracks
 	// array. Absent for non-playlist views — drag-reorder is disabled there.
@@ -586,7 +652,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// padding), so outer padding holds whichever columns are hidden.
 	const pad = lines === 2 ? '<td class="pad"></td>' : '';
 	host.innerHTML = `
-		<tr class="trk${np}${coverMeter}${an}${remote ? ' is-remote' : ''}" data-state="${t.state}" data-id="${t.id}" data-title="${escapeHtml(t.title)}" data-index="${i}"${posAttr}${dragAttr}>
+		<tr class="trk${np}${coverMeter}${an}${remote ? ' is-remote' : ''}${catalogRow ? ' is-catalog' : ''}" data-state="${t.state}" data-id="${t.id}" data-title="${escapeHtml(t.title)}" data-index="${i}"${posAttr}${dragAttr}>
 			${pad}${cols.map((c) => cells[c] ?? '<td></td>').join('')}${pad}
 		</tr>
 	`;
@@ -606,6 +672,8 @@ function groupHeadHtml(g: GroupInfo, collapsed: boolean, album: AlbumSummary | n
 	let title = g.title;
 	let sub = '';
 	let sub2 = '';
+	// Mix / VA / Single / EP / Album, beside an album's name.
+	let kind = '';
 	let countLabel = `${st.count} ${st.count === 1 ? 'track' : 'tracks'}`;
 	if (g.field === 'artist') {
 		thumb = `<span class="grp-thumb grp-thumb--artist">${g.missing ? '–' : escapeHtml(initials(g.title))}</span>`;
@@ -615,18 +683,29 @@ function groupHeadHtml(g: GroupInfo, collapsed: boolean, album: AlbumSummary | n
 		thumb = `<span class="grp-thumb grp-thumb--label">${g.missing ? '–' : escapeHtml(initials(g.title).toUpperCase())}</span>`;
 		if (!g.missing) sub = `${st.artistNames.length} ${st.artistNames.length === 1 ? 'artist' : 'artists'}`;
 	} else {
-		const coverId = album?.coverTrackId ?? g.tracks.find((t) => t.coverUrl)?.id ?? g.tracks[0]?.id ?? '';
+		// A catalogue release brings its own remote cover; a library album's is
+		// served through a member track.
+		const coverId = album?.coverTrackId ?? g.tracks.find((t) => t.coverUrl && !isCatalogRow(t))?.id ?? g.tracks.find((t) => !isCatalogRow(t))?.id ?? '';
+		const coverImg = album?.coverUrl
+			? `url(&quot;${escapeHtml(cssUrl(album.coverUrl))}&quot;), `
+			: coverId ? `url(curator-cover://${encodeURIComponent(coverId)}), ` : '';
 		thumb = g.missing
 			? '<span class="grp-thumb grp-thumb--album grp-thumb--none">–</span>'
-			: `<span class="grp-thumb grp-thumb--album" style="background-image: url(curator-cover://${encodeURIComponent(coverId)}), ${coverGradient(g.title.length)};"></span>`;
+			: `<span class="grp-thumb grp-thumb--album" style="background-image: ${coverImg}${coverGradient(g.title.length)};"></span>`;
 		if (album) title = album.title;
 		if (!g.missing) {
 			const artists = album
 				? (album.various ? 'Various Artists' : album.artists.map((a) => a.name).join(', '))
 				: (st.artistNames.length > 1 ? 'Various Artists' : st.artistNames[0] ?? '');
-			const type = album?.albumType === 'single' ? 'Single' : album?.albumType === 'compilation' ? 'Compilation' : '';
+			// The release's own size, never the rows on screen: one track held
+			// of an album is not a single.
+			const k = releaseKind({
+				type: album?.albumType, title, trackCount: album?.totalTracks, various: album?.various,
+				artists: album?.artists.map((a) => a.name), trackTitles: g.tracks.map((t) => t.title),
+			});
+			if (k) kind = RELEASE_KIND_LABEL[k];
 			const released = album?.releaseDate ?? g.tracks.find((t) => t.releaseDate)?.releaseDate ?? null;
-			sub = [artists, type, released ? fmtReleaseLabel(released) : ''].filter(Boolean).join(' · ');
+			sub = [artists, released ? fmtReleaseLabel(released) : ''].filter(Boolean).join(' · ');
 			const genres = (album?.genres.length ? album.genres : st.genres).slice(0, 2).join(', ');
 			sub2 = [album?.label ?? st.labels[0] ?? '', genres].filter(Boolean).join(' · ');
 			if (album?.totalTracks && album.totalTracks > st.count) countLabel = `${st.count} of ${album.totalTracks} tracks`;
@@ -637,7 +716,7 @@ function groupHeadHtml(g: GroupInfo, collapsed: boolean, album: AlbumSummary | n
 	return `<button type="button" class="grp-btn grp-btn--${g.field}" data-gkey="${escapeHtml(g.key)}" aria-expanded="${collapsed ? 'false' : 'true'}">`
 		+ '<svg class="grp-chev" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M5 3l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 		+ thumb
-		+ `<span class="grp-text"><span class="grp-title">${escapeHtml(title)}</span>`
+		+ `<span class="grp-text"><span class="grp-titleline"><span class="grp-title">${escapeHtml(title)}</span>${kind ? `<span class="feed-chip feed-chip--album grp-kind">${escapeHtml(kind)}</span>` : ''}</span>`
 		+ (sub ? `<span class="grp-sub">${escapeHtml(sub)}</span>` : '')
 		+ (sub2 ? `<span class="grp-sub2">${escapeHtml(sub2)}</span>` : '')
 		+ '</span>'
@@ -705,8 +784,15 @@ const COL_DEFS: Record<Column, { th: string; thAlign?: 'left' | 'center' | 'righ
 // "Released" under "Label" sorts by release date). Two-line columns get
 // their own `c2-` col classes so their persisted widths don't fight the
 // one-line ones.
-function twoLineColClass(c: LayoutColumn): string {
-	return `c2-${c}`;
+function twoLineColClass(c: LayoutColumn, fields: ReadonlySet<Column>): string {
+	return c === 'keyfx' && keyfxIsNarrow(fields) ? 'c2-keyfx1' : `c2-${c}`;
+}
+
+// The key / power / BPM / brightness grid with neither power nor brightness
+// to show is one column wide (key over BPM) — its own width, and its own col
+// class so a width the user gave the wide grid doesn't apply to it.
+function keyfxIsNarrow(fields: ReadonlySet<Column>): boolean {
+	return !fields.has('power') && !fields.has('bright');
 }
 
 function twoLineHeaderHtml(c: LayoutColumn, fields: ReadonlySet<Column>, groupBy: GroupBy, sortable: boolean): { html: string; cls: string; title?: string } {
@@ -733,6 +819,12 @@ function twoLineHeaderHtml(c: LayoutColumn, fields: ReadonlySet<Column>, groupBy
 		}
 		case 'genretags': return { html: stack(fields.has('genre') ? lab('Genre', 'genre') : '', fields.has('tags') ? lab('Tags', null) : ''), cls: 'genretags' };
 		case 'keyfx':
+			if (keyfxIsNarrow(fields)) {
+				return {
+					html: `<span class="kfx kfx--head kfx--1">${fields.has('key') ? lab('Key', 'keyCamelot') : '<span></span>'}${fields.has('bpm') ? lab('BPM', 'bpm') : '<span></span>'}</span>`,
+					cls: 'keyfx',
+				};
+			}
 			return {
 				html: `<span class="kfx kfx--head">${fields.has('key') ? lab('Key', 'keyCamelot') : '<span></span>'}${fields.has('power') ? lab('Pwr', 'power', 'Power') : '<span></span>'}${fields.has('bpm') ? lab('BPM', 'bpm') : '<span></span>'}${fields.has('bright') ? lab('Brt', 'brightness', 'Brightness') : '<span></span>'}</span>`,
 				cls: 'keyfx',
@@ -776,7 +868,7 @@ export function mountTrackList(
 	// Two-line rows carry an empty gutter cell at each end (see createTrackRow).
 	const padded = lines === 2;
 	const colSpan = cols.length + (padded ? 2 : 0);
-	const colClassOf = (c: LayoutColumn): string => (lines === 2 ? twoLineColClass(c) : COL_DEFS[c as Column].colClass);
+	const colClassOf = (c: LayoutColumn): string => (lines === 2 ? twoLineColClass(c, fields) : COL_DEFS[c as Column].colClass);
 
 	// Build the table shell. The host gets its children replaced — caller is
 	// responsible for handing us an empty container (or one whose contents
@@ -792,7 +884,9 @@ export function mountTrackList(
 				}
 				const def = COL_DEFS[c as Column];
 				const cls = def.thClass ? ` class="${def.thClass}"` : '';
-				const style = def.thAlign ? ` style="text-align:${def.thAlign};"` : '';
+				// The `#` label follows its numbers (see sourcesByIndex).
+				const align = c === 'idx' && opts.sourcesByIndex ? 'left' : def.thAlign;
+				const style = align ? ` style="text-align:${align};"` : '';
 				const dataSort = def.sortKey && opts.onSortChange ? ` data-sort="${def.sortKey}"` : '';
 				const title = def.title ? ` title="${def.title}"` : '';
 				return `<th${cls}${dataSort}${style}${title}>${def.th}</th>`;
@@ -800,6 +894,21 @@ export function mountTrackList(
 		: '';
 	const root = document.createElement('div');
 	root.className = 'tracklist';
+	// Room around the rows (style.css .tracklist): the list sits `gutter` in
+	// from both sides, and a group's rows `groupIndent` further in than its
+	// header — the table is inset by both, the headers reach back out.
+	const gutter = Math.max(0, opts.gutter ?? 0);
+	const groupIndent = groupBy === 'none' ? 0 : Math.max(0, opts.groupIndent ?? 0);
+	// The right-hand room is counted from the edge of the view, the scroll
+	// host's own scrollbar inside it (syncViewWidth) — else the right side
+	// reads a scrollbar wider than the left.
+	let gutterEnd = gutter;
+	if (gutter) root.style.setProperty('--list-gutter', `${gutter}px`);
+	if (opts.sourcesByIndex) root.classList.add('tracklist--src-idx');
+	if (groupIndent) {
+		root.style.setProperty('--grp-indent', `${groupIndent}px`);
+		root.classList.add('tracklist--indent');
+	}
 	// When virtualized (the main list), the `table--embedded`
 	// modifier is omitted so the table inherits the full `.table` CSS.
 	const tableClass = `${opts.virtualize ? 'table' : 'table table--embedded'}${lines === 2 ? ' rows-2' : ''}`;
@@ -809,6 +918,7 @@ export function mountTrackList(
 	// header row unmounts while its tracks are still in view).
 	root.innerHTML = `
 		${opts.toolbar ? '<div class="tracklist__toolbar"></div>' : ''}
+		${virtualize ? '<div class="tracklist__inset" aria-hidden="true"></div>' : ''}
 		${groupBy !== 'none' ? '<div class="grp-pin" hidden><div class="grp-pin__inner"></div></div>' : ''}
 		<table class="${tableClass}">
 			<colgroup>${colHtml}</colgroup>
@@ -824,6 +934,12 @@ export function mountTrackList(
 	const thEls = thead ? Array.from(thead.querySelectorAll<HTMLTableCellElement>('th')).filter((th) => !th.classList.contains('pad')) : [];
 	const pinEl = root.querySelector<HTMLElement>('.grp-pin');
 	const pinInner = root.querySelector<HTMLElement>('.grp-pin__inner');
+	const insetEl = root.querySelector<HTMLElement>('.tracklist__inset');
+	// See setTopInset. `lead` shifts every row offset the virtualizer hands
+	// out (its scrollMargin): a row's offset is where the scroll host's
+	// scrollTop is when that row is the first one under the column header.
+	let lead = 0;
+	let stick = 0;
 	// Row height lives in CSS too (`tr { height: var(--row-h) }`) — set it
 	// from the same number the virtualizer uses.
 	const table = root.querySelector<HTMLTableElement>('table')!;
@@ -866,6 +982,11 @@ export function mountTrackList(
 			}
 		}
 		table.style.minWidth = `${Math.ceil(sum)}px`;
+		// The root grows with a table wider than the view (it would otherwise
+		// stay one view wide with the table hanging out of it): the room around
+		// the rows then holds at the far end of a sideways scroll, and the
+		// pinned group header — sticky inside the root — has somewhere to stick.
+		if (virtualize) root.style.minWidth = `${Math.ceil(sum) + gutter + gutterEnd + 2 * groupIndent}px`;
 	};
 	syncTableMinWidth();
 
@@ -901,7 +1022,7 @@ export function mountTrackList(
 	// Start offset of a row (header gaps included) — for keeping a toggled
 	// group header in place.
 	const rowStart = (i: number): number => {
-		let y = 0;
+		let y = lead;
 		for (let k = 0; k < i; k++) y += heightAt(k);
 		return y;
 	};
@@ -960,8 +1081,18 @@ export function mountTrackList(
 
 	function buildRow(r: DisplayRow): HTMLTableRowElement {
 		if (r.kind === 'group') return createGroupRow(r, colSpan, lines, albumOf(r.group));
-		const tr = createTrackRow(r.track, { index: r.trackIndex, columns: cols, lines, fields, groupBy, tagsForTrack: opts.tagsForTrack, inLibraryChip: opts.inLibraryChip?.() });
+		const place = display?.groupPos[r.trackIndex];
+		const tr = createTrackRow(r.track, { index: r.trackIndex, ...(place != null ? { number: place + 1 } : {}), columns: cols, lines, fields, groupBy, tagsForTrack: opts.tagsForTrack, inLibraryChip: opts.inLibraryChip?.() });
 		if (selected.has(r.track.id)) tr.classList.add('selected');
+		if (place != null && display) {
+			const gr = display.rows[display.groupRow.get(display.groupOfTrack.get(r.track.id) ?? '') ?? -1];
+			const n = gr?.kind === 'group' ? gr.group.tracks.length : 0;
+			if (n > 0) {
+				tr.classList.add('grp-body');
+				tr.style.setProperty('--ramp-a', `${(place / n) * 100}%`);
+				tr.style.setProperty('--ramp-b', `${((place + 1) / n) * 100}%`);
+			}
+		}
 		return tr;
 	}
 
@@ -1005,8 +1136,10 @@ export function mountTrackList(
 		virtualizer._willUpdate();
 		const items = virtualizer.getVirtualItems();
 		const totalSize = virtualizer.getTotalSize();
-		const startOffset = items.length > 0 ? items[0]!.start : 0;
-		const endOffset = items.length > 0 ? items[items.length - 1]!.end : 0;
+		if (opts.onNearEnd && items.length > 0 && items[items.length - 1]!.index >= rowCount() - NEAR_END_ROWS) opts.onNearEnd();
+		// Item offsets carry the lead (scrollMargin); the spacers are the table's own.
+		const startOffset = items.length > 0 ? items[0]!.start - lead : 0;
+		const endOffset = items.length > 0 ? items[items.length - 1]!.end - lead : 0;
 
 		(topSpacer.firstElementChild as HTMLElement).style.height = `${startOffset}px`;
 		(bottomSpacer.firstElementChild as HTMLElement).style.height = `${Math.max(0, totalSize - endOffset)}px`;
@@ -1057,18 +1190,30 @@ export function mountTrackList(
 	let pinnedKey: string | null = null;
 	let pinTop = theadH;
 	let viewW = 0;
-	function updatePin(): void {
-		if (!pinEl || !pinInner) return;
-		// Visible width for the sideways-scrolling one-line table's headers
-		// (see .grp-btn / .grp-pin in style.css). renderWindow runs on every
-		// resize via the virtualizer, so this stays current.
+	// Visible width for the sideways-scrolling one-line table's headers (see
+	// .grp-btn / .grp-pin in style.css), and what the scroll host's scrollbar
+	// takes out of the right-hand gutter. renderWindow runs on every resize
+	// via the virtualizer (a scrollbar appearing is one), so both stay current.
+	function syncViewWidth(): void {
 		const w = scrollHost.clientWidth;
-		if (w > 0 && w !== viewW) { viewW = w; root.style.setProperty('--view-w', `${w}px`); }
+		if (w <= 0) return;
+		if (w !== viewW) { viewW = w; root.style.setProperty('--view-w', `${w}px`); }
+		if (!gutter) return;
+		const end = Math.max(0, gutter - Math.max(0, scrollHost.offsetWidth - w));
+		if (end === gutterEnd) return;
+		gutterEnd = end;
+		root.style.setProperty('--list-gutter-end', `${end}px`);
+		syncTableMinWidth();
+	}
+	function updatePin(): void {
+		syncViewWidth();
+		if (!pinEl || !pinInner) return;
 		let g: GroupInfo | null = null;
 		let isCollapsed = false;
 		if (display && virtualizer && display.rows.length > 0) {
 			const top = scrollHost.scrollTop;
-			const item = top > 0 ? virtualizer.getVirtualItemForOffset(top) : undefined;
+			// Within the lead the first group's own header is still on screen.
+			const item = top > lead ? virtualizer.getVirtualItemForOffset(top) : undefined;
 			const r = item ? display.rows[item.index] : undefined;
 			if (r?.kind === 'track') {
 				const key = display.groupOfTrack.get(r.track.id);
@@ -1106,9 +1251,21 @@ export function mountTrackList(
 		}
 		if (pinEl.hidden) pinEl.hidden = false;
 	}
+	// A click on a group header's title opens the group (onGroupOpen) where
+	// the caller offers that; anywhere else on the header toggles it.
+	const openGroup = (evt: MouseEvent, gesture?: LinkGesture): boolean => {
+		if (!opts.onGroupOpen || evt.altKey) return false;
+		const title = (evt.target as HTMLElement).closest<HTMLElement>('.grp-title');
+		const key = title?.closest<HTMLElement>('.grp-btn')?.dataset.gkey;
+		const g = key ? display?.groups.find((x) => x.key === key) : undefined;
+		if (!g || g.missing || !opts.onGroupOpen(g, gesture)) return false;
+		evt.preventDefault();
+		return true;
+	};
 	const onPinClick = (evt: MouseEvent): void => {
 		const btn = (evt.target as HTMLElement).closest<HTMLElement>('.grp-btn');
 		if (!btn?.dataset.gkey) return;
+		if (openGroup(evt)) return;
 		evt.preventDefault();
 		toggleGroup(btn.dataset.gkey, evt.altKey);
 	};
@@ -1224,8 +1381,9 @@ export function mountTrackList(
 		const top = scrollHost.scrollTop;
 		if (collapse) for (const g of display.groups) collapsed.add(g.key);
 		else collapsed.clear();
-		// Bulk actions always land on the group that was at the top.
-		applyCollapse(key, startBefore, Math.max(top, startBefore + 1));
+		// Bulk actions always land on the group that was at the top — unless
+		// the list is still within its lead (nothing scrolled past): it stays.
+		applyCollapse(key, startBefore, top <= lead ? top : Math.max(top, startBefore + 1));
 	}
 
 	function refreshGroupHeaders(): void {
@@ -1355,27 +1513,46 @@ export function mountTrackList(
 		// Group header → collapse / expand (Alt = every group).
 		const head = (evt.target as HTMLElement).closest<HTMLElement>('.grp-btn');
 		if (head?.dataset.gkey) {
+			if (openGroup(evt)) return;
 			evt.preventDefault();
 			toggleGroup(head.dataset.gkey, evt.altKey);
 			return;
 		}
 		if (evt.ctrlKey || evt.metaKey || evt.shiftKey) return;
+		followLink(evt);
+	};
+	// The artist / label / genre / tag link under the pointer, handed to the caller.
+	const followLink = (evt: MouseEvent, gesture?: LinkGesture): boolean => {
 		const target = evt.target as HTMLElement;
 		const artist = opts.onArtistClick ? target.closest<HTMLElement>('.tl-artist[data-aid]') : null;
 		const drill = !artist && opts.onDrillClick ? target.closest<HTMLElement>('[data-drill][data-v]') : null;
 		const link = artist ?? drill;
-		if (!link) return;
+		if (!link) return false;
 		const row = link.closest<HTMLTableRowElement>('tr[data-id]');
 		const t = row ? tracks.find((x) => x.id === row.dataset.id) : undefined;
-		if (!t) return;
+		if (!t) return false;
 		evt.preventDefault();
-		if (artist) opts.onArtistClick!(artist.dataset.aid!, artist.textContent ?? '', t);
-		else opts.onDrillClick!(drill!.dataset.drill as 'label' | 'genre' | 'tag', drill!.dataset.v!, t);
+		if (artist) opts.onArtistClick!(artist.dataset.aid!, artist.textContent ?? '', t, gesture);
+		else opts.onDrillClick!(drill!.dataset.drill as 'label' | 'genre' | 'tag', drill!.dataset.v!, t, gesture);
+		return true;
+	};
+	// Middle-click on a link or a group title: the same target, in a new tab.
+	const isLinkTarget = (evt: MouseEvent): boolean =>
+		!!(evt.target as HTMLElement).closest('.tl-artist[data-aid], [data-drill][data-v]') || (!!opts.onGroupOpen && !!(evt.target as HTMLElement).closest('.grp-title'));
+	const onAuxClick = (evt: MouseEvent): void => {
+		if (evt.button !== 1) return;
+		if (!openGroup(evt, { newTab: true })) followLink(evt, { newTab: true });
+	};
+	// Chromium starts autoscroll on a middle-button press; not over a link.
+	const onAuxDown = (evt: MouseEvent): void => {
+		if (evt.button === 1 && isLinkTarget(evt)) evt.preventDefault();
 	};
 	tbody.addEventListener('mousedown', onMouseDown);
 	tbody.addEventListener('dblclick', onDblClick);
 	tbody.addEventListener('contextmenu', onContextMenu);
 	tbody.addEventListener('click', onClick);
+	tbody.addEventListener('auxclick', onAuxClick);
+	tbody.addEventListener('mousedown', onAuxDown);
 
 	// ─── Drag-reorder ───────────────────────────────────────────────────────
 	// HTML5 drag-and-drop on rows. Active only when `reorderable=true` AND
@@ -1420,7 +1597,10 @@ export function mountTrackList(
 		}
 		// Normalize selection to current list order so the dropped block
 		// reads top-to-bottom regardless of click sequence.
-		const orderedIds = tracks.filter((t) => selected.has(t.id)).map((t) => t.id);
+		// Catalogue rows are not library tracks: they never ride a drag (the
+		// sidebar's playlist drop would push them upstream by a made-up id).
+		const orderedIds = tracks.filter((t) => selected.has(t.id) && !isCatalogRow(t)).map((t) => t.id);
+		if (orderedIds.length === 0) { evt.preventDefault(); return; }
 		// In-list reorder only participates in a reorderable playlist context;
 		// the wire payload below rides along on EVERY drag so external targets
 		// (the sidebar's playlist rows) can accept a drop from any view.
@@ -1882,6 +2062,27 @@ export function mountTrackList(
 			}
 			return handle.scrollToIndex(idx);
 		},
+		setTopInset(inset, nextLead) {
+			if (!virtualizer || !insetEl) return;
+			const to = Math.max(0, Math.round(nextLead));
+			const height = Math.max(to, Math.round(inset));
+			if (to === lead && height - to === stick) return;
+			// Rows already scrolled keep their place: the offset moves with the
+			// lead. Set outright, not nudged — the browser's own scroll anchoring
+			// may or may not have moved it for the taller inset already.
+			const before = scrollHost.scrollTop;
+			const after = before > lead ? before + (to - lead) : before;
+			lead = to;
+			stick = height - to;
+			insetEl.style.height = `${height}px`;
+			root.style.setProperty('--list-stick', `${stick}px`);
+			// The rows' visible bottom is short of the viewport's by what sticks
+			// above them: the column header, and whatever the inset leaves.
+			virtualizer.setOptions({ ...virtualizer.options, scrollMargin: lead, scrollPaddingEnd: Math.max(theadH, thead?.offsetHeight ?? 0) + stick });
+			virtualizer.measure();
+			if (scrollHost.scrollTop !== after) scrollHost.scrollTop = after;
+			renderWindow();
+		},
 		getScrollTop() { return scrollHost.scrollTop; },
 		setScrollTop(n) {
 			scrollHost.scrollTop = n;
@@ -1916,6 +2117,8 @@ export function mountTrackList(
 			tbody.removeEventListener('dblclick', onDblClick);
 			tbody.removeEventListener('contextmenu', onContextMenu);
 			tbody.removeEventListener('click', onClick);
+			tbody.removeEventListener('auxclick', onAuxClick);
+			tbody.removeEventListener('mousedown', onAuxDown);
 			tbody.removeEventListener('dragstart', onDragStart);
 			tbody.removeEventListener('dragover', onDragOver);
 			tbody.removeEventListener('dragleave', onDragLeave);

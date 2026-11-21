@@ -1,6 +1,6 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
-import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedItemActivity, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, FeedLens, FeedLensRule, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, ProductionProfile, ProductionPair, ProductionWinner, ProductionStats, ProductionModelInfo, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction, CatalogClientStatus, CatalogWorkerStatus, CatalogReadSources, CatalogReadSourcesPatch, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit, CatalogWatch, CatalogFollowManyReport, CatalogEnrichReport, TrackCatalogRefs, FollowCandidate, FollowCandidateKind, ConnectSearch, ConnectSubject } from '@curator/core';
+import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary, EntityHeader, EntityRef, EntityTracksPage, EntityWorkEvent, StreamingService, WorldSearchPart, WorldSearchResult } from '@curator/shared';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalyzerHealth, AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedItemActivity, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, FeedLens, FeedLensRule, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, ProductionProfile, ProductionPair, ProductionWinner, ProductionStats, ProductionModelInfo, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction, CatalogClientStatus, CatalogWorkerStatus, CatalogReadCadence, CatalogReadSources, CatalogReadSourcesPatch, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit, CatalogWatch, CatalogFollowManyReport, CatalogEnrichReport, TrackCatalogRefs, FollowCandidate, FollowCandidateKind, ConnectSearch, ConnectSubject } from '@curator/core';
 import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectQueueResult, CatalogProvider, DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
@@ -33,7 +33,7 @@ export interface IpcChannels {
 	'playlists:set-favorite': { args: [playlistId: string, isFavorite: boolean]; ret: void };
 	'playlists:rename':       { args: [playlistId: string, newName: string]; ret: { pushedToSource: boolean } };
 	'playlists:rename-folder': { args: [folderId: string, newName: string]; ret: void };
-	'playlists:reorder': { args: [playlistId: string, newOrder: number[]]; ret: void };
+	'playlists:reorder': { args: [playlistId: string, newOrder: number[]]; ret: { upstream: UpstreamPushOutcome; detail?: string } };
 	'tracks:playlists-batch':        { args: [trackIds: string[]]; ret: Record<string, string[]> };
 	'playlists:list-with-folders':   { args: []; ret: { playlist: Playlist; folderPath: PlaylistFolder[] }[] };
 	'playlists:add-tracks':          { args: [playlistId: string, trackIds: string[]]; ret: { added: number; skipped: number; noUpstreamTrackIds: string[]; upstream: UpstreamPushOutcome } };
@@ -103,6 +103,22 @@ export interface IpcChannels {
 	'artists:resolve': { args: [name: string]; ret: ArtistSummary | null };
 	'artists:links':   { args: [id: string]; ret: ArtistLink[] };
 	'artists:pages':   { args: [target: ArtistPagesTarget]; ret: ArtistPages };
+	// Entity pages (artist / label / album): the header, and a page of the
+	// World side's tracks. The Owned side is `tracks:list` with the header's filter.
+	'entity:page':     { args: [ref: EntityRef, opts?: { localOnly?: boolean }]; ret: EntityHeader };
+	'entity:tracks':   { args: [ref: EntityRef, opts?: { cursor?: string }]; ret: EntityTracksPage };
+	// The entity page in front (null: none) — what core's page work runs for
+	// (apps/core entity/work.ts). Its progress and findings arrive on
+	// 'entity:work', each carrying this `token`.
+	'entity:watch':    { args: [ref: EntityRef | null, token: number]; ret: void };
+	// Look these World rows of the page in front up at the stores now.
+	'entity:enrich':   { args: [recordingIds: string[]]; ret: { asked: number; found: number } };
+	// The omnibar's World scope: one part of a search beyond the library —
+	// the streaming service, the Global Catalog, or the stores. The renderer
+	// asks the parts side by side and shows each as it answers.
+	'world:search':    { args: [query: string, part: WorldSearchPart]; ret: WorldSearchResult };
+	'streaming:get-primary': { args: []; ret: { service: StreamingService | null; stored: boolean } };
+	'streaming:set-primary': { args: [service: StreamingService]; ret: void };
 	'artists:merge-suggestions': { args: [scope?: ArtistScope]; ret: ArtistMergeSuggestion[] };
 	'artists:dismiss-merge':     { args: [aId: string, bId: string]; ret: void };
 	'artists:rename':  { args: [id: string, newName: string]; ret: { artist: ArtistSummary; tracksRewritten: number } };
@@ -254,7 +270,8 @@ export interface IpcChannels {
 	// core caches the result process-life. Renderer fetches once at boot
 	// and uses the entries opaquely (id = "cti:N" tokens).
 	'rekordbox:cue-palette': { args: []; ret: CuePaletteEntry[] };
-	'analysis:status':  { args: []; ret: { running: { trackId: string; name: string }[]; queued: number } };
+	'analysis:status':  { args: []; ret: { running: { trackId: string; name: string }[]; queued: number; analyzer: AnalyzerHealth; lastCompletedAt: number | null } };
+	'analysis:restart': { args: []; ret: void };
 
 	// ─── AI audio analysis engine (apps/mir) ──────────────────────────────
 	// Similarity in the tracklist goes through tracks:page with
@@ -378,7 +395,10 @@ export interface IpcChannels {
 	// of 'kind/provider' → checked; null restores everything on.
 	'catalog:read-sources':     { args: []; ret: CatalogReadSources };
 	'catalog:set-read-sources': { args: [patch: CatalogReadSourcesPatch | null]; ret: CatalogReadSources };
-	'catalog:watches':   { args: []; ret: CatalogWatch[] };
+	// How often one kind of follow is read (Settings → Discover): weekly in
+	// the Friday window (the default), daily, or as often as the source allows.
+	'catalog:set-read-cadence': { args: [kind: CatalogReadSources[number]['kind'], cadence: CatalogReadCadence]; ret: CatalogReadSources };
+	'catalog:watches':  { args: []; ret: CatalogWatch[] };
 	'catalog:search':    { args: [q: string]; ret: CatalogSearchHit[] };
 	'catalog:follow':    { args: [target: CatalogFollowTarget]; ret: CatalogWatch };
 	'catalog:unfollow':  { args: [objectId: string]; ret: void };
@@ -488,6 +508,9 @@ export type EventChannels = {
 	'download:queue-event': QueueEvent;
 	'library:scan-progress': ScanProgress;
 	'analysis:event': AnalysisJobEvent;
+	// Liveness of the analyzer process — separate from the per-track job
+	// stream above: a hung analyzer produces no job events at all.
+	'analysis:health': AnalyzerHealth;
 	'rekordbox:event': RekordboxImportEvent;
 	// Export-side push channel. Separate from the import stream because
 	// the modal flow that consumes it is independent — a sync-to-rb run
@@ -548,6 +571,11 @@ export type EventChannels = {
 	// This desktop's catalogue-worker status, on every change: whether it reads
 	// for the catalogue this week, what it is reading, its tallies.
 	'catalog:worker-event': CatalogWorkerStatus;
+	// What this desktop is doing for the entity page in front, step by step
+	// (a few a second at most): reading the stores for it, reading missing
+	// tracklists, filling in rows — with the rows to patch in place and
+	// "the catalogue's answer changed, read it again".
+	'entity:work': EntityWorkEvent;
 	// A pull or bootstrap changed local rows: the track list patches these
 	// rows; container entities (tag / playlist / folder) refresh the sidebar.
 	'sync:applied': CloudSyncApplied;
@@ -575,6 +603,7 @@ export const EVENT_CATALOG = {
 	onDownloadQueueEvent: 'download:queue-event',
 	onLibraryScanProgress: 'library:scan-progress',
 	onAnalysisEvent: 'analysis:event',
+	onAnalyzerHealth: 'analysis:health',
 	onRekordboxEvent: 'rekordbox:event',
 	onRekordboxExportEvent: 'rekordbox:export-event',
 	onWavConvertEvent: 'wav:convert-event',
@@ -594,6 +623,7 @@ export const EVENT_CATALOG = {
 	onCloudSyncReconnected: 'cloud-sync:reconnected',
 	onCatalogueStatus: 'catalogue:status',
 	onCatalogWorkerStatus: 'catalog:worker-event',
+	onEntityWork: 'entity:work',
 	onSyncApplied: 'sync:applied',
 } as const satisfies Record<string, keyof EventChannels>;
 
@@ -733,7 +763,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'playlists:set-favorite': { description: 'Pin or unpin a playlist as a favorite. Favorite playlists are shown above the rest in the sidebar.' },
 	'playlists:rename': { description: 'Rename a playlist. Updates Curator\'s local row immediately; for Spotify playlists also PUTs to /playlists/{id} so the rename reflects on Spotify. For Rekordbox playlists the rename is local-only — user runs Sync to Rekordbox to push the new name. Returns pushedToSource=true iff the upstream push completed.' },
 	'playlists:rename-folder': { description: 'Rename a Rekordbox playlist folder. Local-only write; the new name is pushed to Rekordbox on the next Sync to Rekordbox for that folder.' },
-	'playlists:reorder': { description: 'Reorder tracks within a playlist. `newOrder` is an array of the rows\' CURRENT positions (playlist_track.position values) listed in the desired order. Position is the unique identity within a playlist, so this disambiguates the same trackId appearing twice. Atomic — written in a single transaction. When the playlist is from a streaming source AND the user has writeSyncAuto enabled for it, mirrors the new order upstream via the source adapter.' },
+	'playlists:reorder': { description: 'Reorder tracks within a playlist. `newOrder` is an array of the rows\' CURRENT positions (playlist_track.position values) listed in the desired order. Position is the unique identity within a playlist, so this disambiguates the same trackId appearing twice. Atomic — written in a single transaction. When the playlist is from a streaming source AND the user has writeSyncAuto enabled for it, mirrors the new order upstream via the source adapter. Returns upstream: pushed / write-sync-off / failed (with detail) / none (not a streaming playlist); the local order stands either way.' },
 	'tracks:playlists-batch': { description: 'Batched membership lookup — returns playlistId[] per trackId. Excludes hidden and smart playlists so the picker only ever paints chips for write-eligible targets.' },
 	'playlists:list-with-folders': { description: 'Every non-hidden, non-smart playlist with its folder ancestry (root-first). Powers the playlist picker dialog\'s full filterable list.' },
 	'playlists:add-tracks': { description: 'Bulk-add tracks to a playlist. Idempotent — tracks already present are skipped (returned in `skipped`). New rows land at the tail (position = max+1, incrementing). Smart playlists reject the write. For spotify/tidal playlists the add is also pushed to the provider when writeSyncAuto is on and the user owns the playlist; `upstream` reports whether that happened (pushed / write-sync-off / not-owner / failed / none) and `noUpstreamTrackIds` lists tracks that could not be added at all because they have no provider id.' },
@@ -786,6 +816,13 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'artists:resolve': { description: 'Look an artist up by name — diacritic/case-insensitive, follows merge aliases. The Discover "Show in library" path.' },
 	'artists:links': { description: 'Provider identities for an artist (Spotify / Tidal artist ids gathered from synced track payloads, with direct URLs). Drives the artist scope header links and the Artists folder menu.' },
 	'artists:pages': { description: "The store pages of an artist, one per store with a direct URL: what the Open Artist in submenu links to. Takes a library artist id, or a name with the ids a Discover card carries (Spotify artist id, catalogue object id). Joins the Spotify / Tidal links the library holds with the pages the Global Catalog knows (Beatport, SoundCloud and others) when Curator Cloud is reachable; answers with the local links alone when it is not. Also returns the library artist of that id or name, if any." },
+	'entity:page': { description: "The header of an artist's, a label's or an album's page. Takes whatever names the entity: a library artist / album id, a Global Catalog object id, a Spotify id, or a label name. Answers who it is on both sides (the library's entity and the catalogue's object are joined by id, never by name), its picture, genres, labels or artists, store links and follow state, how many local files the library holds of it with the track filter that lists them (`tracks:list`), and whether the catalogue side can be read. An artist or an album the catalogue does not know is described from the user's streaming service (Spotify) instead — `world.via` names it — and an artist the library holds no id for comes back with that service's artists of the same name as `world.candidates`. `localOnly` answers from the library at once; without it the catalogue is waited for." },
+	'entity:tracks': { description: "A page of an entity page's World side: the Global Catalog's releases of the artist or label (or the one album), newest first, each with its tracklist in order, with every recording's streaming ids and the library track it is when the library has it. Pass the ref the header returned; `cursor` is the previous page's nextCursor. An artist or an album the catalogue does not know (or with nobody signed in) is answered from the user's streaming service instead, in the same shape under that service's ids. Rejects when neither can answer." },
+	'entity:enrich': { description: "Looks World rows of the artist / label / album page in front up at the stores now (Beatport, then Traxsource) for the BPM, key, genre and label they lack — ahead of the page's own row-by-row pass, and again for rows it already tried. Takes Global Catalog recording ids of rows the page has loaded. Resolves when the lookups are done with how many of the rows the page holds (`asked`) and how many a store had something for (`found`); what was found reaches the rows as 'entity:work' events and goes up to the catalogue. Zero asked: no page in front, a page the catalogue does not know yet, or the lookups are switched off." },
+	'entity:watch': { description: "Names the artist / label / album page the user has in front (the ref its header returned; null when none is). While a page is in front this desktop works for it: reads the stores' listings for an entity the Global Catalog does not know or for releases it lacks and registers them, reads the tracklists of releases the catalogue lists without one, and fills in what the loaded World rows lack (a page on the primary streaming service, BPM, key, genre, label), sending every finding up to the catalogue. Naming another page stops the work for the one before. `token` is echoed on every 'entity:work' event of that page. The UI's own call: an agent has no reason to make it." },
+	'world:search': { description: "One part of a search over music beyond the library, as the omnibar's World scope runs it. `part` 'streaming' asks the user's primary streaming service (Spotify) for artists, albums and tracks matching the query, with the track hits also returned as playable World rows; 'catalog' asks the Global Catalog for the artists, labels and releases whose name starts with the query; 'stores' searches Beatport for labels. Each hit carries the entity ref its page opens with (`entity:page`) and the ids it is known by, so the same thing found by two parts can be merged. Read-only: registers nothing. A part that cannot answer (Spotify not connected, signed out of Curator Cloud, a store that refused) returns no hits and says why in `note`." },
+	'streaming:get-primary': { description: 'The streaming service catalogue tracks (not in the library) play through: the one the user chose in Settings, else the connected account (Spotify when both are connected; null when neither). `stored` says whether the user chose.' },
+	'streaming:set-primary': { description: "Choose the streaming service catalogue tracks play through ('spotify' or 'tidal'). A setting only: nothing is written to either account." },
 	'artists:merge-suggestions': { description: 'Artist pairs identity cannot decide — a bare name beside the same name with a bracketed country/city tag ("Maz" / "Maz (EG)"). Live artists only; dismissed pairs excluded; suggested survivor = the more-credited spelling. `scope` counts a tab\'s tracks and keeps pairs with at least one track in scope.' },
 	'artists:dismiss-merge': { description: 'Remember an artist pair as "not the same artist" so the Suggested merges review never shows it again.' },
 	'albums:by-ids': { description: 'Album summaries for the given Curator album ids (merge aliases answer with the survivor data under the asked id; unknown ids skipped): title, album artists or Various, release date, label, top genres, type, provider track total, live library track count and a cover track id. Drives the track list album group headers.' },
@@ -912,7 +949,8 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'catalogue:backfill': { description: 'Control the upload of this device\'s existing analysis to the account (start | pause | resume | stop). Throttled; waits while analysis runs.' },
 	'analysis:resources': { description: 'How much of the machine the analyzer may take: `workers` = analyses running at once (each pinned to one core, so this is the CPU ceiling), `cpuCount` = cores the analyzer can see (the WSL VM allowance on Windows). Shown in Settings → Library.' },
 	'analysis:set-resources': { description: 'Set the analyzer worker count (clamped to 1..cpuCount). Persisted in app_setting and applied live: the queue stops dispatching above the new number and the sidecar swaps to a pool of the new size — running analyses are never interrupted. Returns the applied state.' },
-	'analysis:status': { description: 'Snapshot of the analyzer queue: trackIds currently being analyzed, and the number of jobs still queued. Used by the renderer to backfill its in-memory state on first wire / HMR reload, since the event stream only delivers transitions from this point forward.' },
+	'analysis:status': { description: 'Snapshot of the analyzer queue: trackIds currently being analyzed, and the number of jobs still queued. Used by the renderer to backfill its in-memory state on first wire / HMR reload, since the event stream only delivers transitions from this point forward. Also `analyzer`: whether the analyzer process is alive (off | idle | starting | ready | unresponsive | disabled, with a reason for the last two) — a job counts as running from the moment it is handed over, so only this tells a busy analyzer from a hung one — and `lastCompletedAt` (epoch ms), the last analysis that finished, across launches.' },
+	'analysis:restart': { description: 'Relaunch the analyzer process after it gave up or stopped responding (the retry on the status chip). No-op while it is running or still launching. Queued jobs resume once it is back.' },
 	'feed:get-page': { description: 'Return a ranked page of Discover feed items (keyset cursor pagination). Items are recency-ordered, suppression-filtered, pass the standing lenses, and exclude dismissed/archived/promoted rows. Also returns the total visible count for the Discover tab chip.' },
 	'feed:lenses': { description: 'Return the Discover feed’s standing lenses (typed filters shown as removable chips, stored in the synced setting feed.lenses).' },
 	'feed:add-lens': { description: 'Add a standing lens to the Discover feed (one per kind: replaces that kind’s lens). Returns the new list.' },
@@ -930,6 +968,7 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'catalog:worker-status': { description: 'Whether this desktop reads the Global Catalog’s sources for the account’s follows this week (one device per account per week; the cloud reads the rest): signed in and offered, active or idle, the sources it can read and the trackers the user checked, its last ask and report, what it has polled and the events raised, sources it paused after a rate limit, the last error, and the check in progress (queued vs read).' },
 	'catalog:read-sources': { description: 'The user’s tracking choices, per kind (artist, label, playlist, genre): each source with whether it is checked and whether only the cloud can read it. Unchecked means nobody reads that source for the user’s follows, the cloud included.' },
 	'catalog:set-read-sources': { description: 'Change the tracking choices: a patch of "kind/provider" → boolean (unknown keys ignored), or null to restore everything on. Device-local; the catalogue worker sends them with its next ask.' },
+	'catalog:set-read-cadence': { description: 'Set how often one kind of follow (artist, label, playlist, genre) is read: "weekly" (once a week in the Friday window, the default), "daily", or "source" (as often as the source allows). Device-local; the catalogue worker sends it with its next ask and the master times the reads by it.' },
 	'catalog:status': { description: 'Whether this device can follow artists and labels for Discover: signed in to Curator Cloud, and the server offers the Global Catalog. reason is ok, signed_out or server_off.' },
 	'catalog:watches': { description: 'The artists and labels this account follows, each with its providers (Spotify, Deezer…), mute state and the cloud trackers following it (last run, next due, failing).' },
 	'catalog:search': { description: 'Search for artists and labels to follow: the shared catalogue matches first (most followed first), then Spotify and Deezer artists it does not hold yet. Each hit says whether this account already follows it.' },

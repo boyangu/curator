@@ -16,7 +16,7 @@ export type { TrackerAdapter, TrackerPoll, TrackerTarget } from './types.js';
 export { CALLS_PER_POLL, callsPerPoll, TrackerRateLimitedError } from './types.js';
 export { getJson, listingHash, ProviderHttpError, rememberSeen, type FetchLike } from './http.js';
 export { parseUploadTitle, splitCatalogNumber, splitCredit, stripFormatWord, type UploadCredit } from './upload-title.js';
-export { DeezerTracker } from './deezer.js';
+export { DEEZER_GENRES, DeezerTracker, type DeezerListedAlbum } from './deezer.js';
 export { BeatportTracker } from './beatport.js';
 export { BEATPORT, BROWSER_USER_AGENT, dateOf as beatportDateOf, fetchNextData, imageUrl as beatportImageUrl, isChallenge, publishedMs as beatportPublishedMs, queryData } from './beatport-pages.js';
 export type { BpArtist, BpImage, BpLabel, BpPage, BpReleaseRef, BpTrack, NextData, NextQuery } from './beatport-pages.js';
@@ -39,3 +39,5 @@ export {
 	type SpPlaylistTrack,
 } from './spotify.js';
 export { SpotifyUserPlaylistTracker, type SpotifyUserPlaylistDeps } from './spotify-user-playlist.js';
+export { LINK_PREVIEW_USER_AGENT, parseMonthlyListeners, readMonthlyListeners, SpotifyPageShapeError } from './spotify-page.js';
+export { LastfmReader } from './lastfm.js';

@@ -8,7 +8,7 @@
 // this module never imports main.ts. IPC goes through the data/api.ts facades,
 // never the raw preload bridge (boundary-checked at build time).
 
-import type { Track, Playlist, PlaylistFolder, PinnedSearch, ZTrackFilterT } from '@curator/shared';
+import type { EntityRef, Track, Playlist, PlaylistFolder, PinnedSearch, ZTrackFilterT } from '@curator/shared';
 import type { RemovableTrackSource } from '@curator/core';
 import type { TrackListHandle } from '../track-list.js';
 import type { AnalyzeModalHandle } from '../layouts/AnalyzeModal.jsx';
@@ -130,9 +130,9 @@ export interface ContextMenusFeatureDeps {
 	openOrganize(trackIds: string[]): void;
 	openDownloadsView(): void;
 	openPlaylistById(id: string): Promise<void>;
-	// "Start Journey" — flip Discover into Journeys mode seeded from a
-	// library track (see startJourneyFromSeed in main.ts).
-	startJourneyFromTrack(trackId: string): void;
+	// An artist's / album's / label's page (main.ts openEntity): in the tab
+	// the menu was opened in, or a page tab of its own.
+	openEntity(ref: EntityRef, opts?: { newTab?: boolean }): void;
 	enterJitScope(jit: JitPlaylist, selectTrackId?: string): Promise<void>;
 	cssEscape(s: string): string;
 	// ── pinned searches (the "Pinned" nav folder) ────────────────────────

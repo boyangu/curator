@@ -25,9 +25,12 @@
 //   pnpm --filter @curator/cloud catalog release dedupe <release id…> | --label <q> | --artist <q> | --shared-slots [--since-days N] [--dry]   (two recordings on one slot → one)
 //   pnpm --filter @curator/cloud catalog library import --file claims.json [--dry]   (a library's labels + releases; fills queued)
 //   pnpm --filter @curator/cloud catalog repair previews [--label <q>] [--dry]   (SoundCloud 0:30 preview copies → their store recordings)
+//   pnpm --filter @curator/cloud catalog repair dj-sets [--dry] [--limit 500]   (long mixed sessions only SoundCloud holds, and releases of nothing else: removed, not undoable)
 //   pnpm --filter @curator/cloud catalog repair credits [--dry]   (artists the SoundCloud/Bandcamp splitter cut out of a credit → the artists they were cut from)
+//   pnpm --filter @curator/cloud catalog repair compound-artists --dry [--lookup] [--stores musicbrainz,spotify] [--max 800] [--class <c>] [--show 15] [--out rows.json]   (--stores asks outside for the whole name, Spotify for at most --max names a run;artists named like several, "A & B", each decided by what the stores say: keep one act, rename an artist a credit line was written on, split a store's page for a credit, or ask; reads only)
 //   pnpm --filter @curator/cloud catalog repair artist-twins [--dry] [--all] [--merge-only]   (same-name artists on one release merged; one store holding both under two ids → an artist.twins inbox item)
 //   pnpm --filter @curator/cloud catalog artist merge <from id> <into id> --note "…" [--approved]   (held for the operator unless approved)
+//   pnpm --filter @curator/cloud catalog artist validate <artist id> [--propose]   (is each Deezer page of the artist one artist: its genres against what Beatport says the artist is; --propose puts a page of several acts to the inbox)
 //   pnpm --filter @curator/cloud catalog artist unlink <artist id> <provider:id> --note "…" [--as namesake|bucket] [--approved]   (a namesake's own page split off with its releases; a store's bucket of namesakes blocked)
 //   pnpm --filter @curator/cloud catalog release merge <from id> <into id> --note "…" [--approved]   (two copies of one release the twins detector did not pair; held unless approved)
 //   pnpm --filter @curator/cloud catalog artist recredit <artist id> <release id> <to artist id> --note "…" --approved   (an artist's credits on one release given to another)
@@ -44,7 +47,7 @@
 //   pnpm --filter @curator/cloud catalog tracking check all|artists|labels|playlists|genres|<object id> [--provider beatport]   (due now; a provider's pause and anything read within the hour are left alone)
 //   pnpm --filter @curator/cloud catalog inbox [<kind>] [--all] [--actor agent] [--limit 30]      (the operator's inbox: what waits for Guy; --all = the activity log)
 //   pnpm --filter @curator/cloud catalog inbox show <id>
-//   pnpm --filter @curator/cloud catalog inbox approve|reject <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] --note "…" --by guy   (--except: twin pairs ruled not twins, the rest merged)
+//   pnpm --filter @curator/cloud catalog inbox approve|reject <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] [--leave 3,7] --note "…" --by guy   (twin pairs by index: --except ruled not twins, --leave stay open on the item, the rest merged)
 //   pnpm --filter @curator/cloud catalog insight add <object id | label> --topic edition|partial|note "<text>"   (what you concluded, on the object)
 //   pnpm --filter @curator/cloud catalog insight list <object id | label> [--retired]
 //   pnpm --filter @curator/cloud catalog insight retire <insight id> [--note "…"]
@@ -62,6 +65,9 @@ import { adminOps, type AdminOps, type LabelView, type ReviewView } from '../cat
 import { coreSet } from '../catalog/agent/evals.js';
 import type { AgentCase } from '../catalog/agent/cases.js';
 import type { ArtistPairView } from '../catalog/artist-twins.js';
+import { COMPOUND_CLASSES, type CompoundRow } from '../catalog/compound-artists.js';
+import { nameFold } from '@curator/library-logic';
+import { NAME_LOOKUP_BATCH, NAME_SOURCES } from '../catalog/name-lookup.js';
 import type { AgentImport } from '../catalog/agent-import.js';
 import type { RelatedEvidence } from '../catalog/label-related.js';
 import type { InboxRow } from '../catalog/inbox.js';
@@ -81,7 +87,7 @@ const arg = (name: string): string | undefined => {
 };
 const flag = (name: string): boolean => argv.includes(name);
 // Positional words: everything that is not a flag or a flag's value.
-const words = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1]!.startsWith('--') && !['--json', '--evidence', '--decided', '--watched', '--gaps', '--dry', '--related', '--approved', '--all', '--retired', '--merge-only', '--shared-slots'].includes(argv[i - 1]!)));
+const words = argv.filter((a, i) => !a.startsWith('--') && !(i > 0 && argv[i - 1]!.startsWith('--') && !['--json', '--evidence', '--decided', '--watched', '--gaps', '--dry', '--related', '--approved', '--all', '--retired', '--merge-only', '--shared-slots', '--lookup'].includes(argv[i - 1]!)));
 
 async function ops(): Promise<AdminOps> {
 	const url = process.env.DATABASE_URL?.trim();
@@ -141,10 +147,14 @@ async function ops(): Promise<AdminOps> {
 		insightList: (a) => call('insightList', a),
 		releaseDedupe: (a) => call('releaseDedupe', a),
 		repairPreviews: (a) => call('repairPreviews', a),
+		repairDjSets: (a) => call('repairDjSets', a),
 		repairCredits: (a) => call('repairCredits', a),
+		compoundArtists: (a) => call('compoundArtists', a),
+		nameLookup: (a) => call('nameLookup', a),
 		repairArtistTwins: (a) => call('repairArtistTwins', a),
 		artistMerge: (a) => call('artistMerge', a),
 		artistUnlink: (a) => call('artistUnlink', a),
+		artistValidate: (a) => call('artistValidate', a),
 		releaseMerge: (a) => call('releaseMerge', a),
 		artistRecredit: (a) => call('artistRecredit', a),
 		libraryImport: (a) => call('libraryImport', a),
@@ -307,14 +317,16 @@ try {
 			if (json) console.log(JSON.stringify(r, null, 2));
 			else printInbox(r, true);
 		} else if (sub === 'approve' || sub === 'reject') {
-			if (!id) throw new Error(`inbox ${sub} <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] --note "…" --by guy`);
+			if (!id) throw new Error(`inbox ${sub} <id> [--choice attach:<n>|merge:<n>|not-same:<n>] [--except 1,16] [--leave 3,7] --note "…" --by guy`);
 			if (arg('--by') !== 'guy') throw new Error('the inbox is the operator\'s: resolve it from the back office, or with --by guy on Guy\'s explicit word in chat');
 			const c = arg('--choice') ? /^(attach|merge|not-same):(\d+)$/.exec(arg('--choice')!) : null;
 			if (arg('--choice') && !c) throw new Error('--choice attach:<n> | merge:<n> | not-same:<n>');
 			const ex = arg('--except');
 			if (ex !== undefined && !/^\d+(,\d+)*$/.test(ex)) throw new Error('--except <pair>,<pair>… (the [n] of `inbox show`)');
-			const r = await api.inboxDecide({ id, action: sub, choice: c ? { action: c[1]!.replace('-', '_') as 'attach' | 'merge' | 'not_same', candidate: Number(c[2]) } : undefined, except: ex?.split(',').map(Number), note: arg('--note') ?? null, by: 'guy' });
-			console.log(`#${r.id} ${r.status}: ${r.resolution}`);
+			const lv = arg('--leave');
+			if (lv !== undefined && !/^\d+(,\d+)*$/.test(lv)) throw new Error('--leave <pair>,<pair>… (the [n] of `inbox show`)');
+			const r = await api.inboxDecide({ id, action: sub, choice: c ? { action: c[1]!.replace('-', '_') as 'attach' | 'merge' | 'not_same', candidate: Number(c[2]) } : undefined, except: ex?.split(',').map(Number), leave: lv?.split(',').map(Number), note: arg('--note') ?? null, by: 'guy' });
+			console.log(r.status === 'open' ? `#${r.id} still open: ${r.note}` : `#${r.id} ${r.status}: ${r.resolution}`);
 		} else if (sub === 'snooze') {
 			if (!id) throw new Error('inbox snooze <id> [--days 7]');
 			const r = await api.inboxSnooze({ id, days: Number(arg('--days') ?? 7) });
@@ -443,6 +455,15 @@ try {
 		if (!Number.isInteger(id)) throw new Error('insight retire <insight id> [--note "…"]');
 		const i = await api.insightRetire({ id, by: arg('--by') ?? 'claude-code', note: arg('--note') ?? null });
 		console.log(`insight #${i.id} retired`);
+	} else if (group === 'artist' && sub === 'validate') {
+		if (rest.length !== 1) throw new Error('artist validate <artist id> [--propose]');
+		const pages = await api.artistValidate({ id: rest[0]!, propose: flag('--propose') });
+		if (!pages.length) console.log('no Deezer page to validate on that artist (none attached, or blocked already)');
+		for (const p of pages) {
+			console.log(`${p.provider}:${p.providerId} «${p.name}» — ${p.verdict}: ${p.reason}`);
+			console.log(`  listed ${p.listed}${p.total !== null ? ` of ${p.total}` : ''}: ${Object.entries(p.genres).sort((a, b) => b[1] - a[1]).map(([g, n]) => `${g} ${n}`).join(', ') || 'no genres'}; Beatport releases: ${p.beatport}`);
+			if (p.inbox !== null) console.log(`  held for approval: inbox #${p.inbox}`);
+		}
 	} else if (group === 'artist' && sub === 'unlink') {
 		if (rest.length !== 2) throw new Error('artist unlink <artist id> <provider:id> --note "whose page it is" [--approved]');
 		const as = arg('--as') ?? 'namesake';
@@ -479,6 +500,13 @@ try {
 			for (const m of r.merged) console.log(`  "${m.title}" → ${m.into} (on "${m.intoRelease}")`);
 			for (const u of r.unmatched) console.log(`  left: "${u.title}" ${u.id} — ${u.why}`);
 		}
+	} else if (group === 'repair' && sub === 'dj-sets') {
+		const r = await api.repairDjSets({ dry: flag('--dry'), limit: arg('--limit') ? Number(arg('--limit')) : undefined, by: arg('--by') ?? 'claude-code' });
+		console.log(`${r.dry ? '[dry run, nothing removed] ' : ''}${r.recordings} DJ set(s) and ${r.releases} release(s) of nothing else ${r.dry ? 'would go' : 'removed'}, ${r.events} event(s) with them; ${r.trimmed.length} release(s) keep their other tracks${r.more ? ' — more left: run again' : ''}`);
+		for (const g of r.gone) console.log(`  - ${g.kind} ${g.name}${g.minutes !== null ? ` (${g.minutes} min)` : ''}  ${g.pages.join(' ')}`);
+		for (const t of r.trimmed) console.log(`  trimmed: ${t.release} loses "${t.set}"`);
+		if (r.watched.length) console.log(`  left, watched: ${r.watched.join(' | ')}`);
+		if (r.elsewhere.count) console.log(`  not touched: ${r.elsewhere.count} long recording(s) another store holds (${r.elsewhere.sample.join(' | ')})`);
 	} else if (group === 'repair' && sub === 'artist-twins') {
 		// --all: call after call (each one bounded) until nothing is left.
 		for (;;) {
@@ -492,6 +520,96 @@ try {
 				for (const x of r.proposed) console.log(`  inbox${x.item === null ? '' : ` #${x.item}`}: "${x.name}" (${x.pairs} pair(s))`);
 			}
 			if (!r.more || !flag('--all') || r.dry) break;
+		}
+	} else if (group === 'repair' && sub === 'compound-artists') {
+		if (!flag('--dry')) throw new Error('repair compound-artists reads only so far: run it with --dry (the repair itself is not built)');
+		const wait = (ms: number) => new Promise((res) => setTimeout(res, ms));
+		// Page after page, each a short read: the whole catalogue in one report.
+		const scan = async (lookup: boolean): Promise<{ rows: CompoundRow[]; asked: number }> => {
+			const rows: CompoundRow[] = [];
+			let after: string | null = null;
+			let asked = 0;
+			for (;;) {
+				const r = await api.compoundArtists({ after, lookup });
+				rows.push(...r.rows);
+				asked += r.appleAsked;
+				if (!r.next) return { rows, asked };
+				after = r.next;
+				// Apple's lookup refuses bursts: one call a page, paced.
+				if (r.appleAsked) await wait(3_500);
+			}
+		};
+		let { rows, asked } = await scan(flag('--lookup'));
+		// --stores: the whole name asked outside the catalogue, for the names no
+		// rule settled and the ones a rule would split. MusicBrainz first; then
+		// Spotify for what is still open, the names its answer decides (each
+		// name in them an artist of its own) first, and no more than --max a run:
+		// its calls are the trackers' too.
+		const stores = (arg('--stores') ?? '').split(/[\s,]+/).filter(Boolean);
+		const unknown = stores.filter((s) => !(NAME_SOURCES as readonly string[]).includes(s));
+		if (unknown.length) throw new Error(`--stores takes ${NAME_SOURCES.join(', ')} — not "${unknown.join('", "')}"`);
+		const looked: string[] = [];
+		for (const source of NAME_SOURCES) {
+			if (!stores.includes(source)) continue;
+			let need = rows.filter((r) => (r.decision === 'ask' || r.decision === 'split') && !r.asked.includes(source));
+			if (source === 'spotify') {
+				// A name whose Spotify page the catalogue holds needs no asking.
+				need = need.filter((r) => !r.pages.some((x) => x.startsWith('spotify:')));
+				const decides = (r: CompoundRow) => (r.tokens.length >= 2 && r.tokens.every((l) => l >= 3) ? 1 : 0);
+				need = need.sort((a, b) => decides(b) - decides(a) || b.credits.tracks + b.credits.releases - (a.credits.tracks + a.credits.releases)).slice(0, Number(arg('--max') ?? 800));
+			}
+			// One spelling a folded name, as the lookup counts them.
+			const names = [...new Map(need.map((r) => [nameFold(r.name), r.name] as const)).values()];
+			let done = 0;
+			let refused = 0;
+			let why: string | null = null;
+			for (let i = 0; i < names.length; ) {
+				// A failed call (the source timing out) is a refusal like any other:
+				// what it answered before is kept, the batch is asked again.
+				const batch = names.slice(i, i + NAME_LOOKUP_BATCH);
+				const r = await api.nameLookup({ names: batch, source }).catch((): Awaited<ReturnType<AdminOps['nameLookup']>> => ({ asked: 0, known: 0, stopped: 'refused' }));
+				done += r.asked;
+				if (r.stopped === 'budget' || r.stopped === 'unavailable') {
+					why = r.stopped === 'budget' ? "today's calls are spent" : 'not configured here';
+					break;
+				}
+				if (r.stopped === 'refused') {
+					// A long wall is a ban in the making: leave it, the answers so far are kept.
+					if ((r.retryAfterSec ?? 30) > 120 || ++refused > 12) {
+						why = `it refused${r.retryAfterSec ? ` (wait ${r.retryAfterSec}s)` : ''}`;
+						break;
+					}
+					await wait((r.retryAfterSec ?? 60) * 1000);
+					continue;
+				}
+				refused = 0;
+				// Cut short by its own time limit (a slow source): the rest again.
+				if (r.asked + r.known < batch.length) continue;
+				i += NAME_LOOKUP_BATCH;
+				if (!json && i % (NAME_LOOKUP_BATCH * 10) === 0) console.error(`  ${source}: ${Math.min(i, names.length)} of ${names.length} name(s)`);
+			}
+			looked.push(`${source}: ${done} of ${names.length} name(s) asked${why ? `, stopped: ${why}` : ''}`);
+			if (!done) continue;
+			// Read again with the answers; Apple's names are kept from the first read.
+			const first = new Map(rows.map((r) => [r.id, r]));
+			rows = (await scan(false)).rows.map((r) => (first.get(r.id)?.class === 'apple_line' ? first.get(r.id)! : r));
+		}
+		const out = arg('--out');
+		if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
+		if (json) console.log(JSON.stringify(rows, null, 2));
+		else {
+			const only = arg('--class');
+			const show = Number(arg('--show') ?? 15);
+			const weight = (r: CompoundRow) => r.credits.tracks + r.credits.releases;
+			console.log(`[dry run, nothing written] ${rows.length} artist(s) named like several${flag('--lookup') ? `, ${asked} Apple id(s) asked` : ''}${out ? ` — rows in ${out}` : ''}`);
+			for (const l of looked) console.log(`  ${l}`);
+			console.log(`  ${(['keep', 'rename', 'split', 'ask'] as const).map((d) => `${d} ${rows.filter((r) => r.decision === d).length}`).join(' · ')}`);
+			for (const c of COMPOUND_CLASSES) {
+				const of = rows.filter((r) => r.class === c).sort((a, b) => weight(b) - weight(a));
+				console.log(`${String(of.length).padStart(6)} ${c.padEnd(10)} ${of.reduce((n, r) => n + r.credits.tracks, 0)} track credit(s), ${of.reduce((n, r) => n + r.credits.releases, 0)} release credit(s)`);
+				if (only && only !== c) continue;
+				for (const r of of.slice(0, only ? Math.max(show, 50) : show)) console.log(`         ${r.decision.padEnd(6)} "${r.name}"${r.into ? ` → ${r.into.map((n) => `"${n}"`).join(' + ')}` : r.to ? ` → "${r.to}"` : ''}  ${r.id}  [${[...new Set(r.pages.map((x) => x.split(':')[0]))].join(',') || 'no page'}]  ${r.why}`);
+			}
 		}
 	} else if (group === 'repair' && sub === 'credits') {
 		const r = await api.repairCredits({ dry: flag('--dry'), by: arg('--by') ?? 'claude-code' });
@@ -601,7 +719,7 @@ try {
 			}
 		}
 	} else {
-		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe|merge | artist merge|unlink|recredit | repair previews|credits|artist-twins | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass | tracking [check]   (see the header of src/cli/catalog.ts)');
+		console.log('catalog search | label add|show|link|unlink|merge|rename|import|verify|refresh|releases | release stubs|fill|link|dedupe|merge | artist merge|unlink|recredit | repair previews|credits|artist-twins|dj-sets | review scan|open|list|show|decide | inbox [show|approve|reject|snooze] | agent cases|show|run|ask|advise|sweep|drop|evals export | pass | tracking [check]   (see the header of src/cli/catalog.ts)');
 	}
 } catch (e) {
 	log.error('catalog_cli_failed', { error: e instanceof Error ? e.message : String(e) });

@@ -18,6 +18,7 @@
 
 import { createMemo, createSignal } from 'solid-js';
 import type { Accessor } from 'solid-js';
+import { searchFold, type EntityRef, type EntityScopeKind } from '@curator/shared';
 import type { JitPlaylist, SourceTab } from './shell.js';
 
 // What the tracks table is scoped to under a source tab. `playlist` covers
@@ -29,24 +30,33 @@ export type TracksScope =
 	| { type: 'folder'; id: string }
 	| { type: 'jit'; jit: JitPlaylist };
 
+// A user-opened page tab ("open in new tab"): its own stack, like any tab's.
+export type PageTabId = `page:${number}`;
+export const isPageTab = (tab: string | null | undefined): tab is PageTabId => !!tab && tab.startsWith('page:');
+
+// The tab an entity page sits on: the source tab or Discover it was opened
+// from, or a page tab of its own.
+export type EntityHost = SourceTab | 'discover' | PageTabId;
+
 export type NavLocation =
 	| { kind: 'tracks'; source: SourceTab; scope: TracksScope }
+	// An artist / label / album page. Owned ↔ World is the same place (the
+	// toggle replaces the entry), so `scope` is not part of its identity.
+	| { kind: 'entity'; host: EntityHost; entity: EntityRef; scope: EntityScopeKind }
 	| { kind: 'tag'; view: 'interested' | 'basket' }
 	| { kind: 'sync' }
 	| { kind: 'downloads' }
 	// Standing lenses are settings, not navigation: Back must never revoke one.
 	| { kind: 'discover'; mode: 'feed'; archived: boolean }
-	// journeyId null ⇔ the journey list; nodeId is the journey node the user
-	// was standing on (traversal re-jumps there, moving the journey's pointer).
-	| { kind: 'discover'; mode: 'journeys'; journeyId: string | null; nodeId: string | null }
 	| { kind: 'discover'; mode: 'agent-results'; resultSetId: string };
 
 // The top-strip tab a location lives under — the key of its history stack.
-export type NavTab = SourceTab | 'discover' | 'interested' | 'basket' | 'downloads' | 'sync';
+export type NavTab = SourceTab | 'discover' | 'interested' | 'basket' | 'downloads' | 'sync' | PageTabId;
 
 export function tabOf(loc: NavLocation): NavTab {
 	switch (loc.kind) {
 		case 'tracks': return loc.source;
+		case 'entity': return loc.host;
 		case 'tag': return loc.view;
 		case 'discover': return 'discover';
 		case 'sync': return 'sync';
@@ -95,14 +105,23 @@ export interface TabStack {
 	index: number;
 }
 
+// An open page tab, in strip order. `opener`: the tab it was opened from —
+// where closing it returns.
+export interface PageTab {
+	id: PageTabId;
+	opener: NavTab;
+}
+
 export interface HistoryState {
 	stacks: Partial<Record<NavTab, TabStack>>;
 	// null ⇔ empty (pre-boot).
 	activeTab: NavTab | null;
+	pages: readonly PageTab[];
 }
 
 export const HISTORY_CAP = 100;
-export const EMPTY_HISTORY: HistoryState = { stacks: {}, activeTab: null };
+export const PAGE_TABS_CAP = 12;
+export const EMPTY_HISTORY: HistoryState = { stacks: {}, activeTab: null, pages: [] };
 
 let nextEntryId = 1;
 
@@ -121,8 +140,31 @@ export function makeEntry(location: NavLocation, label: string, opts: { restore?
 // Identity of a location for "am I already there" checks. A JIT is keyed by
 // its query (a pinned search loaded from the sidebar and the same search
 // re-run from the omnibar are one place); the name is presentation.
+// Identity of an entity for "is this the page already open": the strongest
+// id the ref carries. The library's id leads because a lookup never changes
+// it (a catalogue id is learned along the way).
+const nameKey = (name: string): string => searchFold(name).trim();
+
+export function entityKey(r: EntityRef): string {
+	const id = r.libraryId ? `l:${r.libraryId}` : r.catalogId ? `c:${r.catalogId}` : r.spotifyId ? `s:${r.spotifyId}` : `n:${nameKey(r.name)}${r.within ? `@${r.within.catalogId}` : ''}`;
+	return `${r.kind}:${id}`;
+}
+
+// Two refs for one entity: any id in common. A name says so only for labels
+// (they have no other identity in the library) — never for an artist or an
+// album, where namesakes are real.
+export function sameEntity(a: EntityRef, b: EntityRef): boolean {
+	if (a.kind !== b.kind) return false;
+	if (a.libraryId && a.libraryId === b.libraryId) return true;
+	if (a.catalogId && a.catalogId === b.catalogId) return true;
+	if (a.spotifyId && a.spotifyId === b.spotifyId) return true;
+	if (a.kind === 'label') return nameKey(a.name) === nameKey(b.name) && !(a.catalogId && b.catalogId);
+	return entityKey(a) === entityKey(b);
+}
+
 export function locationKey(loc: NavLocation): string {
 	switch (loc.kind) {
+		case 'entity': return `entity:${loc.host}:${entityKey(loc.entity)}`;
 		case 'tracks': {
 			const s = loc.scope;
 			const scope = s.type === 'all' ? 'all'
@@ -137,7 +179,6 @@ export function locationKey(loc: NavLocation): string {
 		case 'discover':
 			switch (loc.mode) {
 				case 'feed': return `discover:feed:${loc.archived ? 'archived' : 'live'}`;
-				case 'journeys': return `discover:journeys:${loc.journeyId ?? ''}:${loc.nodeId ?? ''}`;
 				case 'agent-results': return `discover:agent:${loc.resultSetId}`;
 			}
 	}
@@ -200,7 +241,7 @@ export function ancestorsOf(state: HistoryState, entry: NavEntry): NavEntry[] {
 }
 
 function withStack(state: HistoryState, tab: NavTab, stack: TabStack, activate = true): HistoryState {
-	return { stacks: { ...state.stacks, [tab]: stack }, activeTab: activate ? tab : state.activeTab };
+	return { ...state, stacks: { ...state.stacks, [tab]: stack }, activeTab: activate ? tab : state.activeTab };
 }
 
 // Append after the current entry OF THE ENTRY'S TAB, discarding that tab's
@@ -239,7 +280,7 @@ export function replace(state: HistoryState, entry: NavEntry): HistoryState {
 // alone — the caller seeds it with a push.
 export function activateTab(state: HistoryState, tab: NavTab): HistoryState {
 	if (!stackOf(state, tab) || state.activeTab === tab) return state;
-	return { stacks: state.stacks, activeTab: tab };
+	return { ...state, activeTab: tab };
 }
 
 // Move the active tab's pointer by `delta`; past either end is a no-op.
@@ -276,7 +317,8 @@ export function dropAt(state: HistoryState, tab: NavTab, i: number): HistoryStat
 	if (entries.length === 0) {
 		const stacks = { ...state.stacks };
 		delete stacks[tab];
-		return { stacks, activeTab: state.activeTab === tab ? null : state.activeTab };
+		// A page tab is its stack: with nothing left to show it is gone.
+		return { stacks, activeTab: state.activeTab === tab ? null : state.activeTab, pages: state.pages.filter((p) => p.id !== tab) };
 	}
 	let index = s.index;
 	if (index > i) index -= 1;
@@ -303,7 +345,40 @@ export function rewritePlaylistId(state: HistoryState, oldId: string, newId: str
 			}),
 		};
 	}
-	return changed ? { stacks, activeTab: state.activeTab } : state;
+	return changed ? { ...state, stacks } : state;
+}
+
+// ── Page tabs ──────────────────────────────────────────────────────────────
+
+let nextPageTabId = 1;
+
+// Register a new page tab after the open ones. It has no stack until the
+// caller pushes its first entry (which also activates it).
+export function openPageTab(state: HistoryState, opener: NavTab): { state: HistoryState; id: PageTabId } {
+	const id: PageTabId = `page:${nextPageTabId++}`;
+	return { state: { ...state, pages: [...state.pages, { id, opener }] }, id };
+}
+
+// Close a page tab: its stack and its place in the strip. Closing the active
+// one leaves no tab active — the caller switches to another first (see
+// closeTarget), so this only ever drops a background tab's state.
+export function closePageTab(state: HistoryState, id: PageTabId): HistoryState {
+	if (!state.pages.some((p) => p.id === id)) return state;
+	const stacks = { ...state.stacks };
+	delete stacks[id];
+	return { stacks, activeTab: state.activeTab === id ? null : state.activeTab, pages: state.pages.filter((p) => p.id !== id) };
+}
+
+// Where closing a page tab lands: the tab it was opened from while that tab
+// still has something to show (a page tab's opener may itself have closed),
+// else the page tab beside it, else nothing the history knows.
+export function closeTarget(state: HistoryState, id: PageTabId): NavTab | null {
+	const at = state.pages.findIndex((p) => p.id === id);
+	if (at < 0) return null;
+	const opener = state.pages[at]!.opener;
+	if (opener !== id && stackOf(state, opener)) return opener;
+	const beside = state.pages[at + 1] ?? state.pages[at - 1];
+	return beside && stackOf(state, beside.id) ? beside.id : null;
 }
 
 // ── Live store ─────────────────────────────────────────────────────────────
@@ -324,9 +399,21 @@ const ancestors: Accessor<NavEntry[]> = createMemo(() => {
 	return c ? ancestorsOf(historyState(), c) : [];
 });
 
+// The open page tabs with what each shows now, in strip order. A tab between
+// its registration and its first entry is not listed.
+const pageTabs: Accessor<{ id: PageTabId; entry: NavEntry }[]> = createMemo(() => {
+	const st = historyState();
+	return st.pages.flatMap((p) => {
+		const s = stackOf(st, p.id);
+		const entry = s ? s.entries[s.index] : undefined;
+		return entry ? [{ id: p.id, entry }] : [];
+	});
+});
+
 export const navHistory = {
 	// ── Reads ──
 	state: historyState,
+	pageTabs,
 	activeTab: createMemo(() => historyState().activeTab),
 	current,
 	backEntry,
@@ -353,6 +440,13 @@ export const navHistory = {
 	updateCurrentRestore(restore: NavRestore): void { setHistoryState((s) => updateRestore(s, restore)); },
 	dropAt(tab: NavTab, i: number): void { setHistoryState((s) => dropAt(s, tab, i)); },
 	rewritePlaylistId(oldId: string, newId: string): void { setHistoryState((s) => rewritePlaylistId(s, oldId, newId)); },
+	openPageTab(opener: NavTab): PageTabId {
+		const r = openPageTab(historyState(), opener);
+		setHistoryState(r.state);
+		return r.id;
+	},
+	closePageTab(id: PageTabId): void { setHistoryState((s) => closePageTab(s, id)); },
+	closeTarget(id: PageTabId): NavTab | null { return closeTarget(historyState(), id); },
 	// Boot: the first entry is whatever the restored session shows.
 	reset(entry: NavEntry): void { setHistoryState(push(EMPTY_HISTORY, entry)); },
 };

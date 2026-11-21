@@ -13,6 +13,7 @@ import { withSystemTx } from '../db/system-tx.js';
 import { clearInbox, decideInbox, failInbox, getInbox, inboxCounts, listInbox, OPERATOR, raise, snoozeInbox, type InboxChoice, type InboxFilter, type InboxOp, type InboxRow } from './inbox.js';
 import { mergePolicy, objectFacts, reversiblePolicy } from './inbox-policy.js';
 import { splitArtistPage, type SplitArgs, type SplitResult } from './artist-split.js';
+import { validateArtist } from './artist-validation.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { attachPage, decideReview, getReview, holdReview, listReviews, mergeObjects, mergeOverruling, objectReleases, renameObject, scanDuplicates, unlinkPage, type ReviewStatus, type ObjectRelease, type Review, type ReviewCandidate, type ReviewDecision, type ReviewKind } from './admin.js';
 import { candidateReleases, type EvidenceDeps } from './admin-evidence.js';
@@ -37,8 +38,11 @@ import { classifyUrl, labelClaimFromPage, websiteLink } from './profile/links.js
 import { libraryImport, type LibraryImportResult } from './library-import.js';
 import { openRelatedPair, queueLabelDedupe, scanRelatedLabels } from './label-related.js';
 import { artistTwins, type ArtistTwinReport } from './artist-twins.js';
+import { compoundArtists, type CompoundReport } from './compound-artists.js';
+import { lookUpNames, type NameLookupReport, type NameSource } from './name-lookup.js';
 import { recreditOn, repairCredits, type CreditRepairReport } from './repair-credits.js';
 import { repairPreviews, type PreviewRepairReport } from './repair-previews.js';
+import { removeDjSets, type DjSetReport } from './repair-dj-sets.js';
 import { dedupeRelease, dedupeTracks, fillReleases, linkReleasePage, releaseStubs, type DedupeReport, type FillReport, type ReleaseScope, type ReleaseStub } from './release-fill.js';
 import { AppleLookup } from './trackers/apple.js';
 import { BandcampTracker } from '@curator/catalog-readers';
@@ -91,8 +95,9 @@ export type AdminOps = {
 	inboxList(args: InboxFilter): Promise<{ total: number; rows: InboxRow[] }>;
 	inboxCounts(args: Record<string, never>): Promise<{ approval: number; notice: number; snoozed: number }>;
 	inboxGet(args: { id: number }): Promise<InboxRow | null>;
-	// `except`: a twins item's pairs (by index) ruled not twins while the rest merge.
-	inboxDecide(args: { id: number; action: 'approve' | 'reject'; choice?: InboxChoice; except?: number[]; note?: string | null; by?: string }): Promise<InboxRow>;
+	// A twins item's pairs, by index: `except` ruled not twins, `leave` left
+	// open on the item, the rest merged.
+	inboxDecide(args: { id: number; action: 'approve' | 'reject'; choice?: InboxChoice; except?: number[]; leave?: number[]; note?: string | null; by?: string }): Promise<InboxRow>;
 	inboxSnooze(args: { id: number; days?: number; until?: string | null }): Promise<InboxRow>;
 	// Look-alikes: artists by folded name; labels by name, shared releases and
 	// roster (label-related.ts), for the labels named or every live one.
@@ -106,6 +111,11 @@ export type AdminOps = {
 	// identifiers it alone brought go with it; no finder attaches it again). Held
 	// for the operator (`held`) unless `approved`.
 	artistUnlink(args: { id: string; source: string; by?: string; note: string; approved?: boolean; as?: 'namesake' | 'bucket' }): Promise<{ provider: string; providerId: string; name: string; releases: number; held: number | null; result: SplitResult | null }>;
+	// An artist's Deezer pages read and judged now (artist-validation.ts): is
+	// each one artist, by the genres it lists and what Beatport says the
+	// artist is. The verdicts are kept; `propose` puts a page that is not one
+	// artist to the operator (a block, held for approval).
+	artistValidate(args: { id: string; propose?: boolean }): Promise<{ provider: string; providerId: string; name: string; verdict: string; reason: string; listed: number; total: number | null; genres: Record<string, number>; beatport: number; inbox: number | null }[]>;
 	// Two labels merged, overruling a "not the same": held for the operator
 	// (`held` = the inbox item) unless `approved` — the operator said so in chat.
 	labelMerge(args: { from: string; into: string; by?: string; note: string; approved?: boolean }): Promise<{ from: string; into: string; name: string; moved?: Record<string, number>; held?: number | null }>;
@@ -160,9 +170,19 @@ export type AdminOps = {
 	// SoundCloud preview copies (0:30, credited to the label) undone and
 	// merged into the store recording they are (repair-previews.ts).
 	repairPreviews(args: { label?: string; dry?: boolean; by?: string }): Promise<PreviewRepairReport>;
+	// DJ sets (long mixed sessions only SoundCloud holds) out of the catalogue: not releases, not mapped. Not undoable.
+	repairDjSets(args: { dry?: boolean; limit?: number; by?: string }): Promise<DjSetReport>;
 	// Artists the SoundCloud/Bandcamp splitter cut out of a credit, folded
 	// into the artists they were cut from (repair-credits.ts).
 	repairCredits(args: { dry?: boolean; by?: string }): Promise<CreditRepairReport>;
+	// Artists whose name reads as several, sorted by the evidence beside the
+	// name (compound-artists.ts). Reads only; one bounded page per call, paged
+	// by `next`. `lookup`: ask Apple for the own name of Apple-only ids.
+	compoundArtists(args: { after?: string | null; limit?: number; lookup?: boolean }): Promise<CompoundReport>;
+	// Asks a source outside the catalogue whether it holds an artist of each
+	// whole name (name-lookup.ts): one call a name not yet answered, kept. A
+	// short batch per call; `stopped` says why it ended early.
+	nameLookup(args: { names: string[]; source: NameSource }): Promise<NameLookupReport>;
 	// Same-name artists on one release merged, unless one store holds both
 	// (then put to the operator; mergeOnly: not) — artist-twins.ts.
 	repairArtistTwins(args: { dry?: boolean; by?: string; mergeOnly?: boolean }): Promise<ArtistTwinReport>;
@@ -286,6 +306,9 @@ async function labelView(tx: Queryable, id: string): Promise<LabelView> {
 		gaps,
 	};
 }
+
+// Artist ids in one Apple lookup (compoundArtists).
+const APPLE_IDS_PER_CALL = 150;
 
 export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void>; kick?: () => void; agent?: { model: ModelCall; cfg: AgentReasonerConfig } | null } = {}): AdminOps {
 	async function view(r: Review, withEvidence: boolean): Promise<ReviewView> {
@@ -521,6 +544,9 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			if (!r.dry && !r.duplicate) await audit(`Library import: ${args.claims.length} claim(s) — ${r.created} created, ${r.attached} attached, ${r.fills} fill(s) queued`, 'library.import', [], { key: args.key, created: r.created, attached: r.attached, fills: r.fills, profiles: r.profiles }, args.by);
 			return r;
 		},
+		async repairDjSets(args) {
+			return removeDjSets(db, { dry: args.dry, limit: args.limit, by: args.by ?? 'claude-code' });
+		},
 		async repairPreviews(args) {
 			const labelId = args.label ? await label(args.label) : null;
 			const r = await repairPreviews(db, { labelId, dry: args.dry, by: args.by });
@@ -534,6 +560,29 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			const r = await repairCredits(db, { dry: args.dry, by: args.by });
 			if (!r.dry && (r.fixed.length || r.renamed.length)) await audit(`Repaired ${r.fixed.length} split artist credit(s), renamed ${r.renamed.length} back`, 'repair.credits', [...r.fixed.map((f) => f.id), ...r.renamed.map((n) => n.id)], { renamed: r.renamed.slice(0, 50), fixed: r.fixed.slice(0, 50).map((f) => ({ name: f.name, into: f.into, minted: f.minted })) }, args.by);
 			return r;
+		},
+		async compoundArtists(args) {
+			const apple = args.lookup ? evidence.apple : null;
+			return compoundArtists(db, {
+				after: args.after,
+				limit: args.limit,
+				...(apple
+					? {
+						appleNames: async (ids) => {
+							const out = new Map<string, string>();
+							for (let i = 0; i < ids.length; i += APPLE_IDS_PER_CALL) {
+								// The lookup refuses bursts (about twenty a minute).
+								if (i) await new Promise((r) => setTimeout(r, 3_500));
+								for (const [id, name] of await apple.artistNames(ids.slice(i, i + APPLE_IDS_PER_CALL), AbortSignal.timeout(30_000))) out.set(id, name);
+							}
+							return out;
+						},
+					}
+					: {}),
+			});
+		},
+		async nameLookup(args) {
+			return lookUpNames(db, { fetch: evidence.fetch, spotify: evidence.spotify }, args);
 		},
 		async artistMerge(args) {
 			if (!args.note?.trim()) throw new Error('artist merge needs --note (why they are one)');
@@ -550,6 +599,10 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 				await raise(tx, { kind: 'artist.merge', severity: 'audit', title: `Merged artist «${f.name}» into «${i.name}»`, subjects: [i.id], evidence: { note: args.note, from: f.id }, actor: by });
 				return { moved: r.moved };
 			});
+		},
+		async artistValidate(args) {
+			const pages = await validateArtist(db, fetchers.deezer, args.id, { propose: args.propose === true });
+			return pages.map((p) => ({ provider: p.provider, providerId: p.providerId, name: p.name, verdict: p.check.verdict, reason: p.check.reason, listed: p.profile.listed, total: p.profile.total, genres: p.profile.genres, beatport: p.anchor.releases, inbox: p.inbox }));
 		},
 		async artistUnlink(args) {
 			if (!args.note?.trim()) throw new Error('artist unlink needs --note (whose page it is)');
@@ -610,7 +663,7 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 				}
 				const r = await mergeObjects(tx, f.id, i.id, by, args.note, { manual: true });
 				await artistTwinsOn(tx, [i.id], by);
-				await dedupeRelease(tx, i.id, by);
+				await dedupeRelease(tx, i.id, by, { twins: true });
 				await raise(tx, { kind: 'release.twins', severity: 'audit', title: `Merged release «${f.name}» into «${i.name}»`, subjects: [i.id], evidence: { note: args.note, from: f.id, pairs }, actor: by, approvedBy: OPERATOR });
 				return { moved: r.moved };
 			});
@@ -757,7 +810,7 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 		async inboxDecide(args) {
 			const by = args.by || OPERATOR;
 			try {
-				return await withSystemTx(db, (tx) => decideInbox(tx, args.id, { action: args.action, choice: args.choice, except: args.except, note: args.note ?? null, by }));
+				return await withSystemTx(db, (tx) => decideInbox(tx, args.id, { action: args.action, choice: args.choice, except: args.except, leave: args.leave, note: args.note ?? null, by }));
 			} catch (e) {
 				// The transaction rolled back; the item says why it is still open.
 				await withSystemTx(db, (tx) => failInbox(tx, args.id, e instanceof Error ? e.message : String(e))).catch(() => {});

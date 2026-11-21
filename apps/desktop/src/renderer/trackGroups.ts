@@ -19,6 +19,9 @@ import type { Track } from '@curator/shared';
 import { searchFold } from '@curator/shared';
 
 export type GroupBy = 'none' | 'artist' | 'album' | 'label';
+// A group's `albumId` for a Global Catalog release (no library album behind
+// it): the album details come from the page's own data, not `albums:by-ids`.
+export const CATALOG_ALBUM_PREFIX = 'catalog:';
 export const GROUP_BY_VALUES: readonly GroupBy[] = ['none', 'artist', 'album', 'label'];
 
 export interface GroupStats {
@@ -60,6 +63,10 @@ export interface DisplayList {
 	visibleTracks: Track[];
 	// visibleTracks index → rows index.
 	trackRow: number[];
+	// visibleTracks index → the track's place in its group, from 0: what the
+	// `#` column counts when the list is grouped (each group starts at 1).
+	// Empty when ungrouped.
+	groupPos: number[];
 	groups: GroupInfo[];
 	// Group key → rows index of its header.
 	groupRow: Map<string, number>;
@@ -83,14 +90,20 @@ export function mainArtistOf(t: Track): { name: string; id: string | null } | nu
 	return { name: list[idx]!.name.trim(), id: t.artistIds?.[idx] ?? null };
 }
 
+// A catalogue row (an entity page's World side, `t.catalog`) is filed by the
+// catalogue's own release, so a library track shown there sits in the same
+// album group as its catalogue siblings — its library album id would file it
+// apart. Artists are filed by name there: library rows carry library artist
+// ids and catalogue rows catalogue ids, for the same act.
 export function groupIdentity(t: Track, by: Exclude<GroupBy, 'none'>): { key: string; title: string; missing: boolean; albumId: string | null } {
 	if (by === 'artist') {
 		const a = mainArtistOf(t);
 		if (!a || !a.name) return { key: 'artist:', title: MISSING_TITLE.artist, missing: true, albumId: null };
-		return { key: `artist:${a.id ?? `n:${searchFold(a.name)}`}`, title: a.name, missing: false, albumId: null };
+		return { key: `artist:${t.catalog || !a.id ? `n:${searchFold(a.name)}` : a.id}`, title: a.name, missing: false, albumId: null };
 	}
 	if (by === 'album') {
 		const title = (t.albumTitle ?? '').trim();
+		if (t.catalog) return { key: `album:c:${t.catalog.releaseId}`, title: title || MISSING_TITLE.album, missing: false, albumId: `${CATALOG_ALBUM_PREFIX}${t.catalog.releaseId}` };
 		if (t.albumId) return { key: `album:${t.albumId}`, title: title || MISSING_TITLE.album, missing: false, albumId: t.albumId };
 		if (!title) return { key: 'album:', title: MISSING_TITLE.album, missing: true, albumId: null };
 		const main = mainArtistOf(t);
@@ -125,7 +138,7 @@ export function groupStats(tracks: readonly Track[]): GroupStats {
 			bpmHi = bpmHi == null ? b : Math.max(bpmHi, b);
 		}
 		if (t.keyCamelot && keys.length < 3 && !keys.includes(t.keyCamelot)) keys.push(t.keyCamelot);
-		const rel = t.albumId ?? ((t.albumTitle ?? '').trim() ? `t:${searchFold(t.albumTitle)}` : '');
+		const rel = t.catalog ? `c:${t.catalog.releaseId}` : t.albumId ?? ((t.albumTitle ?? '').trim() ? `t:${searchFold(t.albumTitle)}` : '');
 		if (rel) releases.add(rel);
 	}
 	return {
@@ -143,7 +156,7 @@ export function groupStats(tracks: readonly Track[]): GroupStats {
 
 // Album order inside an album group: numbered members first by (disc,
 // track), the unnumbered rest after them in sort order. Stable.
-function albumOrder(tracks: Track[]): Track[] {
+export function albumOrder(tracks: Track[]): Track[] {
 	if (!tracks.some((t) => t.trackNumber != null)) return tracks;
 	const numbered = tracks.filter((t) => t.trackNumber != null);
 	const rest = tracks.filter((t) => t.trackNumber == null);
@@ -158,6 +171,7 @@ export function buildDisplayList(tracks: readonly Track[], by: GroupBy, collapse
 			rows: visibleTracks.map((track, trackIndex) => ({ kind: 'track', track, trackIndex })),
 			visibleTracks,
 			trackRow: visibleTracks.map((_, i) => i),
+			groupPos: [],
 			groups: [],
 			groupRow: new Map(),
 			groupOfTrack: new Map(),
@@ -184,6 +198,7 @@ export function buildDisplayList(tracks: readonly Track[], by: GroupBy, collapse
 	const rows: DisplayRow[] = [];
 	const visibleTracks: Track[] = [];
 	const trackRow: number[] = [];
+	const groupPos: number[] = [];
 	const groups: GroupInfo[] = [];
 	const groupRow = new Map<string, number>();
 	keys.forEach((key, gi) => {
@@ -203,13 +218,14 @@ export function buildDisplayList(tracks: readonly Track[], by: GroupBy, collapse
 		groupRow.set(key, rows.length);
 		rows.push({ kind: 'group', group: info, first: gi === 0, collapsed: isCollapsed });
 		if (isCollapsed) return;
-		for (const track of members) {
+		members.forEach((track, place) => {
 			trackRow.push(rows.length);
+			groupPos.push(place);
 			rows.push({ kind: 'track', track, trackIndex: visibleTracks.length });
 			visibleTracks.push(track);
-		}
+		});
 	});
-	return { rows, visibleTracks, trackRow, groups, groupRow, groupOfTrack };
+	return { rows, visibleTracks, trackRow, groupPos, groups, groupRow, groupOfTrack };
 }
 
 // ─── Row geometry — the one source of truth for row heights ────────────────
@@ -218,14 +234,19 @@ export function buildDisplayList(tracks: readonly Track[], by: GroupBy, collapse
 // header rows carry their height inline.
 export type RowLines = 1 | 2;
 export const TRACK_ROW_H: Record<RowLines, number> = { 1: 30, 2: 52 };
+// An album's and a label's header carry a picture and a title a third larger
+// than an artist's (78px cover / 48px tile, 20px title — style.css .grp-*):
+// they are what a page of releases is scanned by.
 export const GROUP_HEAD_H = 56;
-export const ALBUM_HEAD_H = 84;
+export const LABEL_HEAD_H = 68;
+export const ALBUM_HEAD_H = 102;
 // Breathing room above every group after the first (it sits inside the
-// header row, above its top rule).
-export const GROUP_GAP_H = 28;
+// header row, above the header): the group above ends, then this much
+// nothing, then the next header.
+export const GROUP_GAP_H = 68;
 
 export function groupHeadInnerHeight(field: Exclude<GroupBy, 'none'>): number {
-	return field === 'album' ? ALBUM_HEAD_H : GROUP_HEAD_H;
+	return field === 'album' ? ALBUM_HEAD_H : field === 'label' ? LABEL_HEAD_H : GROUP_HEAD_H;
 }
 
 export function rowHeight(row: DisplayRow, lines: RowLines): number {

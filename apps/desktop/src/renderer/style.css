@@ -973,16 +973,6 @@ body.resizing * { user-select: none !important; }
 .filter-bar { display: flex; align-items: center; gap: 8px; padding: 10px 24px; border-bottom: 1px solid var(--line-soft); background: var(--bg-1); }
 .playlist-title { font-size: 15px; font-weight: 500; color: var(--fg); margin-right: 12px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .playlist-title[hidden] { display: none; }
-/* Artist scope: provider link row after the title. Direct links (the
-   library holds the provider's artist id) read solid; searches read faint. */
-.scope-links { display: inline-flex; gap: 4px; margin-left: 10px; vertical-align: middle; }
-.scope-link {
-	background: transparent; border: 1px solid var(--line); border-radius: 3px; cursor: pointer;
-	color: var(--fg-3); font: inherit; font-size: 11px; line-height: 1; padding: 3px 6px;
-}
-.scope-link.is-direct { color: var(--fg-1); border-color: var(--fg-3); }
-.scope-link:hover { color: var(--fg); border-color: var(--accent); }
-.playlist-title:has(.scope-links) { max-width: none; overflow: visible; }
 /* Drill-down breadcrumb inside the scope title: ancestors are buttons
    ("drill back up" = a targeted history traversal), the current scope is
    plain text. Each crumb ellipsizes on its own so a deep chain stays on
@@ -1126,7 +1116,7 @@ body.resizing * { user-select: none !important; }
    dividers via `border-bottom` on the <tr>, which renders the same under
    separate-borders, so the visual is unchanged. */
 .table { width: 100%; min-width: 1320px; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
-.table thead th { position: sticky; top: 0; z-index: 2; background: var(--bg); color: var(--fg-2); text-align: left; font-family: var(--sans); font-weight: 500; font-size: 12px; letter-spacing: 0; text-transform: none; padding: 2px 10px; border-bottom: 1px solid var(--line); height: 22px; vertical-align: middle; user-select: none; cursor: pointer; }
+.table thead th { position: sticky; top: var(--list-stick, 0px); z-index: 2; background: var(--bg); color: var(--fg-2); text-align: left; font-family: var(--sans); font-weight: 500; font-size: 12px; letter-spacing: 0; text-transform: none; padding: 2px 10px; border-bottom: 1px solid var(--line); height: 22px; vertical-align: middle; user-select: none; cursor: pointer; }
 .table thead th.sorted { color: var(--fg); }
 .table thead th .sort { color: var(--accent); margin-left: 4px; }
 .table tbody tr { border-bottom: 1px solid var(--line-soft); height: var(--row-h); transition: background 0.06s linear; }
@@ -1448,6 +1438,8 @@ td.added, td.rel { color: var(--fg-1); font-size: 12px; }
 .kfx { display: grid; grid-template-columns: 34px 30px; column-gap: 10px; row-gap: 5px; align-items: center; font-family: var(--mono); font-size: 11.5px; line-height: 15px; font-variant-numeric: tabular-nums; color: var(--fg-1); }
 .kfx .key-chip { min-width: 0; padding: 0 5px; font-size: 12px; }
 .kfx--head { font-family: var(--sans); font-size: 12px; color: var(--fg-2); }
+/* Neither power nor brightness to show: key over BPM. */
+.kfx--1 { grid-template-columns: 34px; }
 .kfx-c { overflow: hidden; white-space: nowrap; }
 /* Similarity highlight on a sub-cell (paired columns hold several values,
    so the highlight sits on the value, not the whole td). */
@@ -1482,6 +1474,7 @@ col.c2-title2 { width: auto; }
 col.c2-labelrel { width: 152px; }
 col.c2-genretags { width: 162px; }
 col.c2-keyfx { width: 86px; }
+col.c2-keyfx1 { width: 46px; }
 col.c2-timerating { width: 72px; }
 col.c2-added { width: 68px; }
 
@@ -1533,39 +1526,64 @@ tr.row-playing .cover2 .np-cover-meter { display: flex; }
 .table tbody tr.grp-head:hover { background: transparent; }
 .table td.grp-cell { padding: 0; vertical-align: bottom; overflow: visible; white-space: normal; box-shadow: none; }
 .grp-btn {
-	width: 100%;
+	width: calc(100% + 2 * var(--grp-indent, 0px));
 	height: 56px;
 	display: grid;
 	grid-template-columns: 14px auto minmax(0, 1fr) auto;
 	align-items: center;
 	column-gap: 12px;
 	padding: 0 16px;
-	margin: 0;
+	/* Reaches back out of the table by what its rows are indented (0 unless
+	   the list's owner asks for an indent — .tracklist below). */
+	margin: 0 calc(-1 * var(--grp-indent, 0px));
 	border: 0;
 	border-bottom: 1px solid var(--line-soft);
 	border-radius: 0;
-	background: var(--bg-1);
+	background: #000;
 	color: var(--fg-1);
 	font: inherit;
 	text-align: left;
 	cursor: pointer;
 	box-sizing: border-box;
 }
-.grp-btn--album { height: 84px; }
+/* A group's body ramps from --bg-1 under its header to black at its last
+   row. Rows are separate boxes, so each paints its own slice of the one ramp
+   (--ramp-a / --ramp-b, set by track-list.ts buildRow). :where() keeps this
+   under hover / selected / now-playing, which all replace the background. */
+.table tbody tr:where(.grp-body) {
+	background: linear-gradient(
+		color-mix(in srgb, #000 var(--ramp-a), var(--bg-1)),
+		color-mix(in srgb, #000 var(--ramp-b), var(--bg-1))
+	);
+}
+/* Plain hover is --bg-1 — the ramp's own top colour — so step up one. */
+.table tbody tr:where(.grp-body):hover { background: var(--bg-2); }
+/* Album and label headers: a third larger than the artist's — picture and
+   title (trackGroups.ts ALBUM_HEAD_H / LABEL_HEAD_H hold the heights; the
+   virtualizer lays rows out by those numbers, nothing is measured). */
+.grp-btn--album { height: 102px; column-gap: 14px; }
+.grp-btn--label { height: 68px; column-gap: 14px; }
 /* One-line rows scroll sideways (every column) — keep the header's content
    in the visible width so its stats don't sit off-screen to the right.
    --view-w is the scroll host's width, kept current by track-list.ts. */
-.table:not(.rows-2) .grp-btn { position: sticky; left: 0; width: var(--view-w, 100%); }
-tr.grp-head:not(.grp-head--first) .grp-btn { border-top: 1px solid var(--line); }
+.table:not(.rows-2) .grp-btn { position: sticky; left: var(--list-gutter, 0px); width: calc(var(--view-w, 100%) - var(--list-gutter, 0px) - var(--list-gutter-end, var(--list-gutter, 0px))); }
 .grp-chev { color: var(--fg-2); transition: transform 0.12s ease; }
 .grp-btn[aria-expanded="true"] .grp-chev { transform: rotate(90deg); }
 .grp-thumb { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex: none; }
 .grp-thumb--artist { border-radius: 50%; background: var(--bg-3); color: var(--fg-1); }
-.grp-thumb--label { border-radius: 0; background: var(--bg-2); color: var(--fg-2); }
-.grp-thumb--album { width: 60px; height: 60px; border-radius: 2px; background-color: var(--bg-3); background-size: cover; background-position: center; }
+.grp-thumb--label { width: 48px; height: 48px; font-size: 15px; border-radius: 0; background: var(--bg-2); color: var(--fg-2); }
+.grp-thumb--album { width: 78px; height: 78px; border-radius: 2px; background-color: var(--bg-3); background-size: cover; background-position: center; }
 .grp-thumb--none { color: var(--fg-3); }
 .grp-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+/* The gap above a group (track-list.ts createGroupRow): black, as wide as
+   the headers, so the last row's black runs on into the next header. */
+.grp-gap { background: #000; margin: 0 calc(-1 * var(--grp-indent, 0px)); }
+/* An album's name with its kind (Mix / VA / Single / EP / Album) beside it:
+   the feed's chip, a size down. */
+.grp-titleline { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.grp-btn .grp-kind { font-size: 8px; line-height: 12px; text-transform: uppercase; }
 .grp-title { font-size: 15px; font-weight: 600; line-height: 18px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.grp-btn--album .grp-title, .grp-btn--label .grp-title { font-size: 20px; line-height: 24px; letter-spacing: -0.008em; }
 .grp-sub, .grp-sub2 { font-size: 12px; line-height: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .grp-sub { color: var(--fg-2); }
 .grp-sub2 { color: var(--fg-1); }
@@ -1577,10 +1595,44 @@ tr.grp-head:not(.grp-head--first) .grp-btn { border-top: 1px solid var(--line); 
 /* Pinned group header — a zero-height sticky strip right under the column
    header; its child overlays the top rows with the current group's header. */
 .tracklist { position: relative; }
-.grp-pin { position: sticky; top: var(--thead-h, 0px); left: 0; width: var(--view-w, 100%); height: 0; z-index: 2; }
+/* Room around the rows, set by the list's owner (track-list.ts gutter /
+   groupIndent, from listProfile.ts): the table sits --list-gutter in from
+   both sides plus --grp-indent when grouped; group headers (and the pinned
+   one) reach back out over the indent, so a group reads as a header with its
+   rows set in under it. Padding, not a margin on the table — the table's
+   width: 100% then means the room that is left. --list-gutter-end is the
+   right-hand gutter less the scroll host's scrollbar (track-list.ts
+   syncViewWidth): both sides measure the same from the edges of the view. */
+.tracklist {
+	box-sizing: border-box;
+	padding: 0 calc(var(--list-gutter-end, var(--list-gutter, 0px)) + var(--grp-indent, 0px)) 0 calc(var(--list-gutter, 0px) + var(--grp-indent, 0px));
+}
+/* Source marks set against the index (track-list.ts sourcesByIndex): marks
+   at the end of their cell, the number at the start of its own. The two-line
+   marks are a grid — it fills from the index side. */
+.tracklist--src-idx .table td.sources { text-align: right; }
+.tracklist--src-idx .table .src-marks { justify-content: end; direction: rtl; }
+.tracklist--src-idx .table td.idx,
+.tracklist--src-idx .table thead th.idx { text-align: left; padding-left: 6px; }
+/* The column header is as wide as the rows; group headers are wider. Wings
+   on its two ends keep a header scrolling under it from showing either side. */
+.tracklist--indent .table thead th:first-child::before,
+.tracklist--indent .table thead th:last-child::after {
+	content: ""; position: absolute; top: 0; bottom: -1px; width: var(--grp-indent);
+	background: var(--bg); border-bottom: 1px solid var(--line); box-sizing: border-box;
+	pointer-events: none;
+}
+.tracklist--indent .table thead th:first-child::before { right: 100%; }
+.tracklist--indent .table thead th:last-child::after { left: 100%; }
+/* Room at the top of the scroll content for what is laid over the list (an
+   entity page's header): track-list.ts setTopInset sizes it, and sets
+   --list-stick — how far below the top the column header sticks. */
+.tracklist__inset { height: 0; }
+.grp-pin { position: sticky; top: calc(var(--list-stick, 0px) + var(--thead-h, 0px)); left: var(--list-gutter, 0px); width: calc(var(--view-w, 100%) - var(--list-gutter, 0px) - var(--list-gutter-end, var(--list-gutter, 0px))); margin: 0 calc(-1 * var(--grp-indent, 0px)); height: 0; z-index: 2; }
 .grp-pin[hidden] { display: none; }
 .grp-pin__inner { position: absolute; left: 0; right: 0; top: 0; box-shadow: 0 6px 12px -6px rgba(0, 0, 0, 0.6); }
-.grp-pin .grp-btn { border-top: 0; }
+/* The pin is already as wide as a header: nothing to reach out over. */
+.grp-pin .grp-btn { width: 100%; margin: 0; }
 
 /* ── Group / Rows chips in the filter bar ── */
 .tl-chips { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
@@ -1608,6 +1660,14 @@ tr.grp-head:not(.grp-head--first) .grp-btn { border-top: 1px solid var(--line); 
 .tl-chip.is-active,
 .tl-chip.is-active:hover { background: var(--accent-dim); border-color: oklch(0.82 0.15 210 / 0.45); }
 .tl-chip.is-active .tl-chip__icon { color: var(--accent); }
+/* Owned / World on an entity page: two chips joined into one switch. */
+.tl-seg { display: inline-flex; }
+.tl-seg__btn { padding: 0 11px; }
+.tl-seg__btn:first-child { border-radius: 4px 0 0 4px; }
+.tl-seg__btn:last-child { border-radius: 0 4px 4px 0; margin-left: -1px; }
+.tl-seg__btn.is-active { position: relative; }
+.tl-seg__btn.is-active .tl-chip__label { color: var(--fg); }
+.tl-seg__btn .tl-chip__value { font-family: var(--mono); font-size: 11.5px; font-weight: 400; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 /* Row-mode toggle — same idiom as the topframe's player-size button
    (.tf-icon-btn): borderless until hovered, the icon is the state. Sized to
    the chips' 28px row. */
@@ -3120,6 +3180,15 @@ body[data-player-mode="big"] .big-wave-info { display: block; }
 .analysis-chip__dot { width: 9px; height: 9px; border-radius: 1.5px; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
 .analysis-chip[data-state="active"] .analysis-chip__dot { background: var(--accent); }
 .analysis-chip[data-state="errors"] .analysis-chip__dot { background: var(--hot); animation: none; }
+/* The analyzer process itself is in trouble: not answering and being
+   relaunched (stalled — still pulsing, it may come back), or stopped for good
+   (down). Either way the chip is the retry button. */
+.analysis-chip[data-state="stalled"],
+.analysis-chip[data-state="down"] { cursor: pointer; }
+.analysis-chip[data-state="stalled"] .analysis-chip__dot { background: var(--warn); }
+.analysis-chip[data-state="down"]    .analysis-chip__dot { background: var(--hot); animation: none; }
+.analysis-chip[data-state="stalled"] { border-color: var(--warn); }
+.analysis-chip[data-state="down"]    { border-color: var(--hot); }
 
 /* Reactive analyzer tooltip — replaces the native `title` so it updates while
    visible. Right-aligned because the chip sits at the top-right of the frame. */
@@ -3157,6 +3226,9 @@ body[data-player-mode="big"] .big-wave-info { display: block; }
 .analysis-chip__tt-row { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .analysis-chip__tt-foot { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line); color: var(--fg-3); }
 .analysis-chip__tt-err { margin-top: 6px; color: var(--hot); }
+.analysis-chip__tt-head--down { color: var(--hot); }
+.analysis-chip__tt-reason { margin: 4px 0; color: var(--fg-2); overflow-wrap: anywhere; }
+.analysis-chip__tt-last { margin-top: 6px; color: var(--fg-3); }
 
 /* Hide the entire sidebar on the Downloads view — the brand-search-playlists-
    status stack is service navigation for Spotify/Tidal and has no meaning
@@ -3177,13 +3249,13 @@ body[data-view="downloads"] .filter-bar .pin-search-btn,
 body[data-view="downloads"] .filter-bar .enrich-inline,
 body[data-view="downloads"] .filter-bar .filter-bar__filter-wrap,
 body[data-view="downloads"] .filter-bar .tl-chips,
-body[data-view="discover"] .filter-bar .tl-chips,
-body[data-view="discover"] .filter-bar .playlist-title,
-body[data-view="discover"] .filter-bar .pin-search-btn,
-body[data-view="discover"] .filter-bar .enrich-inline,
-body[data-view="discover"] .filter-bar .filter-bar__filter-wrap { display: none; }
+body[data-view="discover"][data-region="discover"] .filter-bar .tl-chips,
+body[data-view="discover"][data-region="discover"] .filter-bar .playlist-title,
+body[data-view="discover"][data-region="discover"] .filter-bar .pin-search-btn,
+body[data-view="discover"][data-region="discover"] .filter-bar .enrich-inline,
+body[data-view="discover"][data-region="discover"] .filter-bar .filter-bar__filter-wrap { display: none; }
 body[data-view="downloads"] .filter-bar,
-body[data-view="discover"] .filter-bar { padding-top: 6px; padding-bottom: 6px; }
+body[data-view="discover"][data-region="discover"] .filter-bar { padding-top: 6px; padding-bottom: 6px; }
 
 /* Tag views (Interested / Basket) — global, not source-scoped. Sidebar is
    not meaningful here so we collapse it the same way Downloads does. */
@@ -3298,6 +3370,13 @@ body[data-player-dock="bottom"][data-player-presence="dock"] .np-chip {
    filters. */
 body[data-view="discover"] .sidebar { display: none; }
 body[data-view="discover"] .app {
+	grid-template-columns: 1fr auto;
+	grid-template-areas: "main agent";
+}
+/* A page tab (an artist / label / album opened in its own tab) belongs to no
+   source: no sidebar, the page takes the width. */
+body[data-view="page"] .sidebar { display: none; }
+body[data-view="page"] .app {
 	grid-template-columns: 1fr auto;
 	grid-template-areas: "main agent";
 }
@@ -4180,6 +4259,12 @@ body[data-view="discover"] .app {
 .omnibar__row-sub mark { background: var(--accent-dim); color: var(--fg-1); padding: 0 1px; }
 .omnibar__row-bpm { font-family: var(--mono); font-size: 11.5px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 .omnibar__row-key { text-align: center; }
+/* World scope (omnibar.ts): where a hit was found, in the BPM column's
+   place, and an artist's picture round like the artist page's. */
+.omnibar__row-src { font-family: var(--mono); font-size: 10.5px; color: var(--fg-3); white-space: nowrap; }
+.omnibar__row-art--round { border-radius: 50%; }
+/* Which parts of a World search are still out, under the rows so far. */
+.omnibar__status { padding: 8px 16px 6px; font-size: 12px; color: var(--fg-3); }
 .omnibar__empty {
 	padding: 22px 18px;
 	text-align: center;
@@ -4697,11 +4782,9 @@ body[data-view="discover"] .app {
    reliable than text-align for the inline-flex span. */
 .feed-track--playing .feed-track__num { display: flex; align-items: center; justify-content: center; }
 
-/* ─── Discovery journeys ────────────────────────────────────────────────
-   Bare v1 surface (components/JourneyView.tsx) sharing the Discover region
-   with the feed behind a minimal mode bar. Deliberately plain — a real
-   design pass (tree rail, entity-page layout) follows once the mechanic
-   proves itself. */
+/* ─── Discover mode bar ─────────────────────────────────────────────────
+   The small bar over the Discover region: the feed, and the toggle for the
+   agent dock. */
 .discover-modebar {
 	display: flex; align-items: center; gap: 6px;
 	padding: 8px 24px 0;
@@ -4713,100 +4796,14 @@ body[data-view="discover"] .app {
 }
 .discover-mode-btn:hover { background: var(--bg-3); color: var(--fg); }
 .discover-mode-btn.is-active { background: var(--bg-2); color: var(--fg); border-bottom-color: transparent; }
-.discover-feed-host[hidden], .journey-host[hidden] { display: none; }
-.discover-feed-host, .journey-host { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
-.journey-root { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow-y: auto; padding: 12px 24px 80px; }
-.journey-title { font-size: 14px; font-weight: 600; color: var(--fg); }
-.journey-list-head { padding: 4px 0 10px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
-.journey-empty { color: var(--fg-2); font-size: 12.5px; line-height: 1.6; max-width: 520px; padding: 18px 0; }
-.journey-row {
-	display: flex; align-items: center; gap: 8px;
-	padding: 9px 10px; border: 1px solid var(--line); border-top: none; cursor: pointer;
-}
-.journey-row:first-of-type { border-top: 1px solid var(--line); }
-.journey-row:hover { background: var(--bg-2); }
-.journey-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.journey-row-name { font-size: 13px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.journey-row-sub { font-family: var(--mono); font-size: 10.5px; color: var(--fg-3); }
-.journey-row-btn {
-	font-size: 11px; color: var(--fg-2); background: none;
-	border: 1px solid var(--line); padding: 2px 8px; cursor: pointer;
-}
-.journey-row-btn:hover { background: var(--bg-3); color: var(--fg); }
-.journey-row-btn.is-danger:hover { color: #e66; border-color: #a44; }
-.journey-nav { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; }
-.journey-back {
-	font-size: 12px; color: var(--fg-1); background: var(--bg-2);
-	border: 1px solid var(--line); padding: 3px 10px; cursor: pointer;
-}
-.journey-back:hover { background: var(--bg-3); color: var(--fg); }
-.journey-name { font-size: 12px; color: var(--fg-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.journey-path {
-	display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
-	padding: 4px 0 12px; border-bottom: 1px solid var(--line);
-}
-.journey-path-sep { color: var(--fg-3); font-size: 11px; }
-.journey-crumb {
-	font-size: 11.5px; color: var(--fg-1); background: var(--bg-1);
-	border: 1px solid var(--line); padding: 2px 8px; cursor: pointer;
-	max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.journey-crumb:hover { background: var(--bg-3); color: var(--fg); }
-.journey-crumb.is-current { background: var(--bg-2); color: var(--fg); cursor: default; }
-.journey-entity-head { display: flex; align-items: center; gap: 10px; padding: 14px 0 8px; }
-.journey-entity-name { font-size: 17px; font-weight: 600; color: var(--fg); }
-.journey-kind {
-	font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em;
-	color: var(--fg-3); border: 1px solid var(--line); padding: 1px 6px; flex-shrink: 0;
-}
-.journey-chip {
-	font-family: var(--mono); font-size: 10px; color: var(--fg-2);
-	border: 1px solid var(--line); padding: 0 6px; line-height: 15px; flex-shrink: 0;
-}
-.journey-chip.in-library { color: #7c6; border-color: #474; }
-.journey-chip.is-hardened { color: var(--fg-1); }
-.journey-interested {
-	font-size: 11px; color: var(--fg-1); background: var(--bg-2);
-	border: 1px solid var(--line); padding: 2px 10px; cursor: pointer; flex-shrink: 0;
-}
-.journey-interested:hover { background: var(--bg-3); color: var(--fg); }
-.journey-aspects { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 6px 0 14px; }
-.journey-aspect {
-	display: inline-flex; align-items: center; gap: 6px;
-	font-size: 12px; color: var(--fg-1); background: var(--bg-2);
-	border: 1px solid var(--line); padding: 4px 12px; cursor: pointer;
-}
-.journey-aspect:hover:not(:disabled) { background: var(--bg-3); color: var(--fg); }
-.journey-aspect:disabled { opacity: 0.6; cursor: default; }
-.journey-aspect.is-unavailable { opacity: 0.5; cursor: default; border-style: dashed; }
-.journey-aspect-status { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
-.journey-aspect.is-busy .journey-aspect-status { color: var(--cool); }
-.journey-aspect.is-error .journey-aspect-status { color: #e66; }
-.journey-research-mark { font-size: 10px; color: #b9a; }
-.journey-error { color: #e66; font-size: 12px; padding: 6px 0; }
-.journey-section { padding: 10px 0 4px; }
-.journey-section-title {
-	display: flex; align-items: center; gap: 8px;
-	font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-	color: var(--fg-3); padding-bottom: 6px;
-}
-.journey-neighbor {
-	display: flex; align-items: center; gap: 8px;
-	padding: 6px 8px; border-top: 1px solid var(--line); cursor: pointer;
-}
-.journey-neighbor:hover { background: var(--bg-2); }
-.journey-neighbor-name { font-size: 13px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.journey-neighbor-sub { font-family: var(--mono); font-size: 10.5px; color: var(--fg-3); flex-shrink: 0; }
-.journey-confidence { font-family: var(--mono); font-size: 10.5px; color: #b9a; flex-shrink: 0; }
-.journey-citations { display: inline-flex; gap: 4px; flex-shrink: 0; }
-.journey-citations a { font-family: var(--mono); font-size: 10px; color: var(--fg-2); text-decoration: none; }
-.journey-citations a:hover { color: var(--fg); text-decoration: underline; }
+.discover-feed-host[hidden] { display: none; }
+.discover-feed-host { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
 
 /* ─── In-app agent ──────────────────────────────────────────────────────
    Conversational panel (components/AgentPanel.tsx, hosted in the app-level
    .agent-dock column so it exists on every tab) + agent result-set list
-   (AgentResultView.tsx, the third Discover main-area mode). Same flat
-   bordered language as the journey v1. */
+   (AgentResultView.tsx, the second Discover main-area mode). Flat and
+   bordered, like the mode bar above it. */
 .agent-result-host[hidden] { display: none; }
 .agent-result-host { flex: 1; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
 .discover-mode-btn--agent { margin-left: auto; }
@@ -5087,7 +5084,208 @@ col.c-pq { width: 52px; }
 .settings-discover__sources { display: flex; flex-wrap: wrap; gap: 8px 32px; }
 .settings-discover__kind { min-width: 150px; }
 .settings-discover__kind-label { font-size: 12px; color: var(--fg-2); margin-bottom: 2px; }
+.settings-discover__cadence { display: block; margin: 2px 0 6px; }
 .settings-discover__cloud {
 	font-family: var(--mono); font-size: 9px; letter-spacing: 0.08em; vertical-align: 1px;
 	color: var(--fg-3); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-left: 6px;
 }
+
+/* ─── Entity page header (components/EntityHeader.tsx) ───────────────────────
+   An artist's / label's / album's page: this header above the track list.
+   The picture and the name carry it; everything else is one quiet line per
+   fact, links set as text like the credits in the list below. */
+/* The header lies OVER the top of the list's scroll host and closes as the
+   list scrolls (features/entityHeaderCollapse.ts): that module sets the
+   host's height (and takes it back out of the flow with a negative margin),
+   and two variables on `.eh` —
+     --eh-p        0 (open) → 1 (closed down to the two top lines)
+     --eh-more-y   how far the lower part has ridden up with the rows
+   Everything that changes size between the two is a calc() of --eh-p, so the
+   header is the same element at every point in between, never two looks
+   swapped. */
+.entity-header-host {
+	flex: none; position: relative; z-index: 3; overflow: hidden; box-sizing: border-box;
+	border-bottom: 1px solid var(--line-soft); background: var(--bg);
+}
+.eh {
+	--eh-p: 0;
+	--eh-more-y: 0px;
+	display: grid;
+	grid-template-columns: calc(96px - 56px * var(--eh-p)) minmax(0, 1fr);
+	/* The picture spans both rows; what it stands taller than the head by
+	   goes to the lower row, never between the name and the facts. */
+	grid-template-rows: auto 1fr;
+	column-gap: calc(22px - 8px * var(--eh-p));
+	padding: calc(18px - 10px * var(--eh-p)) 24px calc(14px - 6px * var(--eh-p));
+	align-items: start;
+}
+.eh-art {
+	grid-row: 1 / span 2;
+	width: calc(96px - 56px * var(--eh-p)); height: calc(96px - 56px * var(--eh-p));
+	display: grid; place-items: center;
+	background: var(--bg-3);
+	overflow: hidden;
+	border-radius: 2px;
+}
+.eh[data-kind="label"] .eh-art { border-radius: 0; background: var(--bg-2); }
+.eh-art--round { border-radius: 50%; }
+.eh-art__img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.eh-art__initials { font-size: calc(30px - 16px * var(--eh-p)); font-weight: 600; color: var(--fg-2); letter-spacing: 0.02em; }
+/* The head stays; the rest slides in behind it — so it is opaque and above. */
+.eh-head { grid-column: 2; min-width: 0; position: relative; z-index: 1; background: var(--bg); }
+/* The rest: rides up with the rows (the transform), fading out well before
+   the head is down to its two lines. */
+.eh-more {
+	grid-column: 2; min-width: 0;
+	transform: translateY(var(--eh-more-y));
+	opacity: calc(1 - var(--eh-p) * 1.5);
+}
+.eh--collapsed .eh-more { visibility: hidden; }
+/* For the length of one measurement: the header as small as it gets. */
+.eh--measure-compact .eh-more { display: none; }
+/* The name with the page's actions right after it: follow, then the stores. */
+.eh-titleline { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.eh-name {
+	margin: 0; min-width: 0;
+	font-size: calc(27px - 10px * var(--eh-p)); font-weight: 650; line-height: 1.15; letter-spacing: -0.012em;
+	color: var(--fg);
+	white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.eh-facts { margin-top: calc(5px - 4px * var(--eh-p)); font-size: 12.5px; color: var(--fg-2); display: flex; flex-wrap: wrap; }
+.eh--collapsed .eh-facts, .eh--measure-compact .eh-facts { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
+.eh-facts span + span::before { content: "·"; margin: 0 8px; color: var(--fg-4); }
+.eh-facts__pending { color: var(--fg-3); }
+.eh-rows { margin-top: 11px; display: grid; row-gap: 4px; }
+.eh-row { display: grid; grid-template-columns: 66px minmax(0, 1fr); font-size: 12.5px; line-height: 18px; }
+.eh-row__label { color: var(--fg-3); }
+.eh-row__text { color: var(--fg-1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Two lines of links at most; a long roster ends where the header does. */
+.eh-row__links { display: flex; flex-wrap: wrap; column-gap: 14px; max-height: 36px; overflow: hidden; }
+.eh-row__note { color: var(--fg-3); }
+/* "+n more": the rest of a list, named in its tooltip. */
+.eh-row__more { color: var(--fg-2); cursor: default; border-bottom: 1px dotted var(--fg-4); line-height: 16px; align-self: center; }
+.eh-link {
+	padding: 0; border: 0; background: none;
+	font: inherit; color: var(--fg-1);
+	cursor: pointer; white-space: nowrap;
+}
+.eh-link:hover { color: var(--fg); text-decoration: underline; }
+.eh-link--action { color: var(--accent); }
+.eh-link--action:hover { color: var(--accent); }
+.eh-link:focus-visible, .eh-follow:focus-visible, .eh-store:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Follow sits on the name line. Its width holds across Follow / Following /
+   Unfollow so the stores beside it do not jump when the pointer crosses it. */
+.eh-follow {
+	flex: none;
+	height: 26px; min-width: 88px; padding: 0 12px;
+	border: 1px solid var(--fg-3);
+	font-size: 12.5px; color: var(--fg);
+	cursor: pointer;
+}
+.eh-follow:hover { background: var(--bg-2); border-color: var(--fg-2); }
+.eh-follow.is-following { color: var(--accent); background: var(--accent-dim); border-color: oklch(0.82 0.15 210 / 0.45); }
+/* Hovering "Following" shows what the click does. */
+.eh-follow.is-following.is-leaving { color: var(--hot); background: transparent; border-color: var(--hot); }
+.eh-follow[disabled] { opacity: 0.5; pointer-events: none; }
+/* An artist's badges, right after its name: the feed's chips, a size up. */
+.eh-badges { display: flex; align-items: center; gap: 6px; flex: none; margin-left: -4px; }
+.eh-badge {
+	font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase;
+	padding: 1px 6px; line-height: 15px; cursor: default;
+	border: 1px solid var(--line); color: var(--fg-2);
+}
+.eh-badge--veteran { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
+.eh-badge--workhorse { color: var(--buy); border-color: color-mix(in oklab, var(--buy) 40%, transparent); }
+.eh-badge--prolific { color: var(--cool); border-color: color-mix(in oklab, var(--cool) 40%, transparent); }
+/* Reach: the score and which way it went — numbers, so tabular. */
+.eh-reach { display: inline-flex; align-items: baseline; gap: 6px; flex: none; cursor: default; font-variant-numeric: tabular-nums; }
+.eh-reach__label { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-3); }
+.eh-reach__score { font-size: 15px; font-weight: 650; color: var(--fg); }
+.eh-reach__change { font-size: 11.5px; color: var(--fg-3); }
+.eh-reach__change.is-up { color: var(--buy); }
+.eh-reach__change.is-down { color: var(--hot); }
+.eh-reach:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* What Reach is made of, on hover: fixed to the viewport (portalled), so the
+   header's clipping never cuts it. One row per store's count. */
+.reach-card {
+	position: fixed; z-index: 1000; box-sizing: border-box;
+	padding: 10px 12px;
+	background: var(--bg); color: var(--fg);
+	border: 1px solid var(--line);
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+	font-size: 12px; line-height: 1.45;
+	pointer-events: none;
+	font-variant-numeric: tabular-nums;
+}
+.reach-card__head { display: flex; align-items: baseline; gap: 8px; padding-bottom: 8px; margin-bottom: 6px; border-bottom: 1px solid var(--line-soft); }
+.reach-card__title { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-3); }
+.reach-card__score { font-size: 16px; font-weight: 650; }
+.reach-card__change { margin-left: auto; font-size: 11.5px; color: var(--fg-3); }
+.reach-card__change.is-up { color: var(--buy); }
+.reach-card__change.is-down { color: var(--hot); }
+.reach-card__rows { display: grid; row-gap: 3px; }
+.reach-card__row { display: grid; grid-template-columns: 16px 76px 92px 1fr auto; align-items: center; column-gap: 8px; }
+.reach-card__icon { display: grid; place-items: center; width: 16px; height: 16px; }
+.reach-card__icon .ctx-brand { width: 14px; height: 14px; }
+.reach-card__store { color: var(--fg-1); }
+.reach-card__n { text-align: right; color: var(--fg); font-weight: 600; }
+.reach-card__metric { color: var(--fg-2); }
+.reach-card__at { color: var(--fg-3); font-size: 11px; }
+.reach-card__row.is-outlier .reach-card__n { color: var(--fg-3); text-decoration: line-through; font-weight: 400; }
+.reach-card__note { grid-column: 2 / -1; font-size: 11px; color: var(--warn); }
+.reach-card__foot { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line-soft); font-size: 11px; color: var(--fg-3); }
+.eh-stores { display: flex; align-items: center; gap: 2px; flex: none; }
+.eh-store { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; cursor: pointer; }
+.eh-store:hover { background: var(--bg-2); border-color: var(--line); }
+.eh-store__icon { display: grid; place-items: center; }
+.eh-store__icon .ctx-brand { width: 16px; height: 16px; }
+.eh-store__text { font-size: 11px; color: var(--fg-2); padding: 0 4px; }
+.eh-store:has(.eh-store__text) { width: auto; }
+.eh-status { margin-top: 10px; font-size: 12px; color: var(--fg-2); display: flex; gap: 12px; }
+/* What the desktop is doing for the page (reading the stores, filling in
+   rows): its own line under the list's, with a dot that breathes while the
+   work runs and rests when it reports a result. */
+.eh-status + .eh-work { margin-top: 4px; }
+/* Closed: what the desktop is doing for the page, kept in sight on the facts line. */
+.eh-facts__work { display: inline-flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.eh-facts__work .eh-work__dot { display: inline-block; }
+.eh-facts__work.is-busy .eh-work__dot { background: var(--accent); animation: breathe 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .eh-facts__work.is-busy .eh-work__dot { animation: none; } }
+.eh-work { align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+.eh-work__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-3); flex: none; }
+.eh-work.is-busy .eh-work__dot { background: var(--accent); animation: breathe 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .eh-work.is-busy .eh-work__dot { animation: none; } }
+
+/* A catalogue row on a page's World side: a recording the library does not
+   hold. Set back a step so the rows you own read first. */
+.trk.is-catalog { color: var(--fg-2); }
+.trk.is-catalog .t-name { color: var(--fg-1); }
+.trk.is-catalog .cover, .trk.is-catalog .cover2__img { opacity: 0.82; }
+
+/* ─── Page tabs (layouts/TopFrame.tsx) ───────────────────────────────────────
+   Pages opened "in a new tab": closable tabs after the fixed ones, each with
+   its own history. They share the strip's tab look; the mark says what kind
+   of page (round = artist, square = label, soft square = album). */
+.tf-pages { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.tf-pages::-webkit-scrollbar { display: none; }
+.tf-tab--page { padding: 0 4px 0 0; gap: 0; flex: none; max-width: 200px; -webkit-app-region: no-drag; }
+.tf-page__main {
+	height: 100%; min-width: 0;
+	display: inline-flex; align-items: center; gap: 9px;
+	padding: 0 6px 0 14px;
+	font: inherit; color: inherit; cursor: pointer;
+}
+.tf-page__mark { width: 9px; height: 9px; flex: none; border: 1.5px solid currentColor; opacity: 0.7; }
+.tf-page__mark[data-kind="artist"] { border-radius: 50%; }
+.tf-page__mark[data-kind="album"] { border-radius: 2px; }
+.tf-page__title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tf-page__close {
+	width: 20px; height: 20px; flex: none;
+	display: grid; place-items: center;
+	color: var(--fg-3); cursor: pointer;
+}
+.tf-page__close:hover { color: var(--fg); background: #3d3d46; }
+.tf-tab--page:not(.active):not(:hover) .tf-page__close { visibility: hidden; }
+/* A label / album name on a feed card that opens its page: a link by
+   behaviour, in the weight and colour of the line it sits in. */
+.feed-card__link--entity { font-weight: inherit; color: inherit; }

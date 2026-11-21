@@ -16,12 +16,16 @@
 
 import { createMemo, createSignal } from 'solid-js';
 import type { Accessor } from 'solid-js';
+import type { EntityRef, EntityScopeKind } from '@curator/shared';
 
 // The source tabs in the top strip. Rekordbox is the DJ-side library: the
 // rekordbox collection plus local files not in rekordbox yet (there is no
 // separate Local tab; `local` is a track source, not a tab).
 export type SourceTab = 'spotify' | 'tidal' | 'rekordbox';
-export type ActiveView = 'tracks' | 'sync' | 'downloads' | 'interested' | 'basket' | 'discover';
+// 'page': a user-opened page tab (an artist / label / album page opened "in a
+// new tab"). It renders into the tracks region like a source tab, but belongs
+// to no source: which page tab is `activePageTab`.
+export type ActiveView = 'tracks' | 'sync' | 'downloads' | 'interested' | 'basket' | 'discover' | 'page';
 
 // Which MainPane region a view renders into. Tag views (interested /
 // basket) reuse the tracks-table region with a tag-filtered fetch.
@@ -40,6 +44,17 @@ export interface JitPlaylist {
 	// "already pinned" state and the Pinned nav row's selected highlight.
 	// Absent for transient JITs (omnibar Shift+Enter, drill-into ▶).
 	pinnedId?: string;
+}
+
+// An entity page (artist / label / album) open in the tracks region: a header
+// above the track list, listing the entity's local files ('owned') or the
+// Global Catalog's releases ('world'). `host` is the tab whose history holds
+// it — a source tab, Discover, or a page tab — so the same page can sit on
+// any of them. Mutually exclusive with playlist / folder / JIT scope.
+export interface EntityScope {
+	host: string;
+	entity: EntityRef;
+	scope: EntityScopeKind;
 }
 
 // Empty-state slot content for the tracks region: onboarding/connect
@@ -75,6 +90,8 @@ export type TabContext = 'dj' | 'streaming';
 export interface PlaybackOrigin {
 	source: SourceTab;
 	view: ActiveView;
+	// The page tab playback started from, when `view` is 'page'.
+	pageTab?: string | null;
 }
 
 const [activeSource, setActiveSourceRaw] = createSignal<SourceTab>('spotify');
@@ -82,19 +99,28 @@ const [activeView, setActiveViewRaw] = createSignal<ActiveView>('tracks');
 const [currentPlaylistId, setCurrentPlaylistIdRaw] = createSignal<string | null>(null);
 const [currentFolderId, setCurrentFolderIdRaw] = createSignal<string | null>(null);
 const [currentJit, setCurrentJitRaw] = createSignal<JitPlaylist | null>(null);
+const [currentEntity, setCurrentEntityRaw] = createSignal<EntityScope | null>(null);
+const [activePageTab, setActivePageTabRaw] = createSignal<string | null>(null);
 const [emptyState, setEmptyStateRaw] = createSignal<EmptyStateContent | null>(null);
 const [playingLayout, setPlayingLayoutRaw] = createSignal<PlayingLayout | null>(null);
 const [playbackOrigin, setPlaybackOriginRaw] = createSignal<PlaybackOrigin | null>(null);
 const [sidebarCollapsed, setSidebarCollapsedRaw] = createSignal(false);
 
-const region: Accessor<Region> = createMemo(() => {
-	switch (activeView()) {
+// Which region a view renders into. An entity page hosted by Discover takes
+// the tracks region while it is up: the page is the same header + list
+// wherever it was opened, and Discover's own feed returns when it closes.
+// `entity` is consulted with its host so a page left open on another tab
+// can never pull Discover's feed out from under it.
+export function deriveRegion(s: { view: ActiveView; entity: EntityScope | null }): Region {
+	switch (s.view) {
 		case 'sync': return 'sync';
 		case 'downloads': return 'downloads';
-		case 'discover': return 'discover';
-		default: return 'tracks'; // tracks + tag views
+		case 'discover': return s.entity?.host === 'discover' ? 'tracks' : 'discover';
+		default: return 'tracks'; // tracks + tag views + page tabs
 	}
-});
+}
+
+const region: Accessor<Region> = createMemo(() => deriveRegion({ view: activeView(), entity: currentEntity() }));
 
 const showsTracksLayout: Accessor<boolean> = createMemo(() => region() === 'tracks');
 
@@ -115,7 +141,8 @@ export function deriveTabContext(s: { view: ActiveView; source: SourceTab }): Ta
 	// basket) fall through to the latent source tab — only the idle fallback
 	// and the chip comparison ever consult this, so the latent source never
 	// decides anything user-visible while a track is playing.
-	return s.view === 'discover' || s.source === 'spotify' || s.source === 'tidal' ? 'streaming' : 'dj';
+	// A page tab stands with Discover: it browses a catalogue, not a deck's crate.
+	return s.view === 'discover' || s.view === 'page' || s.source === 'spotify' || s.source === 'tidal' ? 'streaming' : 'dj';
 }
 
 // Which player the strip renders: the deck strip ('local') or the
@@ -190,9 +217,11 @@ const chipVisible: Accessor<boolean> = createMemo(() =>
 // highlight. A source tab is active exactly while we're in a tracks-like
 // view (activeView === 'tracks'); otherwise the active state tab wins. So
 // entering Discover no longer leaves the previously-browsed source lit.
-const activeTabId: Accessor<string> = createMemo(() =>
-	activeView() === 'tracks' ? activeSource() : activeView(),
-);
+const activeTabId: Accessor<string> = createMemo(() => {
+	const view = activeView();
+	if (view === 'page') return activePageTab() ?? '';
+	return view === 'tracks' ? activeSource() : view;
+});
 
 export const shell = {
 	// ── Reads (signals/memos — subscribe anywhere) ─────────────────────
@@ -202,6 +231,8 @@ export const shell = {
 	currentPlaylistId,
 	currentFolderId,
 	currentJit,
+	currentEntity,
+	activePageTab,
 	emptyState,
 	region,
 	showsTracksLayout,
@@ -229,18 +260,19 @@ export const shell = {
 	// user-initiated player.play(...) so the cross-context chip reacts to
 	// the click, not to the backend's first state event.
 	notePlaybackOrigin(): void {
-		setPlaybackOriginRaw({ source: activeSource(), view: activeView() });
+		setPlaybackOriginRaw({ source: activeSource(), view: activeView(), pageTab: activeView() === 'page' ? activePageTab() : null });
 	},
 	openSource(src: SourceTab): void {
 		setActiveSourceRaw(src);
 	},
-	// Playlist / folder / JIT scope are mutually exclusive — setting one
-	// clears the others, in the model rather than at every call site.
+	// Playlist / folder / JIT / entity scope are mutually exclusive — setting
+	// one clears the others, in the model rather than at every call site.
 	setPlaylist(id: string | null): void {
 		setCurrentPlaylistIdRaw(id);
 		if (id !== null) {
 			setCurrentFolderIdRaw(null);
 			setCurrentJitRaw(null);
+			setCurrentEntityRaw(null);
 		}
 	},
 	setFolder(id: string | null): void {
@@ -248,6 +280,7 @@ export const shell = {
 		if (id !== null) {
 			setCurrentPlaylistIdRaw(null);
 			setCurrentJitRaw(null);
+			setCurrentEntityRaw(null);
 		}
 	},
 	setJit(jit: JitPlaylist | null): void {
@@ -255,7 +288,22 @@ export const shell = {
 		if (jit !== null) {
 			setCurrentPlaylistIdRaw(null);
 			setCurrentFolderIdRaw(null);
+			setCurrentEntityRaw(null);
 		}
+	},
+	// An entity page takes the tracks region whole: no playlist, folder or
+	// search underneath. Null closes it (every navigation away does).
+	setEntity(entity: EntityScope | null): void {
+		setCurrentEntityRaw(entity);
+		if (entity !== null) {
+			setCurrentPlaylistIdRaw(null);
+			setCurrentFolderIdRaw(null);
+			setCurrentJitRaw(null);
+		}
+	},
+	// Which page tab the 'page' view shows.
+	setActivePageTab(tab: string | null): void {
+		setActivePageTabRaw(tab);
 	},
 	// Source-level "all tracks": no playlist, folder, or JIT. One transition
 	// so a navigation to the root can't leave a sibling scope lingering (a
@@ -265,6 +313,7 @@ export const shell = {
 		setCurrentPlaylistIdRaw(null);
 		setCurrentFolderIdRaw(null);
 		setCurrentJitRaw(null);
+		setCurrentEntityRaw(null);
 	},
 	setEmptyState(content: EmptyStateContent | null): void {
 		setEmptyStateRaw(content);

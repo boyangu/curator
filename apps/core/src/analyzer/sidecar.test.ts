@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { AnalyzerSidecar, type AnalyzeParams, type SidecarError } from './sidecar.js';
+import { AnalyzerSidecar, type AnalyzeParams, type AnalyzerHealth, type SidecarError, type SidecarOptions } from './sidecar.js';
 
 // Scripted fake analyzer (plain Node via -e): says hello, answers every
 // analyze with a minimal result echoing the track id + peaks paths.
@@ -45,10 +45,24 @@ async function settledState(p: Promise<unknown>): Promise<'pending' | 'resolved'
 }
 
 let live: AnalyzerSidecar[] = [];
-function makeSidecar(opts: { executable?: string; script?: string } = {}): AnalyzerSidecar {
-	const s = new AnalyzerSidecar({ executable: opts.executable ?? process.execPath, args: ['-e', opts.script ?? FAKE_ANALYZER] });
+function makeSidecar(opts: { executable?: string; script?: string } & Pick<SidecarOptions, 'preflight' | 'helloTimeoutMs' | 'pingIntervalMs'> = {}): AnalyzerSidecar {
+	const { executable, script, ...liveness } = opts;
+	const s = new AnalyzerSidecar({ executable: executable ?? process.execPath, args: ['-e', script ?? FAKE_ANALYZER], ...liveness });
 	live.push(s);
 	return s;
+}
+
+// Records every health transition; `until` resolves on the next one that matches.
+function watchHealth(sidecar: AnalyzerSidecar): { seen: AnalyzerHealth[]; until: (pred: (h: AnalyzerHealth) => boolean) => Promise<AnalyzerHealth> } {
+	const seen: AnalyzerHealth[] = [];
+	let waiters: Array<{ pred: (h: AnalyzerHealth) => boolean; resolve: (h: AnalyzerHealth) => void }> = [];
+	sidecar.on('health', (h: AnalyzerHealth) => {
+		seen.push(h);
+		const hit = waiters.filter((w) => w.pred(h));
+		waiters = waiters.filter((w) => !w.pred(h));
+		for (const w of hit) w.resolve(h);
+	});
+	return { seen, until: (pred) => new Promise((resolve) => { waiters.push({ pred, resolve }); }) };
 }
 
 afterEach(async () => {
@@ -154,4 +168,115 @@ rl.on('line', (line) => {
 		await expect(sidecar.analyze(params('b'))).rejects.toMatchObject({ kind: 'decode', message: 'second life' });
 		rmSync(dirname(marker), { recursive: true, force: true });
 	});
+});
+
+// A process that spawns, reads stdin, and never writes a byte — what `wsl.exe`
+// does when the WSL service behind it is hung. Once the marker file exists it
+// behaves (hello + answers), so a test can "fix the host" and retry.
+const hungUnless = (marker: string): string => `
+const fs = require('node:fs');
+const rl = require('node:readline').createInterface({ input: process.stdin });
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const ok = fs.existsSync(${JSON.stringify(marker)});
+if (ok) send({ event: 'hello', name: 'curator-analyzer', version: '0.0.0-test', protocol: 1 });
+rl.on('line', (line) => {
+	if (!ok || !line.trim()) return;
+	const f = JSON.parse(line);
+	if (f.method === 'ping') send({ id: f.id, event: 'pong' });
+	if (f.method === 'analyze') send({ id: f.id, error: { kind: 'decode', message: 'alive' } });
+	if (f.method === 'shutdown') process.exit(0);
+});
+`;
+
+// Says hello, then answers each ping with the given statement (or not at all).
+const helloThen = (onPing: string): string => `
+const rl = require('node:readline').createInterface({ input: process.stdin });
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+send({ event: 'hello', name: 'curator-analyzer', version: '0.0.0-test', protocol: 1 });
+rl.on('line', (line) => {
+	if (!line.trim()) return;
+	const f = JSON.parse(line);
+	if (f.method === 'ping') { ${onPing} }
+	if (f.method === 'shutdown') process.exit(0);
+});
+`;
+
+describe('AnalyzerSidecar liveness', () => {
+	it('kills a process that never says hello, hands its work back, and stops after three strikes', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'curator-analyzer-hung-'));
+		const marker = join(dir, 'fixed');
+		const sidecar = makeSidecar({ script: hungUnless(marker), helloTimeoutMs: 150 });
+		const health = watchHealth(sidecar);
+		expect(sidecar.status).toEqual({ state: 'idle' });
+
+		sidecar.start();
+		// Written to the hung process's stdin — this used to wait forever.
+		await expect(sidecar.analyze(params('a'))).rejects.toMatchObject({ kind: 'sidecar_unavailable', message: expect.stringContaining('did not start') });
+		expect(sidecar.status).toMatchObject({ state: 'unresponsive' });
+		expect(sidecar.disabled).toBeNull();
+
+		const stopped = await health.until((h) => h.state === 'disabled');
+		expect(stopped).toMatchObject({ state: 'disabled', reason: expect.stringContaining('did not start') });
+		expect(sidecar.disabled).toContain('did not start');
+		// Never 'ready', and 'unresponsive' held through the relaunches.
+		expect(health.seen.map((h) => h.state)).toEqual(['starting', 'unresponsive', 'disabled']);
+		await expect(sidecar.analyze(params('b'))).rejects.toMatchObject({ kind: 'sidecar_unavailable' });
+
+		// The host is fixed; restart() is the way back.
+		writeFileSync(marker, '1');
+		sidecar.restart();
+		expect(await health.until((h) => h.state === 'ready')).toEqual({ state: 'ready', version: '0.0.0-test' });
+		expect(sidecar.disabled).toBeNull();
+		await expect(sidecar.analyze(params('c'))).rejects.toMatchObject({ kind: 'decode', message: 'alive' });
+		rmSync(dir, { recursive: true, force: true });
+	}, 15_000);
+
+	it('catches a sidecar that goes silent after hello', async () => {
+		const sidecar = makeSidecar({ script: helloThen(''), pingIntervalMs: 40 });
+		const health = watchHealth(sidecar);
+		sidecar.start();
+		await health.until((h) => h.state === 'ready');
+		const pending = sidecar.analyze(params('a'));
+		expect(await health.until((h) => h.state === 'unresponsive')).toMatchObject({ reason: expect.stringContaining('stopped responding') });
+		await expect(pending).rejects.toMatchObject({ kind: 'sidecar_unavailable' });
+		// Relaunched: the fresh process says hello and counts as ready again.
+		await health.until((h) => h.state === 'ready');
+		expect(sidecar.disabled).toBeNull();
+	}, 15_000);
+
+	it.each([
+		['a pong', "send({ id: f.id, event: 'pong' });"],
+		// A bundle that predates ping: any frame still proves it is alive.
+		['an unknown-method error', "send({ id: f.id, error: { kind: 'internal', message: 'unknown method' } });"],
+	])('stays ready while pings are answered with %s', async (_name, onPing) => {
+		const sidecar = makeSidecar({ script: helloThen(onPing), pingIntervalMs: 30 });
+		const health = watchHealth(sidecar);
+		sidecar.start();
+		await health.until((h) => h.state === 'ready');
+		await new Promise((r) => setTimeout(r, 500));
+		expect(health.seen.map((h) => h.state)).toEqual(['starting', 'ready']);
+	});
+
+	it('does not spawn while the launch check fails, and reports its reason', async () => {
+		let problem: string | null = 'WSL is not responding.';
+		let checks = 0;
+		let ready = 0;
+		const sidecar = makeSidecar({ preflight: async () => { checks++; return problem; } });
+		sidecar.on('ready', () => { ready++; });
+		const health = watchHealth(sidecar);
+
+		sidecar.start();
+		// Parked behind the check, then handed back with its reason.
+		await expect(sidecar.analyze(params('a'))).rejects.toMatchObject({ kind: 'sidecar_unavailable', message: 'WSL is not responding.' });
+		expect(await health.until((h) => h.state === 'disabled')).toEqual({ state: 'disabled', reason: 'WSL is not responding.' });
+		expect(checks).toBe(3);
+		expect(ready).toBe(0);
+
+		problem = null;
+		sidecar.restart();
+		const parked = sidecar.analyze(params('b'));
+		expect((await parked).track_id).toBe('b');
+		expect(ready).toBe(1);
+		expect(sidecar.status).toMatchObject({ state: 'ready' });
+	}, 15_000);
 });

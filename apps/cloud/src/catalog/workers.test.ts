@@ -9,6 +9,7 @@ import type { TrackerAdapter, TrackerPoll, TrackerTarget } from '@curator/catalo
 import { createLogger } from '../log.js';
 import { createTestApp, errorReason, type TestApp } from '../test/harness.js';
 import { providerPauses } from './tracking.js';
+import { nextDueAt, nextDueFor, spreadOf } from './trackers/cadence.js';
 import { runTrackers } from './trackers/sweep.js';
 
 const quiet = createLogger(() => {});
@@ -186,7 +187,7 @@ describe('workerReport', () => {
 		expect(r).toEqual({ applied: 1, stale: 0, events: 1 });
 
 		expect(await cursorOf(app, objectId)).toMatchObject({ lease_holder: null, last_reported_by: `device:${fan.deviceId}`, last_error: null, ran: true });
-		// Daily, or the Friday window if that comes first (cadence.ts).
+		// The Friday window that opens next (cadence.ts; 'read cadence' below).
 		expect(Number((await cursorOf(app, objectId)).due_in_s)).toBeGreaterThan(3600);
 		await settle(app);
 		const { events } = await fan.api.feed.events.query({ deviceId: fan.deviceId, afterSeq: 0 });
@@ -265,5 +266,46 @@ describe('workerReport', () => {
 		await app.pg.query(`update curator.catalog_cursor set next_due_at = now()`);
 		expect((await due(['spotify', 'deezer'], [{ provider: 'spotify', until: Date.now() + 60_000 }])).tasks).toEqual([]);
 		expect((await due()).tasks).toHaveLength(1);
+	});
+});
+
+// Settings → Discover: how often a kind is read, sent with every ask.
+describe('read cadence', () => {
+	// The seeded artist/spotify tracker (sql/0012).
+	const ARTIST_SPOTIFY = { everyMin: 1440, friday: { fromUtc: '00:00', toUtc: '12:00', everyMin: 120 } };
+	const dueAt = async (app: TestApp, objectId: string) =>
+		Number((await app.db.query<{ ms: unknown }>(`select extract(epoch from next_due_at) * 1000 as ms from curator.catalog_cursor where object_id = $1 and provider = 'spotify'`, [objectId]))[0]!.ms);
+	const near = (got: number, want: number) => expect(Math.abs(got - want)).toBeLessThan(60_000);
+
+	it('times a read by its followers’ choice: weekly unless said, the most frequent of several', async () => {
+		const { app, fan, objectId, due } = await setup();
+		const read = async (over: Partial<CatalogWorkerDueInput> = {}) => {
+			await app.pg.query(`update curator.catalog_cursor set next_due_at = now()`);
+			expect((await due(undefined, undefined, over)).tasks).toHaveLength(1);
+			await fan.api.catalog.workerReport.mutate({ deviceId: fan.deviceId, results: [{ objectId, provider: 'spotify', outcome: { poll: pollOf([]) } }] });
+			return dueAt(app, objectId);
+		};
+		// A desktop from before the choice says nothing: once, in the Friday window.
+		near(await read(), nextDueFor(Date.now(), ARTIST_SPOTIFY, 'weekly', spreadOf(objectId)));
+		near(await read({ cadence: { artist: 'daily', playlist: 'weekly' } }), Date.now() + DAY);
+		near(await read({ cadence: { artist: 'source' } }), nextDueAt(Date.now(), ARTIST_SPOTIFY, spreadOf(objectId)));
+		// A second follower who never said (weekly) does not slow the first's daily read.
+		const other = await app.signIn('desk-9');
+		await other.api.catalog.watch.mutate({ deviceId: other.deviceId, objectId, source: 'manual' });
+		near(await read({ cadence: { artist: 'daily' } }), Date.now() + DAY);
+	});
+
+	it('pulls the user’s cursors forward when a kind is to be read more often, and leaves a backoff where it is', async () => {
+		const { app, fan, objectId, due } = await setup();
+		const failing = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: artist('sa2', 'Amber Tide'), source: 'manual' });
+		// Both read two days ago and parked for most of a week; one of them failing.
+		await app.pg.query(`update curator.catalog_cursor set last_run_at = now() - interval '2 days', next_due_at = now() + interval '6 days'`);
+		await app.pg.query(`update curator.catalog_cursor set last_error = 'HTTP 500', fail_count = 1 where object_id = $1`, [failing.watch.object.id]);
+		// Weekly said outright is what it was by default: nothing moves.
+		expect((await due(undefined, undefined, { cadence: { artist: 'weekly' } })).tasks).toEqual([]);
+		// Daily: the healthy cursor was due a day ago, and the same call hands it out.
+		const r = await due(undefined, undefined, { cadence: { artist: 'daily' } });
+		expect(r.tasks.map((t) => t.objectId)).toEqual([objectId]);
+		expect(Number((await cursorOf(app, failing.watch.object.id)).due_in_s)).toBeGreaterThan(5 * 86400);
 	});
 });

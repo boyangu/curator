@@ -9,7 +9,7 @@ import type { SourceTabId, StateTab as StateTabId } from '../layouts/TopFrame.js
 import { shell, type SourceTab } from '../viewmodel/shell.js';
 import { log } from '../data/log.js';
 import { GROUP_BY_VALUES, type GroupBy, type RowLines } from '../trackGroups.js';
-import type { ArtistCreditFormat, ArtistSeparator, RemixStyle } from '@curator/shared';
+import type { ArtistCreditFormat, ArtistSeparator, EntityKind, RemixStyle } from '@curator/shared';
 
 // applyActiveTabFallback needs to bump navigation + repaint the track
 // list when the active tab disappears from the visible set. Those still
@@ -70,6 +70,14 @@ export type AnalysisSourcePref = 'rekordbox' | 'curator';
 // label changes. Single source of truth read by music-utils.resolveKeyChip.
 export type KeyDisplayFormat = 'camelot' | 'musical';
 
+// How an entity page lists its tracks: the grouping and sort it opens with,
+// per kind of page. Kept apart from the library's own trackGroupBy so a page
+// can default to albums-newest-first without regrouping every playlist.
+export interface EntityLayout {
+	groupBy: GroupBy;
+	sort: { column: string; dir: 'asc' | 'desc' };
+}
+
 export interface UISettings {
 	sourceTabs: Record<SourceTabId, boolean>;
 	pinned:    StateTabPref;
@@ -90,6 +98,9 @@ export interface UISettings {
 	// paired columns; and the field rows are grouped under.
 	trackRowLines: RowLines;
 	trackGroupBy: GroupBy;
+	// Artist / label / album pages: what the Group chip and a header click
+	// set while a page is open (see EntityLayout).
+	entityLayout: Record<EntityKind, EntityLayout>;
 	// The toolbar's "This device" chip: hide the account's tracks this
 	// device holds no source of (remote rows, ZTrackFilter.hideRemote).
 	// Off by default — every device shows the account's whole library.
@@ -110,8 +121,35 @@ const DEFAULT_UI_SETTINGS: UISettings = {
 	remixStyle: 'parenthesis',
 	trackRowLines: 2,
 	trackGroupBy: 'none',
+	// An artist's and a label's tracks read as a discography: albums, newest
+	// first. An album is its tracklist, in order (`index` = disc / track there).
+	entityLayout: {
+		artist: { groupBy: 'album', sort: { column: 'releaseDate', dir: 'desc' } },
+		label: { groupBy: 'album', sort: { column: 'releaseDate', dir: 'desc' } },
+		album: { groupBy: 'none', sort: { column: 'index', dir: 'asc' } },
+	},
 	hideRemoteTracks: false,
 };
+
+function sanitizeEntityLayout(raw: unknown): Record<EntityKind, EntityLayout> {
+	const out = cloneEntityLayout(DEFAULT_UI_SETTINGS.entityLayout);
+	if (!raw || typeof raw !== 'object') return out;
+	for (const kind of Object.keys(out) as EntityKind[]) {
+		const v = (raw as Record<string, Partial<EntityLayout> | undefined>)[kind];
+		if (!v) continue;
+		if ((GROUP_BY_VALUES as readonly unknown[]).includes(v.groupBy)) out[kind].groupBy = v.groupBy!;
+		if (v.sort && typeof v.sort.column === 'string' && (v.sort.dir === 'asc' || v.sort.dir === 'desc')) out[kind].sort = { column: v.sort.column, dir: v.sort.dir };
+	}
+	return out;
+}
+
+function cloneEntityLayout(l: Record<EntityKind, EntityLayout>): Record<EntityKind, EntityLayout> {
+	return {
+		artist: { groupBy: l.artist.groupBy, sort: { ...l.artist.sort } },
+		label: { groupBy: l.label.groupBy, sort: { ...l.label.sort } },
+		album: { groupBy: l.album.groupBy, sort: { ...l.album.sort } },
+	};
+}
 
 // Only the tabs that exist today: a persisted key for a retired tab (the old
 // Local tab) must not leak into the visible set.
@@ -143,6 +181,7 @@ function loadUiSettings(): UISettings {
 			remixStyle: parsed.remixStyle === 'dash' ? 'dash' : 'parenthesis',
 			trackRowLines: parsed.trackRowLines === 1 ? 1 : 2,
 			trackGroupBy: (GROUP_BY_VALUES as readonly unknown[]).includes(parsed.trackGroupBy) ? parsed.trackGroupBy! : 'none',
+			entityLayout: sanitizeEntityLayout(parsed.entityLayout),
 			hideRemoteTracks: parsed.hideRemoteTracks === true,
 		};
 	} catch {
@@ -163,6 +202,7 @@ function cloneUiSettings(s: UISettings): UISettings {
 		remixStyle: s.remixStyle,
 		trackRowLines: s.trackRowLines,
 		trackGroupBy: s.trackGroupBy,
+		entityLayout: cloneEntityLayout(s.entityLayout),
 		hideRemoteTracks: s.hideRemoteTracks,
 	};
 }

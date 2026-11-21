@@ -11,7 +11,8 @@
 //   3. an unchanged listing costs one cursor update; a changed one is ingested
 //      (reason 'tracker') in one transaction, then the recent releases among
 //      the children raise events in a second, short one (events.ts);
-//   4. the cursor moves to its next due time (cadence.ts), or backs off on a
+//   4. the cursor moves to its next due time — the tracker's cadence, slowed
+//      to what its followers chose (cadence.ts nextDueFor) — or backs off on a
 //      failure; a provider's rate limit parks every tracker of that provider
 //      until the wait it named has passed (tracking.ts providerPauses).
 // Objects nobody watches lose their cursors first (watches.ts).
@@ -36,9 +37,9 @@ import { raiseChartEntry, raisePlaylistAdd, raiseReleaseEvent } from '../events.
 import { findRepresentation } from '../identity.js';
 import { ingestClaims, Ingester, linkReleasesToLabel } from '../ingest.js';
 import { repointRepresentation } from '../profile/label-profiler.js';
-import { providerPauses, wantedSql } from '../tracking.js';
+import { providerPauses, readCadenceOf, wantedSql } from '../tracking.js';
 import { collectCursors } from '../watches.js';
-import { backoffAt, nextDueAt, spreadOf, type Cadence } from './cadence.js';
+import { backoffAt, nextDueFor, spreadOf, type Cadence } from './cadence.js';
 import { TrackerRateLimitedError, type TrackerAdapter, type TrackerPoll, type TrackerTarget } from '@curator/catalog-readers';
 
 export type SweepDeps = {
@@ -205,11 +206,12 @@ export async function applyPoll(
 			const changed = poll.listingHash !== c.cursor.listingHash;
 			if (!changed) r.unchanged = true;
 			else r.events = await ingestFound(deps.db, t, c.objectId, poll, opts.nowMs, opts.holder);
+			const choice = await readCadenceOf(deps.db, c.objectId, t.kind, t.provider);
 			await deps.db.query(
 				`update curator.catalog_cursor set cursor = $3::text::jsonb, next_due_at = to_timestamp($4::float8 / 1000), last_run_at = now(),
 					fail_count = 0, last_error = null, last_reported_by = $5, lease_holder = null, lease_until = null
 				where object_id = $1 and provider = $2`,
-				[c.objectId, t.provider, JSON.stringify({ ...poll.cursor, listingHash: poll.listingHash }), String(nextDueAt(opts.nowMs, t.cadence, spreadOf(c.objectId))), opts.holder],
+				[c.objectId, t.provider, JSON.stringify({ ...poll.cursor, listingHash: poll.listingHash }), String(nextDueFor(opts.nowMs, t.cadence, choice, spreadOf(c.objectId))), opts.holder],
 			);
 			// Read through, changed or not: the back office's "last scanned".
 			await deps.db.query(`update curator.catalog_object set scanned_at = now() where id = $1`, [c.objectId]);

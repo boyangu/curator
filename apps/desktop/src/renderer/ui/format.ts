@@ -5,8 +5,10 @@
 export const fmt2 = (n: number): string => String(n).padStart(2, '0');
 
 export const fmtTime = (sec: number | null): string => {
-	if (!sec) return '—';
-	return `${fmt2(Math.floor(sec / 60))}:${fmt2(sec % 60)}`;
+	// To the second: a store's length can carry a fraction.
+	const s = sec ? Math.round(sec) : 0;
+	if (s <= 0) return '—';
+	return `${fmt2(Math.floor(s / 60))}:${fmt2(s % 60)}`;
 };
 
 // Terse age for table columns: <1d / 3d / 2w / 5mo / 1y.

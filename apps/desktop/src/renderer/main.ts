@@ -1,16 +1,22 @@
 ﻿import type { Api } from '../ipc.js';
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, SegmentRecord } from '@curator/shared';
-import type { ArtistLink, ArtistPagesTarget, ArtistScope, ArtistSummary } from '@curator/shared';
-import { artistExternalLinks } from './features/artistLinks.js';
+import type { ArtistPagesTarget, ArtistScope, ArtistSummary } from '@curator/shared';
 import { artistOpenSubmenu, configureArtistOpen } from './features/artistOpenMenu.js';
 import type { ClearableTrackField } from '@curator/core';
-import type { SyncProgress, DownloadJob, QueueSummary, AuthStatus, ScanProgress, JourneySeed, AgentResultSet, AgentViewContext } from '@curator/core';
+import type { SyncProgress, DownloadJob, QueueSummary, AuthStatus, ScanProgress, AgentResultSet, AgentViewContext } from '@curator/core';
 import * as player from './player.js';
 import type { PlayerState } from './player.js';
 import { initPlayTracker, setPlayContextProvider } from './play-tracker.js';
 import { createSignal, createEffect, createMemo, on } from 'solid-js';
-import { mountTrackList, twoLineColumns, type TrackListHandle, ALL_COLUMNS, type Column, type LayoutColumn } from './track-list.js';
-import type { GroupBy } from './trackGroups.js';
+import { mountTrackList, oneLineColumns, twoLineColumns, type TrackListHandle, ALL_COLUMNS, type Column, type LayoutColumn } from './track-list.js';
+import { LIST_PROFILES, profileHides, type ListContext, type ListProfile } from './listProfile.js';
+import { albumOrder, CATALOG_ALBUM_PREFIX, mainArtistOf, type GroupBy, type GroupInfo } from './trackGroups.js';
+import type { EntityHeader as EntityHeaderData, EntityRef, EntityScopeKind, StreamingService } from '@curator/shared';
+import { catalogArtistId, canSortCatalogRows, isCatalogRow, isLibraryTrackId, normalizeCatalogRef, sortRows } from './catalogRows.js';
+import { entityPage } from './features/entityPage.js';
+import { entitySimilar } from './features/entitySimilar.js';
+import { mountEntityHeader, worldOffText } from './components/EntityHeader.jsx';
+import { mountHeaderCollapse, type HeaderCollapse } from './features/entityHeaderCollapse.js';
 import { albums } from './data/albums.js';
 import { parseQuery, matchTrack, collectTagNames, extractSqlPrefilter, isEmptyExpr, buildExactAttr, hasSimilarTerm, type TagResolver, type SqlPrefilter } from './query.js';
 import { attachTagSuggest } from './tagSuggest.js';
@@ -20,11 +26,10 @@ import { mountPlayerFooter, type PlayerFooterHandle } from './layouts/PlayerFoot
 import { mountNowPlayingChip } from './components/NowPlayingChip.jsx';
 import { mountTopFrame, type TopFrameHandle, type AnalyzerStatus } from './layouts/TopFrame.jsx';
 import { mountSidebar, type SidebarHandle, type SidebarSnapshot } from './layouts/Sidebar.jsx';
-import { mountMainPane, type MainPaneHandle } from './layouts/MainPane.jsx';
+import { mountMainPane, type MainPaneHandle, type PageScopeView } from './layouts/MainPane.jsx';
 import { mountAppShell, type AppShellHandle } from './layouts/AppShell.jsx';
 import { mountDownloadsView, type DownloadsViewHandle } from './components/DownloadsView.jsx';
 import { mountDiscoverView, type DiscoverViewHandle } from './components/DiscoverView.jsx';
-import { mountJourneyView, type JourneyViewHandle } from './components/JourneyView.jsx';
 import { mountAgentPanel, type AgentPanelHandle } from './components/AgentPanel.jsx';
 import { mountAgentResultView, type AgentResultViewHandle } from './components/AgentResultView.jsx';
 import { startEqDriver } from './eq-driver.js';
@@ -130,8 +135,8 @@ function applyStoredOrDefaultSort(id: string): void {
 	state.tracksFilter = 'all';
 	mainTrackList?.setSort({ column: state.sortColumn, dir: state.sortDir });
 }
-import { shell, type JitPlaylist } from './viewmodel/shell.js';
-import { navHistory, locationKey, makeEntry, stackOf, type NavLocation, type NavEntry, type NavRestore, type NavGesture, type NavTab, type TracksScope } from './viewmodel/navHistory.js';
+import { shell, type EntityScope, type JitPlaylist } from './viewmodel/shell.js';
+import { navHistory, entityKey, isPageTab, locationKey, makeEntry, sameEntity, stackOf, PAGE_TABS_CAP, type EntityHost, type NavLocation, type NavEntry, type NavRestore, type NavGesture, type NavTab, type PageTabId, type TracksScope } from './viewmodel/navHistory.js';
 import { mountRegionEffect, type RegionEffectHandle } from './views/regionEffect.js';
 import { agentApi } from './data/agent.js';
 import { downloads } from './data/downloads.js';
@@ -146,7 +151,8 @@ import { fmtTime, fmtAgo, coverGradient, escapeHtml } from './ui/format.js';
 import { showToast, showProgressToast } from './ui/toast.js';
 import { wireDataEvents } from './data/events.js';
 import { log, installGlobalErrorCapture } from './data/log.js';
-import { backupApi, cloudSyncApi, shellApi } from './data/api.js';
+import { backupApi, catalogApi, cloudSyncApi, entityApi, kbApi, shellApi } from './data/api.js';
+import { buildCatalogRowMenu } from './features/catalogCommands.js';
 import { initBackupSettingsFeature } from './features/backupSettings.js';
 import { initDeletedTracksSettingsFeature } from './features/deletedTracksSettings.js';
 import { initAccountSettingsFeature } from './features/accountSettings.js';
@@ -352,7 +358,9 @@ function captureSourceState(): void {
 	// The slot describes the source's TRACKS view. Tag views (Interested /
 	// Basket) clear the scope while they're up, so a capture there would
 	// overwrite the remembered playlist with "nothing".
-	if (shell.activeView() !== 'tracks') return;
+	// An entity page hosted by a source tab is no scope of that source either
+	// (it would file the tab under "all tracks").
+	if (shell.activeView() !== 'tracks' || shell.currentEntity()) return;
 	state.sourceSlots.set(shell.activeSource(), {
 		scope: currentTracksScope(),
 		selectedTrackIds: [...getSelectedTrackIds()],
@@ -469,19 +477,18 @@ let appShell: AppShellHandle | null = null;
 // the queue/progress IPC listeners.
 let downloadsView: DownloadsViewHandle | null = null;
 let discoverView: DiscoverViewHandle | null = null;
-let journeyView: JourneyViewHandle | null = null;
 // Agent surfaces inside Discover: the docked conversational panel (right
 // column) and the result-set list (third main-area mode). Assigned by
 // mountDiscoverRegion.
 let agentPanel: AgentPanelHandle | null = null;
 let agentResultView: AgentResultViewHandle | null = null;
-// Feed ↔ Journeys ↔ agent-results mode inside the Discover region —
-// assigned by mountDiscoverRegion (v1 minimal toggle; the Discover
-// toolbar/side-pane design pass replaces it). 'agent-results' is entered
-// programmatically (a result set arriving / a card click), not via the bar.
-let setDiscoverMode: (m: 'feed' | 'journeys' | 'agent-results') => void = () => {};
+// Feed ↔ agent-results mode inside the Discover region — assigned by
+// mountDiscoverRegion. 'agent-results' is entered programmatically (a result
+// set arriving / a card click), not via the bar. (An artist / label / album
+// page opened from Discover is not a mode: it takes the tracks region.)
+let setDiscoverMode: (m: 'feed' | 'agent-results') => void = () => {};
 // Mirror of the current Discover mode for the agent's view-context capture.
-let currentDiscoverMode: 'feed' | 'journeys' | 'agent-results' = 'feed';
+let currentDiscoverMode: 'feed' | 'agent-results' = 'feed';
 let regionEffect: RegionEffectHandle | null = null;
 // SyncView — reactive component mounted into #sync-view inside
 // MainPane. Replaces renderSyncView + wireSyncNowButton. Reads rows /
@@ -866,7 +873,7 @@ function getSidebarSnapshot(): SidebarSnapshot {
 		artistsExpanded: artistsExpanded(),
 		artistsSearch: artistsSearch(),
 		artistsLoading: artistsLoading(),
-		currentArtistId: artistIdOfJit(shell.currentJit()),
+		currentArtistId: openArtistId(),
 		spotifyMeId: library.auth()?.spotify.id ?? null,
 		tidalMeId: library.auth()?.tidal.id ?? null,
 	};
@@ -929,6 +936,14 @@ async function renderTracks(): Promise<void> {
 	// Indicator visibility follows the active playlist — hides when navigating
 	// to another playlist mid-enrichment, reappears on return.
 	renderEnrichInline();
+
+	// An entity page: the list is the artist's / label's / album's local
+	// files, or the catalogue's releases (renderEntityTracks).
+	const entityNow = shell.currentEntity();
+	if (entityNow) {
+		await renderEntityTracks(entityNow, renderSeq);
+		return;
+	}
 
 	// JIT scope branch — when active, the tracklist is the result of the
 	// JIT's grammar query, not a playlist / folder / source view. SQL
@@ -1192,7 +1207,8 @@ function applyFilterToMainList(): void {
 	// await resolves areTracksSettled() is true for these ids (or the list
 	// was swapped by a newer renderTracks, and the re-check covers it).
 	if (collectTagNames(expr).length > 0) {
-		const ids = mainTracksUnfiltered.map((t) => t.id);
+		// Catalogue rows have no memberships to wait for.
+		const ids = mainTracksUnfiltered.map((t) => t.id).filter(isLibraryTrackId);
 		if (!tagsStore.areTracksSettled(ids)) {
 			void tagsStore.ensureTracksLoaded(ids)
 				.then(() => applyFilterToMainList())
@@ -1235,7 +1251,7 @@ function updateReorderableState(): void {
 	}
 	// Grouped rows aren't in playlist order (groups follow the sort, album
 	// groups play in album order), so an in-list drop has no clean meaning.
-	const ungrouped = uiSettingsSignal().trackGroupBy === 'none';
+	const ungrouped = effectiveGroupBy() === 'none';
 	mainTrackList?.setReorderable(sortOk && playlistOk && filterOk && notSmart && providerOk && ungrouped);
 }
 
@@ -1251,14 +1267,38 @@ function currentVisibleColumns(): LayoutColumn[] {
 	const similar = isSimilarScope();
 	const ui = uiSettingsSignal();
 	if (ui.trackRowLines === 2) {
-		return twoLineColumns((c) => COLUMN_LOCKED.has(c) || getColumnVisibility(c), { groupBy: ui.trackGroupBy, match: similar });
+		return twoLineColumns(fieldVisible, { groupBy: effectiveGroupBy(), match: similar });
 	}
-	return getColumnOrder(ALL_COLUMNS).filter((c) => (c === 'match' ? similar : getColumnVisibility(c)));
+	return oneLineColumns(getColumnOrder(ALL_COLUMNS), fieldVisible, { groupBy: effectiveGroupBy(), match: similar });
 }
 
 // Fields visible for the two-line paired columns (locked fields always).
 function currentVisibleFields(): ReadonlySet<Column> {
-	return new Set(ALL_COLUMNS.filter((c) => COLUMN_LOCKED.has(c) || getColumnVisibility(c)));
+	return new Set(ALL_COLUMNS.filter(fieldVisible));
+}
+
+// Who owns the list right now, and that owner's say over it (listProfile.ts):
+// an open page is Discover's wherever it is hosted, everything else is the
+// library's. Reactive — the layout effect remounts the list when it changes.
+function listContext(): ListContext {
+	return shell.currentEntity() ? 'discover' : 'library';
+}
+function listProfile(): ListProfile {
+	return LIST_PROFILES[listContext()];
+}
+// A field shows when its owner allows it here and the user has it on.
+function fieldVisible(c: Column): boolean {
+	if (profileHides(listProfile(), c, effectiveGroupBy())) return false;
+	return COLUMN_LOCKED.has(c) || getColumnVisibility(c);
+}
+
+// The grouping in force: an entity page's own (per kind of page — an artist
+// reads as albums, an album as its tracklist) while one is open, else the
+// library's. Reactive: the layout effect remounts the list when it changes.
+function effectiveGroupBy(): GroupBy {
+	const ent = shell.currentEntity();
+	const ui = uiSettingsSignal();
+	return ent ? ui.entityLayout[ent.entity.kind].groupBy : ui.trackGroupBy;
 }
 
 // Collapsed group keys, per grouping field — session-only memory that
@@ -1318,7 +1358,9 @@ function rebuildMainTrackList(): void {
 // views which have their own keyboard semantics. Interested/Basket are
 // workflow tabs (different activeView values) and explicitly excluded for now.
 function isMusicSourceView(): boolean {
-	return shell.activeView() === 'tracks';
+	// An entity page is a track list wherever it is hosted (a source tab,
+	// Discover, a page tab).
+	return shell.activeView() === 'tracks' || (shell.currentEntity() !== null && shell.showsTracksLayout());
 }
 
 // Keyboard navigation through the visible tracks. Collapses multi-selection
@@ -1538,8 +1580,10 @@ function persistUiState(): void {
 		for (const [pid, tid] of state.playlistAnchors) anchors[pid] = tid;
 		const data: Persisted = {
 			activeSource: shell.activeSource(),
-			sortColumn: state.sortColumn,
-			sortDir: state.sortDir,
+			// The library list's sort: while an entity page has the list (it
+			// sorts its own way), that is the one set aside for the way back.
+			sortColumn: entitySortStash?.column ?? state.sortColumn,
+			sortDir: entitySortStash?.dir ?? state.sortDir,
 			sourceSlots: slots,
 			playlistAnchors: anchors,
 		};
@@ -2674,6 +2718,9 @@ function wireOmnibar(): void {
 			// The Rekordbox pill covers local files too, so a watched folder
 			// alone is enough to make it worth showing.
 			if (src === 'rekordbox') return library.rekordboxTree().playlists.length > 0 || library.libraryFolders().length > 0;
+			// World: the streaming service, the catalogue or the stores — one
+			// of them always has something to say (and says why when not).
+			if (src === 'world') return true;
 			return false;
 		},
 		onPickTrack: (track, list) => {
@@ -2692,6 +2739,19 @@ function wireOmnibar(): void {
 		},
 		onPickFolder: async (folder) => {
 			await openFolderById(folder.id);
+		},
+		searchWorld: (query, part) => entityApi.searchWorld(query, part),
+		worldRows: (page) => entityPage.rowsOf(page),
+		// A World hit: an artist's, a label's or an album's page; a track plays
+		// through the streaming service like any World row (the other track
+		// hits queue behind it).
+		onPickWorld: (hit, pick) => {
+			if (pick.row && !pick.newTab) {
+				shell.notePlaybackOrigin();
+				player.play(pick.row, pick.list).catch(reportPlayFailure);
+				return;
+			}
+			void openEntity(hit.ref, { newTab: pick.newTab, scope: 'world' });
 		},
 		onLoadAsJit: async (query, name, selectTrackId) => {
 			// Re-running a query that's already pinned (verbatim) should light
@@ -3330,6 +3390,10 @@ async function reseedAnalysisStatus(): Promise<void> {
 	try {
 		const snap = await window.api['analysis:status']();
 		analysisStatus.reconcile(snap.running, snap.queued);
+		// `??`: in dev the renderer hot-reloads ahead of a main process that
+		// still answers with the older, shorter snapshot.
+		analysisStatus.setHealth(snap.analyzer ?? { state: 'off' });
+		analysisStatus.seedLastCompleted(snap.lastCompletedAt ?? null);
 		// Paint the blink on any rows already rendered before this snapshot
 		// landed (the tracklist can boot before this IPC resolves). Rows
 		// painted after this read it live via createTrackRow.
@@ -3552,6 +3616,34 @@ function wireAnalysisEvents(): void {
 		}
 		// (TopFrame chip reads analysisStatus.snapshot() reactively.)
 	});
+	// The analyzer process itself. A hung one sends no job events at all, so
+	// this is the only signal that the work on the chip isn't moving. One
+	// toast when it goes down; the chip carries the state (and the retry)
+	// from there.
+	window.api.onAnalyzerHealth?.((health) => {
+		const was = analysisStatus.health();
+		analysisStatus.setHealth(health);
+		const down = (h: typeof health): boolean => h.state === 'unresponsive' || h.state === 'disabled';
+		if (down(health) && !down(was)) {
+			analysisLog.warn('analyzer down', { state: health.state, reason: 'reason' in health ? health.reason : null });
+			showToast(health.state === 'disabled' ? 'Analyzer stopped' : 'Analyzer not responding', {
+				kind: 'error',
+				sub: 'reason' in health ? health.reason : undefined,
+				durationMs: 12_000,
+			});
+		} else if (health.state === 'ready' && down(was)) {
+			showToast('Analyzer is back', { kind: 'success' });
+			// Jobs handed back while it was down are queued again; recount.
+			void reseedAnalysisStatus();
+		}
+	});
+}
+
+// The chip's retry: relaunch an analyzer that gave up or isn't answering.
+function retryAnalyzer(): void {
+	window.api['analysis:restart']().catch((err: unknown) => {
+		analysisLog.error('analyzer restart failed', err);
+	});
 }
 
 // renderAnalysisChip moved into layouts/TopFrame.tsx — the chip is now a
@@ -3660,50 +3752,35 @@ function mountDownloadsRegion(): void {
 function mountDiscoverRegion(): void {
 	const discoverViewHost = document.getElementById('discover-view');
 	if (!discoverViewHost) return;
-	// Split the Discover region: the feed, the journey surface, and the
-	// agent-results list behind a minimal Feed/Journeys mode bar (v1 — the
-	// real Discover toolbar/side-pane arrives with the journey-tree design
-	// pass). Each Solid surface mounts into its own child host. The agent
-	// PANEL is no longer here — it docks app-level (mountAgentDock) so it's
-	// available on every tab; the ✦ button just toggles that global dock.
+	// Split the Discover region: the feed and the agent-results list, each
+	// Solid surface in its own child host under a small bar. The agent PANEL
+	// is not here — it docks app-level (mountAgentDock) so it's available on
+	// every tab; the ✦ button just toggles that global dock.
 	const modeBar = document.createElement('div');
 	modeBar.className = 'discover-modebar';
 	const feedBtn = document.createElement('button');
 	feedBtn.textContent = 'Feed';
 	feedBtn.className = 'discover-mode-btn is-active';
-	const journeysBtn = document.createElement('button');
-	journeysBtn.textContent = 'Journeys';
-	journeysBtn.className = 'discover-mode-btn';
 	const agentBtn = document.createElement('button');
 	agentBtn.textContent = '✦ Agent';
 	agentBtn.className = 'discover-mode-btn discover-mode-btn--agent';
 	agentBtn.title = 'Toggle the agent panel';
-	modeBar.append(feedBtn, journeysBtn, agentBtn);
+	modeBar.append(feedBtn, agentBtn);
 	const feedHost = document.createElement('div');
 	feedHost.className = 'discover-feed-host';
-	const journeyHost = document.createElement('div');
-	journeyHost.className = 'journey-host';
-	journeyHost.hidden = true;
 	const agentResultHost = document.createElement('div');
 	agentResultHost.className = 'agent-result-host';
 	agentResultHost.hidden = true;
-	discoverViewHost.append(modeBar, feedHost, journeyHost, agentResultHost);
+	discoverViewHost.append(modeBar, feedHost, agentResultHost);
 	setDiscoverMode = (m) => {
 		currentDiscoverMode = m;
 		feedHost.hidden = m !== 'feed';
-		journeyHost.hidden = m !== 'journeys';
 		agentResultHost.hidden = m !== 'agent-results';
 		feedBtn.classList.toggle('is-active', m === 'feed');
-		journeysBtn.classList.toggle('is-active', m === 'journeys');
-		if (m === 'journeys') journeyView?.refresh();
 	};
-	// Mode switches are history navigations: each lands on the sub-state that
-	// surface was left in (the feed's filters, the open journey node).
+	// A mode switch is a history navigation, landing on the sub-state the
+	// feed was left in (its filters).
 	feedBtn.addEventListener('click', () => { void navigate(feedLocation()); });
-	journeysBtn.addEventListener('click', () => {
-		const j = journeyView?.getLocation() ?? null;
-		void navigate({ kind: 'discover', mode: 'journeys', journeyId: j?.journeyId ?? null, nodeId: j?.nodeId ?? null });
-	});
 	agentBtn.addEventListener('click', () => toggleAgentDock());
 	const playAgentSpotify = async (req: { sourceTrackId: string; title: string; artist: string; coverUrl: string | null; durationSec: number | null }): Promise<void> => {
 		try {
@@ -3722,15 +3799,6 @@ function mountDiscoverRegion(): void {
 		onPlay: (req) => { void playAgentSpotify(req); },
 		onBackToFeed: () => { void navigate(feedLocation()); },
 		onToast: (msg, kind, sub) => showToast(msg, { kind, sub }),
-	});
-	journeyView = mountJourneyView(journeyHost, {
-		onToast: (msg, kind, sub) => showToast(msg, { kind, sub }),
-		// Journey hops / breadcrumb jumps / back-to-list are history entries
-		// the view applies itself; it reports each one before moving.
-		onNavigate: (loc) => recordNavigation(
-			{ kind: 'discover', mode: 'journeys', journeyId: loc.journeyId, nodeId: loc.nodeId },
-			loc.label,
-		),
 	});
 	discoverView = mountDiscoverView(feedHost, {
 		// A followed playlist is synced into the library, so its name on a card
@@ -3767,7 +3835,7 @@ function mountDiscoverRegion(): void {
 		onTogglePause: () => { player.togglePause().catch(() => {}); },
 		onOpenOrganize: (trackIds) => { void openOrganizeForTracks(trackIds); },
 		onOpenOrganizeDeferred: (session) => { void openOrganizeForFeedPromotion(session); },
-		onStartJourney: (seed) => startJourneyFromSeed(seed),
+		onOpenEntity: (ref, gesture) => { void openEntity(ref, { newTab: gesture.newTab }); },
 		onToast: (msg, kind, sub) => showToast(msg, { kind, sub }),
 		onProgressToast: (title, sub) => showProgressToast(title, sub),
 		onTotalChange: (totalCount) => {
@@ -3791,6 +3859,8 @@ function mountDiscoverRegion(): void {
 	// (read at play start) live in the tracker.
 	setPlayContextProvider(() => {
 		const view = shell.activeView();
+		const ent = shownEntity();
+		if (ent) return { type: 'entity', id: entityKey(ent.entity) };
 		if (view === 'discover') return { type: 'feed', id: null };
 		if (view === 'interested' || view === 'basket') return { type: 'tag', id: view };
 		const jit = shell.currentJit();
@@ -3902,21 +3972,21 @@ function smartPlaylistName(id: string): string | null {
 function locationLabel(loc: NavLocation): string {
 	switch (loc.kind) {
 		case 'tracks': return scopeTitle(loc.scope) ?? SOURCE_LABELS[loc.source];
+		case 'entity': return loc.entity.name;
 		case 'tag': return loc.view === 'interested' ? 'Interested' : 'Basket';
 		case 'sync': return 'Sync';
 		case 'downloads': return 'Downloads';
 		case 'discover':
 			switch (loc.mode) {
 				case 'feed': return loc.archived ? 'Discover · Archived' : 'Discover';
-				case 'journeys': return loc.journeyId ? 'Journey' : 'Journeys';
 				case 'agent-results': return 'Agent results';
 			}
 	}
 }
 
 // Display label for an entry. Library scopes re-derive from the live
-// catalog (a renamed playlist shows its new name); journey / agent entries
-// keep the title captured when they were recorded (a lookup otherwise).
+// catalog (a renamed playlist shows its new name); agent entries keep the
+// title captured when they were recorded (a lookup otherwise).
 function entryLabel(e: NavEntry): string {
 	return e.location.kind === 'discover' && e.location.mode !== 'feed' ? e.label : locationLabel(e.location);
 }
@@ -3940,10 +4010,6 @@ function feedLocation(): NavLocation {
 // click re-enters and what the now-playing chip jumps back to.
 function discoverLocation(): NavLocation {
 	switch (currentDiscoverMode) {
-		case 'journeys': {
-			const j = journeyView?.getLocation() ?? null;
-			return { kind: 'discover', mode: 'journeys', journeyId: j?.journeyId ?? null, nodeId: j?.nodeId ?? null };
-		}
 		case 'agent-results': {
 			const rs = agentResultView?.current();
 			if (rs) return { kind: 'discover', mode: 'agent-results', resultSetId: rs.id };
@@ -3956,6 +4022,10 @@ function discoverLocation(): NavLocation {
 
 function currentLocation(): NavLocation {
 	const view = shell.activeView();
+	// A page is up wherever the tracks region shows one (its host may be a
+	// source tab, Discover or a page tab).
+	const ent = shell.currentEntity();
+	if (ent && shell.showsTracksLayout()) return { kind: 'entity', host: ent.host as EntityHost, entity: ent.entity, scope: ent.scope };
 	switch (view) {
 		case 'interested':
 		case 'basket': return { kind: 'tag', view };
@@ -4042,6 +4112,7 @@ async function applyTracksLocation(loc: Extract<NavLocation, { kind: 'tracks' }>
 	if (seq !== navApplySeq) return true;
 	const targetKey = locationKey(loc);
 	const moved = locationKey(currentLocation()) !== targetKey;
+	const leftPage = leaveEntityPage();
 	const sourceChanged = shell.activeSource() !== loc.source;
 	if (sourceChanged) {
 		// Per-source slot: pull the destination's remembered playlist +
@@ -4051,7 +4122,7 @@ async function applyTracksLocation(loc: Extract<NavLocation, { kind: 'tracks' }>
 		restoreSourceState(loc.source);
 	}
 	const scopeChanged = locationKey({ kind: 'tracks', source: loc.source, scope: currentTracksScope() }) !== targetKey;
-	if (scopeChanged && !restore?.selectedTrackIds) clearTrackSelection();
+	if ((scopeChanged || leftPage) && !restore?.selectedTrackIds) clearTrackSelection();
 	applyTracksScope(loc.scope);
 	// Sort: the entry's own on traversal; otherwise per-scope memory for
 	// playlists / folders, Match order for similarity searches, and the
@@ -4104,6 +4175,7 @@ async function applyTagLocation(loc: Extract<NavLocation, { kind: 'tag' }>, rest
 	const seq = ++navApplySeq;
 	const moved = locationKey(currentLocation()) !== locationKey(loc);
 	if (moved && !restore?.selectedTrackIds) clearTrackSelection();
+	leaveEntityPage();
 	// Tag views are global — no playlist / folder / JIT underneath. The
 	// per-source slot keeps the tab's playlist (captureSourceState skips
 	// these views), so the sort + anchor memory can't leak onto it anymore.
@@ -4137,6 +4209,13 @@ async function applyDiscoverLocation(loc: Extract<NavLocation, { kind: 'discover
 		if (seq !== navApplySeq) return true;
 		if (!resultSet) return false;
 	}
+	// A page Discover was hosting hands the region back to the feed. The
+	// feed underneath never moved: Back from a page lands on the same card.
+	const feedKept = discoverView !== null && currentDiscoverMode === 'feed' && loc.mode === 'feed' && discoverView.getNavState().archived === loc.archived;
+	if (shell.currentEntity()?.host === 'discover') {
+		blankMainList();
+		shell.setEntity(null);
+	}
 	ensureRegionMounted('discover', { refresh: false });
 	shell.openView('discover');
 	switch (loc.mode) {
@@ -4144,15 +4223,9 @@ async function applyDiscoverLocation(loc: Extract<NavLocation, { kind: 'discover
 			setDiscoverMode('feed');
 			// A fresh entry / tab click refreshes (the tab-click contract); a
 			// traversal onto the state the feed already shows restores it as-is.
-			discoverView?.applyNavState({ archived: loc.archived }, { reload: refresh || moved });
-			if (!refresh && !moved && restore?.scrollTop != null) discoverView?.setScrollTop(restore.scrollTop);
+			discoverView?.applyNavState({ archived: loc.archived }, { reload: refresh || (moved && !feedKept) });
+			if (!refresh && (!moved || feedKept) && restore?.scrollTop != null) discoverView?.setScrollTop(restore.scrollTop);
 			return true;
-		case 'journeys': {
-			setDiscoverMode('journeys');
-			if (!loc.journeyId) { journeyView?.showList(); return true; }
-			const ok = await journeyView?.openAt(loc.journeyId, loc.nodeId);
-			return ok ?? false;
-		}
 		case 'agent-results':
 			setDiscoverMode('agent-results');
 			agentResultView?.show(resultSet!);
@@ -4173,6 +4246,7 @@ async function applyLocation(loc: NavLocation, restore: NavRestore | null, opts:
 	}
 	switch (loc.kind) {
 		case 'tracks': return applyTracksLocation(loc, restore);
+		case 'entity': return applyEntityLocation(loc, restore);
 		case 'tag': return applyTagLocation(loc, restore);
 		case 'sync':
 			ensureRegionMounted('sync', { refresh: opts.refresh });
@@ -4186,11 +4260,445 @@ async function applyLocation(loc: NavLocation, restore: NavRestore | null, opts:
 	}
 }
 
-// Gesture hints for the NEXT navigate / recordNavigation call, set by the
-// handler that triggers it synchronously (the sidebar ↑/↓ commands, the
-// Start-Journey flow) and consumed on read.
+// ─── Entity pages (artist / label / album) ──────────────────────────────────
+// A page is the tracks region with a header above the list: the entity's
+// local files ("owned") or the Global Catalog's releases ("world"). It is a
+// location like any other — `host` says whose history holds it (the source
+// tab or Discover it was opened from, or a page tab of its own) — and it
+// reuses the ONE main track list, so keyboard, selection, restore, the
+// Group / Rows chips and the play queue all work as in a playlist.
+// Data: features/entityPage.ts; header: components/EntityHeader.tsx.
+
+// The page the pane is showing right now. shell.currentEntity() alone can
+// name a page left open on another tab.
+function shownEntity(): EntityScope | null {
+	const ent = shell.currentEntity();
+	return ent && shell.showsTracksLayout() ? ent : null;
+}
+
+// The library list's sort + SRC filter from before a page took the list: a
+// page sorts its own way (albums newest first), and leaving it must not
+// leave that on the playlist underneath.
+let entitySortStash: { column: SortColumn; dir: SortDir; filter: typeof state.tracksFilter } | null = null;
+
+function blankMainList(): void {
+	tracksData.setAll([]);
+	mainTracksUnfiltered = [];
+	mainTrackList?.update([]);
+}
+
+// Called by every navigation onto a library list. True when a page was up.
+function leaveEntityPage(): boolean {
+	const was = shell.currentEntity() !== null;
+	if (entitySortStash) {
+		state.sortColumn = entitySortStash.column;
+		state.sortDir = entitySortStash.dir;
+		state.tracksFilter = entitySortStash.filter;
+		entitySortStash = null;
+	}
+	// Emptied BEFORE the scope change: closing the page regroups the list
+	// (the layout effect remounts it), and that must not repaint the page's
+	// rows under the playlist's grouping for a frame.
+	if (was) blankMainList();
+	return was;
+}
+
+const isCatalogOrder = (sort: { column: string; dir: string }): boolean =>
+	sort.column === 'index' || (sort.column === 'releaseDate' && sort.dir === 'desc');
+
+// What the Owned list was last fetched with — the catalogue's answer can
+// widen it (a label's other spelling, a catalogue artist the library holds).
+let renderedOwnedFilter: unknown = null;
+// Whether the World list was last painted from a readable catalogue (false:
+// it could not be read then — the header coming back repaints it).
+let renderedWorldAvailable: boolean | null = null;
+// What the World list on screen was read from (entityPage.worldKey): the
+// catalogue's object, or the streaming service while the catalogue does not
+// know the entity. It changes when the catalogue takes the page over.
+let renderedWorldKey: string | null = null;
+let worldFill: Promise<void> | null = null;
+let worldLoadingMore = false;
+
+async function renderEntityTracks(ent: EntityScope, renderSeq: number): Promise<void> {
+	const page = entityPage.open(ent.entity);
+	const sort = { column: state.sortColumn, dir: state.sortDir };
+	let rows: Track[] = [];
+	try {
+		if (ent.scope === 'owned') {
+			const h = entityPage.header() ?? await page.local;
+			if (renderSeq !== renderTracksSeq) return;
+			renderedOwnedFilter = h.owned.filter;
+			if (h.owned.filter) {
+				// The whole Owned side, as the switch counts it: the "This
+				// device" preference is not offered on a page (the switch stands
+				// in its place), so what it would hide is not hidden here.
+				rows = await window.api['tracks:list'](h.owned.filter, sort);
+				if (renderSeq !== renderTracksSeq) return;
+				// An album lists in its own order: `index` there is disc / track.
+				if (sort.column === 'index') {
+					rows = albumOrder(rows);
+					if (sort.dir === 'desc') rows = [...rows].reverse();
+				}
+			}
+		} else {
+			const h = await page.full;
+			if (renderSeq !== renderTracksSeq) return;
+			renderedWorldAvailable = h.world.available;
+			renderedWorldKey = entityPage.worldKey(h);
+			if (h.world.available) {
+				const all = await entityPage.worldRows(h);
+				if (renderSeq !== renderTracksSeq) return;
+				rows = canSortCatalogRows(sort.column) ? sortRows(all, sort) : all;
+				// Any order but the catalogue's own, or a typed filter, is only
+				// true over every page: load the rest (to a cap) behind the paint.
+				if (entityPage.world().more && (!isCatalogOrder(sort) || mainFilterText.trim())) fillWorldRows(h);
+			}
+		}
+	} catch (err) {
+		log.for('entity-page').warn('page list failed', { kind: ent.entity.kind, scope: ent.scope }, err);
+		if (renderSeq !== renderTracksSeq) return;
+	}
+	tracksData.setAll(rows);
+	mainTracksUnfiltered = rows;
+	applyFilterToMainList();
+	updateReorderableState();
+	// Tag chips for the library's rows; a catalogue row has none.
+	const ids = rows.map((t) => t.id).filter(isLibraryTrackId);
+	if (ids.length > 0) {
+		tagsStore.ensureTracksLoaded(ids).then(() => {
+			for (const t of rows) if (!isCatalogRow(t)) mainTrackList?.patchOne(t);
+		}).catch((err) => { tagsLog.error('batch fetch failed', err); });
+	}
+}
+
+function fillWorldRows(h: EntityHeaderData): void {
+	if (worldFill) return;
+	worldFill = entityPage.loadAll(h, () => { void renderTracks(); }).finally(() => { worldFill = null; });
+}
+
+// The list scrolled near its end on a World page: the next page of releases.
+async function loadMoreWorldRows(): Promise<void> {
+	const ent = shownEntity();
+	const h = entityPage.header();
+	if (!ent || ent.scope !== 'world' || !h?.world.available || worldLoadingMore || worldFill || !entityPage.world().more) return;
+	worldLoadingMore = true;
+	try {
+		if (await entityPage.loadMore(h)) await renderTracks();
+	} finally {
+		worldLoadingMore = false;
+	}
+}
+
+// The open page's header closing with the list's scroll (set up in boot),
+// and whether it is fully closed — down to its two lines.
+let entityHeaderCollapse: HeaderCollapse | null = null;
+const [entityHeaderCompact, setEntityHeaderCompact] = createSignal(false);
+
+// The open page's header changed (an effect over entityPage.header, set up in
+// boot): the catalogue's half landed — or landed again, after a follow, or
+// when a catalogue that could not be reached came back (the page re-asks by
+// itself). Name the page by every id the answer found (the history entry and
+// the shell both carry the ref), and repaint the list where the answer
+// changed what it holds: a wider Owned filter (a label's other spelling, a
+// catalogue artist the library holds), or a World side that is readable now.
+function onEntityHeader(h: EntityHeaderData | null): void {
+	const ent = shownEntity();
+	// 'pending' is the library's half: it says nothing the open did not.
+	if (!h || !ent || h.world.reason === 'pending') return;
+	const within = ent.entity.within;
+	const entity: EntityRef = { ...h.ref, ...(within ? { within } : {}) };
+	if (JSON.stringify(entity) !== JSON.stringify(ent.entity)) {
+		const cur = navHistory.current();
+		if (cur?.location.kind === 'entity' && cur.location.host === ent.host && sameEntity(cur.location.entity, ent.entity)) {
+			navHistory.replace({ ...cur, location: { ...cur.location, entity }, label: entity.name });
+		}
+		shell.setEntity({ ...ent, entity });
+	}
+	paintScopeTitle();
+	const stale = ent.scope === 'owned'
+		? JSON.stringify(h.owned.filter) !== JSON.stringify(renderedOwnedFilter)
+		: h.world.available && (renderedWorldAvailable === false || renderedWorldKey !== entityPage.worldKey(h));
+	if (stale) void renderTracks();
+}
+
+async function applyEntityLocation(loc: Extract<NavLocation, { kind: 'entity' }>, restore: NavRestore | null): Promise<boolean> {
+	const seq = ++navApplySeq;
+	const shown = shownEntity();
+	const same = !!shown && shown.host === loc.host && sameEntity(shown.entity, loc.entity);
+	if (!shell.currentEntity() && !entitySortStash) entitySortStash = { column: state.sortColumn, dir: state.sortDir, filter: state.tracksFilter };
+	if (!same) {
+		if (!restore?.selectedTrackIds) clearTrackSelection();
+		blankMainList();
+		entitySimilar.reset();
+	} else if (shown.scope !== loc.scope) {
+		blankMainList();
+	}
+	if (shell.emptyState()?.kind === 'watermark') shell.setEmptyState(null);
+	const sort = restore?.sort ?? uiSettingsSignal().entityLayout[loc.entity.kind].sort;
+	state.sortColumn = sort.column as SortColumn;
+	state.sortDir = sort.dir;
+	state.tracksFilter = 'all';
+	entityPage.open(loc.entity);
+	// The list is empty by now, so the regroup this triggers (a page groups
+	// its own way) remounts nothing stale.
+	shell.setEntity({ host: loc.host, entity: loc.entity, scope: loc.scope });
+	let sourceChanged = false;
+	if (isPageTab(loc.host)) {
+		shell.setActivePageTab(loc.host);
+		shell.openView('page');
+	} else if (loc.host === 'discover') {
+		ensureRegionMounted('discover', { refresh: false });
+		shell.openView('discover');
+	} else {
+		sourceChanged = shell.activeSource() !== loc.host;
+		if (sourceChanged) shell.openSource(loc.host);
+		shell.openView('tracks');
+	}
+	mainTrackList?.setSort({ column: state.sortColumn, dir: state.sortDir });
+	syncMatchColumn();
+	if (sourceChanged) await refreshAll(); else await renderTracks();
+	if (seq !== navApplySeq) return true;
+	if (restore) applyTracksRestore(restore);
+	return true;
+}
+
+// Open an artist's / a label's / an album's page — the one entry point every
+// surface uses (a chip in the list, a feed card's credit, the sidebar, the
+// header's own links). In the tab you are in, as a drill-down (Back returns);
+// `newTab` opens a page tab of its own instead.
+async function openEntity(asked: EntityRef, opts: { scope?: EntityScopeKind; newTab?: boolean; root?: boolean } = {}): Promise<void> {
+	// A ref off a row the streaming service answered names it by that service.
+	const ref = normalizeCatalogRef(asked);
+	const shown = shownEntity();
+	if (!opts.newTab && shown && sameEntity(shown.entity, ref)) {
+		if (opts.scope && opts.scope !== shown.scope) void setEntityScope(opts.scope);
+		return;
+	}
+	// The library's half answers at once: it names the entity by the ids the
+	// library holds (a stable identity for the history), and says whether
+	// there are local files to open on.
+	let local: EntityHeaderData | null = null;
+	try {
+		local = await entityApi.page(ref, { localOnly: true });
+	} catch (err) {
+		log.for('entity-page').warn('local header failed', { kind: ref.kind }, err);
+	}
+	const entity: EntityRef = local ? { ...local.ref, ...(ref.within ? { within: ref.within } : {}) } : ref;
+	// Which side it opens on: where you are browsing. A library tab opens on
+	// your files when there are any; Discover (and a page already on World)
+	// opens on the catalogue when it can be asked.
+	const prefer: EntityScopeKind = shown ? shown.scope : shell.activeView() === 'discover' ? 'world' : 'owned';
+	const hasFiles = (local?.owned.count ?? 0) > 0;
+	const canAsk = local?.world.reason === 'pending';
+	const scope = opts.scope ?? (prefer === 'owned' ? (hasFiles || !canAsk ? 'owned' : 'world') : (canAsk ? 'world' : 'owned'));
+	let host: EntityHost;
+	if (opts.newTab) {
+		const open = navHistory.pageTabs();
+		if (open.length >= PAGE_TABS_CAP) {
+			// The oldest tab that is not the one in front makes room.
+			const oldest = open.find((t) => t.id !== navHistory.activeTab());
+			if (oldest) {
+				navHistory.closePageTab(oldest.id);
+				showToast('Closed the oldest page tab', { sub: entryLabel(oldest.entry), kind: 'info', durationMs: 2500 });
+			}
+		}
+		host = navHistory.openPageTab(navHistory.activeTab() ?? shell.activeSource());
+	} else {
+		const tab = navHistory.activeTab();
+		host = tab === 'discover' || isPageTab(tab) ? tab : shell.activeSource();
+	}
+	// `root`: opened from the tab's own navigation (the sidebar), not from
+	// something on the page — no breadcrumb back.
+	await navigate({ kind: 'entity', host, entity, scope }, { drill: !opts.newTab && !opts.root });
+}
+
+// The toolbar's Owned / World switch (layouts/MainPane.tsx): the open page's
+// side and what each side holds. Null off a page — the toolbar then shows
+// its "This device" chip there instead.
+function pageScopeView(): PageScopeView | null {
+	const ent = shownEntity();
+	if (!ent) return null;
+	const h = entityPage.header();
+	const kind = ent.entity.kind;
+	const world = h?.world.available ? (kind === 'album' ? h.world.trackCount : h.world.releaseCount) : null;
+	const worldHint = !h ? ''
+		: h.world.available && h.world.via ? (kind === 'album' ? 'The whole release, as Spotify lists it' : 'What Spotify lists, until the catalogue knows this artist')
+		: h.world.available ? (kind === 'album' ? 'The whole release, from the catalogue' : 'Every release the catalogue knows')
+			: worldOffText(h.world.reason, kind);
+	return { scope: ent.scope, owned: h ? h.owned.count : null, world, worldHint };
+}
+
+// Owned ↔ World: the same place (the entry keeps its id, its parent and its
+// breadcrumb), showing its other side.
+async function setEntityScope(scope: EntityScopeKind): Promise<void> {
+	const ent = shownEntity();
+	if (!ent || ent.scope === scope) return;
+	const loc: NavLocation = { kind: 'entity', host: ent.host as EntityHost, entity: ent.entity, scope };
+	const cur = navHistory.current();
+	if (cur?.location.kind === 'entity') navHistory.replace({ ...cur, location: loc });
+	await applyLocation(loc, null, { refresh: false });
+}
+
+// What a tab shows the first time it is visited (nothing in its history yet).
+function initialLocationOf(tab: NavTab): NavLocation {
+	if (tab === 'discover') return discoverLocation();
+	if (tab === 'interested' || tab === 'basket') return { kind: 'tag', view: tab };
+	if (tab === 'downloads') return { kind: 'downloads' };
+	if (tab === 'sync') return { kind: 'sync' };
+	const source = isPageTab(tab) ? shell.activeSource() : tab;
+	return { kind: 'tracks', source, scope: sourceTabScope(source) };
+}
+
+// Close a page tab. The one in front hands over to the tab it was opened
+// from (or its neighbour) first, so there is always something showing.
+async function closePageTab(id: PageTabId): Promise<void> {
+	if (navHistory.activeTab() === id) {
+		const target = navHistory.closeTarget(id) ?? shell.activeSource();
+		await switchToTab(target, () => initialLocationOf(target));
+	}
+	navHistory.closePageTab(id);
+}
+
+async function followEntity(following: boolean): Promise<void> {
+	const h = entityPage.header();
+	if (!h) return;
+	const { ref } = h;
+	try {
+		if (!following) {
+			if (!ref.catalogId) return;
+			await catalogApi.unfollow(ref.catalogId);
+			showToast('Unfollowed', { sub: ref.name, kind: 'info', durationMs: 2500 });
+		} else {
+			// By the catalogue's object when it has one; else by what a follow
+			// can register it from — a label's name, an artist's Spotify page.
+			const target = ref.catalogId ? { objectId: ref.catalogId }
+				: ref.kind === 'label' ? { labelName: ref.name }
+					: ref.kind === 'artist' && ref.spotifyId ? { url: `https://open.spotify.com/artist/${ref.spotifyId}` }
+						: null;
+			if (!target) {
+				showToast('Nothing to follow this by yet', { sub: 'The catalogue does not know it, and the library holds no Spotify page for it', kind: 'info' });
+				return;
+			}
+			await catalogApi.follow(target);
+			showToast('Following', { sub: `${ref.name} — new releases arrive in Discover`, kind: 'info', durationMs: 3000 });
+		}
+		await entityPage.refresh();
+	} catch (err) {
+		showToast(following ? 'Follow failed' : 'Unfollow failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+	}
+}
+
+// The streaming service catalogue rows play through (Settings → Playback);
+// read once and kept, updated by the setting's own change.
+let primaryStreaming: StreamingService | null = null;
+async function refreshPrimaryStreaming(): Promise<void> {
+	try {
+		primaryStreaming = (await entityApi.primaryStreaming()).service;
+		player.setPrimaryStreaming(primaryStreaming);
+	} catch (err) {
+		log.for('entity-page').warn('primary streaming read failed', undefined, err);
+	}
+}
+
+function showCatalogRowMenu(evt: MouseEvent, t: Track, selectedIds: readonly string[]): void {
+	// The rows selected with it — the lookup acts on all of them.
+	const picked = new Set(selectedIds);
+	const selection = picked.has(t.id) && picked.size > 1 ? getMainTracks().filter((row) => picked.has(row.id)) : [t];
+	const { items, handlers } = buildCatalogRowMenu(t, {
+		primary: primaryStreaming,
+		play: (row) => playFromMainList(row),
+		pin: (row) => { void pinCatalogRow(row); },
+		open: (ref, gesture) => { void openEntity(ref, { newTab: gesture.newTab }); },
+		openLink: (url, source) => { void (source === 'spotify' ? shellApi.openSpotify(url) : shellApi.openExternal(url)); },
+		copyLink: (url, service) => {
+			void shellApi.copyText(url).then(
+				() => showToast(`Copied ${service} URL`, { sub: url, kind: 'success' }),
+				(err) => showToast('Copy failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' }),
+			);
+		},
+		enrich: (rows) => { void enrichCatalogRows(rows); },
+		// A page read from the streaming service has no catalogue rows to
+		// look up yet: the lookups start once the catalogue holds it.
+		enrichBlocked: entityPage.header()?.world.via ? 'Available once the catalogue has this page (it is being registered now)' : null,
+	}, selection);
+	openContextMenu(items, handlers, { at: evt });
+}
+
+// The stores' BPM, key, genre and label for catalogue rows, asked for by hand
+// (core entity/work.ts enrich): what is found lands on the rows as the page's
+// work events, so this only says how it went.
+async function enrichCatalogRows(rows: Track[]): Promise<void> {
+	const ids = [...new Set(rows.map((t) => t.catalog?.recordingId).filter((id): id is string => !!id))];
+	if (!ids.length) return;
+	const many = ids.length > 1;
+	showToast(many ? `Looking up ${ids.length} tracks at the stores…` : 'Looking it up at the stores…', { sub: many ? undefined : rows[0]!.title, kind: 'info', durationMs: 2500 });
+	try {
+		const res = await entityApi.enrich(ids);
+		if (res.asked === 0) showToast('Nothing to look up', { sub: 'The page was left, or the store lookups are switched off', kind: 'info' });
+		else if (res.found === 0) showToast(many ? 'The stores had none of them' : 'The stores do not have it', { sub: 'Beatport and Traxsource were asked', kind: 'info', durationMs: 4000 });
+		else showToast(many ? `Enriched ${res.found} of ${res.asked} tracks` : 'Enriched', { sub: many ? undefined : rows[0]!.title, kind: 'success', durationMs: 3000 });
+	} catch (err) {
+		showToast('Lookup failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+	}
+}
+
+// A catalogue recording into the library, as an Interested track — the same
+// promotion a feed track takes (through its Spotify id).
+async function pinCatalogRow(t: Track): Promise<void> {
+	const spotifyId = t.catalog?.streamIds.spotify;
+	if (!spotifyId) return;
+	try {
+		const detail = await kbApi.resolve({ kind: 'source-ref', source: 'spotify', sourceKind: 'track', sourceId: spotifyId, entityKind: 'track', name: t.title });
+		await kbApi.promote(detail.entity.id, { pin: true });
+		showToast('Pinned to Interested', { sub: t.title, kind: 'info', durationMs: 2500 });
+		// The recording is a library track now: read the page's rows again.
+		entityPage.forgetWorlds();
+		void refreshTagCounts();
+		void renderTracks();
+	} catch (err) {
+		showToast('Pin failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+	}
+}
+
+// Play a row of the main list into the visible list's queue.
+function playFromMainList(t: Track): void {
+	shell.notePlaybackOrigin();
+	player.play(t, [...getMainTracks()]).catch(reportPlayFailure);
+}
+
+function reportPlayFailure(err: unknown): void {
+	if (err instanceof player.TidalNotReadyError) {
+		showToast('Tidal playback', { sub: 'Coming soon', kind: 'info' });
+	} else {
+		showToast('Playback failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+	}
+}
+
+// A group header's title was clicked: the album's / artist's / label's page.
+// False when the group names nothing a page can be opened by.
+function openGroupPage(g: GroupInfo, newTab: boolean): boolean {
+	const first = g.tracks[0];
+	let ref: EntityRef | null = null;
+	if (g.field === 'album') {
+		if (g.albumId?.startsWith(CATALOG_ALBUM_PREFIX)) ref = { kind: 'album', name: g.title, catalogId: g.albumId.slice(CATALOG_ALBUM_PREFIX.length) };
+		else if (g.albumId) ref = { kind: 'album', name: g.title, libraryId: g.albumId };
+	} else if (g.field === 'artist') {
+		const main = first ? mainArtistOf(first) : null;
+		const cat = catalogArtistId(main?.id);
+		if (cat) ref = { kind: 'artist', name: g.title, catalogId: cat };
+		else if (main?.id) ref = { kind: 'artist', name: g.title, libraryId: main.id };
+	} else {
+		ref = { kind: 'label', name: g.title, catalogId: first?.catalog?.labelId ?? null };
+	}
+	if (!ref) return false;
+	void openEntity(ref, { newTab });
+	return true;
+}
+
+// Gesture hint for the NEXT navigate / recordNavigation call, set by the
+// handler that triggers it synchronously (the sidebar ↑/↓ commands) and
+// consumed on read.
 let pendingNavGesture: NavGesture | null = null;
-let pendingRecordMode: 'push' | 'replace' | null = null;
 
 function newEntry(loc: NavLocation, label?: string, gesture: NavGesture | null = null, parentId: number | null = null): NavEntry {
 	return makeEntry(loc, label ?? locationLabel(loc), { gesture, parentId });
@@ -4212,8 +4720,7 @@ function recordEntry(loc: NavLocation, opts: NavigateOpts = {}): void {
 	const gesture = pendingNavGesture;
 	pendingNavGesture = null;
 	navHistory.updateCurrentRestore(captureRestore());
-	let mode = opts.mode ?? pendingRecordMode ?? 'push';
-	pendingRecordMode = null;
+	let mode = opts.mode ?? 'push';
 	const cur = navHistory.current();
 	if (mode === 'push' && gesture === 'sidebar-step' && cur?.gesture === 'sidebar-step' && Date.now() - cur.createdAt < SIDEBAR_STEP_COALESCE_MS) {
 		mode = 'replace';
@@ -4237,6 +4744,12 @@ async function navigate(loc: NavLocation, opts: NavigateOpts = {}): Promise<void
 async function switchToTab(tab: NavTab, initial: () => NavLocation): Promise<void> {
 	if (navHistory.activeTab() === tab) {
 		const cur = navHistory.current();
+		// On a page, the tab is the way home: its own root (a page tab has none).
+		if (cur?.location.kind === 'entity') {
+			if (tab === 'discover') await navigate(feedLocation());
+			else if (!isPageTab(tab)) await navigate(initial());
+			return;
+		}
 		if (tab === 'discover' && cur) await applyLocation(cur.location, null, { refresh: true });
 		else if (shell.activeView() === 'tracks' && shell.currentJit()) await navigate({ kind: 'tracks', source: shell.activeSource(), scope: { type: 'all' } });
 		return;
@@ -4275,10 +4788,11 @@ function paintScopeTitle(): void {
 	const titleEl = document.getElementById('playlist-title');
 	if (!titleEl) return;
 	const view = shell.activeView();
-	const jitNow = shell.currentJit();
-	const text = view === 'interested' ? 'Interested'
-		: view === 'basket' ? 'Basket'
-			: scopeTitle(currentTracksScope());
+	const ent = shell.currentEntity();
+	const text = ent ? (entityPage.header()?.ref.name || ent.entity.name)
+		: view === 'interested' ? 'Interested'
+			: view === 'basket' ? 'Basket'
+				: scopeTitle(currentTracksScope());
 	const cur = navHistory.current();
 	const chain = navHistory.ancestors();
 	titleEl.replaceChildren();
@@ -4305,12 +4819,6 @@ function paintScopeTitle(): void {
 	here.className = 'scope-crumb is-current';
 	here.textContent = text ?? (cur ? locationLabel(cur.location) : '');
 	titleEl.append(here);
-	// Artist scope — the closest thing to an artist page: the name plus a
-	// row of provider links (direct where the library knows the provider's
-	// artist id, a search otherwise). Async: the text lands first, the
-	// links follow.
-	const scopedArtistId = artistIdOfJit(jitNow);
-	if (jitNow && scopedArtistId) void renderArtistScopeLinks(titleEl, scopedArtistId, jitNow.name.replace(/^Artist: /, ''));
 }
 
 // Breadcrumb click: a targeted traversal to an ancestor entry — its tab is
@@ -4339,8 +4847,8 @@ async function traverseToEntry(id: number): Promise<void> {
 	}
 }
 
-// A surface that moves itself (Discover's feed toolbar, a journey hop)
-// reports where it is about to land — called BEFORE it applies the change,
+// A surface that moves itself (Discover's feed toolbar) reports where it is
+// about to land — called BEFORE it applies the change,
 // so the snapshot still describes the view being left.
 function recordNavigation(loc: NavLocation, label?: string): void {
 	recordEntry(loc, { label });
@@ -4395,6 +4903,8 @@ function toggleAgentDock(): void {
 // references ("in my library") override it (see core's SYSTEM_PROMPT rules).
 function captureAgentViewContext(): AgentViewContext {
 	const view = shell.activeView();
+	const ent = shownEntity();
+	if (ent) return { view, page: { kind: ent.entity.kind, name: entityPage.header()?.ref.name || ent.entity.name, scope: ent.scope } };
 	if (view === 'discover') {
 		const lenses = discoverView?.getLenses() ?? [];
 		return { view, discover: { mode: currentDiscoverMode, ...(lenses.length > 0 ? { lenses } : {}) } };
@@ -4443,21 +4953,6 @@ function mountAgentDock(): void {
 		getViewContext: () => captureAgentViewContext(),
 	});
 	setAgentDockOpen(localStorage.getItem(AGENT_DOCK_KEY) === '1');
-}
-
-// App-wide "Start Journey" entry point (track context menus, feed cards):
-// jump to Discover in Journeys mode and create the journey from the seed.
-function startJourneyFromSeed(seed: JourneySeed): void {
-	void (async () => {
-		// Land on the journey list first (an entry of its own), then let the
-		// JourneyView report the created journey's node — which REPLACES
-		// that list entry so Back from the new journey returns to where the
-		// seed came from, not to an empty list the user never looked at.
-		await navigate({ kind: 'discover', mode: 'journeys', journeyId: null, nodeId: null });
-		pendingRecordMode = 'replace';
-		try { await journeyView?.startFromSeed(seed); }
-		finally { pendingRecordMode = null; }
-	})();
 }
 
 // Populate syncRows from the known-playlists cache so the table shows a
@@ -4716,41 +5211,19 @@ function artistScopeForTab(src: SourceTab): ArtistScope {
 }
 const TAB_LABEL: Record<SourceTab, string> = { spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Rekordbox' };
 
-// The artist id behind the loaded JIT when it is an "Artist: X" scope — the
-// query the chips / drill / folder all build is exactly `artistid={id}`.
-function artistIdOfJit(jit: JitPlaylist | null): string | null {
-	const m = jit?.query.match(/^artistid=\{([^}]+)\}$/);
-	return m?.[1] ?? null;
+// The library artist the pane is about — what the Artists folder marks as
+// selected: the artist whose page is open, or the one an `artistid={id}`
+// search is scoped to (a pinned search from before artists had pages).
+function openArtistId(): string | null {
+	const ent = shownEntity();
+	if (ent?.entity.kind === 'artist') return ent.entity.libraryId ?? null;
+	return shell.currentJit()?.query.match(/^artistid=\{([^}]+)\}$/)?.[1] ?? null;
 }
 // After a rename/merge: refetch the folder, then the tracklist (credits on
 // rows changed) and the sidebar counts follow through the signals.
 async function afterArtistMutation(): Promise<void> {
 	await loadArtists();
 	await renderTracks();
-}
-// Paint the provider link row into the scope title. Re-checks that the same
-// artist scope is still open when the links arrive (the user may have moved
-// on) so a slow lookup never decorates the wrong title.
-async function renderArtistScopeLinks(titleEl: HTMLElement, artistId: string, name: string): Promise<void> {
-	let links: ArtistLink[] = [];
-	try { links = await window.api['artists:links'](artistId); } catch { /* links are optional */ }
-	if (artistIdOfJit(shell.currentJit()) !== artistId) return;
-	// Two paints of the same scope in flight (lazy sync, a refresh) must not
-	// stack two link rows.
-	titleEl.querySelector('.scope-links')?.remove();
-	const row = document.createElement('span');
-	row.className = 'scope-links';
-	for (const l of artistExternalLinks(name, links)) {
-		const b = document.createElement('button');
-		b.type = 'button';
-		b.className = 'scope-link';
-		b.classList.toggle('is-direct', l.direct);
-		b.textContent = l.label;
-		b.title = l.direct ? `Open ${name} on ${l.label}` : `Search ${l.label} for ${name}`;
-		b.addEventListener('click', (e) => { e.preventDefault(); void window.api['shell:open-external'](l.url); });
-		row.appendChild(b);
-	}
-	titleEl.appendChild(row);
 }
 
 function showArtistContextMenu(evt: MouseEvent, id: string): void {
@@ -4978,6 +5451,15 @@ async function boot(): Promise<void> {
 		renderLibraryFoldersModalIfOpen,
 		getDeck: () => deck,
 		getAutoplayNext: player.getAutoplayNext,
+		getPrimaryStreaming: () => primaryStreaming,
+		setPrimaryStreaming: (service) => {
+			// Kept in core (app_setting): one value for the dev and the packaged app.
+			primaryStreaming = service;
+			player.setPrimaryStreaming(service);
+			void entityApi.setPrimaryStreaming(service).catch((err) => {
+				showToast('Could not save the setting', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+			});
+		},
 		setAutoplayNext: player.setAutoplayNext,
 	});
 	initEditTrackFeature({
@@ -5053,7 +5535,7 @@ async function boot(): Promise<void> {
 		openPlaylistById: (id) => openPlaylistById(id, { drill: true }),
 		enterJitScope: (jit, selectTrackId) => enterJitScope(jit, selectTrackId, { drill: true }),
 		cssEscape,
-		startJourneyFromTrack: (trackId) => startJourneyFromSeed({ kind: 'library-track', trackId }),
+		openEntity: (ref, opts) => { void openEntity(ref, opts); },
 		getPinnedSearches: () => pinnedSearches(),
 		unpinSearch: (id) => { void unpinSearch(id); },
 		createPlaylistFromPinned: (id) => { void createPlaylistFromPinned(id); },
@@ -5119,7 +5601,7 @@ async function boot(): Promise<void> {
 				onForward: goForward,
 			},
 			tracklist: {
-				groupBy: () => uiSettingsSignal().trackGroupBy,
+				groupBy: effectiveGroupBy,
 				rowLines: () => uiSettingsSignal().trackRowLines,
 				open: tracklistMenu,
 				onGroupClick: (anchor) => openTracklistMenu('group', anchor),
@@ -5132,6 +5614,8 @@ async function boot(): Promise<void> {
 					updateUiSettings((d) => { d.hideRemoteTracks = !d.hideRemoteTracks; });
 					void renderTracks();
 				},
+				page: pageScopeView,
+				onPageScope: (scope) => { void setEntityScope(scope); },
 			},
 		});
 	}
@@ -5143,6 +5627,70 @@ async function boot(): Promise<void> {
 		applyPlayerMode: setCurrentPlayerModeSignal,
 		deckPlayerModePref,
 	});
+	// Entity page header — mounted once; it shows whatever page is open
+	// (features/entityPage.ts signals) and acts through these callbacks.
+	const entityHeaderHost = document.getElementById('entity-header');
+	if (entityHeaderHost) {
+		mountEntityHeader(entityHeaderHost, {
+			header: entityPage.header,
+			opened: () => { const e = shell.currentEntity(); return e ? { kind: e.entity.kind, name: e.entity.name } : null; },
+			pending: entityPage.headerPending,
+			scope: () => shell.currentEntity()?.scope ?? 'owned',
+			world: entityPage.world,
+			work: entityPage.work,
+			compact: entityHeaderCompact,
+			similar: { state: entitySimilar.state, chips: entitySimilar.chips, canResearch: entitySimilar.canResearch },
+			onOpen: (ref, gesture) => { void openEntity(ref, { newTab: gesture.newTab }); },
+			onFollow: followEntity,
+			onLink: (link) => { if (link.url) void (link.source === 'spotify' ? shellApi.openSpotify(link.url) : shellApi.openExternal(link.url)); },
+			onResearchSimilar: () => { const h = entityPage.header(); if (h) void entitySimilar.research(h.ref); },
+			onRetryWorld: () => { void entityPage.retry().catch(() => {}).then(() => renderTracks()); },
+		});
+		createRoot(() => { createEffect(on(entityPage.header, onEntityHeader, { defer: true })); });
+		// The header closes as the list scrolls and opens again at its top
+		// (features/entityHeaderCollapse.ts). It lies over the list's scroll
+		// host — #tracks-view, which outlives every list remount — and the
+		// list keeps the room for it at the top of its content.
+		const tracksHost = document.getElementById('tracks-view');
+		if (tracksHost) {
+			const collapse = mountHeaderCollapse({
+				host: entityHeaderHost,
+				scroller: tracksHost,
+				active: () => shownEntity() !== null,
+				onInset: (inset, lead) => mainTrackList?.setTopInset(inset, lead),
+				onCollapsed: setEntityHeaderCompact,
+			});
+			entityHeaderCollapse = collapse;
+			// Whatever changes what the header shows changes its height: measured
+			// again once the header has rendered it (its own effects run in this
+			// same batch; the region effect unhides the host in it too).
+			createRoot(() => {
+				createEffect(() => {
+					entityPage.header(); entityPage.headerPending(); entityPage.world(); entityPage.work();
+					entitySimilar.state(); entitySimilar.chips();
+					shell.currentEntity(); shell.showsTracksLayout();
+					queueMicrotask(() => collapse.remeasure());
+				});
+			});
+		}
+		// Core works for the page in front (reads the stores, fills in rows):
+		// a row it filled in is repainted in place, releases or tracklists it
+		// added repaint the list from the pages read again.
+		entityPage.setListPort({
+			rowsPatched: (rows) => {
+				if (shownEntity()?.scope !== 'world') return;
+				for (const t of rows) {
+					if (!tracksData.get(t.id)) continue;
+					tracksData.upsert(t);
+					const i = mainTracksUnfiltered.findIndex((x) => x.id === t.id);
+					if (i >= 0) mainTracksUnfiltered[i] = t;
+					mainTrackList?.patchOne(t);
+				}
+			},
+			worldReloaded: () => { if (shownEntity()?.scope === 'world') void renderTracks(); },
+		});
+	}
+	void refreshPrimaryStreaming();
 	// Dirty-replay for the gated tracks repaint: a render requested while
 	// the table's region was inactive runs exactly once on return.
 	createEffect(() => {
@@ -5572,7 +6120,7 @@ async function boot(): Promise<void> {
 	// on the track that was at the top. The memo dedupes so unrelated UI
 	// settings don't remount.
 	createRoot(() => {
-		const layoutKey = createMemo(() => { const s = uiSettingsSignal(); return `${s.trackRowLines}|${s.trackGroupBy}`; });
+		const layoutKey = createMemo(() => `${uiSettingsSignal().trackRowLines}|${effectiveGroupBy()}|${listContext()}`);
 		createEffect(on(layoutKey, () => { rebuildMainTrackList(); updateReorderableState(); }, { defer: true }));
 		// Album details landed → repaint the album group headers in view.
 		createEffect(on(albums.rev, () => mainTrackList?.refreshGroupHeaders(), { defer: true }));
@@ -5667,21 +6215,32 @@ async function boot(): Promise<void> {
 					queuedCount: s.queuedCount,
 					completedSession: s.completedSession,
 					lastError: s.lastError,
+					health: s.health,
+					lastCompletedAt: s.lastCompletedAt,
 				};
 			},
+			onAnalyzerRetry: retryAnalyzer,
 			playerMode: currentPlayerMode,
 			visibleSourceTabs: visibleSourceTabsMemo,
 			visibleStateTabs:  visibleStateTabsMemo,
 			zoomLevel: zoomLevelSignal,
 			sourceSyncTooltip: sourceSyncTooltipSignal,
-			// Discover pulses while the feed fetches — a Refresh click or the
-			// background poll — or while this desktop's catalogue worker reads
-			// a check's follows, and turns orange once a source of that pass failed.
+			// Discover pulses while the feed fetches for a click (Refresh, Load
+			// more) or while this desktop's catalogue worker reads follows, and
+			// turns orange once a source of a pass failed. The background poll
+			// alone does not pulse it (feedRefreshText.ts passShown).
 			stateSyncTooltip: () => {
 				const s = feedRefresh.status();
 				const tooltip = statusTooltip(s, feedRefresh.worker());
 				return tooltip ? { discover: { tooltip, alert: s.pass?.steps.some((step) => step.state === 'error') ?? false } } : {};
 			},
+			pageTabs: () => navHistory.pageTabs().map(({ id, entry }) => ({
+				id,
+				title: entryLabel(entry),
+				kind: entry.location.kind === 'entity' ? entry.location.entity.kind : 'artist',
+			})),
+			onPageClick: (id) => { if (isPageTab(id)) void switchToTab(id, () => initialLocationOf(id)); },
+			onPageClose: (id) => { if (isPageTab(id)) void closePageTab(id); },
 			userInitials: 'GB',
 			onSourceClick: (src) => {
 				// A tab switch: the tab's own history resumes where it was left;
@@ -6030,7 +6589,7 @@ async function boot(): Promise<void> {
 				showPinnedSearchContextMenu(evt, id);
 			},
 			onArtistActivate: (id, name) => {
-				void enterJitScope({ name: `Artist: ${name}`, query: buildExactAttr('artistid', id) });
+				void openEntity({ kind: 'artist', name, libraryId: id }, { root: true });
 			},
 			onArtistsCaretToggle: () => {
 				const next = !artistsExpanded();
@@ -6123,20 +6682,33 @@ function mountMainTrackList(): void {
 	const host = document.getElementById('tracks-view');
 	if (!host) return;
 	const ui = uiSettingsSignal();
-	mountedLayout = `${ui.trackRowLines}|${ui.trackGroupBy}`;
+	const groupBy = effectiveGroupBy();
+	mountedLayout = `${ui.trackRowLines}|${groupBy}`;
+	// A fresh list starts without the room an open page's header needs: handed
+	// over right after the mount (below).
+	const headerRoom = entityHeaderCollapse?.inset() ?? { inset: 0, lead: 0 };
+	const profile = listProfile();
 	mainTrackList = mountTrackList(host, [], {
 		showHeader: true,
 		virtualize: true,
 		columns: (mountedColumns = currentVisibleColumns()),
 		rowLines: ui.trackRowLines,
 		fields: currentVisibleFields(),
-		groupBy: ui.trackGroupBy,
-		collapsedGroups: collapsedGroupsFor(ui.trackGroupBy),
+		groupBy,
+		gutter: profile.gutter,
+		groupIndent: profile.groupIndent,
+		sourcesByIndex: profile.sourcesByIndex,
+		collapsedGroups: collapsedGroupsFor(groupBy),
 		// Album group headers read the release's own details (title, album
 		// artists, date, label, type) from the albums store; the list asks
-		// for the ids it shows and repaints its headers when they land.
-		albumInfo: (id) => albums.get(id),
-		onNeedAlbums: (ids) => albums.ensure(ids),
+		// for the ids it shows and repaints its headers when they land. A
+		// catalogue release (an entity page's World side) has no library
+		// album behind it: its details come with the page's rows.
+		albumInfo: (id) => (id.startsWith(CATALOG_ALBUM_PREFIX) ? entityPage.albumInfo(id) : albums.get(id)),
+		onNeedAlbums: (ids) => albums.ensure(ids.filter((id) => !id.startsWith(CATALOG_ALBUM_PREFIX))),
+		// A group header's title opens the album's (artist's, label's) page.
+		onGroupOpen: (g, gesture) => openGroupPage(g, gesture?.newTab === true),
+		onNearEnd: () => { void loadMoreWorldRows(); },
 		sort: { column: state.sortColumn, dir: state.sortDir },
 		resizableColumns: true,
 		initialColumnWidths: getAllColumnWidths(),
@@ -6189,38 +6761,43 @@ function mountMainTrackList(): void {
 			// (source-level view) — we don't try to remember per-source.
 			const activeId = shell.currentPlaylistId() ?? shell.currentFolderId();
 			if (activeId) setPlaylistSort(activeId, { column: next.column, dir: next.dir });
+			// A page remembers its sort per kind of page (every artist page
+			// opens the way the last one was left).
+			const ent = shownEntity();
+			if (ent) updateUiSettings((d) => { d.entityLayout[ent.entity.kind].sort = { column: next.column, dir: next.dir }; });
 			persistUiState();
 			void renderTracks();
 		},
 		onPlay: (t, all) => {
 			shell.notePlaybackOrigin();
-			player.play(t, all).catch((err) => {
-				if (err instanceof player.TidalNotReadyError) {
-					showToast('Tidal playback', { sub: 'Coming soon', kind: 'info' });
-				} else {
-					showToast('Playback failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
-				}
-			});
+			player.play(t, all).catch(reportPlayFailure);
 		},
-		// Artist chip click → "Artist: X" JIT scope keyed by Curator artist
-		// id (exact SQL pushdown; survives renames/merges via aliases).
-		onArtistClick: (artistId, name) => {
-			void enterJitScope({ name: `Artist: ${name}`, query: buildExactAttr('artistid', artistId) }, undefined, { drill: true });
+		// Artist chip → the artist's page. A library row names the artist by
+		// its Curator id, a catalogue row by the catalogue's.
+		onArtistClick: (artistId, name, _t, gesture) => {
+			const cat = catalogArtistId(artistId);
+			void openEntity(cat ? { kind: 'artist', name, catalogId: cat } : { kind: 'artist', name, libraryId: artistId }, { newTab: gesture?.newTab });
 		},
-		// Label / genre / tag click → the same drill scopes the context menu's
-		// "Navigate to" offers (exact attr match; a tag drills via its #name).
-		onDrillClick: (kind, value) => {
+		// Label → the label's page. Genre / tag → the drill scopes the context
+		// menu's "Navigate to" offers (exact attr match; a tag via its #name).
+		onDrillClick: (kind, value, t, gesture) => {
+			if (kind === 'label') {
+				void openEntity({ kind: 'label', name: value, catalogId: t.catalog?.labelId ?? null }, { newTab: gesture?.newTab });
+				return;
+			}
 			const query = kind === 'tag' ? `#"${value.replace(/"/g, '')}"` : buildExactAttr(kind, value);
-			const title = kind === 'tag' ? 'Tag' : kind === 'label' ? 'Label' : 'Genre';
-			void enterJitScope({ name: `${title}: ${value}`, query }, undefined, { drill: true });
+			void enterJitScope({ name: `${kind === 'tag' ? 'Tag' : 'Genre'}: ${value}`, query }, undefined, { drill: true });
 		},
 		onContextMenu: (evt, t, _all, selectedIds) => {
+			// A catalogue row has its own short menu (nothing of the library's
+			// applies to it); a library row's menu never carries one along.
+			if (isCatalogRow(t)) { showCatalogRowMenu(evt, t, selectedIds); return; }
 			// Unified, command-derived track menu. The selection resolves to full
 			// Track objects (they carry `sources`, which every command predicate
 			// reads); the view tells the curate commands whether to read as
 			// "Mark as Interested" or "Unpin".
 			const tracks = selectedIds.length > 1
-				? selectedIds.map((id) => tracksData.get(id)).filter((x): x is Track => !!x)
+				? selectedIds.map((id) => tracksData.get(id)).filter((x): x is Track => !!x && !isCatalogRow(x))
 				: [t];
 			void showTrackMenu(evt, { tracks, view: shell.activeView(), source: shell.activeSource(), playlist: currentEditablePlaylist(), jit: shell.currentJit() });
 		},
@@ -6235,6 +6812,7 @@ function mountMainTrackList(): void {
 			persistUiState();
 		},
 	});
+	mainTrackList.setTopInset(headerRoom.inset, headerRoom.lead);
 }
 
 // ─── Track-list Group chip ──────────────────────────────────────────────────
@@ -6246,19 +6824,21 @@ const GROUP_MENU_LABELS: Record<GroupBy, string> = { none: 'None', artist: 'Arti
 
 function openTracklistMenu(kind: 'group', anchor: HTMLElement): void {
 	if (tracklistMenu() === kind) { dismissContextMenu(); return; }
-	const ui = uiSettingsSignal();
+	const current = effectiveGroupBy();
+	const pageKind = shownEntity()?.entity.kind ?? null;
 	const items: ContextMenuItem[] = [];
 	const handlers: Record<string, () => void> = {};
 	items.push({ kind: 'header', label: 'Group' });
 	for (const g of ['none', 'artist', 'album', 'label'] as const) {
-		items.push({ kind: 'radio', id: `group-${g}`, label: GROUP_MENU_LABELS[g], checked: ui.trackGroupBy === g });
-		handlers[`group-${g}`] = () => updateUiSettings((d) => { d.trackGroupBy = g; });
+		items.push({ kind: 'radio', id: `group-${g}`, label: GROUP_MENU_LABELS[g], checked: current === g });
+		// On a page the pick is that kind of page's own grouping, not the library's.
+		handlers[`group-${g}`] = () => updateUiSettings((d) => { if (pageKind) d.entityLayout[pageKind].groupBy = g; else d.trackGroupBy = g; });
 	}
 	// Bulk collapse — Alt+click on any group header does the same toggle.
 	items.push(
 		{ kind: 'divider' },
-		{ kind: 'item', id: 'collapse-all', label: 'Collapse all', disabled: ui.trackGroupBy === 'none' },
-		{ kind: 'item', id: 'expand-all', label: 'Expand all', disabled: ui.trackGroupBy === 'none' },
+		{ kind: 'item', id: 'collapse-all', label: 'Collapse all', disabled: current === 'none' },
+		{ kind: 'item', id: 'expand-all', label: 'Expand all', disabled: current === 'none' },
 	);
 	handlers['collapse-all'] = () => mainTrackList?.collapseAll();
 	handlers['expand-all'] = () => mainTrackList?.expandAll();
@@ -6292,8 +6872,11 @@ const COLUMN_LOCKED = new Set<Column>(['idx', 'art', 'title']);
 
 function showColumnVisibilityMenu(evt: MouseEvent): void {
 	const checkIcon = (cond: boolean) => `<span class="ctx-menu__check">${cond ? '✓' : ''}</span>`;
-	// Match is scope-driven (similarity scopes only), never a user toggle.
-	const toggleable = ALL_COLUMNS.filter((c) => !COLUMN_LOCKED.has(c) && c !== 'match');
+	// Match is scope-driven (similarity scopes only), never a user toggle;
+	// what the list's owner hides here (listProfile.ts) is not on offer either.
+	const profile = listProfile();
+	const groupBy = effectiveGroupBy();
+	const toggleable = ALL_COLUMNS.filter((c) => !COLUMN_LOCKED.has(c) && c !== 'match' && !profileHides(profile, c, groupBy));
 	const items: ContextMenuItem[] = toggleable.map((c) => ({
 		kind: 'item' as const,
 		id: c,
@@ -6505,24 +7088,30 @@ function openNamePrompt(opts: NamePromptOptions): void {
 // hold just says so.
 async function showArtistInLibrary(name: string): Promise<void> {
 	try {
+		// The playing track's own credit names the artist by id (a library
+		// row carries Curator artist ids aligned with its artists).
+		const t = player.currentTrack();
+		const i = t?.artists?.findIndex((a) => a.name === name) ?? -1;
+		const aid = i >= 0 ? t?.artistIds?.[i] : undefined;
+		if (aid) { await openEntity({ kind: 'artist', name, libraryId: aid }); return; }
 		const a = await window.api['artists:resolve'](name);
 		if (!a) { showToast('Not in your library', { sub: name, kind: 'info' }); return; }
 		// A click on an artist name is a drill-down from wherever it happened
-		// (Discover card, now-playing credit) — the breadcrumb leads back there.
-		await enterJitScope({ name: `Artist: ${a.name}`, query: buildExactAttr('artistid', a.id) }, undefined, { drill: true });
+		// (the now-playing credit) — the breadcrumb leads back there.
+		await openEntity({ kind: 'artist', name: a.name, libraryId: a.id });
 	} catch (err) {
 		showToast('Artist lookup failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
 	}
 }
 
-// "Open Artist in ▸ Open Locally" (features/artistOpenMenu.ts): the local
-// collection — the Rekordbox tab — scoped to the artist, from any tab. A
-// drill-down, so Back returns to where the menu was opened.
+// "Open Artist in ▸ Open Locally" (features/artistOpenMenu.ts): the artist's
+// page on its Owned side — the local files — in the tab the menu was opened
+// in. A drill-down, so Back returns to where that was.
 async function openArtistLocally(target: ArtistPagesTarget, libraryArtistId: string | null): Promise<void> {
 	try {
 		const a = libraryArtistId ? await window.api['artists:get'](libraryArtistId) : await window.api['artists:resolve'](target.name);
 		if (!a) { showToast('Not in your library', { sub: target.name, kind: 'info' }); return; }
-		await navigate({ kind: 'tracks', source: 'rekordbox', scope: { type: 'jit', jit: { name: `Artist: ${a.name}`, query: buildExactAttr('artistid', a.id) } } }, { drill: true });
+		await openEntity({ kind: 'artist', name: a.name, libraryId: a.id }, { scope: 'owned' });
 	} catch (err) {
 		showToast('Artist lookup failed', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
 	}
@@ -7061,6 +7650,14 @@ function jumpToPlayingTrackTab(): void {
 	// Same shape as the TopFrame tab clicks — a tab switch to the origin tab,
 	// which resumes its own history where it was left.
 	switch (origin.view) {
+		case 'page': {
+			// The page tab playback started from, while it is still open.
+			const tab = origin.pageTab;
+			if (isPageTab(tab) && navHistory.pageTabs().some((t) => t.id === tab)) { void switchToTab(tab, () => initialLocationOf(tab)); return; }
+			const source = origin.source;
+			void switchToTab(source, () => initialLocationOf(source));
+			return;
+		}
 		case 'interested':
 		case 'basket': {
 			const view = origin.view;
@@ -7287,6 +7884,17 @@ function wirePlayer(): void {
 	// two chords around its typing guard so they fire inside the filterbox
 	// like a browser's.
 	commands.register({
+		id: 'nav.closePageTab',
+		title: 'Close page tab',
+		keys: ['Mod+w'],
+		when: () => isPageTab(navHistory.activeTab()),
+		run: (evt) => {
+			evt.preventDefault();
+			const tab = navHistory.activeTab();
+			if (isPageTab(tab)) void closePageTab(tab);
+		},
+	});
+	commands.register({
 		id: 'nav.back',
 		title: 'Back',
 		keys: ['Alt+ArrowLeft'],
@@ -7314,7 +7922,9 @@ function wirePlayer(): void {
 	// are taken in visible order so a multi-action reads top-to-bottom.
 	const trackCtx = (): TrackSelectionContext => {
 		const sel = getSelectedTrackIds();
-		return { tracks: getMainTracks().filter((t) => sel.has(t.id)), view: shell.activeView(), source: shell.activeSource(), playlist: currentEditablePlaylist(), jit: shell.currentJit() };
+		// Catalogue rows (a page's World side) are not library tracks: no
+		// keyboard command (rate, organize, edit, delete) reaches them.
+		return { tracks: getMainTracks().filter((t) => sel.has(t.id) && !isCatalogRow(t)), view: shell.activeView(), source: shell.activeSource(), playlist: currentEditablePlaylist(), jit: shell.currentJit() };
 	};
 
 	// The old check was `evt.key === ' ' || evt.code === 'Space'` with no

@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Track } from '@curator/shared';
-import { buildDisplayList, groupIdentity, groupStats, mainArtistOf, rowHeight, TRACK_ROW_H, GROUP_HEAD_H, ALBUM_HEAD_H, GROUP_GAP_H } from './trackGroups.js';
+import { buildDisplayList, groupIdentity, groupStats, mainArtistOf, rowHeight, TRACK_ROW_H, GROUP_HEAD_H, LABEL_HEAD_H, ALBUM_HEAD_H, GROUP_GAP_H } from './trackGroups.js';
 
 let n = 0;
 function trk(p: Partial<Track> & { artist?: string }): Track {
@@ -104,11 +104,46 @@ describe('groupStats', () => {
 describe('rowHeight', () => {
 	it('maps track rows by line mode and adds the gap above every group after the first', () => {
 		const d = buildDisplayList([trk({ label: 'A' }), trk({ label: 'B' })], 'label');
-		expect(rowHeight(d.rows[0]!, 2)).toBe(GROUP_HEAD_H);
+		expect(rowHeight(d.rows[0]!, 2)).toBe(LABEL_HEAD_H);
 		expect(rowHeight(d.rows[1]!, 2)).toBe(TRACK_ROW_H[2]);
-		expect(rowHeight(d.rows[2]!, 1)).toBe(GROUP_HEAD_H + GROUP_GAP_H);
+		expect(rowHeight(d.rows[2]!, 1)).toBe(LABEL_HEAD_H + GROUP_GAP_H);
 		expect(rowHeight(d.rows[3]!, 1)).toBe(TRACK_ROW_H[1]);
 		const al = buildDisplayList([trk({ albumId: 'x' } as Partial<Track>)], 'album');
 		expect(rowHeight(al.rows[0]!, 2)).toBe(ALBUM_HEAD_H);
+		const ar = buildDisplayList([trk({ artists: [{ name: 'A' }] } as Partial<Track>), trk({ artists: [{ name: 'B' }] } as Partial<Track>)], 'artist');
+		expect(rowHeight(ar.rows[2]!, 2)).toBe(GROUP_HEAD_H + GROUP_GAP_H);
+	});
+
+	it("counts each track's place inside its own group, skipping what a collapsed group hides", () => {
+		const tracks = [trk({ label: 'A' }), trk({ label: 'B' }), trk({ label: 'A' }), trk({ label: 'B' }), trk({ label: 'B' }), trk({ label: 'C' })];
+		const d = buildDisplayList(tracks, 'label');
+		// A: two tracks, B: three, C: one — each group starts over.
+		expect(d.groupPos).toEqual([0, 1, 0, 1, 2, 0]);
+		expect(d.visibleTracks.map((t) => t.label)).toEqual(['A', 'A', 'B', 'B', 'B', 'C']);
+		expect(buildDisplayList(tracks, 'label', new Set(['label:b'])).groupPos).toEqual([0, 1, 0]);
+		expect(buildDisplayList(tracks, 'none').groupPos).toEqual([]);
+	});
+});
+
+describe('catalogue rows', () => {
+	const cat = (releaseId: string, synthetic = true) => ({ recordingId: 'r', releaseId, synthetic, libraryTrackId: null, streamIds: {}, links: [], albumArtistId: null, labelId: null });
+
+	it("files a row under the catalogue's release, whatever library album the row carries", () => {
+		const own = trk({ albumId: 'lib-album', albumTitle: 'Lailonie', catalog: cat('rel-1', false) } as Partial<Track>);
+		const synthetic = trk({ albumTitle: 'Lailonie', catalog: cat('rel-1') } as Partial<Track>);
+		const other = trk({ albumTitle: 'Lailonie', catalog: cat('rel-2') } as Partial<Track>);
+		expect(groupIdentity(own, 'album')).toEqual({ key: 'album:c:rel-1', title: 'Lailonie', missing: false, albumId: 'catalog:rel-1' });
+		expect(groupIdentity(synthetic, 'album').key).toBe('album:c:rel-1');
+		// Two releases of one title are two groups.
+		expect(groupIdentity(other, 'album').key).toBe('album:c:rel-2');
+		expect(groupStats([own, synthetic, other]).releaseCount).toBe(2);
+	});
+
+	it('files artists by name there: a library row and a catalogue row name one act by different ids', () => {
+		const own = trk({ artist: 'Marsh', artistIds: ['a1'], catalog: cat('rel-1', false) } as Partial<Track>);
+		const synthetic = trk({ artist: 'Marsh', artistIds: ['catalog:art-1'], catalog: cat('rel-1') } as Partial<Track>);
+		expect(groupIdentity(own, 'artist').key).toBe(groupIdentity(synthetic, 'artist').key);
+		// A plain library row still keys by its artist id.
+		expect(groupIdentity(trk({ artist: 'Marsh', artistIds: ['a1'] } as Partial<Track>), 'artist').key).toBe('artist:a1');
 	});
 });

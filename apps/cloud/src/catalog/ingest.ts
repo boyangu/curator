@@ -25,6 +25,7 @@ import {
 } from '@curator/protocol';
 import { nameFold, recordingKey } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
+import { isCreditStore, queueCredits } from './credits.js';
 import { foldAttrs, releaseAtOf, type FactRow } from './fold.js';
 import {
 	type ClaimParent,
@@ -63,6 +64,17 @@ export class Ingester {
 		const rep = await this.attachRepresentation(c, objectId);
 		await this.attachIdentifiers(c, objectId, rep.id);
 		await this.attachFacts(c, objectId);
+		if (rep.inserted) await this.creditsGap(c, objectId);
+	}
+
+	// A release gains a page on a store that credits every track in full, and
+	// the page came without its tracklist (a listing, a link someone found, a
+	// device's match): if Deezer alone credited the release's tracks, the page
+	// is read for their credits (credits.ts). A claim carrying its tracklist
+	// brings the credits itself.
+	private async creditsGap(c: CatalogClaim, objectId: string): Promise<void> {
+		if (c.kind !== 'release' || c.recordings?.length || !isCreditStore(c.provider)) return;
+		await queueCredits(this.tx, [objectId]);
 	}
 
 	// A claim's identifiers onto an object the claim's representation already
@@ -86,6 +98,7 @@ export class Ingester {
 		await this.attachIdentifiers(c, objectId, rep.id);
 		await this.attachFacts(c, objectId);
 		if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
+		if (rep.inserted) await this.creditsGap(c, objectId);
 		return { objectId, kind: c.kind, created: false };
 	}
 
@@ -180,6 +193,7 @@ export class Ingester {
 		await this.attachIdentifiers(c, objectId, repNew.id);
 		await this.attachFacts(c, objectId);
 		await this.attachRelationships(c, objectId, repNew.id, parent);
+		if (!created && repNew.inserted) await this.creditsGap(c, objectId);
 		if (created) await this.recordGaps(c, objectId);
 		return { objectId, kind: c.kind, created };
 	}
@@ -337,6 +351,10 @@ export class Ingester {
 				const rec = await this.claim({ ...r, artists: r.artists?.length ? r.artists : c.artists }, { ...self, position, artistFolds });
 				if (rec.kind === 'recording') await this.edge(objectId, 'release-recording', rec.objectId, sourceObjectId, null, position);
 			}
+			// Deezer's tracklist names a track's primary artist only: where no
+			// other store credited these tracks, the release's Spotify or
+			// Beatport page is read for the rest (credits.ts).
+			if (c.provider === 'deezer' && c.recordings?.length) await queueCredits(this.tx, [objectId]);
 			if (c.label) {
 				const label = await this.claim(c.label, self);
 				if (label.kind === 'label') await this.edge(objectId, 'release-label', label.objectId, sourceObjectId, null, null);

@@ -11,8 +11,10 @@
 //   workerDue    — every minute: the device offers its providers (never the
 //                  cloud's keyed ones) and its user's checked trackers (the
 //                  Refresh menu; cloud-only ones included, so the master
-//                  knows whether anyone wants them), takes or keeps the week,
-//                  runs the check a Refresh asked for, and is handed its due
+//                  knows whether anyone wants them) and how often the user
+//                  wants each kind read (the cursors are timed by it:
+//                  tracking.ts readCadenceOf), takes or keeps the week, runs
+//                  the check a Refresh asked for, and is handed its due
 //                  cursors of the checked trackers under a ten-minute lease
 //                  with the poll's calls reserved.
 //   workerReport — the polls, or the errors the readers met. A result whose
@@ -26,13 +28,13 @@
 // (tracking.ts providerPauses by holder): its IP and login are not the
 // cloud's.
 
-import { CATALOG_TRACKERS, type CatalogCheckReport, type CatalogProvider, type CatalogWorkerDueInput, type CatalogWorkerDueResult, type CatalogWorkerReportInput, type CatalogWorkerReportResult, type CatalogWorkerTask } from '@curator/protocol';
+import { CATALOG_TRACKERS, type CatalogCheckReport, type CatalogProvider, type CatalogReadCadenceChoices, type CatalogWorkerDueInput, type CatalogWorkerDueResult, type CatalogWorkerReportInput, type CatalogWorkerReportResult, type CatalogWorkerTask } from '@curator/protocol';
 import { callsPerPoll } from '@curator/catalog-readers';
 import type { Caller } from '../account/device-gate.js';
 import { num } from '../db/db.js';
 import type { Logger } from '../log.js';
 import { gated, type CatalogDeps } from './catalog.js';
-import { checkNow, providerPauses } from './tracking.js';
+import { checkNow, providerPauses, retimeCursors } from './tracking.js';
 import { applyPoll, deviceHolder, leaseDue, loadTarget, loadTrackers, releaseLease, reserveCalls, WORKER_LIVE_WINDOW, type TrackerRow } from './trackers/sweep.js';
 
 export type WorkerDeps = CatalogDeps & { log: Logger };
@@ -65,14 +67,21 @@ export async function workerDue(deps: WorkerDeps, userId: string, caller: Caller
 	// The check runs in the same transaction, whoever holds the week: what it
 	// makes due is leased below by the holder, or read by the cloud.
 	const { active, check } = await gated(deps, userId, caller, input.deviceId, async (tx) => {
+		// The choices on record, to see below whether this call changes them.
+		const [prev] = input.cadence ? await tx.query<{ cadence: string | null }>(`select cadence::text as cadence from curator.catalog_worker where user_id = $1`, [userId]) : [];
 		const rows = await tx.query<{ device_id: string }>(
-			`insert into curator.catalog_worker as k (user_id, device_id, providers, trackers, week_of, checked_in_at)
-			values ($1, $2, $3::text[], $4::text[], (date_trunc('week', now() at time zone 'utc'))::date, now())
-			on conflict (user_id) do update set device_id = excluded.device_id, providers = excluded.providers, trackers = excluded.trackers, week_of = excluded.week_of, checked_in_at = now()
+			`insert into curator.catalog_worker as k (user_id, device_id, providers, trackers, cadence, week_of, checked_in_at)
+			values ($1, $2, $3::text[], $4::text[], $5::text::jsonb, (date_trunc('week', now() at time zone 'utc'))::date, now())
+			on conflict (user_id) do update set device_id = excluded.device_id, providers = excluded.providers, trackers = excluded.trackers, cadence = excluded.cadence, week_of = excluded.week_of, checked_in_at = now()
 				where k.device_id = excluded.device_id or k.week_of < excluded.week_of or k.checked_in_at < now() - ${WORKER_LIVE_WINDOW}
 			returning device_id`,
-			[userId, input.deviceId, `{${providers.join(',')}}`, `{${input.trackers.join(',')}}`],
+			[userId, input.deviceId, `{${providers.join(',')}}`, `{${input.trackers.join(',')}}`, input.cadence ? JSON.stringify(input.cadence) : null],
 		);
+		// The holder's choices are the ones that count, like its trackers.
+		if (rows.length && input.cadence) {
+			const moved = await retimeCursors(tx, userId, prev?.cadence ? (JSON.parse(prev.cadence) as CatalogReadCadenceChoices) : null, input.cadence);
+			if (moved) deps.log.info('worker_cadence_retimed', { by: holder, moved, cadence: input.cadence });
+		}
 		let check: CatalogCheckReport | undefined;
 		if (input.check) {
 			const r = await checkNow(tx, { ...(input.check.kind ? { kind: input.check.kind } : { all: true }), userId, trackers: input.trackers });

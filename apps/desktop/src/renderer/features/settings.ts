@@ -53,6 +53,10 @@ export interface SettingsFeatureDeps {
 	// panel can read/write it without settings → player coupling.
 	getAutoplayNext(mode: PlayerMode): boolean;
 	setAutoplayNext(mode: PlayerMode, on: boolean): void;
+	// The streaming service catalogue tracks (not in the library) play
+	// through. Null: neither account is connected and none was chosen.
+	getPrimaryStreaming(): 'spotify' | 'tidal' | null;
+	setPrimaryStreaming(service: 'spotify' | 'tidal'): void;
 }
 
 let deps: SettingsFeatureDeps;
@@ -732,7 +736,21 @@ export function renderSettingsPlayer(): void {
 			<span class="settings-toggle__hint">${escapeHtml(hint)}</span>
 		</label>
 	`;
+	const primary = deps.getPrimaryStreaming();
+	const primaryRadio = (value: 'spotify' | 'tidal', label: string): string => `
+		<label class="settings-radio">
+			<input type="radio" name="player-primary-streaming" data-player-primary value="${value}" ${primary === value ? 'checked' : ''} />
+			<span class="settings-radio__label">${label}</span>
+		</label>`;
 	wrap.innerHTML = `
+		<div class="settings-ui__section">
+			<div class="settings-ui__section-label">Primary streaming</div>
+			<div class="settings-ui__hint">Tracks from the catalogue that are not in your library — an artist's, a label's or an album's page on its World side — play through this service. Tidal playback is not available yet: with Tidal chosen those tracks do not play.</div>
+			<div class="settings-ui__radios">
+				${primaryRadio('spotify', 'Spotify')}
+				${primaryRadio('tidal', 'Tidal')}
+			</div>
+		</div>
 		<div class="settings-ui__section">
 			${autoplayRow('streaming', 'Streaming Source', 'When a Spotify/Tidal track finishes on its own, continue to the next track in the list. Off — playback stops at the end of the track.')}
 		</div>
@@ -755,6 +773,11 @@ export function renderSettingsPlayer(): void {
 	const cb = wrap.querySelector<HTMLInputElement>('[data-player-quantize]');
 	cb?.addEventListener('change', () => {
 		deps.getDeck()?.setQuantize(cb.checked);
+	});
+	wrap.querySelectorAll<HTMLInputElement>('[data-player-primary]').forEach((input) => {
+		input.addEventListener('change', () => {
+			if (input.checked) deps.setPrimaryStreaming(input.value === 'tidal' ? 'tidal' : 'spotify');
+		});
 	});
 	wrap.querySelectorAll<HTMLInputElement>('[data-player-autoplay]').forEach((input) => {
 		input.addEventListener('change', () => {

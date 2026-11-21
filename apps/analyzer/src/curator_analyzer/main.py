@@ -14,8 +14,10 @@ Protocol (one JSON object per line, both directions):
       {"id": 43, "method": "cancel", "params": {"trackId": "uuid"}}
       {"method": "configure", "params": {"workers": 3}}   (no reply)
       {"id": 44, "method": "shutdown"}
+      {"id": 45, "method": "ping"}
 
     sidecar → Node:
+      {"id": 45, "event": "pong"}
       {"id": 42, "event": "progress", "stage": "beatgrid", "pct": 0.25}
       {"id": 42, "event": "partial",  "fields": {...}}    (reserved; not used yet)
       {"id": 42, "result": {...}}                          (success)
@@ -28,6 +30,11 @@ Cancellation is best-effort: we only check the cancel set between job
 dispatches (not mid-Essentia). For most workloads that's fine — a single
 track is ~10-20s, so a cancel propagates within seconds. Mid-stage cancel
 would require Essentia signal handling we don't have.
+
+Heartbeat: the host pings on an interval and treats any frame as proof of
+life, killing a sidecar that stays silent. `ping` is answered from the stdin
+thread, which never runs analysis, so a busy pool can't delay it. (Progress
+frames can't stand in: workers buffer them until the job ends.)
 
 Concurrency: the pool starts at min(cpus - 1, 4) workers (one per core,
 minus one for the master + the Node main process) and the host resizes it
@@ -77,13 +84,20 @@ from .worker import worker_entrypoint
 PROTOCOL_VERSION = 1
 
 
+# Frames are written from the stdin thread (pong, request errors) and from
+# the pool's callback thread (results) — one at a time, or two lines can
+# interleave into a frame the host can't parse.
+_stdout_lock = threading.Lock()
+
+
 def _stdout_write(payload: dict[str, Any]) -> None:
     # JSON-RPC frames are one per line; Python's `print` adds the newline.
     # `flush=True` is essential — without it the Node side waits forever
     # for a result that's sitting in Python's stdout buffer.
     line = json.dumps(payload, ensure_ascii=False, default=_jsonable)
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+    with _stdout_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
 
 
 def _jsonable(obj: Any) -> Any:
@@ -148,6 +162,8 @@ class Sidecar:
             self._cancel(msg.get("params") or {})
         elif method == "configure":
             self._configure(msg.get("params") or {})
+        elif method == "ping":
+            _stdout_write({"id": req_id, "event": "pong"})
         elif method == "shutdown":
             self.shutdown()
             sys.exit(0)

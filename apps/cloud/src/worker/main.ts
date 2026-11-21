@@ -20,7 +20,14 @@
 //   CURATOR_YOUTUBE_API_KEY
 //     YouTube Data API (label channel uploads);
 //   CURATOR_SOUNDCLOUD_CLIENT_ID + CURATOR_SOUNDCLOUD_CLIENT_SECRET
-//     SoundCloud's official API (label profile uploads).
+//     SoundCloud's official API (label profile uploads);
+//   CURATOR_LASTFM_API_KEY
+//     Last.fm (artists' listeners, for Reach);
+//   CURATOR_FEED_SPOTIFY_PAGES=1
+//     Spotify's public artist pages, key-less (monthly listeners, for Reach;
+//     catalog-readers spotify-page.ts on the terms).
+// Reach (catalog/audience.ts, reach.ts) reads each store above it has a
+// reader for: Deezer, Tidal, SoundCloud, YouTube, Last.fm, Spotify's pages.
 // The label profiler (MusicBrainz, Discogs: key-less) always runs.
 //   CURATOR_SPOTIFY_CLIENT_ID + CURATOR_TOKEN_KEY (the API's gateway secrets)
 //     Spotify playlists, read with a watcher's own Spotify login.
@@ -38,6 +45,11 @@ import { soundcloudCredentials, tidalCredentials } from '../config.js';
 import { runInboxDetectors } from '../catalog/inbox-detectors.js';
 import { runLabelDedupe } from '../catalog/label-related.js';
 import { runReleaseFiller } from '../catalog/release-fill.js';
+import { runCreditFill } from '../catalog/credit-fill.js';
+import { runPageValidation } from '../catalog/artist-validation.js';
+import { audienceReaders, runAudience } from '../catalog/audience.js';
+import { runReachScores } from '../catalog/reach.js';
+import { LastfmReader } from '@curator/catalog-readers';
 import { runStoreLinker } from '../catalog/store-links.js';
 import { AppleLookup } from '../catalog/trackers/apple.js';
 import { TidalApp } from '../catalog/trackers/tidal-app.js';
@@ -108,6 +120,17 @@ const fillFetchers = {
 	bandcamp: (adapters.find((a) => a instanceof BandcampTracker) as BandcampTracker | undefined) ?? null,
 };
 
+// An artist's audience at each store, for its Reach score.
+const lastfmKey = env('CURATOR_LASTFM_API_KEY');
+const audience = audienceReaders({
+	deezer: fillFetchers.deezer,
+	tidal: stores.tidal,
+	soundcloud: (adapters.find((a) => a instanceof SoundCloudTracker) as SoundCloudTracker | undefined) ?? null,
+	youtube: (adapters.find((a) => a instanceof YouTubeTracker) as YouTubeTracker | undefined) ?? null,
+	lastfm: lastfmKey ? new LastfmReader(lastfmKey) : null,
+	spotifyPages: flagOf(process.env, 'CURATOR_FEED_SPOTIFY_PAGES'),
+});
+
 // Two connections are plenty: one pass at a time, a few statements each.
 const db = createPostgresDb(databaseUrl, { max: 2 });
 const gateway = loadSpotify(process.env).spotify;
@@ -129,7 +152,7 @@ if (!(await migrationGate(db, log).catch(() => false))) {
 	await db.close().catch(() => {});
 	process.exit(1);
 }
-log.info('catalog_worker', { trackers: adapters.map((a) => a.provider), finders: finders.map((f) => f.provider), reasoner: agentCfg ? `${agentCfg.backend}:${agentCfg.model}` : 'off' });
+log.info('catalog_worker', { trackers: adapters.map((a) => a.provider), audience: audience.map((r) => r.provider), finders: finders.map((f) => f.provider), reasoner: agentCfg ? `${agentCfg.backend}:${agentCfg.model}` : 'off' });
 
 const holder = `${hostname()}:${process.pid}`;
 let running = false;
@@ -141,10 +164,14 @@ async function pass(): Promise<void> {
 	try {
 		await runTrackers({ db, log, adapters, holder }).catch((e: unknown) => log.error('tracker_pass_failed', { error: e }));
 		await runPlanner({ db, log, finders }).catch((e: unknown) => log.error('identity_pass_failed', { error: e }));
+		await runPageValidation({ db, log, reader: fillFetchers.deezer }).catch((e: unknown) => log.error('page_validation_failed', { error: e }));
+		await runAudience({ db, log, readers: audience, holder }).catch((e: unknown) => log.error('audience_pass_failed', { error: e }));
+		await runReachScores({ db, log }).catch((e: unknown) => log.error('reach_pass_failed', { error: e }));
 		if (spotify) await runRecordingResolver({ db, log, spotify }).catch((e: unknown) => log.error('recording_resolve_failed', { error: e }));
 		if (spotify) await runIsrcFill({ db, log, spotify }).catch((e: unknown) => log.error('isrc_fill_failed', { error: e }));
 		await runStoreLinker({ db, log, readers: stores }).catch((e: unknown) => log.error('store_link_pass_failed', { error: e }));
 		await runReleaseFiller({ db, log, fetchers: fillFetchers, holder }).catch((e: unknown) => log.error('release_fill_pass_failed', { error: e }));
+		await runCreditFill({ db, log, spotify, beatport: fillFetchers.beatport }).catch((e: unknown) => log.error('credit_fill_pass_failed', { error: e }));
 		await runLabelProfiler({ db, log, spotify, providers: { beatport, bandcamp } }).catch((e: unknown) => log.error('label_profile_pass_failed', { error: e }));
 		await runBackfill({ db, log, adapters, holder }).catch((e: unknown) => log.error('catalog_backfill_failed', { error: e }));
 		await runCataloguePlaylists({ db, log, spotify, holder }).catch((e: unknown) => log.error('catalogue_playlists_pass_failed', { error: e }));

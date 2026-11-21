@@ -47,6 +47,17 @@ export class YouTubeTracker implements TrackerAdapter {
 		}
 	}
 
+	// How many subscribers a channel has (the Reach score). Null: a channel
+	// that hides the count, or none at that page.
+	async channelSubscribers(pageId: string, signal: AbortSignal): Promise<number | null> {
+		const { id } = await this.channelId(pageId, signal);
+		const r = await this.get<{ items?: { statistics?: { subscriberCount?: string; hiddenSubscriberCount?: boolean } }[] }>('/channels', { part: 'statistics', id }, signal);
+		const s = r.items?.[0]?.statistics;
+		if (!s || s.hiddenSubscriberCount) return null;
+		const n = Number(s.subscriberCount);
+		return Number.isFinite(n) ? n : null;
+	}
+
 	private async channelId(pageId: string, signal: AbortSignal): Promise<{ id: string; calls: number }> {
 		if (/^UC[\w-]{20,}$/.test(pageId)) return { id: pageId, calls: 0 };
 		const params: Record<string, string> = pageId.startsWith('user/') ? { forUsername: pageId.slice(5) } : { forHandle: pageId.replace(/^c\//, '').replace(/^@?/, '@') };

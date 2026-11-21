@@ -13,6 +13,11 @@ import {
 	EMPTY_HISTORY,
 	activateTab,
 	ancestorsOf,
+	closePageTab,
+	closeTarget,
+	entityKey,
+	openPageTab,
+	sameEntity,
 	canBack,
 	canForward,
 	currentEntry,
@@ -58,8 +63,8 @@ describe('locationKey / tabOf', () => {
 
 	it('separates the Discover sub-states', () => {
 		const archived: NavLocation = { kind: 'discover', mode: 'feed', archived: true };
-		const node: NavLocation = { kind: 'discover', mode: 'journeys', journeyId: 'j1', nodeId: 'n2' };
-		expect(new Set([feed, archived, node].map(locationKey)).size).toBe(3);
+		const results: NavLocation = { kind: 'discover', mode: 'agent-results', resultSetId: 'rs1' };
+		expect(new Set([feed, archived, results].map(locationKey)).size).toBe(3);
 	});
 
 	it('maps every location onto its top-strip tab', () => {
@@ -240,5 +245,86 @@ describe('rewritePlaylistId', () => {
 		expect(keys(r, 'rekordbox')).toEqual([locationKey(playlist('new', 'rekordbox'))]);
 		expect(r.activeTab).toBe(s.activeTab);
 		expect(rewritePlaylistId(s, 'missing', 'x')).toBe(s);
+	});
+});
+
+// ── Entity pages and page tabs ──────────────────────────────────────────────
+
+describe('entity locations', () => {
+	const marsh = { kind: 'artist' as const, name: 'Marsh', libraryId: 'a1' };
+	const page = (host: 'rekordbox' | 'discover' | `page:${number}`, scope: 'owned' | 'world' = 'owned'): NavLocation => ({ kind: 'entity', host, entity: marsh, scope });
+
+	it('sits on the tab that hosts it: a source tab, Discover, or a page tab of its own', () => {
+		expect(tabOf(page('rekordbox'))).toBe('rekordbox');
+		expect(tabOf(page('discover'))).toBe('discover');
+		expect(tabOf(page('page:7'))).toBe('page:7');
+		// One entity on two tabs is two places.
+		expect(locationKey(page('rekordbox'))).not.toBe(locationKey(page('discover')));
+	});
+
+	it('Owned and World are one place: toggling replaces the entry instead of stacking', () => {
+		let s = push(EMPTY_HISTORY, makeEntry(feed, 'Discover'));
+		s = push(s, makeEntry(page('discover', 'world'), 'Marsh'));
+		s = push(s, makeEntry(page('discover', 'owned'), 'Marsh'));
+		const stack = stackOf(s, 'discover')!;
+		expect(stack.entries.map((e) => e.location.kind)).toEqual(['discover', 'entity']);
+		expect(stack.entries[1]!.location).toMatchObject({ scope: 'owned' });
+		expect(canBack(s)).toBe(true);
+	});
+
+	it("keys an entity by the strongest id it carries, the library's first, and never joins artists by name", () => {
+		expect(entityKey({ kind: 'artist', name: 'Marsh', libraryId: 'a1', catalogId: 'c1' })).toBe('artist:l:a1');
+		expect(entityKey({ kind: 'artist', name: 'Marsh', catalogId: 'c1', spotifyId: 's1' })).toBe('artist:c:c1');
+		expect(entityKey({ kind: 'label', name: 'Ánjunadeep ' })).toBe(entityKey({ kind: 'label', name: 'anjunadeep' }));
+		expect(sameEntity({ kind: 'artist', name: 'Marsh', libraryId: 'a1' }, { kind: 'artist', name: 'x', libraryId: 'a1', catalogId: 'c1' })).toBe(true);
+		expect(sameEntity({ kind: 'artist', name: 'Marsh', catalogId: 'c1' }, { kind: 'artist', name: 'Marsh', catalogId: 'c2' })).toBe(false);
+		expect(sameEntity({ kind: 'artist', name: 'Marsh', libraryId: 'a1' }, { kind: 'artist', name: 'Marsh', catalogId: 'c1' })).toBe(false);
+		// A label is its name where nothing else names it; two catalogue labels of one name are not one.
+		expect(sameEntity({ kind: 'label', name: 'Lost' }, { kind: 'label', name: 'LOST', catalogId: 'l1' })).toBe(true);
+		expect(sameEntity({ kind: 'label', name: 'Lost', catalogId: 'l1' }, { kind: 'label', name: 'Lost', catalogId: 'l2' })).toBe(false);
+		expect(sameEntity({ kind: 'artist', name: 'Marsh', libraryId: 'a1' }, { kind: 'album', name: 'Marsh', libraryId: 'a1' })).toBe(false);
+	});
+});
+
+describe('page tabs', () => {
+	const artist = (name: string, host: `page:${number}`): NavLocation => ({ kind: 'entity', host, entity: { kind: 'artist', name, catalogId: name }, scope: 'world' });
+
+	it('opens with its own stack, leaving the tab it came from where it was', () => {
+		let s = push(EMPTY_HISTORY, makeEntry(all('rekordbox'), 'Rekordbox'));
+		s = push(s, makeEntry(playlist('p1', 'rekordbox'), 'p1'));
+		const opened = openPageTab(s, 'rekordbox');
+		s = push(opened.state, makeEntry(artist('Marsh', opened.id), 'Marsh'));
+		expect(s.activeTab).toBe(opened.id);
+		expect(s.pages).toEqual([{ id: opened.id, opener: 'rekordbox' }]);
+		expect(canBack(s)).toBe(false);
+		s = push(s, makeEntry(artist('Nox Vahn', opened.id), 'Nox Vahn'));
+		expect(canBack(s)).toBe(true);
+		// The opener's stack is untouched.
+		expect(stackOf(s, 'rekordbox')).toMatchObject({ index: 1 });
+		expect(currentEntry(activateTab(s, 'rekordbox'))!.label).toBe('p1');
+	});
+
+	it('closes back to its opener; a tab whose opener is gone hands over to its neighbour', () => {
+		let s = push(EMPTY_HISTORY, makeEntry(feed, 'Discover'));
+		const a = openPageTab(s, 'discover');
+		s = push(a.state, makeEntry(artist('A', a.id), 'A'));
+		const b = openPageTab(s, a.id);
+		s = push(b.state, makeEntry(artist('B', b.id), 'B'));
+		expect(closeTarget(s, b.id)).toBe(a.id);
+		expect(closeTarget(s, a.id)).toBe('discover');
+		// Close A (in the background): B's opener is gone, Discover is no neighbour of it.
+		s = closePageTab(s, a.id);
+		expect(s.pages.map((p) => p.id)).toEqual([b.id]);
+		expect(stackOf(s, a.id)).toBeNull();
+		expect(s.activeTab).toBe(b.id);
+		expect(closeTarget(s, b.id)).toBeNull();
+		// Closing the active one leaves none active: the caller switched first.
+		expect(closePageTab(s, b.id)).toMatchObject({ activeTab: null, pages: [] });
+	});
+
+	it('a page tab whose last entry dies is gone from the strip', () => {
+		const opened = openPageTab(push(EMPTY_HISTORY, makeEntry(feed, 'Discover')), 'discover');
+		const s = push(opened.state, makeEntry(artist('A', opened.id), 'A'));
+		expect(dropAt(s, opened.id, 0).pages).toEqual([]);
 	});
 });

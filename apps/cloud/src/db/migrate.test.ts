@@ -29,6 +29,8 @@ const SHARED_TABLES = [
 	'catalog_audio',
 	'catalog_chart_entry',
 	'catalog_connect_vote',
+	'catalog_page_check',
+	'catalog_name_lookup',
 	'catalog_credit_rule',
 	'catalog_cursor',
 	'catalog_worker',

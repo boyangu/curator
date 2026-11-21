@@ -87,6 +87,10 @@ export const ZTrackFilter = z.object({
 	keyCamelot: z.string().optional(),
 	genre: z.string().optional(),
 	label: z.string().optional(),
+	// Label scope by folded name (searchFold values, OR within the array) —
+	// the indexed `label_ascii` column, so a label page lists every spelling
+	// that folds alike and a big label is one index range, not a LIKE scan.
+	labelFolds: z.array(z.string()).optional(),
 	search: z.string().optional(),
 	// Source membership — the SQL side of a track's `sources` set. Restrict to
 	// tracks that HAVE at least one of the given sources (a string, or an
@@ -268,6 +272,229 @@ export interface AlbumSummary {
 	// A member whose cover the `curator-cover://<trackId>` protocol can serve
 	// (one with a cover URL first) — the album thumb.
 	coverTrackId: string | null;
+	// A remote cover, for a release the library holds no track of (a catalogue
+	// album on an entity page): shown in place of the protocol's.
+	coverUrl?: string | null;
+}
+// ─── Entity pages (artist / label / album) ──────────────────────────────────
+// One page per entity: a header and the track list, over the library's local
+// files ("owned") or the Global Catalog ("world"). An entity is named by
+// whatever ids the surface that opened it holds; core fills in the rest.
+export type EntityKind = 'artist' | 'label' | 'album';
+export interface EntityRef {
+	kind: EntityKind;
+	// Display name. Identity only for a label's library side (labels are text
+	// there): a name alone never joins an artist or an album across the
+	// library and the catalogue (namesakes).
+	name: string;
+	// artist.id / album.id.
+	libraryId?: string | null;
+	// The Global Catalog's artist / label / release object.
+	catalogId?: string | null;
+	// Spotify artist / album id.
+	spotifyId?: string | null;
+	// A credit on a catalogue object the surface does hold (a feed card's
+	// release or recording): the entity is resolved among THAT object's
+	// credits by name — the one place a name is safe.
+	within?: { catalogId: string } | null;
+}
+export type EntityScopeKind = 'owned' | 'world';
+export type StreamingService = 'spotify' | 'tidal';
+export interface EntityChip {
+	ref: EntityRef;
+	// How many releases / tracks back the relation, where known.
+	count?: number;
+	// What tells it from a namesake, where the source says (a streaming
+	// candidate's genres or following).
+	detail?: string;
+}
+export type EntityWorldReason = 'ok' | 'signed_out' | 'server_off' | 'old_server' | 'unknown' | 'ambiguous' | 'pending';
+// What an artist's output earns it (entity/badges.ts holds the rules).
+export type ArtistBadge = 'veteran' | 'workhorse' | 'prolific';
+export interface ArtistActivity {
+	firstRelease: string | null;
+	lastRelease: string | null;
+	// What it released in the last `recentDays`; a track counts at its first release.
+	recentDays: number;
+	recentReleases: number;
+	recentTracks: number;
+}
+// An artist's audience as one open-ended number (the catalogue's Reach:
+// 10 · log10 of its audience in Spotify-listener equivalents). `change` over
+// about three months; `parts` what each store said (`outlier`: left out, the
+// other stores disagree). Times in ms.
+export interface ArtistReach {
+	score: number;
+	change: number | null;
+	at: number;
+	parts: { provider: string; metric: string; n: number; at: number; outlier?: boolean }[];
+}
+export interface EntityHeader {
+	// The entity with every id the lookups found: what later calls pass back.
+	ref: EntityRef;
+	imageUrl: string | null;
+	// An owned track whose cover `curator-cover://` serves (an album's thumb).
+	coverTrackId: string | null;
+	// album only.
+	facts: { releaseDate?: string | null; albumType?: string | null };
+	genres: { name: string; count?: number }[];
+	// artist: the labels it releases on, most recently active first; album: its label.
+	labels: EntityChip[];
+	// label: who releases on it, by count; album: its artists.
+	artists: EntityChip[];
+	// artist: what the catalogue holds (research claims are read apart).
+	similar: EntityChip[];
+	// artist: who shares its tracks' credits, `count` the shared tracks, most first.
+	collabs: EntityChip[];
+	// artist: the catalogue's account of its releases over time; null where
+	// it gave none (an older server, a page read from a streaming service).
+	activity: ArtistActivity | null;
+	badges: ArtistBadge[];
+	// artist: null until the catalogue has scored it.
+	reach: ArtistReach | null;
+	links: ArtistLink[];
+	// null: nothing to follow (an album), or the catalogue did not answer.
+	follow: { following: boolean; muted: boolean } | null;
+	owned: {
+		// Local files only (a file on disk, or on another device of the account).
+		count: number;
+		// What `tracks:list` is asked for; null when the library holds no such entity.
+		filter: ZTrackFilterT | null;
+		// A library artist of the same name the catalogue's was NOT joined to:
+		// offered, never assumed.
+		nameHint?: EntityRef;
+	};
+	world: {
+		available: boolean;
+		reason: EntityWorldReason;
+		releaseCount: number | null;
+		trackCount: number | null;
+		// `ambiguous`: the catalogue objects the name could be. `unknown`: the
+		// streaming service's artists of that name — offered, never assumed.
+		candidates?: EntityChip[];
+		// Set when the World side is read from the user's streaming service
+		// and not from the catalogue: the catalogue does not know the entity
+		// (yet), or cannot be asked. The page is what the service lists, shown
+		// at once; where the catalogue can be reached the desktop registers it
+		// there (entity/work.ts) and the page becomes the catalogue's.
+		via?: StreamingService;
+	};
+}
+export interface EntityWorldAlbum {
+	id: string;
+	title: string;
+	date: string | null;
+	type: string | null;
+	coverUrl: string | null;
+	label: { id: string | null; name: string } | null;
+	artists: { id: string; name: string }[];
+	genres: string[];
+	trackCount: number;
+	// Someone else's release the page's artist has tracks on.
+	appearance: boolean;
+	links: ArtistLink[];
+}
+export interface EntityWorldTrack {
+	recordingId: string;
+	releaseId: string;
+	title: string;
+	artists: { id: string; name: string; role?: string | null }[];
+	position: number | null;
+	disc: number | null;
+	durationSec: number | null;
+	isrc: string | null;
+	bpm: number | null;
+	keyCamelot: string | null;
+	genre: string | null;
+	// The row's own label, where a lookup found one its release does not name.
+	label?: string | null;
+	links: ArtistLink[];
+	// The track's id on each streaming service the catalogue has its page on.
+	streamIds: Partial<Record<StreamingService, string>>;
+	// The library track this recording is (any source), and whether this row
+	// is the one that stands for it when several releases carry the recording.
+	libraryTrackId: string | null;
+	libraryPrimary: boolean;
+}
+export interface EntityTracksPage {
+	albums: EntityWorldAlbum[];
+	tracks: EntityWorldTrack[];
+	nextCursor: string | null;
+	// A library row with every column empty: what a catalogue recording is
+	// laid over to stand in the track list beside real rows. Built from the
+	// schema, so a new track column needs nothing here.
+	template: Track;
+}
+// What this desktop is doing for the entity page in front (entity/work.ts):
+// reading the stores for an entity the catalogue does not know ('discover')
+// or for releases it lacks ('updates'), reading the tracklists of releases
+// the catalogue lists without one ('tracklists'), and filling in what the
+// page's rows lack — BPM, key, genre, a page on the user's streaming service
+// ('details').
+export type EntityWorkPhase = 'discover' | 'updates' | 'tracklists' | 'details';
+export interface EntityWorkStatus {
+	// null: nothing running (`added` then says what the last check found).
+	phase: EntityWorkPhase | null;
+	// The store being read right now, when one is.
+	source: string | null;
+	// discover / updates: releases the stores listed, and how many of them
+	// were new to the catalogue.
+	found: number;
+	added: number;
+	// tracklists / details: how far through.
+	done: number;
+	total: number;
+}
+// What a lookup found for one World row; only the fields it found.
+export interface EntityRowPatch {
+	recordingId: string;
+	bpm?: number;
+	keyCamelot?: string;
+	genre?: string;
+	label?: string;
+	streamIds?: Partial<Record<StreamingService, string>>;
+}
+export interface EntityWorkEvent {
+	// The number the renderer watched the page with: a late event of a page
+	// since left is told apart by it.
+	watch: number;
+	status: EntityWorkStatus;
+	// The catalogue's answer changed under the page (the entity is known
+	// now; releases or tracklists were added; row findings went up that its
+	// header counts — genres): read it again.
+	changed?: 'header' | 'tracks';
+	rows?: EntityRowPatch[];
+}
+// ─── World search (the omnibar's World scope) ───────────────────────────────
+// One query, asked of three places that answer at their own speed: the user's
+// streaming service (its own search: fastest), the Global Catalog (what it
+// holds by that name, labels included), and the stores (labels, which a
+// streaming service does not file). The renderer asks each part by itself and
+// merges what comes back, so the first answer shows without the last.
+export type WorldSearchPart = 'streaming' | 'catalog' | 'stores';
+export interface WorldHit {
+	kind: 'artist' | 'album' | 'label' | 'track';
+	name: string;
+	// One line under the name: the credit, a date, the album.
+	detail: string | null;
+	imageUrl: string | null;
+	// The page it opens (a track's: its album's).
+	ref: EntityRef;
+	// What the thing is known by, across the parts ("spotify:artist:<id>",
+	// "catalog:<id>", "beatport:label:<id>"): two hits sharing one are one thing.
+	keys: string[];
+	// Where it was found: a streaming service, 'catalog', a store.
+	sources: string[];
+	// track only: its row in the result's `rows`.
+	recordingId?: string;
+}
+export interface WorldSearchResult {
+	part: WorldSearchPart;
+	hits: WorldHit[];
+	// The track hits as list rows (catalogRows.ts toRows), so a pick plays.
+	rows?: EntityTracksPage;
+	// Why the part has nothing to say, when that is not "no matches".
+	note?: 'not_connected' | 'signed_out' | 'unavailable' | 'failed';
 }
 // A pair identity can't decide: a bare name and the same name with a
 // bracketed disambiguator ("Maz" / "Maz (EG)"). The user merges or

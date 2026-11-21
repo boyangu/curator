@@ -116,6 +116,14 @@ export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorRep
 
 // ── twins ─────────────────────────────────────────────────────────────────────────────────
 
+// How long a twin with no tracklist waits for its fill before it is asked
+// about anyway — inside TWINS_WINDOW_DAYS, or its label would leave the
+// detector's window first and the pair never be asked — and the stubs a fill
+// was queued for, once a process: a fill that read nothing deletes its task,
+// and must not be queued again each pass.
+const FILL_FIRST_HOURS = 24;
+const fillAsked = new Set<string>();
+
 type TwinRelease = { id: string; title: string; artists: string[]; date: string | null; providers: string[]; tracks: number; discoveredMs: number };
 
 async function detectTwins(tx: Queryable, agent: boolean): Promise<number> {
@@ -151,7 +159,20 @@ async function detectTwins(tx: Queryable, agent: boolean): Promise<number> {
 		const proposed = new Set(open.rows.flatMap((i) => ((i.evidence.pairs as { keep: { id: string }; fold: { id: string } }[] | undefined) ?? []).flatMap((p) => [p.keep.id, p.fold.id])));
 		const groups = twinGroups(releases.filter((r) => !proposed.has(r.id)), ruled);
 		if (!groups.length) continue;
-		const pairs = groups.flatMap((g) => g.folds.map((f) => ({ keep: view(g.keep), fold: view(f) })));
+		// A side with no tracklist cannot be told from another edition (Armada's
+		// Bandcamp sells the extended mixes alone: 79 of 93 "twins" were not,
+		// 2026-11-18), and a listing's stub has none until a fill reads it. So a
+		// fresh stub is filled first and its pair asked on a later pass; past the
+		// window (no store reads it) the pair is asked as it stands.
+		const stub = (r: TwinRelease) => r.tracks === 0 && Date.now() - r.discoveredMs < FILL_FIRST_HOURS * 3600_000;
+		const all = groups.flatMap((g) => g.folds.map((f) => ({ keep: g.keep, fold: f })));
+		const stubs = [...new Set(all.flatMap((p) => [p.keep, p.fold]).filter(stub).map((r) => r.id))].filter((id) => !fillAsked.has(id));
+		if (stubs.length) {
+			await tx.query(`insert into curator.catalog_enrich_task (object_id, need, provider) select r, 'fill', 'catalog' from unnest($1::uuid[]) as t(r) on conflict do nothing`, [`{${stubs.join(',')}}`]);
+			for (const id of stubs) fillAsked.add(id);
+		}
+		const pairs = all.filter((p) => !stub(p.keep) && !stub(p.fold)).map((p) => ({ keep: view(p.keep), fold: view(p.fold) }));
+		if (!pairs.length) continue;
 		const key = pairs.map((p) => p.fold.id).sort().join(',');
 		const id = agent
 			? await enqueueCase(tx, { kind: 'release_twin', subjects: pairs.flatMap((p) => [p.keep.id, p.fold.id]), input: { pairs: pairs.map((p) => ({ keep: p.keep.id, fold: p.fold.id })), label: { id: l.id, name: l.name } }, key })

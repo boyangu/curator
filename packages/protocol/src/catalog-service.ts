@@ -96,6 +96,20 @@ export const CATALOG_TRACKERS: readonly { kind: CatalogTrackingKind; provider: C
 ];
 export const trackerKey = (kind: CatalogTrackingKind, provider: CatalogProvider): CatalogTracker => `${kind}/${provider}`;
 
+// How often a user wants their follows of a kind read (Settings → Discover),
+// most frequent first — where several followers of one object chose
+// differently, the earliest in this list wins:
+//   'source'  the tracker's own cadence (hourly for a playlist, daily for an
+//             artist, tighter through Friday);
+//   'daily'   once a day at most;
+//   'weekly'  once a week, in the tracker's Friday window (releases land on
+//             Friday).
+// A choice only ever slows a tracker. A user who never said has the default.
+export const CATALOG_READ_CADENCES = ['source', 'daily', 'weekly'] as const;
+export type CatalogReadCadence = (typeof CATALOG_READ_CADENCES)[number];
+export const CATALOG_READ_CADENCE_DEFAULT: CatalogReadCadence = 'weekly';
+export type CatalogReadCadenceChoices = Partial<Record<CatalogTrackingKind, CatalogReadCadence>>;
+
 // Facts a claim may carry. Raw provider values: the catalogue keeps each
 // source's value and folds them into the object's current attributes.
 export type CatalogFacts = {
@@ -357,7 +371,11 @@ export type CatalogSearchResult = { objects: CatalogObjectSummary[] };
 // catalog.browse: an object with what hangs off it — a label's or an
 // artist's releases, a release's tracks — each row with its store handles,
 // so a device can show and play them without a call per row.
-export type CatalogBrowseInput = { deviceId: string; id: string };
+// `brief` ('catalog_pages'; an older server refuses the key): the object and
+// its facts without the release / track lists — what a page header or a
+// link menu reads. Those lists are the dear part of the answer, and a page
+// gets them from catalog.tracks.
+export type CatalogBrowseInput = { deviceId: string; id: string; brief?: boolean };
 export type CatalogBrowseRef = { id: string; name: string };
 export type CatalogBrowseRelease = {
 	id: string;
@@ -393,10 +411,105 @@ export type CatalogBrowseResult = {
 	artists?: (CatalogBrowseRef & { releases?: number; role?: string | null })[];
 	// artist: the labels it releases on, by count; release: its labels.
 	labels?: (CatalogBrowseRef & { releases: number })[];
+	// artist: the labels its releases name in text only — no label object the
+	// artist is tied to (Spotify and Deezer state a release's label as a
+	// string). `labels` already counts such a release under the label of that
+	// name where the artist is on it. Absent from an older server.
+	labelTexts?: { name: string; releases: number }[];
 	// label: the roster its own page lists.
 	roster?: CatalogBrowseRef[];
+	// What a page header shows ('catalog_pages'; absent from an older server).
+	// release: its own genres; artist / label: those of its newest releases
+	// and their tracks, most frequent first.
+	genres?: (CatalogBrowseRef & { count?: number })[];
+	// artist: the similar-artist edges the catalogue holds.
+	similar?: CatalogBrowseRef[];
+	// artist: who shares its tracks' credits, most shared tracks first (at
+	// most CATALOG_COLLABS_MAX). Absent from an older server.
+	collabs?: (CatalogBrowseRef & { tracks: number })[];
+	// artist: the span of its dated releases, and what it put out in the last
+	// `recentDays` — a track counted once, at its first release. Absent from
+	// an older server.
+	activity?: { firstRelease: string | null; lastRelease: string | null; recentDays: number; recentReleases: number; recentTracks: number };
+	// artist: its Reach score, once the catalogue has read its audience
+	// somewhere. Absent from an older server, or before the first scoring.
+	reach?: CatalogReach;
+	// artist: every recording credited to it; release: its tracklist's length.
+	trackCount?: number;
+	// The caller's own watch of the object, null when they do not follow it:
+	// a header asks for one object, never for the whole watch list.
+	watch?: { muted: boolean } | null;
+};
+// An artist's audience as one open-ended number: 10 · log10 of its audience
+// in Spotify-monthly-listener equivalents (1,000 → 30, 1M → 60; apps/cloud
+// catalog/reach.ts). No rank: the catalogue holds a sliver of all artists,
+// so a place among them would say little. `change` against the readings of
+// about three months before; `parts` what each store said (`outlier`: left
+// out, the others disagree by over 30×). Times in ms.
+export type CatalogReach = {
+	score: number;
+	change: number | null;
+	at: number;
+	parts: { provider: string; metric: string; n: number; at: number; outlier?: boolean }[];
 };
 export const CATALOG_BROWSE_MAX = 500;
+export const CATALOG_COLLABS_MAX = 50;
+
+// catalog.tracks ('catalog_pages'): what an artist's, a label's or an album's
+// page lists — its releases newest first, each with its tracklist in order,
+// a page of releases at a time. One call per page instead of a browse per
+// release, which the read bucket would not carry.
+export type CatalogTracksInput = { deviceId: string; id: string; cursor?: string; limit?: number };
+export type CatalogPageTrack = {
+	id: string;
+	title: string;
+	position: number | null;
+	// Set only where the release's positions repeat (a multi-disc release):
+	// the recording's own disc number is a fact of one release, not of every
+	// release that carries it.
+	disc: number | null;
+	durationSec: number | null;
+	isrc: string | null;
+	bpm: number | null;
+	// The provider's own notation ("A Minor", "F♯ min"); a device converts it.
+	key: string | null;
+	genres: string[];
+	artists: (CatalogBrowseRef & { role?: string | null })[];
+	handles: CatalogHandle[];
+};
+export type CatalogPageRelease = {
+	id: string;
+	title: string;
+	date: string | null;
+	type: string | null;
+	coverUrl: string | null;
+	labelText: string | null;
+	labels: CatalogBrowseRef[];
+	artists: CatalogBrowseRef[];
+	genres: string[];
+	handles: CatalogHandle[];
+	// The whole tracklist's length, whatever `tracks` holds.
+	trackCount: number;
+	// An artist's page only: someone else's release the artist has tracks on
+	// (a remix, a compilation). `tracks` then holds only the artist's.
+	appearance: boolean;
+	tracks: CatalogPageTrack[];
+};
+export type CatalogTracksResult = {
+	object: { id: string; kind: CatalogKind; name: string };
+	// Set when the id asked for was merged away: the result is the winner's.
+	redirectedFrom: string | null;
+	releases: CatalogPageRelease[];
+	// Opaque; null on the last page.
+	nextCursor: string | null;
+	// First page only.
+	releaseCount?: number;
+};
+// Releases a page; a page of long tracklists is cut short of it (never below
+// one release) so no answer carries more than about CATALOG_TRACKS_BUDGET tracks.
+export const CATALOG_TRACKS_PAGE = 40;
+export const CATALOG_TRACKS_MAX = 100;
+export const CATALOG_TRACKS_BUDGET = 1500;
 
 export type CatalogGetInput = { deviceId: string; id: string };
 export type CatalogObjectDetail = CatalogObjectSummary & {
@@ -420,7 +533,11 @@ export type CatalogRefreshResult = { dueAt: number | null };
 // catalog.enrich: ask the catalogue to profile these labels (their pages
 // elsewhere) and read their releases once, with no watch and no events —
 // a device filling the shared catalogue with the labels its library holds.
-export type CatalogEnrichInput = { deviceId: string; objectIds: string[] };
+// `need` ('catalog_audience'; an older server refuses the key): 'audience'
+// asks for artists' audience to be read at their stores, for their Reach
+// score, where 'profile' (the default) asks for a label's profile.
+export type CatalogEnrichNeed = 'profile' | 'audience';
+export type CatalogEnrichInput = { deviceId: string; objectIds: string[]; need?: CatalogEnrichNeed };
 export type CatalogEnrichResult = { queued: number };
 
 export type FeedEventsInput = { deviceId: string; afterSeq: number; limit?: number };
@@ -445,7 +562,10 @@ export const ZCatalogSearchInput = z
 	.object({ deviceId: ZDeviceId, q: z.string().trim().min(1).max(200), kind: ZKind.optional(), limit: z.number().int().min(1).max(25).optional() })
 	.strict();
 export const ZCatalogGetInput = z.object({ deviceId: ZDeviceId, id: ZObjectId }).strict();
-export const ZCatalogBrowseInput = z.object({ deviceId: ZDeviceId, id: ZObjectId }).strict();
+export const ZCatalogBrowseInput = z.object({ deviceId: ZDeviceId, id: ZObjectId, brief: z.boolean().optional() }).strict();
+export const ZCatalogTracksInput = z
+	.object({ deviceId: ZDeviceId, id: ZObjectId, cursor: z.string().min(1).max(200).optional(), limit: z.number().int().min(1).max(CATALOG_TRACKS_MAX).optional() })
+	.strict();
 export const ZCatalogWatchInput = z
 	.object({ deviceId: ZDeviceId, objectId: ZObjectId.optional(), claim: z.unknown().optional(), source: z.enum(CATALOG_WATCH_SOURCES) })
 	.strict()
@@ -457,7 +577,7 @@ export const ZCatalogImportInput = z
 	.object({ deviceId: ZDeviceId, idempotencyKey: ZIdempotencyKey, source: z.enum(CATALOG_WATCH_SOURCES), claims: z.array(z.unknown()) })
 	.strict();
 export const ZCatalogRefreshInput = z.object({ deviceId: ZDeviceId, objectId: ZObjectId }).strict();
-export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.array(ZObjectId).min(1).max(200) }).strict();
+export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.array(ZObjectId).min(1).max(200), need: z.enum(['profile', 'audience']).optional() }).strict();
 export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional() }).strict();
 export const ZFeedRecentInput = z.object({ deviceId: ZDeviceId, days: z.number().int().min(1).max(FEED_RECENT_MAX_DAYS) }).strict();
 
@@ -638,13 +758,15 @@ export type CatalogProviderPause = { provider: CatalogProvider; until: number };
 // master hands it nothing of those, and — on a Refresh — a check: the user's
 // follows of that kind (every checked kind without one) on the checked
 // sources become due now, read within the hour left alone, and are leased
-// by this same call.
+// by this same call. `cadence` ('catalog_read_cadence'; an older server
+// refuses the key): how often the user wants each kind read.
 export type CatalogWorkerDueInput = {
 	deviceId: string;
 	providers: CatalogProvider[];
 	trackers: CatalogTracker[];
 	paused?: CatalogProviderPause[];
 	check?: { kind?: CatalogTrackingKind };
+	cadence?: CatalogReadCadenceChoices;
 };
 // Per provider, what became of the cursors a check named: due now (queued),
 // due anyway, read within the hour, being read, or on a provider that asked
@@ -715,6 +837,7 @@ export const ZCatalogWorkerDueInput = z
 		trackers: z.array(ZTracker).max(CATALOG_TRACKERS.length),
 		paused: z.array(ZPause).max(CATALOG_PROVIDERS.length).optional(),
 		check: z.object({ kind: z.enum(CATALOG_TRACKING_KINDS).optional() }).strict().optional(),
+		cadence: z.record(z.enum(CATALOG_TRACKING_KINDS), z.enum(CATALOG_READ_CADENCES)).optional(),
 	})
 	.strict();
 const ZOutcome: z.ZodType<CatalogWorkerOutcome> = z.union([
@@ -741,4 +864,5 @@ const _workerDue: Same<z.infer<typeof ZCatalogWorkerDueInput>, CatalogWorkerDueI
 const _workerReport: Same<z.infer<typeof ZCatalogWorkerReportInput>, CatalogWorkerReportInput> = true;
 const _recent: Same<z.infer<typeof ZFeedRecentInput>, FeedRecentInput> = true;
 const _browse: Same<z.infer<typeof ZCatalogBrowseInput>, CatalogBrowseInput> = true;
-void [_claim, _ingest, _resolve, _search, _watch, _import, _events, _recent, _browse];
+const _tracks: Same<z.infer<typeof ZCatalogTracksInput>, CatalogTracksInput> = true;
+void [_claim, _ingest, _resolve, _search, _watch, _import, _events, _recent, _browse, _tracks];

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join, normalize as normalizePath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { appendFile, existsSync, promises as fsp, statSync } from 'node:fs';
-import { applyPendingRestore, buildMcpWriteTools, createCoreService, migrate, readRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
+import { applyPendingRestore, buildMcpWriteTools, createCoreService, migrate, probeWsl, readRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
 import { cpus, hostname } from 'node:os';
 import { mainLog, attachFileSink } from './log.js';
 import { isLogLevel } from '@curator/shared/log';
@@ -98,7 +98,7 @@ function toWslPath(p: string): string {
 		.replace(/\\/g, '/');
 }
 
-type SidecarSpec = { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv; translatePathsToWsl?: boolean };
+type SidecarSpec = { executable: string; args?: string[]; cwd?: string; env?: NodeJS.ProcessEnv; translatePathsToWsl?: boolean; preflight?: () => Promise<string | null> };
 
 // Run the analyzer source tree inside WSL Ubuntu's venv (.venv-wsl under
 // analyzerDir), translating paths across the JSON-RPC boundary. Shared by dev
@@ -114,6 +114,9 @@ function wslVenvAnalyzerSpec(analyzerDir: string): SidecarSpec {
 			`cd '${toWslPath(analyzerDir)}' && PYTHONUNBUFFERED=1 PYTHONPATH=src .venv-wsl/bin/python -m curator_analyzer.main`,
 		],
 		translatePathsToWsl: true,
+		// A hung WSL service still lets `wsl` spawn and then never answers;
+		// ask it for one trivial command before trusting it with the analyzer.
+		preflight: () => probeWsl(),
 	};
 }
 
@@ -167,6 +170,7 @@ function getAnalyzerSpec(): SidecarSpec | null {
 				executable: 'wsl',
 				args: ['bash', '-c', `cd '${toWslPath(bundleDir)}' && exec ./curator-analyzer`],
 				translatePathsToWsl: true,
+				preflight: () => probeWsl(),
 			};
 		}
 		// Repo-local fallback: a packaged build launched from inside the
@@ -930,6 +934,9 @@ function registerIpc(svc: CoreService): void {
 		if (evt.kind === 'enqueued') return;
 		broadcastEvent('analysis:event', evt);
 	});
+	// Whether the analyzer process is alive — a handful of transitions per
+	// launch. The job stream above can't say it: a hung analyzer emits nothing.
+	svc.subscribeAnalyzerHealth((health) => broadcastEvent('analysis:health', health));
 	// AI engine: status snapshots are coalesced in core (<= 4/s), so even a
 	// whole-library backfill stays a trickle on the renderer's message pump.
 	svc.subscribeMirEvents((evt) => broadcastEvent('mir:event', evt));
@@ -963,6 +970,12 @@ function registerIpc(svc: CoreService): void {
 	// a few changes a minute at most (Settings → Account shows them).
 	svc.subscribeCatalogWorker((status) => {
 		broadcastEvent('catalog:worker-event', status);
+	});
+
+	// The work for the entity page in front: progress, rows found, "read the
+	// catalogue again". One event a lookup (a second or more apart).
+	svc.subscribeEntityWork((e) => {
+		broadcastEvent('entity:work', e);
 	});
 
 	// KB expansion progress — background provider pages + research results

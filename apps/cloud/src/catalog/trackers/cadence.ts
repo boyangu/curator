@@ -2,6 +2,11 @@
 // day, at midnight local time across the world), so a tracker can poll
 // tighter inside a Friday window and loosely the rest of the week; outside
 // the window, a due time that would overshoot its start snaps back to it.
+//
+// That is the tracker's own cadence — the most often its source is read. How
+// often a cursor is in fact read is its followers' choice (nextDueFor).
+
+import type { CatalogReadCadence } from '@curator/protocol';
 
 export type Cadence = {
 	everyMin: number;
@@ -10,6 +15,10 @@ export type Cadence = {
 
 const MIN = 60_000;
 const DAY = 86400_000;
+const DAY_MIN = 1440;
+const WEEK_MIN = 7 * DAY_MIN;
+// A weekly read of a tracker that names no Friday window of its own.
+const DEFAULT_FRIDAY = { fromUtc: '00:00', toUtc: '12:00', everyMin: 120 };
 
 function minutesOf(hhmm: string): number {
 	const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
@@ -44,6 +53,24 @@ export function nextDueAt(now: number, cadence: Cadence, spread = 0): number {
 	const interval = cadence.friday.everyMin * MIN;
 	if (now >= w.start && now < w.end) return Math.min(base, now + Math.round(interval * (1 + 0.5 * spread)));
 	return Math.min(base, w.start + Math.round(interval * spread));
+}
+
+// When a cursor is next due under its followers' choice (protocol
+// CatalogReadCadence; tracking.ts readCadenceOf picks the most frequent among
+// them). A choice only ever slows the tracker:
+//   'source'  the tracker's own cadence, above;
+//   'daily'   a day from now, with no tightening through Friday;
+//   'weekly'  once, in the Friday window that opens next — a read inside this
+//             week's window is this week's read — each cursor at its own place
+//             in the window's first interval, like a wave outside it above.
+export function nextDueFor(now: number, cadence: Cadence, choice: CatalogReadCadence, spread = 0): number {
+	if (choice === 'source') return nextDueAt(now, cadence, spread);
+	if (choice === 'daily') return now + Math.max(cadence.everyMin, DAY_MIN) * MIN;
+	if (cadence.everyMin > WEEK_MIN) return now + cadence.everyMin * MIN;
+	const f = cadence.friday ?? DEFAULT_FRIDAY;
+	const w = fridayWindow(now, f.fromUtc, f.toUtc);
+	const start = now >= w.start ? w.start + 7 * DAY : w.start;
+	return start + Math.round(Math.min(f.everyMin * MIN, w.end - w.start) * spread);
 }
 
 // A cursor's place in a wave, stable per object id (FNV-1a), in [0, 1).

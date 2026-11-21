@@ -67,6 +67,12 @@ describe('detectors', () => {
 			return out;
 		});
 		expect(new Set(r.outcomes.map((o) => o.objectId)).size).toBe(3);
+		// Deezer's copy is a fresh stub (no tracklist): filled first, not asked about.
+		const aged = () => app.db.query(`update curator.catalog_object set discovered_at = now() - interval '30 hours' where kind = 'release'`);
+		expect(await runInboxDetectors({ db: app.db })).toMatchObject({ twins: 0, pages: 0, trackers: 0 });
+		expect(await app.db.query(`select object_id from curator.catalog_enrich_task where need = 'fill'`)).toEqual([{ object_id: r.outcomes[1]!.objectId }]);
+		// No store read it within the window: asked as it stands.
+		await aged();
 		expect(await runInboxDetectors({ db: app.db })).toMatchObject({ twins: 1, pages: 0, trackers: 0 });
 		const ops = adminOps(app.db, {});
 		const [item] = (await ops.inboxList({ status: 'open', kind: 'release.twins' })).rows;
@@ -85,6 +91,7 @@ describe('detectors', () => {
 			const out = await ingestClaims(tx, more, { reason: 'tracker' });
 			await linkReleasesToLabel(tx, label!.objectId, [{ objectId: out.outcomes[0]!.objectId, claim: more[0]! }]);
 		});
+		await aged();
 		expect((await runInboxDetectors({ db: app.db })).twins).toBe(1);
 		const [second] = (await ops.inboxList({ status: 'open', kind: 'release.twins' })).rows;
 		await ops.inboxDecide({ id: second!.id, action: 'reject', note: 'a remix' });

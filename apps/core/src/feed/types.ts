@@ -125,6 +125,10 @@ export interface FeedTrackRef {
 	// resolved before this field existed lack it — getItemDetail falls back to
 	// album-level artist-name matching for those (see service.getItemDetail).
 	artistIds?: string[];
+	// The Global Catalog's artist object per credit, aligned with `artists`
+	// (null: a credit the card's album-level artists do not name — a remixer,
+	// a guest). What an artist page is opened by; `artistIds` stays the mute key.
+	artistCatalogIds?: (string | null)[];
 	durationSec: number | null;
 	trackNumber?: number | null;
 	// Kept whenever the source exposes it — ISRC is the cross-source
@@ -163,6 +167,12 @@ export interface FeedItemPayload {
 	// Stable per-source artist ids aligned with `artists` where known —
 	// used for artist-scoped dismiss keys.
 	artistIds?: string[];
+	// The Global Catalog's artist objects aligned with `artists`, and the
+	// label's (items the cloud raised): what an artist / label page is opened
+	// by. `artistIds` holds the Spotify id whenever there is one, so it cannot
+	// name the catalogue object, and `label` is only a name.
+	artistCatalogIds?: (string | null)[];
+	labelCatalogId?: string | null;
 	label?: string | null;
 	// ISRC for track items (cross-source identity — also feeds dedupeKey).
 	isrc?: string | null;

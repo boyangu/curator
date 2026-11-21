@@ -24,12 +24,14 @@ How to work:
 export const PACKS: Record<AgentCaseKind, PromptPack> = {
 	release_twin: {
 		id: 'catalog.release_twin',
-		version: '1',
+		version: '2',
 		text: `Question: are these releases, listed on one label under one title, the same release held twice, or different releases?
 
 Rules:
 - The same release: the same tracklist (titles, order, durations within 2 s), the same ISRCs where present, the same or adjacent release dates (a store often lists a week early or late), the same UPC. A store's duplicate listing, a Bandcamp or SoundCloud copy of a store release, and a label's own shop page are the same release.
+- A re-delivery is the same release: every title matches and every duration agrees to the second, but most ISRCs differ (a distributor sent it to the store again under new codes). Say so in the rationale; the merge keeps both codes on each track.
 - Different releases: a 1-track single with its own UPC against the EP or album that later contains it; a remix EP or an "extended" edition against the original; a re-release years later with other tracks; an anniversary or remastered edition with new tracks; two different track lists under one title (a compilation's two discs numbered from 1).
+- A label's own shop often sells another edition than the stores stream (Bandcamp: the extended mixes alone, or a bundle; a shop page: the vinyl). Title, label and date then all match and the tracks do not: a side with no tracklist in the pack proves nothing. Read its page; if you cannot, answer unsure for that pair.
 - Track count alone does not decide: a store may list a partial release (the pack marks a known partial listing as an insight).
 - For each pair answer same, different or unsure. "keep" is the copy the catalogue would keep; your job is the verdict, not the direction.`,
 	},

@@ -37,7 +37,7 @@ describe('track context menu', () => {
 			'# Mother Nature',
 			'Organize… [o]', 'Edit Metadata… [e]', 'Analyze… [a]',
 			'--',
-			'Enhance with BPM, Key, Label, Genre', 'Enhance with Tidal',
+			'Enrich with BPM, Key, Genre, Label', 'Enhance with Tidal',
 			'--',
 			'Find Similar', 'Production Profile…', 'Navigate to > Solee', 'Open Artist in > Open Locally',
 			'--',
@@ -146,3 +146,54 @@ describe('Add to Similarity Match', () => {
 	});
 });
 
+describe('catalogue rows', () => {
+	const catalog = { recordingId: 'r', releaseId: 'rel', synthetic: true, libraryTrackId: null, streamIds: { spotify: 'sp1' }, links: [], albumArtistId: null, labelId: null };
+
+	it('no library command applies to a selection holding a catalogue row', () => {
+		const row = track([], { id: 'catalog:rel:r', catalog } as Partial<Track>);
+		const own = track(['local']);
+		for (const id of ['organize', 'edit', 'delete', 'remove-from-playlist']) {
+			expect(trackCommandAvailable(id, { tracks: [row], view: 'page', source: 'rekordbox' as never })).toBe(false);
+			expect(trackCommandAvailable(id, { tracks: [own, row], view: 'tracks', source: 'rekordbox' as never })).toBe(false);
+		}
+		expect(runTrackCommand('delete', { tracks: [row], view: 'page', source: 'rekordbox' as never })).toBe(false);
+		// The library's own row on the same page is a library track like any other.
+		const shown = track(['local'], { catalog: { ...catalog, synthetic: false } } as Partial<Track>);
+		expect(trackCommandAvailable('organize', { tracks: [shown], view: 'page', source: 'rekordbox' as never })).toBe(true);
+	});
+});
+
+describe('Navigate to / Open in New Tab', () => {
+	it("opens the track's artist, album and label as pages — by the library's ids — and offers each in a tab of its own", () => {
+		const opened: { ref: unknown; opts: unknown }[] = [];
+		const entered: { name: string }[] = [];
+		initTrackCommands({
+			openEntity: (ref: unknown, opts?: unknown) => { opened.push({ ref, opts }); },
+			enterJitScope: async (jit: { name: string }) => { entered.push(jit); },
+		} as unknown as ContextMenusFeatureDeps);
+		const t = track(['local'], { artistIds: ['a1'], albumId: 'al1', albumTitle: 'Lailonie', label: 'Anjunadeep', genre: 'Melodic House' } as Partial<Track>);
+		const ctx: TrackCommandContext = { tracks: [t], view: 'tracks', source: 'rekordbox' as never, tagIds: new Set(), drillPlaylists: [] };
+		const labels = shape(ctx);
+		expect(labels).toContain('Navigate to > Solee | Lailonie | Anjunadeep | Melodic House');
+		// A genre is a search, not a page: it has no tab of its own.
+		expect(labels).toContain('Open in New Tab > Solee | Lailonie | Anjunadeep');
+		expect(labels.indexOf('Open in New Tab > Solee | Lailonie | Anjunadeep')).toBe(labels.indexOf('Navigate to > Solee | Lailonie | Anjunadeep | Melodic House') + 1);
+
+		const { handlers } = buildTrackMenu(ctx);
+		void handlers['drill-artist-0']!();
+		void handlers['tab-drill-album']!();
+		void handlers['drill-label']!();
+		void handlers['drill-genre']!();
+		expect(opened).toEqual([
+			{ ref: { kind: 'artist', name: 'Solee', libraryId: 'a1' }, opts: undefined },
+			{ ref: { kind: 'album', name: 'Lailonie', libraryId: 'al1' }, opts: { newTab: true } },
+			{ ref: { kind: 'label', name: 'Anjunadeep' }, opts: undefined },
+		]);
+		expect(entered.map((j) => j.name)).toEqual(['Genre: Melodic House']);
+
+		// An artist the read named by no id opens no page (a name alone never
+		// does): the exact-name search stands in, and there is nothing to tab.
+		const bare = track(['local']);
+		expect(shape({ ...ctx, tracks: [bare] }).join('\n')).not.toMatch(/Open in New Tab/);
+	});
+});

@@ -10,6 +10,7 @@ export * from './controller-mapping.js';
 export * from './wellformed.js';
 export * from './pkce.js';
 export * from './backup.js';
+export * from './release-kind.js';
 // Logging is subpath-only ('@curator/shared/log', '@curator/shared/log-node')
 // so imports state their intent and the renderer boundary check can ban the
 // node-only sink module by specifier.

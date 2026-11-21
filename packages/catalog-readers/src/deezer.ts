@@ -28,7 +28,38 @@ const EXPAND_PER_POLL = 4;
 const EXPAND_WITHIN_DAYS = 90;
 
 type DzArtist = { id: number; name: string; link?: string; picture_xl?: string };
-type DzAlbumRef = { id: number; title: string; release_date?: string; record_type?: string; cover_xl?: string; link?: string };
+type DzAlbumRef = { id: number; title: string; release_date?: string; record_type?: string; cover_xl?: string; link?: string; genre_id?: number };
+
+// Deezer's genres (GET /genre), by id: an album in an artist's listing carries
+// the id alone. The list is Deezer's whole taxonomy and has not moved in years.
+export const DEEZER_GENRES: Readonly<Record<number, string>> = {
+	2: 'African Music',
+	16: 'Asian Music',
+	75: 'Brazilian Music',
+	81: 'Indian Music',
+	85: 'Alternative',
+	95: 'Kids',
+	98: 'Classical',
+	106: 'Electro',
+	113: 'Dance',
+	116: 'Rap/Hip Hop',
+	129: 'Jazz',
+	132: 'Pop',
+	144: 'Reggae',
+	152: 'Rock',
+	153: 'Blues',
+	165: 'R&B',
+	169: 'Soul & Funk',
+	173: 'Films/Games',
+	197: 'Latin Music',
+	464: 'Metal',
+	466: 'Folk',
+};
+const genreOf = (a: DzAlbumRef): string | null => (a.genre_id !== undefined ? DEEZER_GENRES[a.genre_id] ?? null : null);
+
+// One album as an artist page lists it: what the page validation reads
+// (apps/cloud catalog/artist-validation.ts).
+export type DeezerListedAlbum = { id: string; title: string; date: string | null; genre: string | null };
 type DzAlbum = DzAlbumRef & {
 	upc?: string;
 	label?: string;
@@ -38,7 +69,7 @@ type DzAlbum = DzAlbumRef & {
 	nb_tracks?: number;
 };
 type DzTrack = { id: number; title: string; isrc?: string; duration?: number; track_position?: number; disk_number?: number; link?: string; artist?: DzArtist };
-type DzList<T> = { data?: T[]; error?: { code: number; message: string } };
+type DzList<T> = { data?: T[]; total?: number; error?: { code: number; message: string } };
 
 // Deezer answers 200 with { error } for its quota (code 4) and for missing
 // objects (800).
@@ -62,6 +93,8 @@ function shallowClaim(a: DzAlbumRef, artist: DzArtist): CatalogClaim {
 			...(a.cover_xl ? { coverUrl: a.cover_xl } : {}),
 		},
 		artists: [artistClaim(artist)],
+		// The listing's own genre: all a bare copy says of what kind of music it is.
+		...(genreOf(a) ? { genres: [genreOf(a)!] } : {}),
 	};
 }
 
@@ -102,6 +135,25 @@ export class DeezerTracker implements TrackerAdapter {
 		const list = await this.get<DzList<DzAlbumRef>>(`/search/album?q=${encodeURIComponent(`label:"${name}"`)}&limit=100`, signal);
 		const want = nameFold(name);
 		return this.expand(list.data ?? [], target.cursor, signal, 1, (al) => nameFold(al.label) === want);
+	}
+
+	// How many fans an artist page has (the Reach score). Null: no such page
+	// (Deezer answers one with error 800 and a 200).
+	async artistFans(artistId: string, signal: AbortSignal): Promise<number | null> {
+		const a = await this.get<{ error?: { code: number }; nb_fan?: number }>(`/artist/${encodeURIComponent(artistId)}`, signal);
+		return typeof a.nb_fan === 'number' ? a.nb_fan : null;
+	}
+
+	// What an artist page lists, each album with Deezer's genre for it, and how
+	// many it holds in all: one call, the first hundred. Not a poll — nothing
+	// is ingested from it; the page validation judges the page by it (a page
+	// of rap, J-pop and techno is several acts filed under one name).
+	async artistAlbums(artistId: string, signal: AbortSignal): Promise<{ total: number | null; albums: DeezerListedAlbum[] }> {
+		const list = await this.get<DzList<DzAlbumRef>>(`/artist/${encodeURIComponent(artistId)}/albums?limit=100`, signal);
+		return {
+			total: typeof list.total === 'number' ? list.total : null,
+			albums: (list.data ?? []).map((a) => ({ id: String(a.id), title: a.title, date: a.release_date && /^\d{4}-\d{2}-\d{2}$/.test(a.release_date) ? a.release_date : null, genre: genreOf(a) })),
+		};
 	}
 
 	// One release in full, by its Deezer id or by UPC (`/album/upc:<upc>`):
@@ -170,6 +222,11 @@ export class DeezerTracker implements TrackerAdapter {
 
 	private releaseClaim(al: DzAlbum, tracks: DzTrack[]): CatalogClaim {
 		const artists = al.contributors?.length ? al.contributors : al.artist ? [al.artist] : [];
+		// The tracklist names a track's primary artist only (its full credit is
+		// on the track's own page, a call a track). On a one-track release the
+		// release's credit is the track's; on any other the short one is kept
+		// and the catalogue reads the rest elsewhere (apps/cloud catalog/credits.ts).
+		const single = tracks.length === 1 && (al.nb_tracks ?? 1) === 1 && artists.length > 0;
 		return {
 			provider: 'deezer',
 			kind: 'release',
@@ -193,7 +250,7 @@ export class DeezerTracker implements TrackerAdapter {
 				url: t.link ?? `https://www.deezer.com/track/${t.id}`,
 				identifiers: t.isrc ? [{ namespace: 'isrc' as const, value: t.isrc }] : [],
 				facts: { ...(t.duration ? { durationSec: t.duration } : {}), trackNumber: t.track_position ?? i + 1, ...(t.disk_number ? { discNumber: t.disk_number } : {}) },
-				...(t.artist ? { artists: [artistClaim(t.artist)] } : {}),
+				...(single ? { artists: artists.map(artistClaim) } : t.artist ? { artists: [artistClaim(t.artist)] } : {}),
 			})),
 			genres: (al.genres?.data ?? []).map((g) => g.name),
 		};

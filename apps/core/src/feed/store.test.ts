@@ -358,6 +358,49 @@ describe('SqliteFeedStore recording collapse', () => {
 		s.close();
 	});
 
+	it('a release its source dates ahead is dated when it reached the feed, not on that day', async () => {
+		const s = new SqliteFeedStore(':memory:');
+		const before = Date.now();
+		const ahead = before + 22 * DAY;
+		await s.upsertItems([release('early', [ref('a1', 'Sparklestar')], ahead)]);
+		const early = (await s.getPage()).items[0]!;
+		expect(early.publishedAt).toBeGreaterThanOrEqual(before);
+		expect(early.publishedAt).toBe(early.fetchedAt);
+		const raw = (s as unknown as { db: Database.Database }).db;
+		expect(raw.prepare(`SELECT order_ts FROM feed_item`).get()).toEqual({ order_ts: early.fetchedAt });
+		// A second follow announcing it with the same date is a sighting now.
+		await s.accrueSources([{ ...release('early', [ref('a1', 'Sparklestar')], ahead), origin: { kind: 'label', id: 'lbl', name: 'Label' } }]);
+		expect(raw.prepare(`SELECT COUNT(*) AS n FROM feed_item_origin WHERE seen_at > ?`).get(Date.now())).toEqual({ n: 0 });
+		s.close();
+	});
+
+	it('v9 → v10 migration pulls rows dated ahead back to their fetch time', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v10-'));
+		const path = join(dir, 'feed.db');
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([release('early', [ref('a1', 'Sparklestar')]), plTrack('t2', 'Other', 'P1', T0 + DAY)]);
+			s.close();
+			// Rewind to a v9 row stored with the source's future date.
+			const ahead = Date.now() + 22 * DAY;
+			const raw = new Database(path);
+			raw.prepare(`UPDATE feed_item SET published_at = ?, order_ts = ?, fetched_at = ? WHERE source_id = 'early'`).run(ahead, ahead, T0 + 2 * DAY);
+			raw.prepare(`UPDATE feed_item_origin SET seen_at = ? WHERE origin_id = 'nicky'`).run(ahead);
+			raw.exec(`UPDATE feed_meta SET value = '9' WHERE key = 'schema_version'`);
+			raw.close();
+			const s2 = new SqliteFeedStore(path);
+			const early = (await s2.getPage()).items.find((i) => i.sourceId === 'early')!;
+			expect(early.publishedAt).toBe(T0 + 2 * DAY);
+			const raw2 = new Database(path, { readonly: true });
+			expect(raw2.prepare(`SELECT order_ts FROM feed_item WHERE source_id = 'early'`).get()).toEqual({ order_ts: T0 + 2 * DAY });
+			expect(raw2.prepare(`SELECT seen_at FROM feed_item_origin WHERE origin_id = 'nicky'`).get()).toEqual({ seen_at: T0 + 2 * DAY });
+			raw2.close();
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it('v7 → v8 migration indexes recordings and folds existing duplicate pairs', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'feed-v8-'));
 		const path = join(dir, 'feed.db');

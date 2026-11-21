@@ -47,7 +47,14 @@ import type { Logger } from '@curator/shared/log';
 import { parseInline } from './ingest/parser.js';
 import type { ParseFn } from './ingest/types.js';
 import { createArtistPages } from './library/artist-pages.js';
-import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, AlbumSummary } from '@curator/shared';
+import { createEntityPages } from './entity/service.js';
+import { createEntityWork, type EntityWork } from './entity/work.js';
+import { createSpotifyStreaming, type StreamingCatalog } from './entity/streaming.js';
+import { createWorldSearch } from './entity/world-search.js';
+import { inLane } from './enrich/lane.js';
+import { BeatportEnricher } from './enrich/enrichers/beatport.js';
+import { TraxsourceEnricher } from './enrich/enrichers/traxsource.js';
+import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, AlbumSummary, EntityHeader, EntityRef, EntityTracksPage, EntityWorkEvent, StreamingService, WorldSearchPart, WorldSearchResult } from '@curator/shared';
 import { DEFAULT_SOURCE_SYNC_SETTINGS, artistKey, asciify, asciifyArtists, searchFold, type ArtistCreditFormat } from '@curator/shared';
 import { loadArtistAliasMap, mapCredits, rederiveTrackCreditsRaw } from './library/artist-alias.js';
 import { lookupArtistRaw, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from './library/artists.js';
@@ -194,8 +201,9 @@ import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedD
 import type { LibraryMembershipLookup } from './feed/pipeline.js';
 import type { FeedAction, FeedActionResult, FeedItem, FeedItemActivity, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, EnrichmentResult } from './feed/types.js';
 import { createCatalogWorker, type CatalogWorker, type CatalogWorkerStatus } from './catalog-worker/service.js';
-import { checkedTrackers, readReadSources, writeReadSources, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
+import { checkedTrackers, readCadence, readReadSources, writeReadCadence, writeReadSources, type CatalogReadCadence, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 import { createFactsUp } from './catalog-client/facts-up.js';
+import { createAudienceUp } from './catalog-client/audience-up.js';
 
 // After the catalogue worker reports new events: one background pass of
 // the catalogue producer, so a drain of many reads is one pass.
@@ -222,7 +230,7 @@ import type {
 	KbExpansion,
 } from './knowledge/types.js';
 import type { SpotifyTrack } from '@curator/spotify';
-import { SpotifyClient, configureSpotifyBackoffStore } from '@curator/spotify';
+import { SpotifyClient, configureSpotifyBackoffStore, spotifyBackoffUntil } from '@curator/spotify';
 import { spotifyBackoffStore } from './sources/spotify-backoff.js';
 import { SqliteAgentStore, type AgentSessionDetail, type AgentSessionSummary } from './agent/store.js';
 import { AgentSidecarManager, type AgentSidecarSpec } from './agent/sidecar.js';
@@ -275,7 +283,7 @@ export function isProviderTrackId(source: 'spotify' | 'tidal', id: string | null
 }
 import { effectiveTitle, effectiveArtistName } from './sync/curator-view.js';
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
-import { AnalyzerSidecar } from './analyzer/sidecar.js';
+import { AnalyzerSidecar, type AnalyzerHealth } from './analyzer/sidecar.js';
 import { AnalysisQueue, formatAnalyzerTrackName, splitFileless, type AnalysisJobEvent } from './analyzer/queue.js';
 import { type AnalysisFlags, type AutoAnalyzeSettings, type AnalyzerResources, type AnalyzerResourcesSettings, DEFAULT_AUTO_ANALYZE_SETTINGS, clampAnalyzerWorkers, defaultAnalyzerWorkers, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
 import { runModelsRepair } from './analyzer/models-repair.js';
@@ -359,6 +367,10 @@ export interface CoreServiceOptions {
 		// Windows wheel for Essentia). The sidecar wrapper translates file
 		// paths to /mnt/<drive>/... on outbound JSON and back on inbound.
 		translatePathsToWsl?: boolean;
+		// Launch check run before every spawn (SidecarOptions.preflight):
+		// null = go, else the reason the analyzer can't start. The desktop
+		// main passes the WSL probe with a WSL-hosted spec.
+		preflight?: () => Promise<string | null>;
 	};
 	// Spawn-spec for the Python rekordbox sidecar. Same shape as `analyzer`.
 	// When omitted, rekordbox read methods reject with "rekordbox disabled".
@@ -625,7 +637,9 @@ export interface CoreService {
 	// it disambiguates duplicates that `trackId` alone can't. Atomic: only the
 	// displaced rows get new order keys, then positions are restamped 0..N-1
 	// in the new order, which callers read back on their next fetch.
-	reorderPlaylistTracks(playlistId: string, newOrder: number[]): Promise<void>;
+	// `upstream` says whether a streaming playlist's provider took the order
+	// (as addTracksToPlaylist reports it); the local order stands either way.
+	reorderPlaylistTracks(playlistId: string, newOrder: number[]): Promise<{ upstream: UpstreamPushOutcome; detail?: string }>;
 	// Per-source sync settings. Core owns the canonical store (app_setting
 	// table — origin-independent, shared by dev + packaged renderers; see
 	// schema.ts). The renderer reads them at boot, then calls set after
@@ -882,6 +896,53 @@ export interface CoreService {
 	// through a catalogue id or a Spotify artist id (library/artist-pages.ts).
 	// The catalogue is optional — signed out or slow, the local links answer.
 	getArtistPages(target: ArtistPagesTarget): Promise<ArtistPages>;
+	// ─── Entity pages — an artist's, a label's or an album's page
+	// (entity/service.ts) ──────────────────────────────────────────────────
+	// The page header: who it is on both sides (the library's entity and the
+	// Global Catalog's object, joined by id, never by name), what the library
+	// and the catalogue say about it, the filter of its Owned side (local
+	// files) and whether its World side can be read. `localOnly` answers from
+	// the library at once; without it the catalogue is waited for.
+	getEntityPage(ref: EntityRef, opts?: { localOnly?: boolean }): Promise<EntityHeader>;
+	// A page of the entity's World side: the catalogue's releases, newest
+	// first, with their tracklists, each recording marked with the library
+	// track it is. Rejects when the catalogue is not reachable or does not
+	// know the entity (the header's `world` says which, beforehand) — unless
+	// the user's streaming service can stand in: an artist or an album the
+	// catalogue does not know is answered from there (`world.via`), in the
+	// same shape under that service's ids.
+	getEntityTracks(ref: EntityRef, opts?: { cursor?: string }): Promise<EntityTracksPage>;
+	// The entity page in front of the user (null: none). While one is, this
+	// desktop works for it (entity/work.ts): reads the stores for an entity
+	// the catalogue does not know or for releases it lacks, reads missing
+	// tracklists, and fills in what the loaded World rows lack (a page on
+	// the primary streaming service, BPM / key / genre / label) — all of it
+	// sent up to the catalogue. Naming another page stops the work for the
+	// one before. `token` comes back on every event of that page.
+	watchEntityPage(ref: EntityRef | null, token: number): Promise<void>;
+	// What that work is doing and what it found: progress, rows to patch in
+	// place, and "the catalogue's answer changed, read it again". The
+	// desktop forwards these as 'entity:work'.
+	subscribeEntityWork(cb: (e: EntityWorkEvent) => void): () => void;
+	// The user asked for these World rows of the page in front (Global
+	// Catalog recording ids) to be looked up at the stores now — BPM, key,
+	// genre, label — ahead of the page's own order and again for rows already
+	// tried. Resolves when done: how many of them the page holds, and how
+	// many a store had something for (those rows arrive as work events and go
+	// up to the catalogue like the page's own findings).
+	enrichEntityRows(recordingIds: string[]): Promise<{ asked: number; found: number }>;
+	// The omnibar's World scope (entity/world-search.ts): one part of a
+	// search over music the library may not hold — the user's streaming
+	// service ('streaming': artists, albums, tracks), the Global Catalog
+	// ('catalog': artists, labels, releases by name) or the stores
+	// ('stores': labels at Beatport). Asked a part at a time so the fastest
+	// shows first. Read-only; a part that cannot answer says why in `note`.
+	searchWorld(query: string, part: WorldSearchPart): Promise<WorldSearchResult>;
+	// The streaming service catalogue rows play through. `stored` false: the
+	// user never chose, and `service` is the connected account (Spotify when
+	// both are; null when neither).
+	getPrimaryStreaming(): Promise<{ service: StreamingService | null; stored: boolean }>;
+	setPrimaryStreaming(service: StreamingService): Promise<void>;
 	// ─── Albums — library release entities (derived by library/albums.ts;
 	// see the ALBUM comment in schema.ts) ──────────────────────────────────
 	// Summaries for the track list's album group headers, one per requested
@@ -968,6 +1029,9 @@ export interface CoreService {
 	// Chromium abort in-flight renderer loads (ERR_NETWORK_CHANGED). Analysis
 	// enqueued before this waits; idempotent; no-op when the analyzer is off.
 	startAnalyzer(): void;
+	// Relaunch an analyzer that gave up or is not responding (the status
+	// chip's retry). No-op when it is running, still launching, or off.
+	restartAnalyzer(): Promise<void>;
 	// Full recompute of track.membership. Called after a Spotify connect /
 	// disconnect / account switch — that flips the my-vs-followed split for
 	// every track, so the whole table must be reclassified.
@@ -1026,9 +1090,14 @@ export interface CoreService {
 	// Snapshot of the analyzer queue for renderer backfill — the event stream
 	// only sees transitions from this point forward, so on first wire / HMR
 	// reload the renderer queries this once to populate "currently running"
-	// and queue depth.
-	getAnalysisStatus(): Promise<{ running: { trackId: string; name: string }[]; queued: number }>;
+	// and queue depth. `analyzer` is the process's liveness (a job counts as
+	// running from the moment it is handed over, whether or not anything is
+	// there to run it); `lastCompletedAt` (epoch ms) is the last analysis
+	// that actually finished, across launches.
+	getAnalysisStatus(): Promise<{ running: { trackId: string; name: string }[]; queued: number; analyzer: AnalyzerHealth; lastCompletedAt: number | null }>;
 	subscribeAnalysisEvents(cb: (e: AnalysisJobEvent) => void): () => void;
+	// Liveness transitions of the analyzer process (see AnalyzerHealth).
+	subscribeAnalyzerHealth(cb: (h: AnalyzerHealth) => void): () => void;
 
 	// ─── Rekordbox adapter (read-only v1) ────────────────────────────────────
 	detectRekordbox(): Promise<{ dbPath: string | null; running: boolean }>;
@@ -1223,10 +1292,13 @@ export interface CoreService {
 	getCatalogWorkerStatus(): Promise<CatalogWorkerStatus>;
 	subscribeCatalogWorker(cb: (status: CatalogWorkerStatus) => void): () => void;
 	// The user's tracking choices (catalog-worker/settings.ts): which sources
-	// are read for their follows, per kind. Unchecked means nobody reads it.
-	// Device-local; applied at the worker's next ask.
+	// are read for their follows, per kind, and how often. Unchecked means
+	// nobody reads it. Device-local; applied at the worker's next ask.
 	getCatalogReadSources(): Promise<CatalogReadSources>;
 	setCatalogReadSources(patch: CatalogReadSourcesPatch | null): Promise<CatalogReadSources>;
+	// How often one kind of follow is read: 'weekly' (the default, in the
+	// Friday window), 'daily', or 'source' (as often as the source allows).
+	setCatalogReadCadence(kind: CatalogReadSources[number]['kind'], cadence: CatalogReadCadence): Promise<CatalogReadSources>;
 	// ─── Following (Global Catalog watches; catalog-client/service.ts) ───
 	// Whether this device can follow artists and labels: signed in to the
 	// cloud, and the server offers 'global_catalog'.
@@ -1979,6 +2051,15 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		const fresh = readFeedLenses();
 		if (JSON.stringify(fresh) !== JSON.stringify(feedLenses)) lensesChanged(fresh);
 	};
+	// The store lookups for DJ facts, one set for the feed's drain and the
+	// entity pages' row fill (entity/work.ts): each store in a lane, so the
+	// two running together still ask it one lookup at a time, at the feed's
+	// pace, and share its Cloudflare cool-down.
+	const STORE_LANE_GAP_MS = 1500;
+	const storeEnrichers = [
+		inLane(new BeatportEnricher(opts.beatportFetch), STORE_LANE_GAP_MS),
+		inLane(new TraxsourceEnricher(opts.beatportFetch), STORE_LANE_GAP_MS),
+	];
 	const feedService = createFeedService({
 		lenses: () => feedLenses,
 		catalogFeed: opts.cloud?.transport.feed
@@ -2020,6 +2101,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		store: feedStore,
 		auth, // AuthService satisfies FeedAuthPort structurally
 		beatportFetch: opts.beatportFetch,
+		enrichers: storeEnrichers,
 		library: {
 			membership: feedLibraryMembership,
 			promote: feedPromote,
@@ -2547,6 +2629,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			catalog: catalogProcs,
 			signedIn: () => opts.cloud!.transport.session() !== null,
 			serverOffers: () => opts.cloud!.transport.catalogOffered?.() ?? cloudClient.serverFeatures()?.includes('global_catalog') ?? false,
+			features: () => opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? [],
 			deviceId: () => cloudClient.deviceId(),
 			spotifyToken: () => auth.getSpotifyAccessToken(),
 		})
@@ -2567,6 +2650,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			},
 			spotifyToken: () => auth.getSpotifyAccessToken(),
 			trackers: () => checkedTrackers(sqlite),
+			cadence: () => {
+				const features = opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? [];
+				return features.includes('catalog_read_cadence') ? readCadence(sqlite) : null;
+			},
 			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
 		})
 		: null;
@@ -2599,11 +2686,73 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		ingest: () => (catalogClient?.status().available ? (claims, idempotencyKey) => catalogClient.reportEnrichment(claims, idempotencyKey) : null),
 		subscribe: (cb) => feedService.subscribeEnriched(cb),
 	});
+	// Library artists up (catalog-client/audience-up.ts): the artists of this
+	// desktop's own files, monthly, for their Reach score.
+	const audienceUp = createAudienceUp({ raw: rawOf(db), client: () => catalogClient });
 	const artistPages = createArtistPages({
 		artistById: (id) => lookupLiveArtist(db, id),
 		artistByName: (name) => lookupArtistRaw(rawOf(db), name),
 		links: (artistId) => db.select({ source: artistLink.source, sourceId: artistLink.sourceId, url: artistLink.url }).from(artistLink).where(eq(artistLink.artistId, artistId)).orderBy(asc(artistLink.source)).all(),
 		catalog: () => catalogClient,
+	});
+	// The user's Spotify for the pages' own lookups; not during a quota ban
+	// (they wait it out like the worker's).
+	const pageSpotify = async (): Promise<SpotifyClient | null> => {
+		if (spotifyBackoffUntil() > Date.now()) return null;
+		const token = await auth.getSpotifyAccessToken().catch(() => null);
+		return token ? new SpotifyClient(token, 'entity:page') : null;
+	};
+	// The streaming service read as a catalogue (entity/streaming.ts): where
+	// a page of an artist or an album the catalogue does not know is shown
+	// from, and what the omnibar's World scope searches first. The user's
+	// primary service — Spotify only for now (Tidal's artist and album reads
+	// are not built).
+	const spotifyStreaming = createSpotifyStreaming({ token: () => auth.getSpotifyAccessToken().catch(() => null) });
+	const streamingCatalog = (): StreamingCatalog | null =>
+		primaryStreaming().service === 'spotify' && auth.getStatus().spotify.connected && spotifyBackoffUntil() <= Date.now() ? spotifyStreaming : null;
+	// The page work reads through the pages and the pages tell it what was
+	// read: built one after the other, each reaching the other lazily.
+	let entityWork: EntityWork | null = null;
+	const entityPages = createEntityPages({
+		raw: sqlite,
+		catalog: () => catalogClient,
+		// Followed playlists do not enter an entity scope: nothing to probe.
+		countTracks: (filter) => countTracksImpl(db, filter, () => false),
+		albumSummary: (id) => readAlbumSummaries(sqlite, [id])[0] ?? null,
+		artistByName: (name) => lookupArtistRaw(sqlite, name),
+		onPage: (catalogId, result) => entityWork?.pageLoaded(catalogId, result),
+		patchOf: (recordingId) => entityWork?.patchOf(recordingId),
+		streaming: () => streamingCatalog(),
+		spotifyMatch: pageSpotify,
+	});
+	const worldSearch = createWorldSearch({
+		streaming: () => streamingCatalog(),
+		catalog: () => catalogClient,
+		rows: (result) => entityPages.rows(result),
+		...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
+	});
+	const PRIMARY_STREAMING_KEY = 'primary_streaming';
+	const storedPrimaryStreaming = (): StreamingService | null => {
+		const v = db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, PRIMARY_STREAMING_KEY)).get()?.value;
+		return v === 'spotify' || v === 'tidal' ? v : null;
+	};
+	// The user's choice, else the connected account (Spotify when both are).
+	const primaryStreaming = (): { service: StreamingService | null; stored: boolean } => {
+		const stored = storedPrimaryStreaming();
+		if (stored) return { service: stored, stored: true };
+		const s = auth.getStatus();
+		return { service: s.spotify.connected ? 'spotify' : s.tidal.connected ? 'tidal' : null, stored: false };
+	};
+	entityWork = createEntityWork({
+		catalog: () => catalogClient,
+		pages: entityPages,
+		trackers: () => checkedTrackers(sqlite),
+		spotify: pageSpotify,
+		spotifyToken: () => auth.getSpotifyAccessToken(),
+		primary: async () => primaryStreaming().service,
+		streaming: () => streamingCatalog(),
+		enrichers: storeEnrichers,
+		...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
 	});
 	const catalogConnect: CatalogConnect | null = cloudClient && catalogProcs && catalogClient
 		? createCatalogConnect({
@@ -2617,7 +2766,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				return token ? new TidalApiClient(config.tidal.apiBase, async () => token, auth.getTidalCountryCode() ?? 'US') : null;
 			},
 			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
-			onAttached: () => artistPages.forget(),
+			onAttached: () => { artistPages.forget(); entityPages.forget(); },
 		})
 		: null;
 	const requireConnect = (): CatalogConnect => {
@@ -4323,12 +4472,16 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// (Rolling back would be worse: it'd erase the user's drag and
 			// leave them confused about why the row jumped back.)
 			const pl = db.select().from(playlist).where(eq(playlist.id, playlistId)).get();
-			if (!pl) return;
-			if (pl.source !== 'spotify' && pl.source !== 'tidal') return;
+			if (!pl) return { upstream: 'none' };
+			if (pl.source !== 'spotify' && pl.source !== 'tidal') return { upstream: 'none' };
 			const src = pl.source as StreamingSource;
 			const settings = sourceSyncSettings[src];
 			const adapter = sourceAdapters[src];
-			if (!adapter || !settings.writeSyncAuto || !adapter.capabilities.canReorder) return;
+			if (!adapter || !adapter.capabilities.canReorder) return { upstream: 'none' };
+			if (!settings.writeSyncAuto) {
+				log.for('reorder').warn('upstream push skipped: writeSyncAuto is off; the new order is local-only', { source: src, playlistSourceId: pl.sourceId });
+				return { upstream: 'write-sync-off' };
+			}
 
 			// Every row must carry this provider's own track id before anything
 			// is sent. A row projected from another device (a "not on this
@@ -4347,8 +4500,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const unresolved = wire.filter((r) => !isProviderTrackId(src, r.sourceTrackId) || r.sourceTrackId === r.trackId);
 			if (unresolved.length > 0) {
 				log.for('reorder').warn('upstream reorder refused: rows without a provider id', { source: src, playlistSourceId: pl.sourceId, rows: unresolved.length });
-				mut.ackUpstream(db, pendingOps, src, 'failed', `${unresolved.length} track(s) in this playlist have no ${src} id on this computer, so the new order was kept here only`);
-				return;
+				const detail = `${unresolved.length} track(s) in this playlist have no ${src} id on this computer, so the new order was kept here only`;
+				mut.ackUpstream(db, pendingOps, src, 'failed', detail);
+				return { upstream: 'failed', detail };
 			}
 
 			try {
@@ -4357,7 +4511,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				if (moves.length === 0) {
 					// The provider already has this order.
 					mut.ackUpstream(db, pendingOps, src, 'pushed');
-					return;
+					return { upstream: 'pushed' };
 				}
 				// Positional moves cost one sequential API call EACH. Perfect
 				// for drags (a dragged block = blockSize calls) — catastrophic
@@ -4399,9 +4553,12 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 						.run();
 				}
 				mut.ackUpstream(db, pendingOps, src, 'pushed');
+				return { upstream: 'pushed' };
 			} catch (err) {
+				const detail = err instanceof Error ? err.message : String(err);
 				log.for('reorder').warn('upstream push failed', { source: src, playlistSourceId: pl.sourceId }, err);
-				mut.ackUpstream(db, pendingOps, src, 'failed', err instanceof Error ? err.message : String(err));
+				mut.ackUpstream(db, pendingOps, src, 'failed', detail);
+				return { upstream: 'failed', detail };
 			}
 		},
 
@@ -4695,6 +4852,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		startAnalyzer() {
 			if (analyzerSidecar && !analyzerSidecar.hasStarted) analyzerSidecar.start();
 		},
+		async restartAnalyzer() {
+			analyzerSidecar?.restart();
+		},
 
 		// ─── Discover feed ──────────────────────────────────────────────────
 		// Feed methods delegate to the feed service (feed/service.ts) — the
@@ -4761,6 +4921,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		startFeedPolling() {
 			feedService.startPolling();
 			factsUp.start();
+			audienceUp.start();
 		},
 		async getFeedRole() {
 			return feedService.role();
@@ -4780,6 +4941,9 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async setCatalogReadSources(patch) {
 			return writeReadSources(sqlite, patch);
 		},
+		async setCatalogReadCadence(kind, cadence) {
+			return writeReadCadence(sqlite, kind, cadence);
+		},
 
 		// ─── Following ──────────────────────────────────────────────────────
 		async getCatalogStatus() {
@@ -4792,11 +4956,14 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return requireCatalog().search(q);
 		},
 		async catalogFollow(target) {
+			// A page header carries follow state: drop what it cached.
+			entityPages.forget();
 			return requireCatalog().follow(target);
 		},
 		// A followed Spotify artist / playlist goes through the feed's unfollow,
 		// which also removes the items it brought (core feed/service.ts).
 		async catalogUnfollow(objectId) {
+			entityPages.forget();
 			// Through the feed, so the items the follow brought leave with it.
 			// An artist / playlist without a Spotify id is keyed `catalog:<id>`
 			// in the feed (cloud-producer.ts); a label / genre by its object id.
@@ -4816,6 +4983,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return requireCatalog().unfollow(objectId);
 		},
 		async catalogMute(objectId, muted) {
+			entityPages.forget();
 			return requireCatalog().mute(objectId, muted);
 		},
 		async catalogRefresh(objectId) {
@@ -5073,6 +5241,31 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 		async getArtistPages(target) {
 			return artistPages(target);
+		},
+		async getEntityPage(ref, opts) {
+			return entityPages.page(ref, opts);
+		},
+		async getEntityTracks(ref, opts) {
+			return entityPages.tracks(ref, opts);
+		},
+		async watchEntityPage(ref, token) {
+			entityWork?.watch(ref, token);
+		},
+		subscribeEntityWork(cb) {
+			return entityWork?.subscribe(cb) ?? (() => {});
+		},
+		async enrichEntityRows(recordingIds) {
+			return (await entityWork?.enrich(recordingIds)) ?? { asked: 0, found: 0 };
+		},
+		async searchWorld(query, part) {
+			return worldSearch.search(query, part);
+		},
+		async getPrimaryStreaming() {
+			return primaryStreaming();
+		},
+		async setPrimaryStreaming(service) {
+			if (service !== 'spotify' && service !== 'tidal') throw new Error('Unknown streaming service');
+			mut.setSetting(db, PRIMARY_STREAMING_KEY, service);
 		},
 		async getAlbumsByIds(ids) {
 			return readAlbumSummaries(rawOf(db), ids);
@@ -5533,7 +5726,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			// on. With the queue disabled (no sidecar) nothing dispatches, so
 			// report an empty status rather than surfacing orphaned/parked rows
 			// as active.
-			if (!analysisQueue) return { running: [], queued: 0 };
+			if (!analysisQueue || !analyzerSidecar) return { running: [], queued: 0, analyzer: { state: 'off' }, lastCompletedAt: null };
 			// Running track-ids (+ display name via a left join on the track
 			// row, so a running job whose track row is missing still surfaces,
 			// falling back to the id).
@@ -5564,12 +5757,23 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				))
 				.where(and(eq(analysisJob.state, 'queued'), gte(analysisJob.priority, analysisQueue.dispatchFloor())))
 				.get();
+			// From the job table rather than memory so it spans launches: "last
+			// finished five days ago" is what tells a stuck analyzer from a
+			// busy one. A scan of the done rows, paid only on this snapshot
+			// (boot, and after the user enqueues).
+			const lastDone = db
+				.select({ at: sql<number | null>`max(${analysisJob.finishedAt})` })
+				.from(analysisJob)
+				.where(eq(analysisJob.state, 'done'))
+				.get();
 			return {
 				running: runningRows.map((r) => ({
 					trackId: r.trackId,
 					name: r.title ? formatAnalyzerTrackName(r.title, r.artists) : r.trackId,
 				})),
 				queued: queuedRow?.n ?? 0,
+				analyzer: analyzerSidecar.status,
+				lastCompletedAt: lastDone?.at ?? null,
 			};
 		},
 		async getTrackAnalysis(trackId) {
@@ -5648,6 +5852,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			const handler = (e: AnalysisJobEvent): void => { try { cb(e); } catch (err) { log.for('analyzer').error('subscriber threw', err); } };
 			analysisQueue.on('event', handler);
 			return () => { analysisQueue!.off('event', handler); };
+		},
+		subscribeAnalyzerHealth(cb) {
+			if (!analyzerSidecar) return () => {};
+			const sidecar = analyzerSidecar;
+			const handler = (h: AnalyzerHealth): void => { try { cb(h); } catch (err) { log.for('analyzer').error('subscriber threw', err); } };
+			sidecar.on('health', handler);
+			return () => { sidecar.off('health', handler); };
 		},
 
 		// ─── Rekordbox ──────────────────────────────────────────────────────
@@ -6311,6 +6522,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			albumEnricher.stop();
 			catalogWorker?.stop();
 			factsUp.stop();
+			audienceUp.stop();
 			feedService.stop(); // stops scheduler + enrichment + closes feed.db
 			knowledgeService.stop(); // stops the expansion queue + closes knowledge.db
 			pending.push(agentService.stop()); // closes agent.db, then the workspace
@@ -6638,6 +6850,7 @@ function buildFilteredTrackQuery(
 	if (filter?.keyCamelot) conditions.push(eq(track.keyCamelot, filter.keyCamelot));
 	if (filter?.genre) conditions.push(eq(track.genre, filter.genre));
 	if (filter?.label) conditions.push(eq(track.label, filter.label));
+	if (filter?.labelFolds && filter.labelFolds.length > 0) conditions.push(inArray(track.labelAscii, filter.labelFolds));
 	// Source membership (any-of / none) — pushed predicates, so the Rekordbox
 	// tab root, the grammar's `source:` terms and the SRC-pip filters all work
 	// windowed. 'rekordbox' resolves to rekordbox_link inside sourceMembership.

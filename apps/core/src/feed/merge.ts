@@ -12,8 +12,8 @@
 
 import type { FeedHandle, FeedItemPayload, FeedTrackRef } from './types.js';
 
-const FILL_FIELDS = ['catalogId', 'catalogNumber', 'upc', 'genre', 'label', 'bpm', 'keyCamelot', 'releaseDate', 'albumType', 'trackCount', 'isrc', 'coverUrl', 'albumTitle', 'url'] as const satisfies readonly (keyof FeedItemPayload)[];
-const REF_FILL_FIELDS = ['catalogId', 'isrc', 'bpm', 'keyCamelot', 'genre', 'label', 'releaseDate'] as const satisfies readonly (keyof FeedTrackRef)[];
+const FILL_FIELDS = ['catalogId', 'artistCatalogIds', 'labelCatalogId', 'catalogNumber', 'upc', 'genre', 'label', 'bpm', 'keyCamelot', 'releaseDate', 'albumType', 'trackCount', 'isrc', 'coverUrl', 'albumTitle', 'url'] as const satisfies readonly (keyof FeedItemPayload)[];
+const REF_FILL_FIELDS = ['catalogId', 'artistCatalogIds', 'isrc', 'bpm', 'keyCamelot', 'genre', 'label', 'releaseDate'] as const satisfies readonly (keyof FeedTrackRef)[];
 
 const empty = (v: unknown): boolean => v === undefined || v === null || v === '';
 

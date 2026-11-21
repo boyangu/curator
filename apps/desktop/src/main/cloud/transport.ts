@@ -60,6 +60,8 @@ import {
 	type CatalogGetInput,
 	type CatalogBrowseInput,
 	type CatalogBrowseResult,
+	type CatalogTracksInput,
+	type CatalogTracksResult,
 	type CatalogImportInput,
 	type CatalogImportResult,
 	type CatalogIngestInput,
@@ -153,6 +155,8 @@ const PROCS = {
 	catalogConnectQueue: { path: 'catalog.connectQueue', type: 'mutation' },
 	catalogConnectAnswer: { path: 'catalog.connectAnswer', type: 'mutation' },
 	catalogConnectSearch: { path: 'catalog.connectSearch', type: 'mutation' },
+	// 'catalog_pages'.
+	catalogTracks: { path: 'catalog.tracks', type: 'query' },
 	feedEvents: { path: 'feed.events', type: 'query' },
 	feedRecent: { path: 'feed.recent', type: 'query' },
 } as const;
@@ -418,6 +422,7 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			search: (input: CatalogSearchInput) => call<CatalogSearchResult>(PROCS.catalogSearch, input),
 			get: (input: CatalogGetInput) => call<CatalogObjectDetail>(PROCS.catalogGet, input),
 			browse: (input: CatalogBrowseInput) => call<CatalogBrowseResult>(PROCS.catalogBrowse, input),
+			tracks: (input: CatalogTracksInput) => call<CatalogTracksResult>(PROCS.catalogTracks, input),
 			watch: (input: CatalogWatchInput) => call<CatalogWatchResult>(PROCS.catalogWatch, input),
 			unwatch: (input: CatalogUnwatchInput) => call<{ ok: true }>(PROCS.catalogUnwatch, input),
 			mute: (input: CatalogMuteInput) => call<{ ok: true }>(PROCS.catalogMute, input),
@@ -451,19 +456,35 @@ export function withLocalCatalog(
 ): CloudTransport {
 	let features: string[] = [];
 	let offered = false;
+	// One missed probe is not "the catalogue is gone". The local server runs
+	// PGlite on its own event loop: while a long statement runs (a worker
+	// report takes 10–15 s) it answers nothing, health included, and a single
+	// timeout used to switch the catalogue off in the app for half a minute —
+	// pages said "not reachable" while the server was merely busy (2026-11-18).
+	// The last answer stands until several probes in a row fail, and a failed
+	// probe is asked again soon rather than at the next half minute.
+	const PROBE_MS = 30_000;
+	const RETRY_MS = 5_000;
+	const FAILS_BEFORE_OFF = 4;
+	let fails = 0;
 	const probe = async (): Promise<void> => {
+		let next = PROBE_MS;
 		try {
 			const res = await fetch(`${localBaseUrl}/trpc/health`, { signal: AbortSignal.timeout(5_000) });
 			const body = (await res.json()) as { result?: { data?: { features?: string[] } } };
 			features = body.result?.data?.features ?? [];
 			offered = features.includes('global_catalog');
+			fails = 0;
 		} catch {
-			features = [];
-			offered = false;
+			next = RETRY_MS;
+			if (++fails >= FAILS_BEFORE_OFF) {
+				features = [];
+				offered = false;
+			}
 		}
+		setTimeout(() => void probe(), next).unref();
 	};
 	void probe();
-	setInterval(() => void probe(), 30_000).unref();
 	const registered = new Set<string>();
 	const ensure = async (deviceId: string): Promise<void> => {
 		if (registered.has(deviceId)) return;

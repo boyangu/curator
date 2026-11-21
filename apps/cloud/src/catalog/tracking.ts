@@ -8,6 +8,7 @@
 // alone, a cursor read within the hour stays where it is, and a cursor being
 // read now is not touched.
 
+import { CATALOG_READ_CADENCE_DEFAULT, CATALOG_READ_CADENCES, type CatalogReadCadence, type CatalogReadCadenceChoices } from '@curator/protocol';
 import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
 
@@ -62,15 +63,66 @@ export const wantedSql = (cursor: string, trackerExpr: string): string =>
 	)`;
 export const SWITCHED_OFF = 'switched off by its followers';
 
+// How often a cursor's followers want it read (catalog_worker.cadence, the
+// choices of Settings → Discover, per kind): the most frequent choice among
+// the watchers who want the tracker at all — the same watchers as wantedSql,
+// so one who switched the source off does not speed it up for the rest. A
+// watcher who never said has the default.
+export async function readCadenceOf(q: Queryable, objectId: string, kind: string, provider: string): Promise<CatalogReadCadence> {
+	const rows = await q.query<{ choice: string | null }>(
+		`select k.cadence ->> $2::text as choice
+		from curator.catalog_watch w left join curator.catalog_worker k on k.user_id = w.user_id
+		where w.object_id = $1 and (k.trackers is null or $3 = any(k.trackers))`,
+		[objectId, kind, `${kind}/${provider}`],
+	);
+	const rank = (c: string | null): number => {
+		const i = CATALOG_READ_CADENCES.indexOf(c as CatalogReadCadence);
+		return i < 0 ? CATALOG_READ_CADENCES.indexOf(CATALOG_READ_CADENCE_DEFAULT) : i;
+	};
+	return rows.length ? CATALOG_READ_CADENCES[Math.min(...rows.map((r) => rank(r.choice)))]! : CATALOG_READ_CADENCE_DEFAULT;
+}
+
+// A user's choices changed (workers.ts workerDue): where a kind is now read
+// more often, the user's cursors of it are pulled forward to where the new
+// choice would have put them after their last read — else a move from weekly
+// to daily would show nothing until Friday. Slower choices need nothing: each
+// cursor is read once more where it stands and lands on the new cadence. A
+// failing cursor keeps its backoff, and with it a provider's pause.
+export async function retimeCursors(tx: Queryable, userId: string, before: CatalogReadCadenceChoices | null, after: CatalogReadCadenceChoices): Promise<number> {
+	const rank = (c: CatalogReadCadence | undefined): number => CATALOG_READ_CADENCES.indexOf(c ?? CATALOG_READ_CADENCE_DEFAULT);
+	let moved = 0;
+	for (const kind of TRACKING_KINDS) {
+		const next = after[kind] ?? CATALOG_READ_CADENCE_DEFAULT;
+		if (rank(next) >= rank(before?.[kind])) continue;
+		// 'weekly' is the slowest: a faster choice is a day, or the tracker's own.
+		const floorMin = next === 'daily' ? 1440 : 0;
+		const rows = await tx.query(
+			`update curator.catalog_cursor c
+			set next_due_at = coalesce(c.last_run_at, now()) + make_interval(mins => greatest($3::int, (t.cadence ->> 'everyMin')::int))
+			from curator.catalog_object o, curator.tracker t
+			where o.id = c.object_id and o.kind = $2 and o.merged_into is null and t.kind = o.kind and t.provider = c.provider and t.enabled
+				and c.last_error is null
+				and c.next_due_at > coalesce(c.last_run_at, now()) + make_interval(mins => greatest($3::int, (t.cadence ->> 'everyMin')::int))
+				and exists (select 1 from curator.catalog_watch w where w.object_id = c.object_id and w.user_id = $1::uuid)
+			returning 1`,
+			[userId, kind, String(floorMin)],
+		);
+		moved += rows.length;
+	}
+	return moved;
+}
+
 // The devices reading for their users this week, as the back office shows
 // them (cli/local.ts / worker/main.ts hand their own adapters in beside).
 // `providers`: what the device can read right now; `trackers`: what its user
 // checked ('kind/provider'), null when it never said.
-export type CatalogWorkerView = { userId: string; deviceId: string; name: string; providers: string[]; trackers: string[] | null; weekOf: string; checkedInAt: number; live: boolean };
+// `cadence`: how often its user wants each kind read, null when it never said
+// (the default).
+export type CatalogWorkerView = { userId: string; deviceId: string; name: string; providers: string[]; trackers: string[] | null; cadence: CatalogReadCadenceChoices | null; weekOf: string; checkedInAt: number; live: boolean };
 
 export async function liveWorkers(q: Queryable): Promise<CatalogWorkerView[]> {
-	const rows = await q.query<{ user_id: string; device_id: string; name: string; providers: string; trackers: string | null; week_of: string; checked_ms: unknown; live: boolean }>(
-		`select w.user_id, w.device_id, d.name, array_to_json(w.providers)::text as providers, array_to_json(w.trackers)::text as trackers, w.week_of::text as week_of,
+	const rows = await q.query<{ user_id: string; device_id: string; name: string; providers: string; trackers: string | null; cadence: string | null; week_of: string; checked_ms: unknown; live: boolean }>(
+		`select w.user_id, w.device_id, d.name, array_to_json(w.providers)::text as providers, array_to_json(w.trackers)::text as trackers, w.cadence::text as cadence, w.week_of::text as week_of,
 			extract(epoch from w.checked_in_at) * 1000 as checked_ms, w.checked_in_at > now() - interval '6 hours' as live
 		from curator.catalog_worker w join curator.device d on d.user_id = w.user_id and d.device_id = w.device_id
 		order by w.checked_in_at desc`,
@@ -81,6 +133,7 @@ export async function liveWorkers(q: Queryable): Promise<CatalogWorkerView[]> {
 		name: r.name,
 		providers: JSON.parse(r.providers) as string[],
 		trackers: r.trackers === null ? null : (JSON.parse(r.trackers) as string[]),
+		cadence: r.cadence === null ? null : (JSON.parse(r.cadence) as CatalogReadCadenceChoices),
 		weekOf: r.week_of,
 		checkedInAt: num(r.checked_ms),
 		live: r.live,

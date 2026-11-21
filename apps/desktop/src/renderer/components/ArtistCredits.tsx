@@ -16,7 +16,9 @@ import { artistCreditFormat } from '../features/uiSettings.js';
 
 export interface ArtistCreditsProps {
 	artists: readonly (TrackArtist | string)[];
-	onClick?: ((name: string, index: number) => void) | null;
+	// `evt`: the click itself — a caller that opens pages reads Ctrl / a
+	// middle button off it ("open in new tab").
+	onClick?: ((name: string, index: number, evt: MouseEvent) => void) | null;
 	onContextMenu?: ((evt: MouseEvent, name: string, index: number) => void) | null;
 }
 
@@ -33,7 +35,9 @@ export function ArtistCredits(props: ArtistCreditsProps) {
 				class="artist-link"
 				classList={{ 'is-interactive': interactive() }}
 				data-role={p.artist.role ?? ''}
-				onClick={(e) => { if (!props.onClick) return; e.stopPropagation(); props.onClick(p.artist.name, p.index); }}
+				onClick={(e) => { if (!props.onClick) return; e.stopPropagation(); props.onClick(p.artist.name, p.index, e); }}
+				onAuxClick={(e) => { if (!props.onClick || e.button !== 1) return; e.preventDefault(); e.stopPropagation(); props.onClick(p.artist.name, p.index, e); }}
+				onMouseDown={(e) => { if (props.onClick && e.button === 1) e.preventDefault(); }}
 				onContextMenu={(e) => { if (!props.onContextMenu) return; e.preventDefault(); e.stopPropagation(); props.onContextMenu(e, p.artist.name, p.index); }}
 			>{p.artist.name}</span>
 		}</For>

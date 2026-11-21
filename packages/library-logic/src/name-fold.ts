@@ -30,12 +30,23 @@ const CREDIT_PIECE_RE = /\s*[,;/+]\s*|\s+(?:&|and|x|vs\.?|versus|with|feat\.?|fe
 export function creditFolds(name: string | null | undefined): string[] {
 	const whole = nameFold(name);
 	if (!whole) return [];
-	const out = new Set<string>([whole]);
+	return [whole, ...creditPieces(name).map(nameFold)];
+}
+
+// The same acts as written ("Frankey & Sandrino" → "Frankey", "Sandrino"):
+// what a compound name would read as were it several, for whoever has the
+// evidence to say so.
+export function creditPieces(name: string | null | undefined): string[] {
+	const whole = nameFold(name);
+	const seen = new Set<string>();
+	const out: string[] = [];
 	for (const piece of (name ?? '').split(CREDIT_PIECE_RE)) {
 		const p = nameFold(piece);
-		if (p.length > 1 && p !== whole && p !== 'various artists') out.add(p);
+		if (p.length <= 1 || p === whole || p === 'various artists' || seen.has(p)) continue;
+		seen.add(p);
+		out.push(piece.trim());
 	}
-	return [...out];
+	return out;
 }
 
 // Whether two credits name a common act, by their folds (creditFolds).

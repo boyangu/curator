@@ -14,6 +14,7 @@ import type { FetchLike as BeatportFetch } from '@curator/beatport';
 import type { FeedFilter, FeedStore } from './store.js';
 import { FeedScheduler } from './scheduler.js';
 import { FeedEnrichmentQueue } from './enrichment.js';
+import type { Enricher } from '../enrich/contract.js';
 import { BeatportEnricher } from '../enrich/enrichers/beatport.js';
 import { TraxsourceEnricher } from '../enrich/enrichers/traxsource.js';
 import { SpotifyPlaylistDeltaProducer, SpotifyNewReleasesProducer } from './spotify-producers.js';
@@ -111,6 +112,10 @@ export interface FeedServiceDeps {
 	auth: FeedAuthPort;
 	library: LibraryPort;
 	beatportFetch?: BeatportFetch;
+	// The store lookups for DJ facts, when the host shares one set between
+	// the feed and its other callers (core service.ts: one lane per store).
+	// Absent: the feed's own, built on `beatportFetch`.
+	enrichers?: readonly Enricher[];
 	// Default-deny gate for the live-account writes the feed makes (unfollow
 	// playlist/artist). Injected by createCoreService; omitted ⇒ those ops throw.
 	remoteWriteGate?: RemoteWriteGate;
@@ -272,7 +277,7 @@ export function createFeedService(deps: FeedServiceDeps): FeedService {
 	// backfill can't block the feed from populating.
 	const enrichment = new FeedEnrichmentQueue(
 		store,
-		[new BeatportEnricher(deps.beatportFetch), new TraxsourceEnricher(deps.beatportFetch)],
+		deps.enrichers ? [...deps.enrichers] : [new BeatportEnricher(deps.beatportFetch), new TraxsourceEnricher(deps.beatportFetch)],
 		undefined,
 		(item) => { for (const l of enrichedListeners) l(item); },
 		activity,

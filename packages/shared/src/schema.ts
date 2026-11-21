@@ -1935,6 +1935,27 @@ export type Track = typeof track.$inferSelect & {
 	addedAt?: Date | null;
 	// Cosine similarity to the query, attached only on similarTo reads.
 	matchScore?: number | null;
+	// Attached only by the renderer on an entity page's World side: the
+	// Global Catalog recording this row stands for, on which release.
+	// `synthetic`: the row is not a library track at all (its `id` is
+	// `catalog:<release>:<recording>`), so nothing that edits, tags, drags or
+	// deletes may act on it — renderer catalogRows.ts isCatalogRow is the one
+	// test. A library track shown inside its catalogue album carries the same
+	// decoration with `synthetic` false.
+	catalog?: {
+		recordingId: string;
+		releaseId: string;
+		synthetic: boolean;
+		// The library track this recording is, when a synthetic row repeats one
+		// (the same recording on a second release).
+		libraryTrackId: string | null;
+		// Where it can be played: the track's id per streaming service.
+		streamIds: { spotify?: string; tidal?: string };
+		links: { source: string; sourceId: string; url: string | null }[];
+		// Catalogue ids of what the row's group headers and chips open.
+		albumArtistId: string | null;
+		labelId: string | null;
+	};
 };
 export type NewTrack = typeof track.$inferInsert;
 export type Album = typeof album.$inferSelect;

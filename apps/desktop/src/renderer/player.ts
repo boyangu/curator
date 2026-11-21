@@ -30,7 +30,7 @@
 // 	type MediaProductTransition,
 // } from '@tidal-music/player';
 // import type { CredentialsProvider, Credentials } from '@tidal-music/common';
-import type { Track } from '@curator/shared';
+import type { StreamingService, Track } from '@curator/shared';
 import { formatArtistCredit, type TrackArtist } from '@curator/shared';
 import { artistCreditFormat } from './features/uiSettings.js';
 import { createEffect, createRoot, createSignal, type Accessor } from 'solid-js';
@@ -38,6 +38,7 @@ import { createMutable } from 'solid-js/store';
 import { acquireLoopbackAnalyser } from './spectrum.js';
 import { log } from './data/log.js';
 import { isRemoteRow, RemoteOnlyPlayError } from './remoteRows.js';
+import { catalogStreamId, CatalogRowPlayError, isCatalogRow } from './catalogRows.js';
 
 const slog = log.for('player');
 // Seek/jump latency instrumentation fires on every seek gesture (incl.
@@ -564,7 +565,7 @@ window.api.onSpotifyEvent((evt) => {
 				// eq). The snapshot (setNowPlayingTrack — set on every library play,
 				// cleared to null on feed plays) is authoritative; without this,
 				// Spotify plays left trackId '' so no streaming row ever lit up.
-				trackId: nowPlayingTrack()?.id ?? '',
+				trackId: nowPlayingTrack()?.id ?? catalogRowId ?? '',
 				source: 'spotify',
 				sourceTrackId: evt.track.id,
 				title: evt.track.title,
@@ -758,11 +759,76 @@ function pickSource(track: Track): 'spotify' | 'tidal' | 'local' | null {
 	return null;
 }
 
+// ─── Catalogue rows ──────────────────────────────────────────────────────────
+// A catalogue row (an entity page's World side — catalogRows.ts) is no
+// library track: it has no source_link to resolve. It plays through the
+// user's primary streaming service by the id the catalogue holds for it
+// there, inside the same queue as the library rows around it, so a page plays
+// straight through local files and streamed tracks alike.
+
+// Which service that is (Settings); main.ts pushes it at boot and on change.
+let primaryStreaming: StreamingService | null = null;
+export function setPrimaryStreaming(service: StreamingService | null): void {
+	primaryStreaming = service;
+}
+
+// The catalogue row now playing, by its row id: what lights its row in the
+// list. Not a library track id — nothing that records or edits reads it.
+let catalogRowId: string | null = null;
+
+const STREAMING_NAMES: Record<StreamingService, string> = { spotify: 'Spotify', tidal: 'Tidal' };
+
+async function startCatalogSpotify(track: Track, stid: string): Promise<void> {
+	if (localCurrentPath) stopLocal();
+	// No library row to snapshot: the now-playing surfaces read state.current,
+	// as for a feed play.
+	setNowPlayingTrack(null);
+	catalogRowId = track.id;
+	state.current = {
+		trackId: track.id,
+		source: 'spotify',
+		sourceTrackId: stid,
+		title: track.title,
+		artist: formatArtistCredit(track.artists, artistCreditFormat()),
+		artists: track.artists ?? [],
+		duration: track.duration ?? 0,
+		coverUrl: track.coverUrl ?? null,
+	};
+	state.position = 0;
+	state.duration = track.duration ?? 0;
+	state.playing = false;
+	emit();
+	await playSpotify(stid);
+}
+
+async function playCatalogRow(track: Track, list?: Track[]): Promise<void> {
+	// Every refusal comes before any state moves, so what is playing carries on.
+	if (!primaryStreaming) throw new CatalogRowPlayError('Connect Spotify or Tidal to play catalogue tracks');
+	const stid = catalogStreamId(track, primaryStreaming);
+	if (!stid) throw new CatalogRowPlayError(`The catalogue has no ${STREAMING_NAMES[primaryStreaming]} page for this track`);
+	if (primaryStreaming === 'tidal') throw new TidalNotReadyError();
+	feedPlaybackActive = false;
+	void acquireLoopbackAnalyser();
+	if (list && list.length > 0) {
+		queue = list;
+		queueIndex = Math.max(0, list.findIndex((t) => t.id === track.id));
+	} else {
+		queue = [track];
+		queueIndex = 0;
+	}
+	await startCatalogSpotify(track, stid);
+}
+
 export async function play(track: Track, list?: Track[]): Promise<void> {
 	// A remote row has nothing to play on this device. Refused before any
 	// state moves (queue, ownership, now-playing) so the current playback
 	// carries on; callers toast the message.
 	if (isRemoteRow(track)) throw new RemoteOnlyPlayError();
+	if (isCatalogRow(track)) {
+		await playCatalogRow(track, list);
+		return;
+	}
+	catalogRowId = null;
 	// Library play takes playback ownership back from the feed.
 	feedPlaybackActive = false;
 	// Grab the loopback analyser HERE — before the async source-id resolve below —
@@ -852,6 +918,7 @@ export async function playFeedSpotify(
 	// Feed plays don't use the library queue — natural end is routed to
 	// the feed's advance handler via the feedPlaybackActive flag.
 	feedPlaybackActive = true;
+	catalogRowId = null;
 	queue = [];
 	queueIndex = -1;
 	// Feed cards aren't library rows — no Track to snapshot. The now-playing
@@ -1048,10 +1115,24 @@ async function advanceQueue(): Promise<void> {
 		stopLocal();
 		activeBackend = null;
 		state.playing = false;
+		catalogRowId = null;
 		setNowPlayingTrack(null);
 		emit();
 		return;
 	}
+	// A catalogue row plays where the primary service has it; one it does not
+	// (or a Tidal primary, until that backend exists) is skipped in silence,
+	// like any row with no playable source.
+	if (isCatalogRow(t)) {
+		const stid = primaryStreaming === 'spotify' ? catalogStreamId(t, 'spotify') : null;
+		if (!stid) {
+			await advanceQueue();
+			return;
+		}
+		await startCatalogSpotify(t, stid);
+		return;
+	}
+	catalogRowId = null;
 	const source = pickSource(t);
 	// Skip rows that have no playable source — and, until Tidal playback
 	// lands, also skip tidal-only rows. Auto-advance must stay silent for

@@ -24,7 +24,8 @@ import { reannounceFor, reannounceCard } from './events.js';
 import { findByIdentifier, findRepresentation, recordingByIsrcOk, storeTagless } from './identity.js';
 import { Ingester } from './ingest.js';
 import { ensureCursors } from './watches.js';
-import { getJson, type FetchLike } from '@curator/catalog-readers';
+import { DEEZER_GENRES, getJson, type FetchLike } from '@curator/catalog-readers';
+import { judgePage, profileOf } from './artist-validation.js';
 import { fetchAlbums, spotifyReleaseClaim, type SpotifyTracker } from '@curator/catalog-readers';
 import { applyReleaseClaims } from './store-links.js';
 import { TrackerRateLimitedError } from '@curator/catalog-readers';
@@ -87,10 +88,22 @@ export class DeezerFinder implements IdentityFinder {
 		);
 		if (s.error?.code === 4) throw new TrackerRateLimitedError(10);
 		const candidates = (s.data ?? []).filter((a) => namesake(want, a.name)).map((a) => ({ id: String(a.id), name: a.name, url: a.link ?? `https://www.deezer.com/artist/${a.id}` }));
+		// Each candidate's listing is kept as read: the page is judged by it
+		// before it is taken (artist-validation.ts).
+		const listings = new Map<string, { id: number; title: string; release_date?: string; genre_id?: number }[]>();
 		const r = await confirm(candidates, releaseTitles, async (id) => {
-			const l = await getJson<{ data?: { title: string }[] }>(this.fetchFn, 'deezer', `https://api.deezer.com/artist/${id}/albums?limit=100`, { signal, logPath: '/artist/albums' });
+			const l = await getJson<{ data?: { id: number; title: string; release_date?: string; genre_id?: number }[] }>(this.fetchFn, 'deezer', `https://api.deezer.com/artist/${id}/albums?limit=100`, { signal, logPath: '/artist/albums' });
+			listings.set(id, l.data ?? []);
 			return (l.data ?? []).map((x) => x.title);
 		});
+		// A page of several acts lists a release of every one of them — ours
+		// too, which is all `confirm` asks (Deezer's "Fade", 2026-11-18). It is
+		// not the artist's page: not attached, and not a candidate to review.
+		if (r.hit) {
+			const albums = (listings.get(r.hit.id) ?? []).map((a) => ({ id: String(a.id), title: a.title, date: a.release_date ?? null, genre: a.genre_id !== undefined ? DEEZER_GENRES[a.genre_id] ?? null : null }));
+			const check = judgePage(profileOf(r.hit.id, { total: null, albums }), null);
+			if (check.verdict === 'mixed') return { claim: null, calls: 1 + r.calls, reason: `mixed_page:${r.hit.id}` };
+		}
 		return { claim: r.hit ? { provider: 'deezer', kind: 'artist', providerId: r.hit.id, name: r.hit.name, url: r.hit.url } : null, calls: 1 + r.calls, reason: r.reason, candidates: r.candidates };
 	}
 }

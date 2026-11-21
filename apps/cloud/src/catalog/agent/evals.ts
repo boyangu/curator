@@ -66,7 +66,8 @@ export async function exportEvalCases(tx: Queryable, opts: { since?: number } = 
 		if (r.status === 'rejected') expected = pairs.map(() => 'different');
 		else {
 			const except = exceptedPairs(r.resolution);
-			const merged = new Set((await tx.query<{ from_id: string }>(`select from_id from curator.catalog_merge_log where evidence->>'inbox' = $1`, [String(inbox)])).map((m) => m.from_id));
+			// A part split off an item approved in part (inbox.ts leaveOpen) was merged under the original's id.
+			const merged = new Set((await tx.query<{ from_id: string }>(`select from_id from curator.catalog_merge_log where evidence->>'inbox' = $1`, [String(typeof evidence.of === 'number' ? evidence.of : inbox)])).map((m) => m.from_id));
 			expected = pairs.map((p, i) => (except.has(i) ? 'different' : merged.has(p.fold) ? 'same' : null));
 		}
 		const decided = expected.flatMap((e, i) => (e === null ? [] : [i]));

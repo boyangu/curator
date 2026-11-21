@@ -205,28 +205,13 @@ export const tidalApi = {
 		trpc.tidal.setPlaylistHybrid.mutate([playlistId, enabled, sort]),
 };
 
-// Discovery journeys + knowledge base — thin facades over the journey:* /
-// kb:* channels so components stay off the raw preload bridge (F2). Like the
-// feed, these ride the preload's typed invoke surface rather than tRPC for
-// now; when the feed migrates onto the router (F6), these move with it.
-export const journeyApi = {
-	create: (...args: Parameters<typeof window.api['journey:create']>) => api()['journey:create'](...args),
-	list: () => api()['journey:list'](),
-	get: (journeyId: string) => api()['journey:get'](journeyId),
-	rename: (journeyId: string, name: string) => api()['journey:rename'](journeyId, name),
-	remove: (journeyId: string) => api()['journey:delete'](journeyId),
-	navigate: (...args: Parameters<typeof window.api['journey:navigate']>) => api()['journey:navigate'](...args),
-	jump: (journeyId: string, nodeId: string) => api()['journey:jump'](journeyId, nodeId),
-	setView: (journeyId: string, nodeId: string, view: unknown) => api()['journey:set-view'](journeyId, nodeId, view),
-	deleteBranch: (journeyId: string, nodeId: string) => api()['journey:delete-branch'](journeyId, nodeId),
-};
-
 // Following — the artists and labels the cloud tracks for Discover.
 export const catalogApi = {
 	status: () => api()['catalog:status'](),
 	workerStatus: () => api()['catalog:worker-status'](),
 	readSources: () => api()['catalog:read-sources'](),
 	setReadSources: (patch: Parameters<typeof window.api['catalog:set-read-sources']>[0]) => api()['catalog:set-read-sources'](patch),
+	setReadCadence: (...args: Parameters<typeof window.api['catalog:set-read-cadence']>) => api()['catalog:set-read-cadence'](...args),
 	onWorkerStatus: (cb: Parameters<typeof window.api.onCatalogWorkerStatus>[0]) => api().onCatalogWorkerStatus(cb),
 	watches: () => api()['catalog:watches'](),
 	search: (q: string) => api()['catalog:search'](q),
@@ -240,6 +225,21 @@ export const catalogApi = {
 	followMany: (...args: Parameters<typeof window.api['catalog:follow-many']>) => api()['catalog:follow-many'](...args),
 };
 
+// Entity pages (artist / label / album): the header and the World side's
+// track pages (core entity/service.ts). The Owned side is `tracks:list` with
+// the header's filter; `primary` is the service catalogue rows play through.
+export const entityApi = {
+	page: (...args: Parameters<typeof window.api['entity:page']>) => api()['entity:page'](...args),
+	tracks: (...args: Parameters<typeof window.api['entity:tracks']>) => api()['entity:tracks'](...args),
+	watch: (...args: Parameters<typeof window.api['entity:watch']>) => api()['entity:watch'](...args),
+	enrich: (...args: Parameters<typeof window.api['entity:enrich']>) => api()['entity:enrich'](...args),
+	onWork: (cb: Parameters<typeof window.api.onEntityWork>[0]) => api().onEntityWork(cb),
+	// One part of the omnibar's World search (core entity/world-search.ts).
+	searchWorld: (...args: Parameters<typeof window.api['world:search']>) => api()['world:search'](...args),
+	primaryStreaming: () => api()['streaming:get-primary'](),
+	setPrimaryStreaming: (...args: Parameters<typeof window.api['streaming:set-primary']>) => api()['streaming:set-primary'](...args),
+};
+
 // Help us connect the dots — store pages for the catalogue's artists, labels
 // and albums (features/connectDots.ts).
 export const connectApi = {
@@ -249,6 +249,11 @@ export const connectApi = {
 	answer: (...args: Parameters<typeof window.api['catalog:connect-answer']>) => api()['catalog:connect-answer'](...args),
 };
 
+// The knowledge base — a thin facade over the kb:* channels so components
+// stay off the raw preload bridge (F2). What the renderer uses of it today:
+// similar-artist research for an artist page, and promoting a catalogue
+// track into the library. (Journey trees are parked: core keeps journey:*,
+// nothing here draws them.)
 export const kbApi = {
 	entity: (entityId: string) => api()['kb:entity'](entityId),
 	expand: (...args: Parameters<typeof window.api['kb:expand']>) => api()['kb:expand'](...args),

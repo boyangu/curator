@@ -13,6 +13,11 @@
 //   3. Re-spawn on crash with exponential backoff. Pending requests rejected
 //      with a typed error so the queue can retry/surface them.
 //   4. Provide event streams (progress, partial) per request.
+//   5. Know whether the process is actually alive — a launch check, the hello
+//      window and a heartbeat — and say so (`status`, the 'health' event). A
+//      hung process is killed and treated like a crashed one; without this a
+//      request written to its stdin waits forever and the job reads as
+//      running.
 //
 // The protocol contract is documented at the top of
 // apps/analyzer/src/curator_analyzer/main.py. Keep the two in sync.
@@ -22,6 +27,7 @@ import { EventEmitter } from 'node:events';
 import { isWellFormedString } from '@curator/shared';
 import type { ProductionMeasurements } from '@curator/shared/schema';
 import { log } from '../log.js';
+import { killProcessTree } from './wsl.js';
 
 const alog = log.for('analyzer');
 
@@ -42,7 +48,29 @@ export interface SidecarOptions {
 	// when the analyzer runs inside WSL (no published Windows wheel for
 	// Essentia) while the rest of the app uses native Windows paths.
 	translatePathsToWsl?: boolean;
+	// Launch check, run before every spawn: resolves null when the host the
+	// analyzer runs in can take a process, else a user-facing reason. The
+	// desktop main passes a WSL probe on Windows — spawning `wsl.exe` into a
+	// hung WSL service succeeds and then never produces a byte, which from
+	// here looks exactly like a slow start.
+	preflight?: () => Promise<string | null>;
+	// Liveness timings (tests shorten them).
+	helloTimeoutMs?: number;
+	pingIntervalMs?: number;
 }
+
+// Liveness of the analyzer as the status surfaces show it (getAnalysisStatus
+// and the health subscription).
+//   off           no analyzer in this build (reported by the service)
+//   idle          start() not called yet — the desktop main defers it
+//   starting      launching: launch check, spawn, waiting for the hello frame
+//   ready         said hello and answers the heartbeat
+//   unresponsive  failed a liveness check; being relaunched
+//   disabled      gave up — restart() tries again
+export type AnalyzerHealth =
+	| { state: 'off' | 'idle' | 'starting' }
+	| { state: 'ready'; version: string | null }
+	| { state: 'unresponsive' | 'disabled'; reason: string };
 
 // c:/foo/bar.flac  → /mnt/c/foo/bar.flac
 // C:\foo\bar.flac  → /mnt/c/foo/bar.flac
@@ -274,12 +302,25 @@ const MAX_RESPAWN_BURST = 6;
 // Hello handshake. The sidecar's first stdout frame announces
 // {event:'hello', name, version, protocol}; we refuse to talk to a process
 // announcing the wrong name or protocol (wrong executable, stale PyInstaller
-// bundle) instead of letting it produce schema-mismatched results. A sidecar
-// that never says hello predates the handshake — warn, don't kill, so a
-// slow WSL boot or an old-but-compatible bundle doesn't brick analysis.
+// bundle) instead of letting it produce schema-mismatched results. A process
+// that never says hello is not running the analyzer at all: it used to pass
+// with a warning, and a hung WSL then swallowed every job for days while the
+// queue showed them as running. The window covers a cold start — the worker
+// imports alone (Essentia, read over /mnt/c) take 10-25 s.
 const EXPECTED_SIDECAR_NAME = 'curator-analyzer';
 const EXPECTED_PROTOCOL = 1;
-const HELLO_TIMEOUT_MS = 15_000;
+const HELLO_TIMEOUT_MS = 90_000;
+
+// Heartbeat. After the hello the host pings on an interval, and ANY frame
+// from the sidecar counts as life — so a bundle that predates `ping` still
+// passes (it answers with an unknown-method error). Progress frames can't do
+// this job: the worker buffers them and they arrive with the result.
+const PING_INTERVAL_MS = 15_000;
+const PING_MISSES_ALLOWED = 3;
+
+// Liveness failures in a row (launch check, hello window, heartbeat) before
+// the sidecar stops relaunching and waits for restart(). A hello resets it.
+const MAX_UNRESPONSIVE_STRIKES = 3;
 
 // Python import failures look like this in stderr. When we see one, the
 // sidecar is permanently broken (a missing-dep can't fix itself) — stop
@@ -316,6 +357,15 @@ export class AnalyzerSidecar extends EventEmitter {
 	private disabledReason: string | null = null;
 	private helloSeen = false;
 	private helloTimer: NodeJS.Timeout | null = null;
+	private health: AnalyzerHealth = { state: 'idle' };
+	private unresponsiveStrikes = 0;
+	// The launch check is running; no process yet. Requests park (as before
+	// the first start) instead of bouncing off a process that isn't there.
+	private preflighting = false;
+	private heartbeatTimer: NodeJS.Timeout | null = null;
+	// When the sidecar last wrote anything, and when the heartbeat last ran.
+	private lastFrameAt = 0;
+	private lastBeatAt = 0;
 	// Logical CPUs as the sidecar sees them (from the hello frame). Under
 	// WSL this is the VM's allowance, which .wslconfig can cap below the
 	// host's — so it, not os.cpus(), bounds the user's worker choice.
@@ -345,6 +395,14 @@ export class AnalyzerSidecar extends EventEmitter {
 
 	get cpus(): number | null { return this.cpuCount; }
 
+	get status(): AnalyzerHealth { return this.health; }
+
+	private setHealth(next: AnalyzerHealth): void {
+		if (JSON.stringify(next) === JSON.stringify(this.health)) return;
+		this.health = next;
+		this.emit('health', next);
+	}
+
 	// Resize the sidecar's worker pool. Fire-and-forget (no reply frame): the
 	// sidecar swaps in a pool of the new size for new work and lets the old
 	// one finish what it holds, so nothing running is interrupted. Safe
@@ -361,11 +419,44 @@ export class AnalyzerSidecar extends EventEmitter {
 		} catch { /* sidecar going away; the respawn re-sends */ }
 	}
 
-	// Idempotent — calling start() twice is a no-op while a process is alive.
+	// Idempotent — a no-op while a process is alive or a launch is under way.
 	start(): void {
-		if (this.proc) return;
+		if (this.proc || this.preflighting) return;
 		this.shuttingDown = false;
 		this.started = true;
+		// An unresponsive sidecar keeps saying so through its relaunch, until
+		// a hello frame proves otherwise.
+		if (this.health.state !== 'unresponsive') this.setHealth({ state: 'starting' });
+		const preflight = this.opts.preflight;
+		if (!preflight) { this.spawnProcess(); return; }
+		this.preflighting = true;
+		preflight()
+			.catch((err: unknown) => `analyzer launch check failed: ${err instanceof Error ? err.message : String(err)}`)
+			.then((problem) => {
+				this.preflighting = false;
+				if (this.shuttingDown) return;
+				if (problem) this.failUnresponsive(problem);
+				else this.spawnProcess();
+			});
+	}
+
+	// Relaunch on request — the way back from 'disabled', and a shortcut
+	// through the backoff while unresponsive. No-op before the first start()
+	// (the host decides when that is) and while a process is alive or
+	// launching: a live-but-hung one is the heartbeat's to catch.
+	restart(): void {
+		if (!this.started || this.shuttingDown || this.proc || this.preflighting) return;
+		if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
+		this.permanentlyBroken = false;
+		this.disabledReason = null;
+		this.unresponsiveStrikes = 0;
+		this.respawnAttempts = 0;
+		alog.info('restart requested');
+		this.setHealth({ state: 'starting' });
+		this.start();
+	}
+
+	private spawnProcess(): void {
 		const proc = spawn(this.opts.executable, this.opts.args ?? [], {
 			cwd: this.opts.cwd,
 			env: {
@@ -429,15 +520,12 @@ export class AnalyzerSidecar extends EventEmitter {
 
 		this.helloSeen = false;
 		if (this.helloTimer) clearTimeout(this.helloTimer);
+		const helloTimeoutMs = this.opts.helloTimeoutMs ?? HELLO_TIMEOUT_MS;
 		this.helloTimer = setTimeout(() => {
 			this.helloTimer = null;
-			if (!this.helloSeen && this.proc) {
-				alog.warn(
-					'no hello frame — sidecar predates the handshake (stale binary?). Proceeding, but version compatibility is unverified.',
-					{ timeoutMs: HELLO_TIMEOUT_MS },
-				);
-			}
-		}, HELLO_TIMEOUT_MS);
+			if (this.helloSeen || this.proc !== proc) return;
+			this.failUnresponsive(`The analyzer did not start (no hello frame after ${Math.round(helloTimeoutMs / 1000)} s).`);
+		}, helloTimeoutMs);
 
 		// stdin buffers until the interpreter reads it, so parked requests can
 		// go out now rather than after the hello frame.
@@ -445,7 +533,58 @@ export class AnalyzerSidecar extends EventEmitter {
 		for (const p of parked) this.analyze(p.params).then(p.resolve, p.reject);
 	}
 
+	private startHeartbeat(): void {
+		this.stopHeartbeat();
+		const interval = this.opts.pingIntervalMs ?? PING_INTERVAL_MS;
+		this.lastFrameAt = this.lastBeatAt = Date.now();
+		this.heartbeatTimer = setInterval(() => {
+			const now = Date.now();
+			// Timers stop while the machine sleeps (and stall with the event
+			// loop): the first beat afterwards would count the whole gap as
+			// the sidecar's silence. Start the count again instead.
+			if (now - this.lastBeatAt > interval * 2) this.lastFrameAt = now;
+			this.lastBeatAt = now;
+			if (now - this.lastFrameAt > interval * PING_MISSES_ALLOWED) {
+				this.failUnresponsive('The analyzer stopped responding.');
+				return;
+			}
+			if (!this.proc || !this.proc.stdin.writable) return;
+			try { this.proc.stdin.write(JSON.stringify({ id: this.nextId++, method: 'ping' }) + '\n'); }
+			catch { /* going away; 'exit' cleans up */ }
+		}, interval);
+		this.heartbeatTimer.unref?.();
+	}
+
+	private stopHeartbeat(): void {
+		if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+	}
+
+	// A liveness check failed (launch check, hello window, heartbeat). The
+	// process, if there is one, is hung rather than dead, so nothing else
+	// would ever reject what it holds: kill it, hand the work back, relaunch.
+	// MAX_UNRESPONSIVE_STRIKES in a row and the sidecar stops for restart().
+	private failUnresponsive(reason: string): void {
+		this.unresponsiveStrikes++;
+		const giveUp = this.unresponsiveStrikes >= MAX_UNRESPONSIVE_STRIKES;
+		alog.warn('analyzer unresponsive', { reason, strike: this.unresponsiveStrikes, giveUp });
+		if (giveUp) this.markBroken(reason);
+		else this.setHealth({ state: 'unresponsive', reason });
+		const proc = this.proc;
+		if (proc) {
+			killProcessTree(proc);
+			// A hung process may never deliver 'exit', and anything it still
+			// writes belongs to no one — settle now; onExit's guard drops the
+			// real event if it does come.
+			for (const s of [proc.stdin, proc.stdout, proc.stderr]) s.destroy();
+			this.onExit(proc, null, null, reason);
+			return;
+		}
+		for (const p of this.awaitingStart.splice(0)) p.reject(sidecarError('sidecar_unavailable', reason));
+		this.scheduleRespawn();
+	}
+
 	private onStdout(chunk: string): void {
+		this.lastFrameAt = Date.now();
 		this.stdoutBuffer += chunk;
 		// Frames are newline-delimited JSON. Process one frame at a time;
 		// leftover partials stay in the buffer for the next chunk.
@@ -489,9 +628,15 @@ export class AnalyzerSidecar extends EventEmitter {
 			const cpus = frame['cpus'];
 			if (typeof cpus === 'number' && cpus >= 1) this.cpuCount = Math.floor(cpus);
 			alog.info('sidecar hello', { version: String(frame['version']), protocol: String(protocol), cpus: String(cpus) });
+			this.unresponsiveStrikes = 0;
+			this.setHealth({ state: 'ready', version: typeof frame['version'] === 'string' ? frame['version'] : null });
+			this.startHeartbeat();
 			this.sendConfig();
 			return;
 		}
+
+		// Heartbeat answer — the arrival itself was the point (onStdout).
+		if (event === 'pong') return;
 
 		if (event === 'progress' && typeof id === 'number') {
 			const pending = this.pending.get(id);
@@ -557,8 +702,11 @@ export class AnalyzerSidecar extends EventEmitter {
 		this.pending.clear();
 		this.stdoutBuffer = '';
 		if (this.helloTimer) { clearTimeout(this.helloTimer); this.helloTimer = null; }
+		this.stopHeartbeat();
 
 		if (this.shuttingDown) return;
+		// A crash: back to launching (an unresponsive one keeps its state).
+		if (this.health.state === 'ready' && !this.permanentlyBroken) this.setHealth({ state: 'starting' });
 		this.scheduleRespawn();
 	}
 
@@ -570,6 +718,7 @@ export class AnalyzerSidecar extends EventEmitter {
 	private scheduleRespawn(): void {
 		if (this.permanentlyBroken) {
 			this.disabledReason ??= 'analyzer stopped';
+			this.setHealth({ state: 'disabled', reason: this.disabledReason });
 			this.emit('disabled');
 			return;
 		}
@@ -581,6 +730,7 @@ export class AnalyzerSidecar extends EventEmitter {
 		if (this.respawnAttempts >= MAX_RESPAWN_BURST) {
 			alog.error('respawn limit reached — sidecar disabled. Investigate the sidecar logs.');
 			this.disabledReason = 'analyzer kept crashing and was stopped — see the analyzer log';
+			this.setHealth({ state: 'disabled', reason: this.disabledReason });
 			this.emit('disabled');
 			return;
 		}
@@ -627,7 +777,7 @@ export class AnalyzerSidecar extends EventEmitter {
 				return Promise.reject(sidecarError('internal', `file path is not valid Unicode (lone surrogate): ${p.replace(/[\uD800-\uDFFF]/g, '�')}`));
 			}
 		}
-		if (!this.started && !this.shuttingDown) {
+		if ((!this.started || this.preflighting) && !this.shuttingDown) {
 			return new Promise<AnalyzeResult>((resolve, reject) => {
 				this.awaitingStart.push({ params, resolve, reject });
 			});
@@ -729,6 +879,7 @@ export class AnalyzerSidecar extends EventEmitter {
 		this.shuttingDown = true;
 		if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
 		if (this.helloTimer) { clearTimeout(this.helloTimer); this.helloTimer = null; }
+		this.stopHeartbeat();
 		for (const p of this.awaitingStart.splice(0)) {
 			p.reject(sidecarError('sidecar_unavailable', 'analyzer shut down before it started'));
 		}
@@ -736,11 +887,11 @@ export class AnalyzerSidecar extends EventEmitter {
 		try {
 			this.proc.stdin.write(JSON.stringify({ method: 'shutdown' }) + '\n');
 		} catch { /* ignore */ }
-		// Give the sidecar 2s to exit cleanly before SIGKILL.
+		// Give the sidecar 2s to exit cleanly before killing it.
 		const proc = this.proc;
 		await new Promise<void>((resolve) => {
 			const t = setTimeout(() => {
-				try { proc.kill('SIGKILL'); } catch { /* */ }
+				killProcessTree(proc);
 				resolve();
 			}, 2000);
 			proc.once('exit', () => { clearTimeout(t); resolve(); });

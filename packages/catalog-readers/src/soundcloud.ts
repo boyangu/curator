@@ -27,6 +27,12 @@ const API = 'https://api.soundcloud.com';
 const TOKEN_URL = 'https://secure.soundcloud.com/oauth/token';
 const ANNOUNCE_WITHIN_DAYS = 60;
 const ALBUM_TYPES = new Set(['album', 'ep', 'single', 'compilation']);
+// A DJ set — one long mixed session, a podcast, a live recording — is not a
+// release and the catalogue does not map it (2026-11-19). Length tells them
+// apart: a release's tracks run under twenty minutes, a set over forty-five.
+// A preview's `duration` is the preview's, so only a playable track is judged.
+const DJ_SET_MIN_SEC = 45 * 60;
+const isDjSet = (t: ScTrack): boolean => (t.access ?? 'playable') === 'playable' && (t.duration ?? 0) / 1000 >= DJ_SET_MIN_SEC;
 
 export type SoundCloudCredentials = { clientId: string; clientSecret: string };
 export type ScUser = { id: number; username: string; permalink?: string; permalink_url?: string; avatar_url?: string | null; followers_count?: number; track_count?: number; city?: string | null; country?: string | null };
@@ -165,6 +171,17 @@ export class SoundCloudTracker implements TrackerAdapter {
 		return Array.isArray(r) ? r : r.collection ?? [];
 	}
 
+	// How many followers a profile has (the Reach score). A stored permalink
+	// is resolved first, as poll does. Null: no such profile.
+	async userFollowers(stored: string, url: string | null, signal: AbortSignal): Promise<number | null> {
+		const userId = /^\d+$/.test(stored) ? stored : await this.resolveUser(url ?? `https://soundcloud.com/${stored}`, stored, signal);
+		const u = await this.get<ScUser>(`/users/${userId}`, signal).catch((e: unknown) => {
+			if (e instanceof ProviderHttpError && e.status === 404) return null;
+			throw e;
+		});
+		return typeof u?.followers_count === 'number' ? u.followers_count : null;
+	}
+
 	async poll(target: TrackerTarget, signal: AbortSignal): Promise<TrackerPoll> {
 		if (!target.representation) throw new Error('soundcloud label tracker needs a user id');
 		const stored = target.representation.providerId;
@@ -190,7 +207,8 @@ export class SoundCloudTracker implements TrackerAdapter {
 			const artists = trackArtists(t, credit.artists, userId).map(userArtist);
 			const releaseDate = releaseDateOf(t, at);
 			const recording = recordingOf(t, credit.title, artists, at);
-			if (t.isrc && artists.length) {
+			// A DJ set is never a release, ISRC or not: it stays an announcement.
+			if (t.isrc && artists.length && !isDjSet(t)) {
 				children.push({
 					provider: 'soundcloud',
 					kind: 'release',
@@ -215,9 +233,13 @@ export class SoundCloudTracker implements TrackerAdapter {
 		const s = await this.get<{ collection?: ScSet[] } | ScSet[]>(`/users/${userId}/playlists?limit=50&linked_partitioning=true&show_tracks=true`, signal);
 		const typeOf = (a: ScSet) => (a.playlist_type ?? a.set_type ?? '').toLowerCase();
 		const albums = (Array.isArray(s) ? s : s.collection ?? []).filter((a) => ALBUM_TYPES.has(typeOf(a)) && !/\bsnippets?\b/i.test(a.title));
-		for (const a of albums) {
-			const id = `set:${a.id}`;
+		for (const listed of albums) {
+			const id = `set:${listed.id}`;
 			if (seen.has(id)) continue;
+			// A series of mixes filed as an album is no release; a release keeps
+			// its tracks and loses a continuous mix filed among them.
+			if (listed.tracks?.length && listed.tracks.every(isDjSet)) continue;
+			const a = listed.tracks ? { ...listed, tracks: listed.tracks.filter((t) => !isDjSet(t)) } : listed;
 			const at = parseScDate(a.created_at);
 			const { catalogNumber, rest } = splitCatalogNumber(a.title, target.object.name);
 			const credit = parseUploadTitle(rest);

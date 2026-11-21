@@ -16,6 +16,7 @@
 
 import { subscribe, getState, currentTrack, setPlayLifecycleHook } from './player.js';
 import type { PlayRecordUpsert, PlayEndedReason } from '@curator/shared';
+import { isLibraryTrackId } from './catalogRows.js';
 import { playsApi } from './data/api.js';
 import { log } from './data/log.js';
 
@@ -52,6 +53,11 @@ let lastFlushAt = 0;
 // Registered from main.ts — answers "where was this play launched from"
 // (playlist id, tag view, search, feed…). Snapshotted at play start.
 let contextProvider: (() => { type: string; id: string | null } | null) | null = null;
+
+// The playing track as a library track id. A catalogue row (an entity page's
+// World side) carries a row id there for the list's now-playing mark; it is
+// no library track, and the play is recorded by its streaming id alone.
+const libraryTrackId = (id: string | null | undefined): string | null => (id && isLibraryTrackId(id) ? id : null);
 export function setPlayContextProvider(fn: () => { type: string; id: string | null } | null): void {
 	contextProvider = fn;
 }
@@ -92,7 +98,7 @@ function start(key: string, source: 'local' | 'spotify', sourceTrackId: string):
 		key,
 		// state.current.trackId is '' for feed plays; the library snapshot is
 		// authoritative when present.
-		trackId: currentTrack()?.id ?? (s.current?.trackId || null),
+		trackId: currentTrack()?.id ?? libraryTrackId(s.current?.trackId),
 		sourceTrackId,
 		source,
 		startedAt: Date.now(),
@@ -135,7 +141,7 @@ export function initPlayTracker(): void {
 		if (s.duration > 0) open.durationMs = Math.round(s.duration * 1000);
 		// Late trackId resolution (spotify state_changed re-seeds it from the
 		// now-playing snapshot).
-		if (!open.trackId && cur && cur.trackId) open.trackId = cur.trackId;
+		if (!open.trackId && cur) open.trackId = libraryTrackId(cur.trackId);
 
 		const posMs = s.position * 1000;
 		if (!s.playing) {

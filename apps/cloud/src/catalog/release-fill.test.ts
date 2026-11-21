@@ -10,7 +10,7 @@ import { adminOps } from './admin-ops.js';
 import { runInboxDetectors } from './inbox-detectors.js';
 import { listInbox } from './inbox.js';
 import { ingestClaims } from './ingest.js';
-import { releaseStubs } from './release-fill.js';
+import { dedupeRelease, releaseStubs } from './release-fill.js';
 import { spotifyReleaseClaim as releaseClaim, SpotifyTracker } from '@curator/catalog-readers';
 import { TidalApp } from './trackers/tidal-app.js';
 import type { FetchLike } from '@curator/catalog-readers';
@@ -207,6 +207,41 @@ describe('release fill', () => {
 			[releaseId],
 		);
 		expect(left.map((x) => x.name)).toEqual(['Low Tide', 'Low Tide (Radio Edit)', 'Breakwater', 'Undertow']);
+	});
+
+	it('an operator-approved release merge joins a re-delivered track and keeps both ISRCs; the sweep never does', async () => {
+		const { app, ops, releaseId } = await seeded();
+		await ops.releaseFill({ ids: [releaseId] });
+		const [slot] = await app.db.query<{ id: string; name: string; duration_sec: unknown; position: unknown; isrc: string }>(
+			`select o.id, o.name, o.duration_sec, e.position, i.value as isrc from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst
+				join curator.catalog_identifier i on i.object_id = o.id and i.namespace = 'isrc' where e.src = $1 and e.kind = 'release-recording' order by e.position limit 1`,
+			[releaseId],
+		);
+		// The same track sent to a store again: same title and length, a new code.
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(tx, [{ provider: 'tidal', kind: 'recording', providerId: 'redelivered', name: slot!.name, facts: { durationSec: Number(slot!.duration_sec) }, identifiers: [{ namespace: 'isrc' as const, value: 'GBKQU1458248' }] }], { reason: 'enrichment' }),
+		);
+		const [copy] = await app.db.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'tidal' and provider_id = 'redelivered'`);
+		expect(copy!.object_id).not.toBe(slot!.id);
+		await app.db.query(`insert into curator.catalog_edge (src, kind, dst, position) values ($1, 'release-recording', $2, $3::int)`, [releaseId, copy!.object_id, String(slot!.position)]);
+		expect((await ops.releaseDedupe({ ids: [releaseId] })).merged).toEqual([]);
+		const merged = await withSystemTx(app.db, (tx) => dedupeRelease(tx, releaseId, 'guy', { twins: true }));
+		expect(merged).toHaveLength(1);
+		const codes = await app.db.query<{ value: string }>(
+			`select i.value from curator.catalog_identifier i join curator.catalog_object o on o.id = i.object_id and o.merged_into is null
+			where i.namespace = 'isrc' and i.object_id = any($1::uuid[]) order by i.value`,
+			[`{${slot!.id},${copy!.object_id}}`],
+		);
+		expect(codes.map((c) => c.value).sort()).toEqual([slot!.isrc, 'GBKQU1458248'].sort());
+		// Held twice by code now, it is still one recording to the sweep.
+		expect((await ops.releaseDedupe({ ids: [releaseId] })).merged).toEqual([]);
+		// The shop's own cut of that track, three minutes longer: not merged, named for its store.
+		await withSystemTx(app.db, (tx) => ingestClaims(tx, [{ provider: 'bandcamp', kind: 'recording', providerId: 'longcut', name: slot!.name, facts: { durationSec: Number(slot!.duration_sec) + 180 } }], { reason: 'enrichment' }));
+		const [cut] = await app.db.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'bandcamp' and provider_id = 'longcut'`);
+		await app.db.query(`insert into curator.catalog_edge (src, kind, dst, position) values ($1, 'release-recording', $2, $3::int)`, [releaseId, cut!.object_id, String(slot!.position)]);
+		for (let i = 0; i < 2; i++) expect(await withSystemTx(app.db, (tx) => dedupeRelease(tx, releaseId, 'guy', { twins: true }))).toEqual([]);
+		const names = await app.db.query<{ name: string }>(`select o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null where e.src = $1 and e.kind = 'release-recording' and e.position = $2::int order by o.name`, [releaseId, String(slot!.position)]);
+		expect(names.map((n) => n.name)).toEqual([slot!.name, `${slot!.name} (Bandcamp)`]);
 	});
 
 	it('the shared-slots scope finds the suspect releases on its own, and the worker’s pass merges them and logs it', async () => {

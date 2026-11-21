@@ -11,12 +11,13 @@
 // wireLocalTabContextMenu, wirePlayerModeToggle's button binding) plus
 // renderTopNav/renderAnalysisChip/applyChromeAntiZoom.
 
-import { For, Show, createEffect } from 'solid-js';
+import { For, Show, createEffect, createSignal } from 'solid-js';
 import type { Accessor, JSX } from 'solid-js';
 import { render } from 'solid-js/web';
 import { VolumeControl } from '../components/VolumeControl.jsx';
 import { VUMeter } from '../components/VUMeter.jsx';
 import type { SourceTab } from '../viewmodel/shell.js';
+import type { AnalyzerHealth } from '@curator/core';
 
 // Includes 'soundcloud' for visibility-toggle purposes only — soundcloud is
 // not a real activeSource (no backend wired), but it lives in the tab strip
@@ -137,6 +138,29 @@ export interface AnalyzerStatus {
 	// batch started — the completed/total numerator for the chip tooltip.
 	completedSession: number;
 	lastError: { trackId: string; message: string } | null;
+	// The analyzer process itself. The counts above only say what was handed
+	// to it — 'unresponsive' / 'disabled' mean none of it is moving.
+	health: AnalyzerHealth;
+	// Epoch ms of the last analysis that finished, across launches.
+	lastCompletedAt: number | null;
+}
+
+// "3 min ago" for the analyzer tooltip.
+function formatAgo(fromMs: number, nowMs: number): string {
+	const min = Math.floor(Math.max(0, nowMs - fromMs) / 60_000);
+	if (min < 1) return 'just now';
+	if (min < 60) return `${min} min ago`;
+	const h = Math.floor(min / 60);
+	if (h < 24) return `${h} h ago`;
+	const d = Math.floor(h / 24);
+	return `${d} day${d === 1 ? '' : 's'} ago`;
+}
+
+// A page tab as the strip draws it.
+export interface PageTabView {
+	id: string;
+	title: string;
+	kind: 'artist' | 'label' | 'album';
 }
 
 export interface TopFrameProps {
@@ -170,9 +194,12 @@ export interface TopFrameProps {
 	// owns clearing entries when sync ends.
 	sourceSyncTooltip: Accessor<Partial<Record<SourceTab, { tooltip: string; alert: boolean }>>>;
 	// The same indicator for a state tab whose content is being fetched right
-	// now: Discover while the feed refreshes (a Refresh click or the background
-	// poll). `alert` once a source of that pass has failed.
+	// now: Discover while the feed refreshes for a click, or its background
+	// poll has failed. `alert` once a source of that pass has failed.
 	stateSyncTooltip: Accessor<Partial<Record<StateTab, { tooltip: string; alert: boolean }>>>;
+	// Pages opened "in a new tab" (an artist / label / album page with its
+	// own history), in strip order. `activeTabId` names the active one by id.
+	pageTabs: Accessor<PageTabView[]>;
 	// Static UI bits
 	userInitials: string;
 
@@ -181,6 +208,10 @@ export interface TopFrameProps {
 	onSourceContextMenu?: (evt: MouseEvent, src: SourceTab) => void;
 	onSoundcloudClick: () => void;
 	onViewClick: (view: StateTab) => void;
+	// The analyzer chip was clicked while the analyzer is down: relaunch it.
+	onAnalyzerRetry: () => void;
+	onPageClick: (id: string) => void;
+	onPageClose: (id: string) => void;
 	onOmnibarOpen: () => void;
 	onSettingsOpen: () => void;
 	onPlayerModeToggle: () => void;
@@ -208,15 +239,27 @@ export function TopFrame(props: TopFrameProps) {
 	// Including queued means the chip appears the instant the user enqueues, and
 	// stays through the gaps between dispatches, instead of only flickering on
 	// while a track is actively in a worker slot.
+	// A dead analyzer shows too, with or without work waiting: that it can't
+	// run is the thing to know before the next Analyze click, not after.
+	const chipDown = (): { stopped: boolean; reason: string } | null => {
+		const h = props.analyzerStatus().health;
+		return h.state === 'unresponsive' || h.state === 'disabled'
+			? { stopped: h.state === 'disabled', reason: h.reason }
+			: null;
+	};
 	const chipVisible = (): boolean => {
 		const s = props.analyzerStatus();
-		return s.runningCount > 0 || s.queuedCount > 0 || s.lastError !== null;
+		return s.runningCount > 0 || s.queuedCount > 0 || s.lastError !== null || chipDown() !== null;
 	};
 	// No glance number any more — the breathing square alone signals "analysis
 	// in progress"; exact running/queued counts live in the hover tooltip.
 	// data-state still drives the dot (accent+breathing while active, static red on error).
+	// 'stalled' (not answering, being relaunched) and 'down' (gave up) come
+	// first — the counts mean nothing while nothing is there to run them.
 	const chipDataState = (): string => {
 		const s = props.analyzerStatus();
+		const down = chipDown();
+		if (down) return down.stopped ? 'down' : 'stalled';
 		if (s.runningCount > 0 || s.queuedCount > 0) return s.lastError ? 'errors' : 'active';
 		if (s.lastError) return 'errors';
 		return 'idle';
@@ -236,6 +279,23 @@ export function TopFrame(props: TopFrameProps) {
 	const chipRunningTracks = (): string[] => props.analyzerStatus().runningTracks;
 	const chipParallel = (): number => props.analyzerStatus().runningCount;
 	const chipError = (): string | null => props.analyzerStatus().lastError?.message ?? null;
+	const chipWaiting = (): number => {
+		const s = props.analyzerStatus();
+		return s.runningCount + s.queuedCount;
+	};
+	// Launched but not yet proven alive: jobs handed over so far are only
+	// waiting in its stdin, so the tooltip doesn't call them running.
+	const chipStarting = (): boolean => {
+		const st = props.analyzerStatus().health.state;
+		return st === 'starting' || st === 'idle';
+	};
+	// "Last finished" is relative time; re-read the clock each time the
+	// tooltip opens rather than ticking a timer for a hidden popover.
+	const [tipNow, setTipNow] = createSignal(Date.now());
+	const chipLastFinished = (): string | null => {
+		const at = props.analyzerStatus().lastCompletedAt;
+		return at === null ? null : formatAgo(at, tipNow());
+	};
 
 	const handleSourceClick = (def: SourceTabDef) => {
 		if (def.disabled) { props.onSoundcloudClick(); return; }
@@ -361,6 +421,35 @@ export function TopFrame(props: TopFrameProps) {
 				</For>
 			</div>
 
+			<Show when={props.pageTabs().length > 0}>
+				<div class="tf-group-sep" aria-hidden="true"></div>
+				<div class="tf-tabs tf-pages">
+					<For each={props.pageTabs()}>
+						{(tab) => (
+							// Not a <button>: it holds two (open, close). A middle-click
+							// anywhere on the tab closes it, as in a browser.
+							<div
+								class="tf-tab tf-tab--page"
+								classList={{ active: props.activeTabId() === tab.id }}
+								onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); props.onPageClose(tab.id); } }}
+								onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
+							>
+								<button type="button" class="tf-page__main" title={tab.title} onClick={() => props.onPageClick(tab.id)}>
+									<span class="tf-page__mark" data-kind={tab.kind} aria-hidden="true"></span>
+									<span class="tf-page__title">{tab.title}</span>
+								</button>
+								<button type="button" class="tf-page__close" title="Close tab (Ctrl+W)" aria-label={`Close ${tab.title}`} onClick={() => props.onPageClose(tab.id)}>
+									<svg width="9" height="9" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+										<line x1="1.5" y1="1.5" x2="8.5" y2="8.5"/>
+										<line x1="8.5" y1="1.5" x2="1.5" y2="8.5"/>
+									</svg>
+								</button>
+							</div>
+						)}
+					</For>
+				</div>
+			</Show>
+
 			<div class="tf-drag" aria-hidden="true"></div>
 			<div class="tf-group-sep" aria-hidden="true"></div>
 
@@ -371,6 +460,8 @@ export function TopFrame(props: TopFrameProps) {
 					class="analysis-chip"
 					data-state={chipDataState()}
 					hidden={!chipVisible()}
+					onMouseEnter={() => setTipNow(Date.now())}
+					onClick={() => { if (chipDown()) props.onAnalyzerRetry(); }}
 				>
 					<span class="analysis-chip__dot"></span>
 					{/* Reactive popover (CSS shows it on .analysis-chip:hover).
@@ -378,15 +469,38 @@ export function TopFrame(props: TopFrameProps) {
 					   title it replaced — so completed/total and the running list
 					   update live during analysis. */}
 					<div class="analysis-chip__tooltip" role="tooltip">
-						<div class="analysis-chip__tt-head">{chipCompleted()} / {chipTotal()} tracks</div>
-						<Show when={chipRunningTracks().length > 0}>
-							<div class="analysis-chip__tt-list">
-								<For each={chipRunningTracks()}>
-									{(name) => <div class="analysis-chip__tt-row">{name}</div>}
-								</For>
-							</div>
+						<Show
+							when={chipDown()}
+							fallback={<>
+								<div class="analysis-chip__tt-head">{chipCompleted()} / {chipTotal()} tracks</div>
+								<Show when={chipRunningTracks().length > 0}>
+									<div class="analysis-chip__tt-list">
+										<For each={chipRunningTracks()}>
+											{(name) => <div class="analysis-chip__tt-row">{name}</div>}
+										</For>
+									</div>
+								</Show>
+								<div class="analysis-chip__tt-foot">
+									{chipStarting() ? 'analyzer starting…' : `running ${chipParallel()} in parallel`}
+								</div>
+							</>}
+						>
+							{(down) => <>
+								<div class="analysis-chip__tt-head analysis-chip__tt-head--down">
+									{down().stopped ? 'Analyzer stopped' : 'Analyzer not responding'}
+								</div>
+								<div class="analysis-chip__tt-reason">{down().reason}</div>
+								<Show when={chipWaiting() > 0}>
+									<div class="analysis-chip__tt-row">{chipWaiting()} track{chipWaiting() === 1 ? '' : 's'} waiting</div>
+								</Show>
+								<div class="analysis-chip__tt-foot">
+									{down().stopped ? 'Click to retry' : 'Retrying — click to retry now'}
+								</div>
+							</>}
 						</Show>
-						<div class="analysis-chip__tt-foot">running {chipParallel()} in parallel</div>
+						<Show when={chipLastFinished()}>
+							<div class="analysis-chip__tt-last">last finished {chipLastFinished()}</div>
+						</Show>
 						<Show when={chipError()}>
 							<div class="analysis-chip__tt-err">Last error: {chipError()}</div>
 						</Show>

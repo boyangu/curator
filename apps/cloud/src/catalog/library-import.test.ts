@@ -135,6 +135,18 @@ describe('library import', () => {
 		expect(await count(app, `select count(*) as n from curator.catalog_enrich_task where need = 'profile'`)).toBe(0);
 	});
 
+	it('a release a device read at a store for a page (manual_registration) is queued for its tracklist, and raises nothing', async () => {
+		const app = await createTestApp();
+		const fan = await app.signIn();
+		// A listing's bare copy: a title, a date, the artist — no tracklist.
+		const bare = { provider: 'deezer', kind: 'release', providerId: '9001', name: 'Low Tide EP', facts: { releaseDate: '2019-06-12' }, artists: [{ provider: 'deezer', kind: 'artist', providerId: '77', name: 'Glass Rivers' }] };
+		const r = await fan.api.catalog.ingest.mutate({ deviceId: fan.deviceId, reason: 'manual_registration', idempotencyKey: 'page:test:1', claims: [bare] });
+		expect(r.created).toBe(2);
+		expect(await count(app, `select count(*) as n from curator.catalog_enrich_task where need = 'fill'`)).toBe(1);
+		expect(await count(app, `select count(*) as n from curator.catalog_event`)).toBe(0);
+		expect(await count(app, `select count(*) as n from curator.catalog_watch`)).toBe(0);
+	});
+
 	it("a device browses a label's releases and a release's tracks with their store handles, and an id merged away answers for its winner", async () => {
 		const app = await createTestApp();
 		await seedDeezer(app);

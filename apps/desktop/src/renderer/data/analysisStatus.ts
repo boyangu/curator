@@ -12,8 +12,14 @@
 // query at boot and right after the user enqueues work) replaces the running
 // set + queued count from DB truth, correcting any drift from the `enqueued`
 // events that main deliberately filters out of the broadcast.
+//
+// `health` is the analyzer process itself (analysis:status + the
+// analysis:health event). Running/queued alone can't tell work from a hang: a
+// job is "running" from the moment it is handed over, whether or not anything
+// is there to run it.
 
 import { createStore, produce } from 'solid-js/store';
+import type { AnalyzerHealth } from '@curator/core';
 
 export interface AnalyzerStatusSnapshot {
 	// Track ids currently mid-analysis (capped by the sidecar worker pool).
@@ -26,6 +32,10 @@ export interface AnalyzerStatusSnapshot {
 	queuedCount: number;
 	completedSession: number;
 	lastError: { trackId: string; message: string } | null;
+	health: AnalyzerHealth;
+	// Epoch ms of the last analysis that finished (spans launches); null =
+	// none on record.
+	lastCompletedAt: number | null;
 }
 
 const [store, setStore] = createStore<{
@@ -34,7 +44,11 @@ const [store, setStore] = createStore<{
 	queuedCount: number;
 	completedSession: number;
 	lastError: { trackId: string; message: string } | null;
-}>({ running: {}, queuedCount: 0, completedSession: 0, lastError: null });
+	// Wrapped: the variants differ in shape, and a store merges object fields
+	// in place — a stale `reason` would survive a move to 'ready'.
+	health: { value: AnalyzerHealth };
+	lastCompletedAt: number | null;
+}>({ running: {}, queuedCount: 0, completedSession: 0, lastError: null, health: { value: { state: 'off' } }, lastCompletedAt: null });
 
 export const analysisStatus = {
 	// Reactive snapshot for the TopFrame chip accessor.
@@ -47,7 +61,20 @@ export const analysisStatus = {
 			queuedCount: store.queuedCount,
 			completedSession: store.completedSession,
 			lastError: store.lastError,
+			health: store.health.value,
+			lastCompletedAt: store.lastCompletedAt,
 		};
+	},
+	health(): AnalyzerHealth {
+		return store.health.value;
+	},
+	setHealth(health: AnalyzerHealth): void {
+		setStore('health', { value: health });
+	},
+	// From the analysis:status snapshot; never moves backwards (a completion
+	// seen live may be newer than the snapshot that lands after it).
+	seedLastCompleted(at: number | null): void {
+		if (at !== null && at > (store.lastCompletedAt ?? 0)) setStore('lastCompletedAt', at);
 	},
 	isRunning(trackId: string): boolean {
 		return store.running[trackId] !== undefined;
@@ -102,6 +129,7 @@ export const analysisStatus = {
 			delete s.running[trackId];
 			s.completedSession++;
 			s.lastError = null;
+			s.lastCompletedAt = Date.now();
 		}));
 	},
 	failed(trackId: string, message: string): void {

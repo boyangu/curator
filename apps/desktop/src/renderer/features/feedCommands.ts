@@ -50,9 +50,6 @@ export interface FeedActions {
 	// FeedCommandContext.libraryTrackId).
 	notInterested(item: FeedItem, libraryTrackId: string): void; // remove from pinned + library
 	openOrganize(libraryTrackId: string): void; // open the unified tag/playlist modal
-	// Start a discovery journey seeded from this feed track (card or nested
-	// row) — jumps to Discover's Journeys mode.
-	startJourney(item: FeedItem, track?: FeedTrackRef): void;
 }
 
 export type FeedMode = 'feed' | 'archived';
@@ -282,13 +279,6 @@ const FEED_COMMANDS: FeedCommand[] = [
 	// shown wherever there's a single track to search (track cards + nested
 	// rows). Feed items don't carry Tidal/Beatport links, so there's nothing to
 	// deep-link there — only search.
-	{
-		// Journey seeding — any single feed track (card or nested row) can
-		// embark. Album cards without a target track stay journey-less; their
-		// rows offer it individually.
-		id: 'start-journey', group: 'open', isAvailable: (c) => targetStid(c) !== undefined,
-		build: (c) => leaf('start-journey', 'Start Journey', () => c.actions.startJourney(c.item, c.track)),
-	},
 	{
 		id: 'open-spotify', group: 'open', isAvailable: (c) => (c.track ? !!targetStid(c) : playableId(c.item) !== null),
 		build: (c) => {

@@ -12,7 +12,8 @@
 // works by name.
 
 import { createHash } from 'node:crypto';
-import type { CatalogBrowseResult, CatalogClaim, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
+import { CATALOG_MAX_CLAIMS } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogClaim, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogTracksResult, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { SpotifyClient } from '@curator/spotify';
 import { log } from '../log.js';
@@ -39,6 +40,9 @@ export type CatalogFollowTarget = { objectId: string } | { claim: CatalogClaim }
 
 export type CatalogFollowManyReport = { followed: number; already: number; failed: { name: string; error: string }[] };
 export type CatalogEnrichReport = { labels: number; registered: number; queued: number };
+// A library artist as audience-up.ts sends it: by its id at one store.
+export type CatalogArtistRef = { artistId: string; name: string; provider: 'spotify' | 'tidal'; providerId: string };
+export type CatalogArtistsReport = { artists: number; registered: number; queued: number; objects: { artistId: string; objectId: string }[] };
 
 export type CatalogImportReport = { found: number; created: number; watched: number; existing: number };
 
@@ -59,15 +63,39 @@ export interface CatalogClient {
 	// batch is answered from the cloud's record, not redone).
 	importClaims(claims: CatalogClaim[], source: CatalogWatchSource): Promise<CatalogImportReport>;
 	enrichLabels(names: string[]): Promise<CatalogEnrichReport>;
+	// The library's artists, registered by their store ids (no watch) and
+	// handed to the catalogue's audience reads, for their Reach score.
+	// 'catalog_audience' only (offersAudience). `objects`: the catalogue's
+	// artist for each one it placed.
+	enrichArtists(artists: CatalogArtistRef[]): Promise<CatalogArtistsReport>;
+	offersAudience(): boolean;
 	// Findings up (facts-up.ts): fill-only recording claims from this
 	// desktop's store lookups, under one idempotency key per batch.
 	reportEnrichment(claims: CatalogClaim[], idempotencyKey: string): Promise<CatalogIngestResult>;
+	// What this desktop read at a store for a page the user opened
+	// (entity/work.ts): releases, with their artists, label and tracklist
+	// when read in full. Registered — no watch, no events; the catalogue
+	// reads the tracklists it still lacks itself. Batches of 200 keyed by
+	// their content, so a repeat is answered from the catalogue's record.
+	// `made`: per claim, whether it made a new object (false: the catalogue
+	// held it already and the claim was attached, or it was refused).
+	register(claims: CatalogClaim[]): Promise<{ created: number; attached: number; made: boolean[] }>;
 	// The catalogue's objects for provider refs, in order (null: none), at
 	// most 50 a call (catalog-refs.ts pages them).
 	resolve(refs: CatalogRef[]): Promise<(CatalogObjectSummary | null)[]>;
 	// An object with what hangs off it: a label's or an artist's releases, a
-	// release's tracks, each with its store handles.
-	browse(objectId: string): Promise<CatalogBrowseResult>;
+	// release's tracks, each with its store handles. `brief`: without those
+	// lists (the object, its facts and relations — a page header, a link
+	// menu); asked of a server that knows the option, the whole answer else.
+	browse(objectId: string, opts?: { brief?: boolean }): Promise<CatalogBrowseResult>;
+	// The catalogue's own objects of a kind whose name starts like `q`, most
+	// watched first — no provider candidates (that is `search`, the panel's).
+	find(q: string, kind: CatalogKind, limit?: number): Promise<CatalogObjectSummary[]>;
+	// 'catalog_pages': does the server answer `tracks` and the header facts.
+	offersPages(): boolean;
+	// A page of an artist's, a label's or an album's releases with their
+	// tracklists (entity/service.ts).
+	tracks(objectId: string, cursor?: string): Promise<CatalogTracksResult>;
 }
 
 // A label followed by name: one shared object per folded name, so everyone
@@ -82,6 +110,9 @@ export type CatalogClientDeps = {
 	catalog: CloudService['catalog'];
 	signedIn: () => boolean;
 	serverOffers: () => boolean;
+	// The server's whole feature list, for what rides on top of
+	// 'global_catalog' ('catalog_pages'). Absent: none of it.
+	features?: () => readonly string[];
 	deviceId: () => string;
 	spotifyToken: () => Promise<string | null>;
 	fetch?: typeof fetch;
@@ -350,9 +381,23 @@ export function createCatalogClient(deps: CatalogClientDeps): CatalogClient {
 			return out;
 		},
 
-		browse(objectId) {
+		browse(objectId, opts) {
 			ready();
-			return deps.catalog.browse({ deviceId: deviceId(), id: objectId });
+			// The key came with 'catalog_pages': an older server refuses it.
+			const brief = opts?.brief === true && (deps.features?.().includes('catalog_pages') ?? false);
+			return deps.catalog.browse({ deviceId: deviceId(), id: objectId, ...(brief ? { brief: true } : {}) });
+		},
+
+		async find(q, kind, limit = 10) {
+			ready();
+			return (await deps.catalog.search({ deviceId: deviceId(), q, kind, limit })).objects;
+		},
+
+		offersPages: () => status().available && (deps.features?.().includes('catalog_pages') ?? false),
+
+		tracks(objectId, cursor) {
+			ready();
+			return deps.catalog.tracks({ deviceId: deviceId(), id: objectId, ...(cursor ? { cursor } : {}) });
 		},
 
 		// The library's labels, registered with the catalogue by name (no
@@ -377,9 +422,48 @@ export function createCatalogClient(deps: CatalogClientDeps): CatalogClient {
 			return report;
 		},
 
+		offersAudience: () => status().available && (deps.features?.().includes('catalog_audience') ?? false),
+
+		// Each artist by its own store id, never its name: a name alone would
+		// join a namesake. Batches keyed by their content, so a repeat is
+		// answered from the catalogue's record.
+		async enrichArtists(artists) {
+			ready();
+			const report: CatalogArtistsReport = { artists: artists.length, registered: 0, queued: 0, objects: [] };
+			const url = (a: CatalogArtistRef) => (a.provider === 'spotify' ? `https://open.spotify.com/artist/${a.providerId}` : `https://tidal.com/browse/artist/${a.providerId}`);
+			for (let i = 0; i < artists.length; i += 200) {
+				const batch = artists.slice(i, i + 200);
+				const claims: CatalogClaim[] = batch.map((a) => ({ provider: a.provider, kind: 'artist', providerId: a.providerId, name: a.name, url: url(a) }));
+				const key = `audience:${createHash('sha256').update(claims.map((c) => `${c.provider}:${c.providerId}`).join(',')).digest('hex').slice(0, 32)}`;
+				const r = await deps.catalog.ingest({ deviceId: deviceId(), reason: 'library_import', idempotencyKey: key, claims });
+				report.registered += r.created;
+				const placed = batch.flatMap((a, k) => { const o = r.results[k]; return o && 'objectId' in o ? [{ artistId: a.artistId, objectId: o.objectId }] : []; });
+				report.objects.push(...placed);
+				if (placed.length) report.queued += (await deps.catalog.enrich({ deviceId: deviceId(), objectIds: [...new Set(placed.map((p) => p.objectId))], need: 'audience' })).queued;
+			}
+			clog.info('library artists sent to the catalogue for their audience', { artists: report.artists, registered: report.registered, queued: report.queued });
+			return report;
+		},
+
 		reportEnrichment(claims, idempotencyKey) {
 			ready();
 			return deps.catalog.ingest({ deviceId: deviceId(), reason: 'enrichment', idempotencyKey, claims });
+		},
+
+		async register(claims) {
+			ready();
+			const report = { created: 0, attached: 0, made: [] as boolean[] };
+			for (let i = 0; i < claims.length; i += CATALOG_MAX_CLAIMS) {
+				const batch = claims.slice(i, i + CATALOG_MAX_CLAIMS);
+				// The tracklist's length is part of the key: the same release
+				// read in full later is not the listing's bare copy again.
+				const key = `page:${createHash('sha256').update(batch.map((c) => `${c.provider}:${c.kind}:${c.providerId}:${c.recordings?.length ?? 0}`).join(',')).digest('hex').slice(0, 32)}`;
+				const r = await deps.catalog.ingest({ deviceId: deviceId(), reason: 'manual_registration', idempotencyKey: key, claims: batch });
+				report.created += r.created;
+				report.attached += r.attached;
+				report.made.push(...batch.map((_, k) => { const o = r.results[k]; return !!o && 'objectId' in o && o.created; }));
+			}
+			return report;
 		},
 	};
 

@@ -42,6 +42,7 @@ export function mountRegionEffect(opts: RegionEffectOptions): RegionEffectHandle
 			downloads: document.getElementById('dl-view'),
 			discover: document.getElementById('discover-view'),
 			empty: document.getElementById('tab-empty'),
+			entityHeader: document.getElementById('entity-header'),
 		};
 
 		createEffect(() => {
@@ -50,17 +51,24 @@ export function mountRegionEffect(opts: RegionEffectOptions): RegionEffectHandle
 			// Empty-state panel (onboarding / smart-playlist watermark)
 			// belongs only to the source-bound tracks view, and occupies the
 			// table's slot — table and panel are mutually exclusive.
-			const emptyActive = shell.emptyState() !== null && view === 'tracks';
+			// An entity page is never the tab's own list: the tab's onboarding
+			// panel (a source not connected yet) does not cover it.
+			const emptyActive = shell.emptyState() !== null && view === 'tracks' && shell.currentEntity() === null;
 
 			if (hosts.tracks) hosts.tracks.hidden = region !== 'tracks' || emptyActive;
 			if (hosts.empty) hosts.empty.hidden = !emptyActive;
 			if (hosts.sync) hosts.sync.hidden = region !== 'sync';
 			if (hosts.downloads) hosts.downloads.hidden = region !== 'downloads';
 			if (hosts.discover) hosts.discover.hidden = region !== 'discover';
+			// An entity page is the tracks region with a header above the table.
+			if (hosts.entityHeader) hosts.entityHeader.hidden = region !== 'tracks' || shell.currentEntity() === null;
 
-			// Body attribute drives the CSS side (sidebar collapse, filter-bar
+			// Body attributes drive the CSS side (sidebar collapse, filter-bar
 			// visibility, grid areas) — same contract as before, one writer now.
+			// `data-region` beside `data-view`: Discover showing an entity page
+			// is the tracks region, and wants the track list's toolbar back.
 			document.body.setAttribute('data-view', view);
+			document.body.setAttribute('data-region', region);
 		});
 
 		// User-toggled sidebar collapse (button / Ctrl-B) — zeroes the sidebar

@@ -72,6 +72,7 @@ import * as connect from './catalog/connect.js';
 import * as workers from './catalog/workers.js';
 import { ZCatalogConnectAnswerInput, ZCatalogConnectQueueInput, ZCatalogConnectSearchInput, type CatalogConnectAnswerResult, type CatalogConnectQueueResult, type CatalogConnectSearchResult } from '@curator/protocol';
 import { ZCatalogWorkerDueInput, ZCatalogWorkerReportInput, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
+import { ZCatalogTracksInput, type CatalogTracksResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { CloudError } from './errors.js';
 import { BaseInvariantError } from './sync/base.js';
@@ -94,7 +95,7 @@ export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'ca
 		(f) =>
 			(f !== 'catalogue' || deps.catalogue !== null) &&
 			(f !== 'spotify_gateway' || deps.spotify !== null) &&
-			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect') || deps.catalog),
+			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience') || deps.catalog),
 	);
 }
 
@@ -419,6 +420,13 @@ export const appRouter = router({
 		connectAnswer: authedProcedure.input(ZCatalogConnectAnswerInput).mutation(({ ctx, input }): Promise<CatalogConnectAnswerResult> => {
 			ctx.call.opsIn = input.answers.length;
 			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => connect.connectAnswer({ ...d, fetch: ctx.deps.connectFetch }, ctx.user.id, callerOf(ctx), input));
+		}),
+		// 'catalog_pages' (src/catalog/pages.ts): a page of an artist's, a
+		// label's or an album's releases with their tracklists.
+		tracks: authedProcedure.input(ZCatalogTracksInput).query(async ({ ctx, input }): Promise<CatalogTracksResult> => {
+			const r = await catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.tracks(d, ctx.user.id, callerOf(ctx), input));
+			ctx.call.opsOut = r.releases.length;
+			return r;
 		}),
 	}),
 

@@ -43,6 +43,7 @@ import type { Op, RejectReason } from './ops.js';
 import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, SpotifyGrantStatus, SpotifyTokenInput, SpotifyTokenResult } from './spotify-gateway.js';
 import type { CatalogWorkerDueInput, CatalogWorkerDueResult, CatalogWorkerReportInput, CatalogWorkerReportResult } from './catalog-service.js';
 import type { CatalogConnectAnswerInput, CatalogConnectAnswerResult, CatalogConnectQueueInput, CatalogConnectQueueResult, CatalogConnectSearchInput, CatalogConnectSearchResult } from './catalog-service.js';
+import type { CatalogTracksInput, CatalogTracksResult } from './catalog-service.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -140,7 +141,20 @@ export type PushInput = {
 //     exist ("Help us connect the dots", catalog-service.ts): a user maps
 //     store pages onto the catalogue's artists, labels and albums. With
 //     'global_catalog' only; a desktop hides the feature without it.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect'] as const;
+//   - 'catalog_pages': `catalog.tracks` exists and `catalog.browse` answers
+//     the header facts (genres, the caller's watch): what a desktop's artist,
+//     label and album pages read their World side from. With
+//     'global_catalog' only; without it a page shows the library's side alone.
+//   - 'catalog_read_cadence': `catalog.workerDue` reads `cadence` — how often
+//     the user wants each kind of follow read (catalog-service.ts
+//     CatalogReadCadence) — and the master times the cursors by it. Before it
+//     a desktop sends none (an older server refuses the key) and the server's
+//     trackers keep their own cadence. With 'catalog_workers' only.
+//   - 'catalog_audience': `catalog.enrich` takes `need: 'audience'` — a
+//     desktop's library artists, read at their stores for their Reach score
+//     (catalog-service.ts CatalogReach). Before it a desktop sends none (an
+//     older server refuses the key). With 'global_catalog' only.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -506,6 +520,8 @@ export interface CloudService {
 		connectQueue(input: CatalogConnectQueueInput): Promise<CatalogConnectQueueResult>;
 		connectAnswer(input: CatalogConnectAnswerInput): Promise<CatalogConnectAnswerResult>;
 		connectSearch(input: CatalogConnectSearchInput): Promise<CatalogConnectSearchResult>;
+		// 'catalog_pages'.
+		tracks(input: CatalogTracksInput): Promise<CatalogTracksResult>;
 	};
 	feed: {
 		events(input: FeedEventsInput): Promise<FeedEventsResult>;

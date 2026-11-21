@@ -80,11 +80,17 @@ const artistsOverlap = (ours: readonly string[], theirs: readonly { name: string
 	return theirs.some((a) => folds.has(nameFold(a.name)));
 };
 
+// What the match reads of a track and of a release, whoever asks: a feed
+// card's refs, or a catalogue release on an entity page (entity/work.ts).
+export type MatchTrack = { title: string; durationSec?: number | null; isrc?: string | null };
+export type AlbumQuery<R extends MatchTrack> = { title: string; artists: readonly string[]; upc?: string | null; tracks: readonly R[] };
+export type TrackQuery = MatchTrack & { artists: readonly string[] };
+
 // Our refs paired with the album's tracks: by title and length, else by
 // position when the counts agree. Null when the tracklist does not confirm.
-export function pairTracks(ours: readonly FeedTrackRef[], theirs: readonly SpotifySimplifiedTrack[]): Map<FeedTrackRef, SpotifySimplifiedTrack> | null {
+export function pairTracks<R extends MatchTrack>(ours: readonly R[], theirs: readonly SpotifySimplifiedTrack[]): Map<R, SpotifySimplifiedTrack> | null {
 	if (!ours.length || !theirs.length) return null;
-	const pairs = new Map<FeedTrackRef, SpotifySimplifiedTrack>();
+	const pairs = new Map<R, SpotifySimplifiedTrack>();
 	const taken = new Set<string>();
 	for (const r of ours) {
 		const key = titleKey(r.title);
@@ -149,8 +155,8 @@ export function trackDraft(item: FeedItem, track: SpotifyTrack): FeedItemDraft {
 	};
 }
 
-async function findAlbum(client: SpotifyMatchClient, item: FeedItem): Promise<{ album: { id: string; external_urls?: { spotify?: string } }; pairs: Map<FeedTrackRef, SpotifySimplifiedTrack> } | null> {
-	const ours = item.payload.tracks ?? [];
+export async function findSpotifyAlbum<R extends MatchTrack>(client: SpotifyMatchClient, q: AlbumQuery<R>): Promise<{ album: { id: string; external_urls?: { spotify?: string } }; pairs: Map<R, SpotifySimplifiedTrack> } | null> {
+	const ours = q.tracks;
 	const confirm = async (album: { id: string; external_urls?: { spotify?: string } }, total?: number) => {
 		if (total !== undefined && ours.length && Math.abs(total - ours.length) > 1) return null;
 		const theirs = await client.getAlbumTracks(album.id);
@@ -169,8 +175,8 @@ async function findAlbum(client: SpotifyMatchClient, item: FeedItem): Promise<{ 
 		}
 	}
 	// By the release's UPC.
-	if (item.payload.upc) {
-		for (const a of await client.searchAlbums(`upc:${item.payload.upc}`, 5)) {
+	if (q.upc) {
+		for (const a of await client.searchAlbums(`upc:${q.upc}`, 5)) {
 			if (seen.has(a.id)) continue;
 			seen.add(a.id);
 			const hit = await confirm(a, a.total_tracks);
@@ -178,11 +184,11 @@ async function findAlbum(client: SpotifyMatchClient, item: FeedItem): Promise<{ 
 		}
 	}
 	// By names, confirmed by the tracklist.
-	const artist = item.payload.artists.find((a) => a.trim());
-	const q = artist && nameFold(artist) !== nameFold('Various Artists') ? `album:"${item.payload.title}" artist:"${artist}"` : `album:"${item.payload.title}"`;
-	const key = titleKey(item.payload.title);
-	for (const a of await client.searchAlbums(q, 10)) {
-		if (seen.has(a.id) || titleKey(a.name) !== key || !artistsOverlap(item.payload.artists, a.artists)) continue;
+	const artist = q.artists.find((a) => a.trim());
+	const search = artist && nameFold(artist) !== nameFold('Various Artists') ? `album:"${q.title}" artist:"${artist}"` : `album:"${q.title}"`;
+	const key = titleKey(q.title);
+	for (const a of await client.searchAlbums(search, 10)) {
+		if (seen.has(a.id) || titleKey(a.name) !== key || !artistsOverlap(q.artists, a.artists)) continue;
 		seen.add(a.id);
 		const hit = await confirm(a, a.total_tracks);
 		if (hit) return hit;
@@ -222,8 +228,7 @@ export async function fillAlbumTracks(client: SpotifyMatchClient, item: FeedItem
 	return { album: { id: albumId }, pairs, complete: pairs.size === missing.length };
 }
 
-async function findTrack(client: SpotifyMatchClient, item: FeedItem): Promise<SpotifyTrack | null> {
-	const p = item.payload;
+export async function findSpotifyTrack(client: SpotifyMatchClient, p: TrackQuery): Promise<SpotifyTrack | null> {
 	if (p.isrc) {
 		const hit = (await client.searchTracks(`isrc:${p.isrc}`, 5)).find(
 			(t) => (!t.external_ids?.isrc || t.external_ids.isrc.toUpperCase() === p.isrc!.toUpperCase()) && closeSec(p.durationSec, t.duration_ms / 1000, ISRC_DURATION_TOLERANCE_SEC),
@@ -232,8 +237,8 @@ async function findTrack(client: SpotifyMatchClient, item: FeedItem): Promise<Sp
 	}
 	const artist = p.artists.find((a) => a.trim());
 	const key = titleKey(p.title);
-	const q = artist ? `track:"${p.title}" artist:"${artist}"` : `track:"${p.title}"`;
-	return (await client.searchTracks(q, 10)).find((t) => titleKey(t.name) === key && artistsOverlap(p.artists, t.artists) && closeSec(p.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC)) ?? null;
+	const search = artist ? `track:"${p.title}" artist:"${artist}"` : `track:"${p.title}"`;
+	return (await client.searchTracks(search, 10)).find((t) => titleKey(t.name) === key && artistsOverlap(p.artists, t.artists) && closeSec(p.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC)) ?? null;
 }
 
 // Try once, record the outcome, return the item as it now stands (upgraded
@@ -253,8 +258,8 @@ export async function matchSpotify(deps: SpotifyMatchDeps, item: FeedItem): Prom
 			return next ?? { ...item, matchStatus: status, matchedAt: deps.now?.() ?? Date.now() };
 		}
 		const draft = item.type === 'album'
-			? await findAlbum(client, item).then((hit) => (hit ? albumDraft(item, hit.album, hit.pairs) : null))
-			: await findTrack(client, item).then((hit) => (hit ? trackDraft(item, hit) : null));
+			? await findSpotifyAlbum(client, { title: item.payload.title, artists: item.payload.artists, upc: item.payload.upc, tracks: item.payload.tracks ?? [] }).then((hit) => (hit ? albumDraft(item, hit.album, hit.pairs) : null))
+			: await findSpotifyTrack(client, item.payload).then((hit) => (hit ? trackDraft(item, hit) : null));
 		if (!draft) {
 			await deps.store.markMatched(item.id, 'none');
 			return { ...item, matchStatus: 'none', matchedAt: deps.now?.() ?? Date.now() };

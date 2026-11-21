@@ -94,6 +94,23 @@ describe('DeezerTracker', () => {
 		expect(r.children.map((c) => c.name)).toEqual(['Glass Rivers']);
 	});
 
+	it("credits a single's one track as the release, and leaves a longer tracklist's primary artists as Deezer gives them", async () => {
+		const three = [{ id: 77, name: 'Northfold' }, { id: 78, name: 'Brack Wight' }, { id: 79, name: 'Galen Kine' }];
+		const dz = new DeezerTracker(
+			fakeFetch({
+				'/album/5': { id: 5, title: 'Slate Blue', nb_tracks: 1, contributors: three },
+				'/album/5/tracks': { data: [{ id: 51, title: 'Slate Blue', track_position: 1, artist: three[0] }] },
+				'/album/6': { id: 6, title: 'Slate Blue EP', nb_tracks: 2, contributors: three },
+				'/album/6/tracks': { data: [{ id: 61, title: 'Slate Blue', track_position: 1, artist: three[0] }, { id: 62, title: 'Harbour Light', track_position: 2, artist: three[1] }] },
+			}),
+		);
+		const names = (c: { artists?: { name: string }[] }) => (c.artists ?? []).map((a) => a.name);
+		const single = (await dz.fetchRelease({ id: '5' }, AbortSignal.timeout(5000)))!;
+		expect(names(single.recordings![0]!)).toEqual(['Northfold', 'Brack Wight', 'Galen Kine']);
+		const ep = (await dz.fetchRelease({ id: '6' }, AbortSignal.timeout(5000)))!;
+		expect(ep.recordings!.map(names)).toEqual([['Northfold'], ['Brack Wight']]);
+	});
+
 	it("turns Deezer's quota answer into a rate limit", async () => {
 		const dz = new DeezerTracker(fakeFetch({ '/artist/77/albums': { error: { code: 4, message: 'Quota limit exceeded' } } }));
 		await expect(dz.poll(target('artist', 'Northfold', '77'), AbortSignal.timeout(5000))).rejects.toBeInstanceOf(TrackerRateLimitedError);

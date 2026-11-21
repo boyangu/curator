@@ -35,7 +35,7 @@ describe('feed refresh status text', () => {
 	it('names the pass by who started it and what it does', () => {
 		expect(passTitle(status([]).pass!)).toBe('Refreshing Discover…');
 		expect(passTitle(status([], { mode: 'backfill' }).pass!)).toBe('Loading older items…');
-		expect(passTitle(status([], { manual: false }).pass!)).toBe('Checking for new releases…');
+		expect(passTitle(status([], { manual: false }).pass!)).toBe('Background check…');
 	});
 
 	it('has nothing to say when idle', () => {
@@ -46,8 +46,18 @@ describe('feed refresh status text', () => {
 	});
 
 	it('heads the tab popover with the pass and mentions what is queued', () => {
-		const s = status([step({ state: 'running', detail: 'Asking the catalogue for new releases' })], { manual: false }, 1);
-		expect(statusTooltip(s)).toBe('Checking for new releases…\n▸ Following: Asking the catalogue for new releases\n1 more queued behind this one');
+		const s = status([step({ state: 'running', detail: 'Asking the catalogue for new releases' })], {}, 1);
+		expect(statusTooltip(s)).toBe('Refreshing Discover…\n▸ Following: Asking the catalogue for new releases\n1 more queued behind this one');
+	});
+
+	it('keeps the timer\'s pass off the tab unless a source of it failed', () => {
+		const w: CatalogWorkerStatus = { reason: 'ok', active: true, providers: ['spotify'], trackers: ['artist/spotify'], weekEndsAt: null, lastAskedAt: null, lastReportAt: null, polled: 0, events: 0, inHand: 3, paused: [], lastError: null, check: null };
+		const quiet = status([step({ state: 'running', detail: 'Asking the catalogue for new releases' })], { manual: false });
+		expect(statusTooltip(quiet)).toBeNull();
+		// The worker's reading still shows, without the pass.
+		expect(statusTooltip(quiet, w)).toBe('Reading for the catalogue…\n▸ Reading 3 of your follows for the catalogue');
+		const failed = status([step({ state: 'error', error: 'HTTP 500' })], { manual: false });
+		expect(statusTooltip(failed)).toBe('Background check…\n✕ Following: HTTP 500');
 	});
 
 	it('tells a waiting click that a background pass runs first', () => {

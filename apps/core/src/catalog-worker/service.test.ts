@@ -108,6 +108,21 @@ describe('catalog worker', () => {
 		w.stop();
 	});
 
+	// How often each kind is read rides every ask, once the server reads the key.
+	it('sends the user’s read cadence only to a server that takes it', async () => {
+		vi.useFakeTimers();
+		const master = fakeMaster();
+		let offered = false;
+		const w = worker(master, [reader('spotify', okPoll)], { cadence: () => (offered ? { artist: 'weekly', playlist: 'daily' } : null) });
+		w.start();
+		await vi.advanceTimersByTimeAsync(20);
+		expect(master.dues[0]).not.toHaveProperty('cadence');
+		offered = true;
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(master.dues[1]).toMatchObject({ cadence: { artist: 'weekly', playlist: 'daily' } });
+		w.stop();
+	});
+
 	// A Refresh's "check now": asked at once with the check, answered with the
 	// master's report, the reads it handed out drained in the background with
 	// the check's progress in the status.

@@ -13,12 +13,13 @@
 
 import { For, Show, createSignal, createEffect, createRoot, type JSX } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, JourneySeed, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
+import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
 import { openContextMenu, type ContextMenuItem } from './ContextMenu.jsx';
 import { ArtistCredits } from './ArtistCredits.jsx';
 import { artistOpenSubmenu } from '../features/artistOpenMenu.js';
 import { connectDots } from '../features/connectDots.js';
-import { searchFold } from '@curator/shared';
+import { releaseKind, RELEASE_KIND_LABEL } from '@curator/shared';
+import type { EntityRef } from '@curator/shared';
 import { buildFeedMenu, feedShow, spotifyPlaylistOrigin, type FeedActions } from '../features/feedCommands.js';
 import { BRAND_ICONS, BRAND_ORDER, brandIcon } from '../features/brandIcons.js';
 import { discoverSettingsSignal } from '../features/discoverSettings.js';
@@ -79,9 +80,9 @@ export interface DiscoverViewProps {
 	// A toast that stays while a refresh runs and then becomes its result
 	// (ui/toast.ts showProgressToast).
 	onProgressToast: (title: string, sub?: string) => ProgressToast;
-	// Start a discovery journey from a feed track — main.ts flips Discover
-	// into Journeys mode and creates the journey from the seed.
-	onStartJourney: (seed: JourneySeed) => void;
+	// An artist's / a label's / an album's page (main.ts openEntity): inside
+	// Discover, on its World side, or in a page tab of its own.
+	onOpenEntity: (ref: EntityRef, gesture: { newTab: boolean }) => void;
 	// The playlist name on a "New on <playlist> by <profile>" line — main.ts
 	// opens the followed playlist under the Spotify tab (it is synced into
 	// the library), or the Spotify app when the library has no row for it yet.
@@ -135,10 +136,18 @@ export interface DiscoverViewHandle {
 }
 
 function fmtDuration(sec: number | null | undefined): string {
-	if (!sec || sec <= 0) return '';
-	const m = Math.floor(sec / 60);
-	const s = Math.round(sec % 60);
-	return `${m}:${String(s).padStart(2, '0')}`;
+	// Rounded before the split, so 59.6 s reads 1:00, never 0:60.
+	const total = sec ? Math.round(sec) : 0;
+	if (total <= 0) return '';
+	return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+// Mix / VA / Single / EP / Album on an album card (shared releaseKind — the
+// same word the page's group headers show). A card nothing types reads Album.
+function releaseKindText(item: FeedItem): string {
+	const p = item.payload;
+	const kind = releaseKind({ type: p.albumType, title: p.title, trackCount: p.trackCount, artists: p.artists });
+	return RELEASE_KIND_LABEL[kind ?? 'album'].toUpperCase();
 }
 
 const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -288,8 +297,9 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	const [nextCursor, setNextCursor] = createSignal<string | null>(null);
 	const [loading, setLoading] = createSignal(false);
 	const [refreshing, setRefreshing] = createSignal(false);
-	// Any pass in flight, whoever started it (data/feedRefreshStatus.ts).
-	const passRunning = (): boolean => feedRefresh.status().pass !== null;
+	// A pass someone asked for, in flight — from this view or elsewhere
+	// (data/feedRefreshStatus.ts). The timer's pass stays off the toolbar.
+	const passRunning = (): boolean => feedRefresh.status().pass?.manual === true;
 	const [total, setTotal] = createSignal(0);
 	// Standing lenses (core feed/lenses.ts): stored in the synced setting
 	// feed.lenses and applied by core to every page, so the renderer only
@@ -925,25 +935,55 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// legacy items — then the mute entry is simply not offered).
 	// `artistId` is a Spotify id, or `catalog:<objectId>` for an artist the
 	// catalogue knows without one (mutable all the same, never a Spotify ref).
-	function showArtistMenu(evt: MouseEvent, item: FeedItem, name: string, artistId: string | undefined): void {
+	// "Open in new tab" off a click: Ctrl / ⌘, or the middle button.
+	const gestureOf = (evt: MouseEvent): { newTab: boolean } => ({ newTab: evt.ctrlKey || evt.metaKey || evt.button === 1 });
+
+	// The page ref of credit `i` on a card or one of its tracks. By the
+	// catalogue's own artist id where the card carried it, else the feed's id
+	// (a Spotify artist id, or `catalog:<objectId>`); a credit with neither (a
+	// remixer the card's artists do not name, an item from before the ids
+	// were kept) is resolved among the card's own credits — never by a bare
+	// name, which could be a namesake's.
+	function artistRef(item: FeedItem, name: string, i: number, track?: FeedTrackRef): EntityRef {
+		const feedId = (track ? track.artistIds : item.payload.artistIds)?.[i];
+		const catalogId = (track ? track.artistCatalogIds : item.payload.artistCatalogIds)?.[i]
+			?? (feedId?.startsWith('catalog:') ? feedId.slice('catalog:'.length) : null);
+		const spotifyId = isSpotifyArtistId(feedId) ? feedId! : null;
+		const within = track?.catalogId ?? item.payload.catalogId;
+		return { kind: 'artist', name, catalogId, spotifyId, ...(!catalogId && !spotifyId && within ? { within: { catalogId: within } } : {}) };
+	}
+	function labelRef(item: FeedItem, name: string): EntityRef {
+		const catalogId = item.payload.labelCatalogId ?? null;
+		const within = item.payload.catalogId;
+		return { kind: 'label', name, catalogId, ...(!catalogId && within ? { within: { catalogId: within } } : {}) };
+	}
+	// The page behind a card's origin chip: the followed artist or label.
+	// (A playlist, a genre chart and a bare browse filing have none.)
+	function originEntity(o: FeedOrigin): EntityRef | null {
+		if (o.kind === 'label') return { kind: 'label', name: o.name, catalogId: o.catalogId ?? null };
+		if (o.kind !== 'artist') return null;
+		const catalogId = o.catalogId ?? (o.id.startsWith('catalog:') ? o.id.slice('catalog:'.length) : null);
+		return { kind: 'artist', name: o.name, catalogId, spotifyId: isSpotifyArtistId(o.id) ? o.id : null };
+	}
+	// An album card's release: the catalogue's object, or its Spotify album.
+	const albumRef = (item: FeedItem): EntityRef => ({ kind: 'album', name: item.payload.title, catalogId: item.payload.catalogId ?? null, spotifyId: item.source === 'spotify' ? item.sourceId : null });
+
+	function showArtistMenu(evt: MouseEvent, item: FeedItem, name: string, artistId: string | undefined, ref: EntityRef): void {
 		const spotifyId = isSpotifyArtistId(artistId) ? artistId : undefined;
 		// Open Artist in ▸ — the feed's ids name the artist (a Spotify id, or
 		// the catalogue's own); "Open Locally" is the old "Show in library".
 		const open = artistOpenSubmenu([{ name, spotifyId: spotifyId ?? null, catalogId: artistId?.startsWith('catalog:') ? artistId.slice('catalog:'.length) : null }]);
 		const items: Parameters<typeof openContextMenu>[0] = [
 			{ kind: 'header', label: name },
+			{ kind: 'item', id: 'page', label: 'Open artist page' },
+			{ kind: 'item', id: 'page-tab', label: 'Open in new tab' },
 			...(open ? [open.item] : []),
-			{ kind: 'item', id: 'journey', label: 'Start journey' },
 		];
 		if (artistId) items.push({ kind: 'divider' }, { kind: 'item', id: 'mute', label: `Mute artist: ${name}`, danger: true });
 		openContextMenu(items, {
 			...open?.handlers,
-			// Same seed identities the KB already mints: a Spotify artist ref
-			// when the feed knows the id, else the name-keyed local ref that
-			// library seeding uses — so the journey lands on the existing stub.
-			journey: () => props.onStartJourney(spotifyId
-				? { kind: 'source-ref', source: 'spotify', sourceKind: 'artist', sourceId: spotifyId, entityKind: 'artist', name }
-				: { kind: 'source-ref', source: 'local', sourceKind: 'artist', sourceId: `name:${searchFold(name)}`, entityKind: 'artist', name }),
+			page: () => props.onOpenEntity(ref, { newTab: false }),
+			'page-tab': () => props.onOpenEntity(ref, { newTab: true }),
 			mute: () => { if (artistId) void muteArtist(item, artistId, name); },
 		}, { at: evt });
 	}
@@ -1292,18 +1332,6 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 		isUnavailable,
 		notInterested: (item, libraryTrackId) => { void notInterested(item, libraryTrackId); },
 		openOrganize: (libraryTrackId) => { props.onOpenOrganize([libraryTrackId]); },
-		startJourney: (item, track) => {
-			const sourceId = track || item.type === 'track' ? playableId(item, track) : null;
-			if (!sourceId) return;
-			props.onStartJourney({
-				kind: 'source-ref',
-				source: 'spotify',
-				sourceKind: 'track',
-				sourceId,
-				entityKind: 'track',
-				name: track?.title ?? item.payload.title,
-			});
-		},
 	};
 
 	// Card right-click / "More…" menu — derived from the feed command table.
@@ -1478,6 +1506,18 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 	// a missing genre/label/bpm never leaves a dangling dot. Rebuilt on each card
 	// render (a card re-creates when its item object is replaced — e.g. when
 	// enrichment lands — so it stays current without per-field signals).
+	// A name on a card that opens its page (a label, an album). Ctrl / middle
+	// click opens it in a new tab; the card's own double-click-to-play skips it.
+	const EntityLink = (p: { entity: EntityRef; text?: string; title: string }) => (
+		<span
+			class="feed-card__link feed-card__link--entity"
+			title={p.title}
+			onClick={(e) => { e.stopPropagation(); props.onOpenEntity(p.entity, gestureOf(e)); }}
+			onAuxClick={(e) => { if (e.button !== 1) return; e.preventDefault(); e.stopPropagation(); props.onOpenEntity(p.entity, { newTab: true }); }}
+			onMouseDown={(e) => { if (e.button === 1) e.preventDefault(); }}
+		>{p.text ?? p.entity.name}</span>
+	);
+
 	const MetaLine = (p: { nodes: (JSX.Element | null | false)[] }) => {
 		const present = p.nodes.filter(Boolean) as JSX.Element[];
 		return (
@@ -1583,13 +1623,21 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						const o = () => p.item.origin!;
 						// Every follow kind but a bare browse filing has a menu.
 						const followable = () => o().kind !== 'browse' && (o().kind === 'playlist' || o().kind === 'artist' || !!o().catalogId);
+						// An artist's or a label's follow names the page it came
+						// from: the name opens it (the rest of the chip keeps
+						// its right-click menu).
+						const page = (): EntityRef | null => originEntity(o());
 						return (
 							<span
 								class="feed-card__origin"
 								classList={{ 'feed-card__origin--followable': followable() }}
 								title={followable() ? 'Right-click to unfollow' : undefined}
 								onContextMenu={(e) => { if (followable()) showOriginMenu(e, o(), p.item); }}
-							>{originLabel(p.item)}</span>
+							>
+								<Show when={page()} fallback={originLabel(p.item)}>
+									{(ref) => <>{o().kind === 'label' ? 'new on ' : 'new release · '}<b><EntityLink entity={ref()} text={o().name} title={o().kind === 'label' ? "Open the label's page" : "Open the artist's page"} /></b></>}
+								</Show>
+							</span>
 						);
 					})()}
 				</Show>
@@ -1670,13 +1718,14 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						<div class="feed-card__artists">
 							<ArtistCredits
 								artists={item().payload.artists}
-								onContextMenu={(evt, name, i) => showArtistMenu(evt, item(), name, item().payload.artistIds?.[i])}
+								onClick={(name, i, evt) => props.onOpenEntity(artistRef(item(), name, i), gestureOf(evt))}
+								onContextMenu={(evt, name, i) => showArtistMenu(evt, item(), name, item().payload.artistIds?.[i], artistRef(item(), name, i))}
 							/>
 						</div>
 						<div class="feed-card__metablock">
 							<MetaLine nodes={[
 								item().payload.genre ? <span>{item().payload.genre}</span> : null,
-								item().payload.label ? <span>{item().payload.label}</span> : null,
+								item().payload.label ? <EntityLink entity={labelRef(item(), item().payload.label!)} title="Open the label's page" /> : null,
 								item().payload.bpm ? <span class="feed-meta-dj">{Math.round(item().payload.bpm!)} BPM</span> : null,
 								item().payload.keyCamelot ? <KeyChip keyCamelot={item().payload.keyCamelot} /> : null,
 								fmtDuration(item().payload.durationSec) ? <span class="feed-card__dur">{fmtDuration(item().payload.durationSec)}</span> : null,
@@ -1763,8 +1812,8 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					<CardCover item={item()} onActivate={() => void playAlbum(item())} active={isPlaying()} playing={isPlaying() && audiblyPlaying()} heard={playedAll()} />
 					<div class="feed-card__body">
 						<div class="feed-card__title-row">
-							<span class="feed-card__title" title={item().payload.title}>{item().payload.title}</span>
-							<span class="feed-chip feed-chip--album">{item().payload.albumType === 'single' ? 'SINGLE' : 'ALBUM'}</span>
+							<span class="feed-card__title" title={item().payload.title}><EntityLink entity={albumRef(item())} text={item().payload.title} title="Open the album's page" /></span>
+							<span class="feed-chip feed-chip--album">{releaseKindText(item())}</span>
 							<OfflineChip item={item()} />
 							<Show when={isPlaying()}><PlayingChip /></Show>
 							<Show when={item().playedAt && !isPlaying()}><span class="feed-chip feed-chip--played">LISTENED</span></Show>
@@ -1773,13 +1822,14 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 						<div class="feed-card__artists">
 							<ArtistCredits
 								artists={item().payload.artists}
-								onContextMenu={(evt, name, i) => showArtistMenu(evt, item(), name, item().payload.artistIds?.[i])}
+								onClick={(name, i, evt) => props.onOpenEntity(artistRef(item(), name, i), gestureOf(evt))}
+								onContextMenu={(evt, name, i) => showArtistMenu(evt, item(), name, item().payload.artistIds?.[i], artistRef(item(), name, i))}
 							/>
 						</div>
 						<div class="feed-card__metablock">
 							<MetaLine nodes={[
 								item().payload.genre ? <span>{item().payload.genre}</span> : null,
-								item().payload.label ? <span>{item().payload.label}</span> : null,
+								item().payload.label ? <EntityLink entity={labelRef(item(), item().payload.label!)} title="Open the label's page" /> : null,
 								item().payload.catalogNumber ? <span class="feed-card__catno" title="Catalogue number">{item().payload.catalogNumber}</span> : null,
 								// Being matched on Spotify or enriched right now: say so.
 								feedActivity.of(item().id) ? <span class="feed-meta-enrich feed-meta-enrich--busy">{ACTIVITY_TEXT[feedActivity.of(item().id)!]}</span> : null,
@@ -1895,7 +1945,8 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 											<span class="feed-track__artists" title={t.artists.join(', ')}>
 												<ArtistCredits
 													artists={t.artists}
-													onContextMenu={(evt, name, i) => showArtistMenu(evt, detail()!.item, name, t.artistIds?.[i])}
+													onClick={(name, i, evt) => props.onOpenEntity(artistRef(detail()!.item, name, i, t), gestureOf(evt))}
+													onContextMenu={(evt, name, i) => showArtistMenu(evt, detail()!.item, name, t.artistIds?.[i], artistRef(detail()!.item, name, i, t))}
 												/>
 											</span>
 											<span class="feed-track__genre" title={t.genre ?? ''}>{t.genre ?? ''}</span>
@@ -1936,8 +1987,8 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 					</span>
 				</Show>
 				<Show when={mode() === 'feed' && (!follower() || catalogAvailable())}>
-					{/* The icon turns for any pass in flight, the background poll
-					    included ("Checking…"); the steps are in the progress toast
+					{/* The icon turns for a pass someone asked for ("Checking…" when
+					    it was not this button); the steps are in the progress toast
 					    and on the Discover tab's popover. */}
 					<button class="feed-toolbar__refresh" disabled={refreshing()} onClick={() => void refreshProducers()}>
 						<svg classList={{ 'feed-toolbar__icon--spin': refreshing() || passRunning() }} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7" /><path d="M21 4v5h-5" /></svg>

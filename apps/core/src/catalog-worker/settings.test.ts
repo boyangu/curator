@@ -3,7 +3,7 @@
 
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
-import { checkedTrackers, readReadSources, writeReadSources } from './settings.js';
+import { checkedTrackers, readCadence, readReadSources, writeReadCadence, writeReadSources } from './settings.js';
 
 function db(): Database.Database {
 	const raw = new Database(':memory:');
@@ -39,5 +39,19 @@ describe('catalog read sources', () => {
 		expect(readReadSources(raw).find((r) => r.kind === 'label')!.sources.find((s) => s.provider === 'beatport')!.checked).toBe(false);
 		writeReadSources(raw, null);
 		expect(checkedTrackers(raw)).toContain('label/beatport');
+	});
+
+	it('reads every kind weekly until said otherwise, one kind at a time', () => {
+		const raw = db();
+		expect(readCadence(raw)).toEqual({ artist: 'weekly', label: 'weekly', playlist: 'weekly', genre: 'weekly' });
+		const rs = writeReadCadence(raw, 'playlist', 'daily');
+		expect(rs.map((r) => [r.kind, r.cadence])).toEqual([['artist', 'weekly'], ['label', 'weekly'], ['playlist', 'daily'], ['genre', 'weekly']]);
+		writeReadCadence(raw, 'artist', 'source');
+		expect(readCadence(raw)).toEqual({ artist: 'source', label: 'weekly', playlist: 'daily', genre: 'weekly' });
+		// An unknown value or kind changes nothing, and forgetting the sources leaves the cadence.
+		writeReadCadence(raw, 'artist', 'hourly' as never);
+		writeReadCadence(raw, 'album' as never, 'daily');
+		writeReadSources(raw, null);
+		expect(readCadence(raw)).toEqual({ artist: 'source', label: 'weekly', playlist: 'daily', genre: 'weekly' });
 	});
 });

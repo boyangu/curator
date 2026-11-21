@@ -59,6 +59,8 @@ export interface McpWriteToolRegistry {
 
 const MAX_DETAIL_LINES = 15;
 const DEFAULT_LIST_LIMIT = 50;
+// A reorder names every row; past this a playlist is not a hand-ordered list.
+const MAX_REORDER_ROWS = 2000;
 
 type Args = Record<string, unknown>;
 const asArgs = (a: unknown): Args => (a && typeof a === 'object' ? (a as Args) : {});
@@ -307,6 +309,57 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 					ports.notify(`Claude renamed playlist "${pl.name}" to "${newName}"`);
 				}
 				return { ok: true, pushedToSource: res.pushedToSource };
+			},
+		},
+		{
+			name: 'reorder_playlist_tracks',
+			annotations: STREAMING_EDIT,
+			description: 'Put a playlist\'s tracks in a new order. `trackIds` is EVERY track of the playlist, each as often as it is in it, in the order wanted (ids from get_playlist_tracks). Reordering a spotify/tidal playlist CHANGES THE USER\'S LIVE ACCOUNT and requires the user to approve an in-app confirmation; a re-sort that moves most rows is sent as one replace, which resets the provider\'s "date added" on every row. Local playlists apply instantly. The result\'s `upstream` says whether the provider took the order (pushed / write-sync-off / failed / none) — anything but pushed/none means the new order exists only in Curator.',
+			parameters: {
+				type: 'object',
+				properties: {
+					playlistId: { type: 'string' },
+					trackIds: { type: 'array', items: { type: 'string' }, description: 'All of the playlist\'s tracks, in the new order.' },
+				},
+				required: ['playlistId', 'trackIds'],
+			},
+			async execute(rawArgs) {
+				const a = asArgs(rawArgs);
+				const playlistId = str(a['playlistId']);
+				const trackIds = strArray(a['trackIds']);
+				if (!playlistId) throw new Error('playlistId is required');
+				const pl = await requirePlaylist(playlistId);
+				if (pl.isSmart) throw new Error('a smart playlist has no order of its own');
+				// The rows as they stand. A row is named by its position, not its
+				// track: the same track in twice is two rows, taken in order.
+				const rows = await svc().getTracks({ playlistId }, { column: 'index', dir: 'asc' }, MAX_REORDER_ROWS + 1);
+				if (rows.length > MAX_REORDER_ROWS) throw new Error(`a playlist over ${MAX_REORDER_ROWS} tracks is not reordered here`);
+				if (trackIds.length !== rows.length) throw new Error(`trackIds must list all ${rows.length} tracks of the playlist (got ${trackIds.length}) — use get_playlist_tracks`);
+				const positions = new Map<string, number[]>();
+				for (const t of rows) {
+					if (t.playlistPosition == null) throw new Error('this playlist\'s rows carry no positions');
+					positions.set(t.id, [...(positions.get(t.id) ?? []), t.playlistPosition]);
+				}
+				const newOrder: number[] = [];
+				for (const id of trackIds) {
+					const position = positions.get(id)?.shift();
+					if (position === undefined) throw new Error(`track ${id} is not in the playlist${positions.has(id) ? ' that many times' : ''} — use ids from get_playlist_tracks`);
+					newOrder.push(position);
+				}
+				const moved = newOrder.filter((p, i) => p !== rows[i]!.playlistPosition).length;
+				if (moved === 0) return { ok: true, moved: 0, upstream: 'none' };
+				if (STREAMING_SOURCES.has(pl.source)) {
+					const byId = new Map(rows.map((t) => [t.id, t]));
+					const approved = await ports.confirm({
+						kind: 'streaming-playlist-write',
+						title: `Reorder ${pl.source} playlist "${pl.name}" (${moved} of ${rows.length} tracks move)`,
+						detailLines: ['New order:', ...detailLines(trackIds.map((id) => byId.get(id)!))],
+					});
+					if (!approved) throw deny();
+				}
+				const res = await svc().reorderPlaylistTracks(playlistId, newOrder);
+				if (!STREAMING_SOURCES.has(pl.source)) ports.notify(`Claude reordered "${pl.name}" (${moved} tracks moved)`);
+				return { ok: true, moved, upstream: res.upstream, ...(res.detail ? { detail: res.detail } : {}) };
 			},
 		},
 		{

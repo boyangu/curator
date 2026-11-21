@@ -16,7 +16,7 @@
 // library/album-enrich.ts — the Spotify rate gate and Electron's net.fetch
 // for Beatport live there. Nothing here writes the library.
 
-import type { CatalogCheckReport, CatalogProvider, CatalogProviderPause, CatalogTracker, CatalogTrackingKind, CatalogWorkerDueResult, CatalogWorkerTask, CloudService } from '@curator/protocol';
+import type { CatalogCheckReport, CatalogProvider, CatalogProviderPause, CatalogReadCadenceChoices, CatalogTracker, CatalogTrackingKind, CatalogWorkerDueResult, CatalogWorkerTask, CloudService } from '@curator/protocol';
 import { BandcampTracker, BeatportTracker, DeezerTracker, SpotifyTracker, SpotifyUserPlaylistTracker, TrackerRateLimitedError, type FetchLike, type TrackerAdapter } from '@curator/catalog-readers';
 import { gatedFetch, isSpotifyQuotaBackoff, spotifyBackoffUntil } from '@curator/spotify';
 import { log } from '../log.js';
@@ -72,6 +72,10 @@ export type CatalogWorkerDeps = {
 	// The user's checked trackers (settings.ts checkedTrackers), read on every
 	// ask so a change in the Refresh menu applies at the next one.
 	trackers: () => CatalogTracker[];
+	// How often the user wants each kind read (settings.ts readCadence), read
+	// on every ask like the trackers. Null while the server does not list
+	// 'catalog_read_cadence': it would refuse the key.
+	cadence?: () => CatalogReadCadenceChoices | null;
 	// Electron's net.fetch for Beatport (apps/desktop main/index.ts); plain
 	// fetch otherwise.
 	beatportFetch?: FetchLike;
@@ -197,7 +201,8 @@ export function createCatalogWorker(deps: CatalogWorkerDeps): CatalogWorker {
 			const trackers = deps.trackers();
 			status.providers = providers;
 			status.trackers = trackers;
-			const due = await procs.workerDue({ deviceId: deps.deviceId(), providers, trackers, paused, ...(check ? { check } : {}) });
+			const cadence = deps.cadence?.() ?? null;
+			const due = await procs.workerDue({ deviceId: deps.deviceId(), providers, trackers, paused, ...(check ? { check } : {}), ...(cadence ? { cadence } : {}) });
 			status.lastAskedAt = now();
 			status.reason = 'ok';
 			status.active = due.active;

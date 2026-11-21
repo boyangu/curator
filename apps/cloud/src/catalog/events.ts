@@ -59,13 +59,13 @@ async function handlesOf(tx: Queryable, ids: string[]): Promise<Map<string, Cata
 
 // A recording's canonical genre names (its object-genre edges), '|'-joined
 // in one scalar subquery per row: the card's per-track genres.
-const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by g.name) from curator.catalog_edge ge join curator.catalog_object g on g.id = ge.dst
+export const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by g.name) from curator.catalog_edge ge join curator.catalog_object g on g.id = ge.dst
 	where ge.src = o.id and ge.kind = 'object-genre') as genres`;
 
 const splitNames = (v: string | null): string[] => (v ? v.split('|') : []);
 
 // The DJ facts folded onto a recording (fold.ts: Beatport first).
-function recordingFacts(attrs: Record<string, unknown>, genres: string | null): { bpm: number | null; key: string | null; genres: string[] } {
+export function recordingFacts(attrs: Record<string, unknown>, genres: string | null): { bpm: number | null; key: string | null; genres: string[] } {
 	return {
 		bpm: typeof attrs.bpm === 'number' && Number.isFinite(attrs.bpm) ? attrs.bpm : null,
 		key: typeof attrs.key === 'string' && attrs.key.trim() ? attrs.key : null,

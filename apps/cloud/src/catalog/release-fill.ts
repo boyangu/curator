@@ -22,7 +22,7 @@ import { nameFold } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
 import { withSystemTx, type SystemTx } from '../db/system-tx.js';
-import { mergeObjects, openReview } from './admin.js';
+import { mergeObjects, openReview, renameObject } from './admin.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { storeRef } from './agent-import.js';
 import { reannounceCard } from './events.js';
@@ -290,12 +290,32 @@ export async function fillReleases(db: Db, fetchers: FillFetchers, scope: Releas
 // a slot on different releases, not on one). The survivor is the one with
 // more store copies (ISRC first). Logged merges: undoable like any other.
 //
+// An operator's release merge (`twins`: two releases ruled one) settles two
+// more shapes of a slot held twice.
+//
+// A re-delivery: a distributor sends a release
+// to a store again and every track gets a new ISRC (Tip Records 2014, "Space
+// Jam": 8 of 8 tracks to the second, 7 new codes). When the operator has
+// ruled two releases one, a slot's two copies of one title within a second of
+// each other are one recording under two codes: merged, and the survivor
+// keeps both ISRCs (catalog_identifier holds any number per recording), so a
+// claim carrying either resolves to it. The sweep and ingestion never cross
+// ISRCs on their own.
+//
+// A store's own cut: one title in one slot at two lengths (Bandcamp's 8:02
+// remix where the stores stream 5:22). Not one recording, and not a reason to
+// keep the releases apart: both stay on the release, the copy only one store
+// holds named for it — "… (Bandcamp)" — so the tracklist reads as editions.
+//
 // A SoundCloud preview is the other shape: a label's set uploaded ahead of
 // the stores holds clips (2:00 of a 3:20 track, "… ft. JAW", no ISRC), which a
 // twins merge brings onto the store release beside the full tracks
 // (2026-10-31, Watergate "Tell Me More About You"). Same slot, SoundCloud its
 // only copy, no ISRC, shorter than the store track, and the same title once
 // credits and bracket tags are set aside: merged into the store track.
+// A store as a track's edition suffix names it.
+const STORE_NAMES: Record<string, string> = { bandcamp: 'Bandcamp', beatport: 'Beatport', spotify: 'Spotify', deezer: 'Deezer', apple: 'Apple Music', tidal: 'Tidal', soundcloud: 'SoundCloud', traxsource: 'Traxsource', youtube: 'YouTube' };
+
 export type DedupeMerge = { release: string; releaseId: string; from: string; into: string; title: string };
 export type DedupeReport = { dry: boolean; releases: number; merged: DedupeMerge[] };
 
@@ -309,12 +329,12 @@ export type DedupeReport = { dry: boolean; releases: number; merged: DedupeMerge
 // Callers: the dedupe sweep below, a release twin merge (inbox.ts,
 // admin-ops.ts — merging two releases unions their edges by recording, so
 // both stores' copies of a track survive on the winner).
-export async function dedupeRelease(tx: SystemTx, releaseId: string, by: string): Promise<DedupeMerge[]> {
+export async function dedupeRelease(tx: SystemTx, releaseId: string, by: string, opts: { twins?: boolean } = {}): Promise<DedupeMerge[]> {
 	const [rel] = await tx.query<{ name: string }>(`select name from curator.catalog_object where id = $1`, [releaseId]);
 	if (!rel) return [];
-	const held = await tx.query<{ id: string; name: string; position: unknown; duration_sec: unknown; isrc: string | null; reps: unknown; providers: string | null }>(
+	const held = await tx.query<{ id: string; name: string; position: unknown; duration_sec: unknown; isrcs: string | null; reps: unknown; providers: string | null }>(
 		`select o.id, o.name, e.position, o.duration_sec,
-			(select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc,
+			(select string_agg(i.value, '|') from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc') as isrcs,
 			(select count(*) from curator.catalog_source_object so where so.object_id = o.id) as reps,
 			(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = o.id) as providers
 		from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
@@ -330,16 +350,46 @@ export async function dedupeRelease(tx: SystemTx, releaseId: string, by: string)
 			const da = numOrNull(a.duration_sec);
 			const dbs = numOrNull(b.duration_sec);
 			if (numOrNull(a.position) !== numOrNull(b.position) || da === null || dbs === null) continue;
-			if (a.isrc && b.isrc && a.isrc !== b.isrc) continue;
+			// Two codes that disagree: a recording may hold several (a re-delivery
+			// merged earlier), so it is "share none", not "differ".
+			const [ia, ib] = [a.isrcs?.split('|') ?? [], b.isrcs?.split('|') ?? []];
+			const twoCodes = ia.length > 0 && ib.length > 0 && !ia.some((x) => ib.includes(x));
+			const redelivery = twoCodes && !!opts.twins && Math.abs(da - dbs) <= 1;
+			if (twoCodes && !redelivery) continue;
 			if (!sameTrackTitle(a.name, b.name)) continue;
 			// b, a preview of a: SoundCloud only, no ISRC, shorter.
-			const preview = b.providers === 'soundcloud' && !b.isrc && a.providers !== 'soundcloud' && dbs < da - 2;
+			const preview = b.providers === 'soundcloud' && !ib.length && a.providers !== 'soundcloud' && dbs < da - 2;
 			if (Math.abs(da - dbs) > 2 && !preview) continue;
-			const score = (x: typeof a) => (x.isrc ? 1000 : 0) + num(x.reps);
+			const score = (x: typeof a) => (x.isrcs ? 1000 : 0) + num(x.reps);
 			const [into, from] = preview ? [a, b] : score(a) >= score(b) ? [a, b] : [b, a];
-			await mergeObjects(tx, from.id, into.id, by, preview ? 'SoundCloud preview of the store track in its slot' : 'same slot on one release (position, length)', { release: releaseId, position: numOrNull(a.position), lengths: [da, dbs] });
+			const why = preview ? 'SoundCloud preview of the store track in its slot' : redelivery ? 're-delivered under another ISRC (same slot, title and length): both codes kept' : 'same slot on one release (position, length)';
+			await mergeObjects(tx, from.id, into.id, by, why, { release: releaseId, position: numOrNull(a.position), lengths: [da, dbs], ...(redelivery ? { isrcs: [...ia, ...ib] } : {}) });
 			gone.add(from.id);
 			merged.push({ release: rel.name, releaseId, from: from.name, into: into.name, title: into.name });
+		}
+	}
+	if (opts.twins) {
+		const live = held.filter((h) => !gone.has(h.id));
+		// One title to the letter: "… (Radio Edit)" beside the original already says which it is.
+		const plain = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, '');
+		const only = (h: (typeof held)[number]) => (h.providers && !h.providers.includes('|') ? h.providers : null);
+		for (const a of live) {
+			for (const b of live) {
+				const [da, dbs] = [numOrNull(a.duration_sec), numOrNull(b.duration_sec)];
+				if (a.id >= b.id || numOrNull(a.position) !== numOrNull(b.position) || da === null || dbs === null || Math.abs(da - dbs) <= 2 || plain(a.name) !== plain(b.name)) continue;
+				// The store's own cut is the copy one store holds; two such copies
+				// (Bandcamp against Beatport) are each named for theirs.
+				const cuts = num(a.reps) === num(b.reps) ? [a, b] : [num(a.reps) < num(b.reps) ? a : b];
+				for (const c of cuts) {
+					const store = only(c);
+					const other = c === a ? b : a;
+					if (!store || only(other) === store) continue;
+					const suffix = ` (${STORE_NAMES[store] ?? store})`;
+					if (c.name.endsWith(suffix)) continue;
+					await renameObject(tx, c.id, `${c.name}${suffix}`);
+					c.name = `${c.name}${suffix}`;
+				}
+			}
 		}
 	}
 	if (gone.size) {

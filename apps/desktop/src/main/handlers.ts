@@ -173,6 +173,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'catalog:worker-status': async () => svc.getCatalogWorkerStatus(),
 		'catalog:read-sources': async () => svc.getCatalogReadSources(),
 		'catalog:set-read-sources': async (patch) => svc.setCatalogReadSources(patch),
+		'catalog:set-read-cadence': async (kind, cadence) => svc.setCatalogReadCadence(kind, cadence),
 		'catalog:watches': async () => svc.catalogWatches(),
 		'catalog:search': async (q) => svc.catalogSearch(q),
 		'catalog:follow': async (target) => svc.catalogFollow(target),
@@ -281,6 +282,16 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'artists:links': readViaSidecar('artists:links', async (id) => svc.getArtistLinks(id)),
 		// In-process: it calls the catalogue client, which the read sidecar does not host.
 		'artists:pages': async (target) => svc.getArtistPages(target),
+		// In-process for the same reason: the catalogue client lives here. Their
+		// library reads are point lookups; the track rows come through `tracks:list`.
+		'entity:page': async (ref, opts) => svc.getEntityPage(ref, opts),
+		'entity:tracks': async (ref, opts) => svc.getEntityTracks(ref, opts),
+		'entity:watch': async (ref, token) => svc.watchEntityPage(ref, token),
+		'entity:enrich': async (recordingIds) => svc.enrichEntityRows(recordingIds),
+		// In-process too: the streaming service's token and the catalogue client live here.
+		'world:search': async (query, part) => svc.searchWorld(query, part),
+		'streaming:get-primary': async () => svc.getPrimaryStreaming(),
+		'streaming:set-primary': async (service) => svc.setPrimaryStreaming(service),
 		'albums:by-ids': readViaSidecar('albums:by-ids', async (ids) => svc.getAlbumsByIds(ids)),
 		'artists:merge-suggestions': readViaSidecar('artists:merge-suggestions', async (scope) => svc.listArtistMergeSuggestions(scope)),
 		'artists:dismiss-merge': async (aId, bId) => svc.dismissArtistMergeSuggestion(aId, bId),
@@ -475,6 +486,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'cue:update':                async (cueId, patch)   => svc.updateCue(cueId, patch),
 		'cue:delete':                async (cueId)          => svc.deleteCue(cueId),
 		'analysis:status':           async ()               => svc.getAnalysisStatus(),
+		'analysis:restart':          async ()               => svc.restartAnalyzer(),
 		'analysis:set-auto-enqueue': async (settings)       => svc.setAutoAnalyzeSettings(settings),
 		'analysis:resources':        async ()               => svc.getAnalyzerResources(),
 		'analysis:set-resources':    async (patch)          => svc.setAnalyzerResources(patch),

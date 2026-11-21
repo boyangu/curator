@@ -18,6 +18,7 @@ import {
 	deriveEffectiveVariant,
 	derivePlayerDock,
 	derivePlayerPresence,
+	deriveRegion,
 	deriveTabContext,
 } from './shell.js';
 
@@ -105,5 +106,28 @@ describe('deriveChipVisible', () => {
 		// Downloaded Spotify track: local BACKEND, streaming ORIGIN. Browsing
 		// a DJ tab afterwards is a genuine origin mismatch — chip on.
 		expect(deriveChipVisible({ playing: 'local', origin: { source: 'spotify', view: 'tracks' }, source: 'rekordbox', view: 'tracks' })).toBe(true);
+	});
+});
+
+describe('deriveRegion', () => {
+	const marsh = { kind: 'artist' as const, name: 'Marsh', libraryId: 'a1' };
+	const page = (host: string) => ({ host, entity: marsh, scope: 'world' as const });
+
+	it('an entity page takes the tracks region on whichever tab hosts it', () => {
+		expect(deriveRegion({ view: 'tracks', entity: page('rekordbox') })).toBe('tracks');
+		expect(deriveRegion({ view: 'page', entity: page('page:1') })).toBe('tracks');
+		// Discover hands its region to a page it hosts, and takes it back after.
+		expect(deriveRegion({ view: 'discover', entity: page('discover') })).toBe('tracks');
+		expect(deriveRegion({ view: 'discover', entity: null })).toBe('discover');
+	});
+
+	it("a page left open on another tab never pulls Discover's feed out from under it", () => {
+		expect(deriveRegion({ view: 'discover', entity: page('rekordbox') })).toBe('discover');
+		expect(deriveRegion({ view: 'downloads', entity: page('discover') })).toBe('downloads');
+		expect(deriveRegion({ view: 'sync', entity: page('page:1') })).toBe('sync');
+	});
+
+	it('a page tab browses a catalogue: it stands with Discover for the player chrome', () => {
+		expect(deriveTabContext({ view: 'page', source: 'rekordbox' })).toBe('streaming');
 	});
 });

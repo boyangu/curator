@@ -16,7 +16,7 @@
 // flows that still live there arrive via the deps interface (shared with
 // contextMenus.ts) wired in boot().
 
-import type { Playlist, Track } from '@curator/shared';
+import type { EntityRef, Playlist, Track } from '@curator/shared';
 import { artistNames } from '@curator/shared';
 import { artistOpenSubmenu } from './artistOpenMenu.js';
 import type { RemovableTrackSource } from '@curator/core';
@@ -29,6 +29,7 @@ import { showToast } from '../ui/toast.js';
 import { buildExactAttr, extractSqlPrefilter, parseQuery } from '../query.js';
 import { openTrackEditor } from './editTrack.js';
 import { anyRemoteRow, REMOTE_ONLY_REASON } from '../remoteRows.js';
+import { anyCatalogRow } from '../catalogRows.js';
 import { log } from '../data/log.js';
 import { BRAND_ICONS } from './brandIcons.js';
 
@@ -142,7 +143,7 @@ const REMOVABLE: readonly RemovableTrackSource[] = ['local', 'spotify', 'tidal',
 const allRemovable = (c: TrackCommandContext): boolean => any(c) && c.tracks.every((t) => REMOVABLE.some((s) => hasSrc(t, s)));
 
 // Browser search query — title + primary artist, falling back to title alone.
-const searchQuery = (t: Track): string => {
+export const searchQuery = (t: Track): string => {
 	const artist = t.artists?.[0]?.name ?? '';
 	return artist ? `${t.title} ${artist}` : t.title;
 };
@@ -160,7 +161,7 @@ const ICON_ANALYZE = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none
 const ICON_BEATPORT = BRAND_ICONS.beatport!;
 const ICON_TIDAL = BRAND_ICONS.tidal!;
 const ICON_SPOTIFY = BRAND_ICONS.spotify!;
-const ICON_COPY = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+export const ICON_COPY = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
 const ICON_DOWNLOAD = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 4v12"/><path d="m6 10 6 6 6-6"/><path d="M5 20h14"/></svg>';
 const ICON_FOLDER = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7l-2-2H5a2 2 0 0 0-2 2z"/></svg>';
 const ICON_SYNC_RB = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m9 17 3 3 3-3"/><path d="M12 4v16"/><rect x="4" y="3" width="16" height="4" rx="1"/></svg>';
@@ -296,35 +297,38 @@ async function toggleTagForSelection(
 	}
 }
 
-// Drill-into entries — per-attribute JIT scopes (artist/album/label/genre) plus
-// the playlists the track is in. Single-selection only; `ctx.drillPlaylists` is
-// pre-fetched by showTrackMenu. Built once, read by both isAvailable (length)
-// and the submenu builder.
-function buildDrillEntries(ctx: TrackCommandContext): { id: string; label: string; chip: string; activate: () => void }[] {
+// "Navigate to" entries — the track's artists, album and label as their
+// pages, its genre as a search scope, and the playlists the track is in.
+// Single-selection only; `ctx.drillPlaylists` is pre-fetched by showTrackMenu.
+// Built once, read by both isAvailable (length) and the submenu builders.
+// `page`: the entry opens an entity page, so it can also open in a new tab.
+interface DrillEntry { id: string; label: string; chip: string; activate: () => void; page?: EntityRef }
+function buildDrillEntries(ctx: TrackCommandContext): DrillEntry[] {
 	if (!single(ctx)) return [];
 	const t = ctx.tracks[0]!;
-	const entries: { id: string; label: string; chip: string; activate: () => void }[] = [];
+	const entries: DrillEntry[] = [];
+	const page = (id: string, label: string, chip: string, ref: EntityRef): void => {
+		entries.push({ id, label, chip, activate: () => deps.openEntity(ref), page: ref });
+	};
 	(t.artists ?? []).forEach((a, i) => {
 		if (!a.name) return;
 		const name = a.name;
-		// Id-keyed scope when the read decorated one (exact, indexed SQL
-		// pushdown; survives renames); name-keyed exact attr otherwise.
+		// The artist's page by the Curator id the read decorated. A read that
+		// carried none names nobody a page could be opened by (a name alone
+		// never is): the exact-name search stands in.
 		const aid = t.artistIds?.[i];
-		const query = aid ? buildExactAttr('artistid', aid) : buildExactAttr('artist', name);
-		entries.push({ id: `drill-artist-${entries.length}`, label: name, chip: 'Artist', activate: () => deps.enterJitScope({ name: `Artist: ${name}`, query }) });
+		if (aid) page(`drill-artist-${entries.length}`, name, 'Artist', { kind: 'artist', name, libraryId: aid });
+		else entries.push({ id: `drill-artist-${entries.length}`, label: name, chip: 'Artist', activate: () => deps.enterJitScope({ name: `Artist: ${name}`, query: buildExactAttr('artist', name) }) });
 	});
 	if (t.albumTitle) {
 		const v = t.albumTitle;
 		// By release id when the album seam assigned one (every track on that
 		// release, whichever source spelled the title); the title match
 		// otherwise.
-		const query = t.albumId ? buildExactAttr('albumid', t.albumId) : buildExactAttr('album', v);
-		entries.push({ id: 'drill-album', label: v, chip: 'Album', activate: () => deps.enterJitScope({ name: `Album: ${v}`, query }) });
+		if (t.albumId) page('drill-album', v, 'Album', { kind: 'album', name: v, libraryId: t.albumId });
+		else entries.push({ id: 'drill-album', label: v, chip: 'Album', activate: () => deps.enterJitScope({ name: `Album: ${v}`, query: buildExactAttr('album', v) }) });
 	}
-	if (t.label) {
-		const v = t.label;
-		entries.push({ id: 'drill-label', label: v, chip: 'Label', activate: () => deps.enterJitScope({ name: `Label: ${v}`, query: buildExactAttr('label', v) }) });
-	}
+	if (t.label) page('drill-label', t.label, 'Label', { kind: 'label', name: t.label });
 	if (t.genre) {
 		const v = t.genre;
 		entries.push({ id: 'drill-genre', label: v, chip: 'Genre', activate: () => deps.enterJitScope({ name: `Genre: ${v}`, query: buildExactAttr('genre', v) }) });
@@ -401,7 +405,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		// Shown unless every selected track is already Beatport-synced — a partial
 		// selection still offers it. Runs only on the not-yet-synced subset.
 		id: 'enrich-beatport', group: 'enrich', isAvailable: (c) => !allHave(c, 'beatport'), device: 'hide', iconHtml: ICON_BEATPORT,
-		label: () => 'Enhance with BPM, Key, Label, Genre',
+		label: () => 'Enrich with BPM, Key, Genre, Label',
 		run: async (c) => {
 			const targets = c.tracks.filter((t) => !hasSrc(t, 'beatport')).map((t) => t.id);
 			if (targets.length === 0) { showToast('Already enriched with Beatport', { kind: 'info' }); return; }
@@ -461,15 +465,6 @@ const TRACK_COMMANDS: TrackCommand[] = [
 			const who = artistNames(t.artists).join(', ');
 			deps.openProductionProfile(t.id, who ? `${who} — ${t.title}` : t.title);
 		},
-	},
-	{
-		// Embark on a discovery journey seeded with this track — Discover's
-		// Journeys mode takes over (KB entity minted from the library row).
-		// Hidden from the track menu for now (the user's call, 2026-10-15);
-		// journeys still start from Discover cards.
-		id: 'start-journey', group: 'navigate', isAvailable: () => false,
-		label: () => 'Start Journey',
-		run: (c) => { deps.startJourneyFromTrack(c.tracks[0]!.id); },
 	},
 	{
 		id: 'open-spotify', group: 'open', isAvailable: (c) => single(c) && allKnow(c, 'spotify'), iconHtml: ICON_SPOTIFY,
@@ -551,6 +546,22 @@ const TRACK_COMMANDS: TrackCommand[] = [
 			};
 		},
 	},
+	// The same artist / album / label pages, each in a page tab of its own
+	// (the list behind stays where it is).
+	{
+		id: 'open-new-tab', group: 'navigate',
+		isAvailable: (c) => single(c) && buildDrillEntries(c).some((e) => e.page),
+		build: (c) => {
+			const entries = buildDrillEntries(c).filter((e) => e.page);
+			return {
+				item: {
+					kind: 'submenu', id: 'open-new-tab', label: 'Open in New Tab',
+					items: entries.map((d) => ({ kind: 'item' as const, id: `tab-${d.id}`, label: d.label, chip: d.chip })),
+				},
+				handlers: Object.fromEntries(entries.map((d) => [`tab-${d.id}`, () => deps.openEntity(d.page!, { newTab: true })])),
+			};
+		},
+	},
 	// navigate (cont.) — "Open Artist in ▸": the track's artists, each in the
 	// local collection or on a store (features/artistOpenMenu.ts).
 	{
@@ -628,6 +639,10 @@ const TRACK_COMMANDS: TrackCommand[] = [
 // The command's own predicate AND the remote-row gate — what the menu, the
 // keyboard delegation and a future button surface all ask.
 function commandAvailable(c: TrackCommand, ctx: TrackSelectionContext): boolean {
+	// A catalogue row (an entity page's World side) is not a library track:
+	// no library command reads or writes it. Callers hand over library rows
+	// only; this is the backstop.
+	if (anyCatalogRow(ctx.tracks)) return false;
 	return c.isAvailable(ctx) && !(c.device && anyRemoteRow(ctx.tracks));
 }
 

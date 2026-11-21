@@ -41,7 +41,7 @@ const refsOf = (item: FeedItem): Ref[] => {
 	return [{ title: p.title, artists: p.artists, isrc: p.isrc, durationSec: p.durationSec ?? null, bpm: p.bpm, genre: p.genre, label: p.label, sourceLinks: p.sourceLinks, catalogId: p.catalogId }];
 };
 
-const nameClaims = (names: readonly string[]): CatalogClaim[] =>
+export const nameClaims = (names: readonly string[]): CatalogClaim[] =>
 	names.filter((a) => a.trim()).map((a) => ({ provider: 'user', kind: 'artist', providerId: `name:${nameFold(a)}`, name: a }));
 
 // The Spotify handles this desktop's lazy match found (feed/spotify-match.ts:

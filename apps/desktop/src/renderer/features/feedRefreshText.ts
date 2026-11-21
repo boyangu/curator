@@ -34,8 +34,16 @@ export function workerLine(w: CatalogWorkerStatus | null): string | null {
 
 // What a pass is called while it runs. A background pass is the timer's.
 export function passTitle(pass: Pass): string {
-	if (!pass.manual) return 'Checking for new releases…';
+	if (!pass.manual) return 'Background check…';
 	return pass.mode === 'backfill' ? 'Loading older items…' : 'Refreshing Discover…';
+}
+
+// Whether a pass shows on the Discover tab. The timer's pass is nobody's
+// wait — it asks the catalogue what it already holds, on every launch and
+// every half hour, and a pulse for it reads like a check at the stores — so
+// it shows only once a source of it has failed.
+export function passShown(pass: Pass): boolean {
+	return pass.manual || pass.steps.some((s) => s.state === 'error');
 }
 
 // The steps of the pass in flight, plus what waits behind it. Empty when idle.
@@ -46,11 +54,11 @@ export function statusLines(status: FeedRefreshStatus): string[] {
 	return lines;
 }
 
-// The Discover tab's popover while a pass runs or the worker reads, or null
-// when both are idle.
+// The Discover tab's popover while a pass that shows (passShown) runs or the
+// worker reads, or null when there is nothing to show.
 export function statusTooltip(status: FeedRefreshStatus, worker: CatalogWorkerStatus | null = null): string | null {
 	const reading = workerLine(worker);
-	if (status.pass) return [passTitle(status.pass), ...statusLines(status), ...(reading ? [reading] : [])].join('\n');
+	if (status.pass && passShown(status.pass)) return [passTitle(status.pass), ...statusLines(status), ...(reading ? [reading] : [])].join('\n');
 	return reading ? ['Reading for the catalogue…', reading].join('\n') : null;
 }
 

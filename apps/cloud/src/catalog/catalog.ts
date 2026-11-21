@@ -25,17 +25,22 @@ import {
 	type FeedRecentResult,
 	isLiveKind,
 } from '@curator/protocol';
-import type { CatalogBrowseInput, CatalogBrowseResult, CatalogEnrichInput, CatalogEnrichResult } from '@curator/protocol';
+import type { CatalogBrowseInput, CatalogBrowseResult, CatalogEnrichInput, CatalogEnrichResult, CatalogTracksInput, CatalogTracksResult } from '@curator/protocol';
 import { gateDevice, type Caller } from '../account/device-gate.js';
 import type { AuditEmit } from '../audit.js';
 import type { Db, Queryable } from '../db/db.js';
+import { queueAudience } from './audience.js';
 import { browseForClient } from './browse.js';
+import { queueCredits } from './credits.js';
 import { withSystemTx, type SystemTx } from '../db/system-tx.js';
 import { CloudError } from '../errors.js';
 import { eventsFor, recentFor, recentForUser } from './events.js';
+import { findRepresentation } from './identity.js';
 import { ingestClaims, Ingester, type IngestOutcome } from './ingest.js';
 import { detail, resolveRefs, search } from './objects.js';
+import { pageTracks } from './pages.js';
 import { addWatch, liveTarget, listWatches, refreshNow, removeWatch, setMuted } from './watches.js';
+import { queueValidation } from './artist-validation.js';
 
 export type CatalogDeps = { db: Db; audit: AuditEmit };
 
@@ -124,14 +129,50 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 // found. Never creates an object, never an event, never a follow-up task; a
 // claim naming nothing known is `unknown` (an undefined outcome) and the
 // device moves on.
+//
+// An artist's picture rides the same way (artistPicture below): the page a
+// desktop opened had none, it looked the artist up at the store, and the
+// next device's page has it.
 async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
 	const ingester = new Ingester(tx, { reason: 'enrichment' });
 	const outcomes: (IngestOutcome | undefined)[] = [];
 	for (const c of claims) {
-		const known = c.kind === 'recording' ? await ingester.attachIfKnown(c, { genres: true }) : c.kind === 'release' ? await ingester.attachIfKnown(c) : null;
+		let known: IngestOutcome | null = null;
+		if (c.kind === 'recording') known = await ingester.attachIfKnown(c, { genres: true });
+		else if (c.kind === 'release') known = await ingester.attachIfKnown(c);
+		else if (c.kind === 'artist') {
+			// Only onto the artist that store id already names: a picture never
+			// goes by the identity rules, and never makes a representation.
+			const picture = artistPicture(c);
+			if (picture && (await findRepresentation(tx, picture))) known = await ingester.attachIfKnown(picture);
+		}
 		outcomes.push(known ?? undefined);
 	}
 	return { outcomes, created: 0, attached: ingester.stats.attached };
+}
+
+// The stores a device may state an artist's picture from, and where each
+// serves its images. The picture must be the store's own (its image host):
+// the catalogue shows it to everyone.
+const PICTURE_HOSTS: Partial<Record<CatalogClaim['provider'], RegExp>> = {
+	spotify: /(^|\.)(scdn\.co|spotifycdn\.com)$/,
+	deezer: /(^|\.)dzcdn\.net$/,
+};
+
+// An artist claim cut down to its picture — the one fact a device's
+// enrichment may add to an artist. Null when it carries none, or one that is
+// not on the store's image host.
+export function artistPicture(c: CatalogClaim): CatalogClaim | null {
+	const hosts = PICTURE_HOSTS[c.provider];
+	const url = c.facts?.coverUrl;
+	if (!hosts || typeof url !== 'string') return null;
+	try {
+		const u = new URL(url);
+		if (u.protocol !== 'https:' || !hosts.test(u.hostname)) return null;
+	} catch {
+		return null;
+	}
+	return { provider: c.provider, kind: 'artist', providerId: c.providerId, name: c.name, facts: { coverUrl: url } };
 }
 
 export async function ingest(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogIngestInput): Promise<CatalogIngestResult> {
@@ -148,7 +189,10 @@ export async function ingest(deps: CatalogDeps, userId: string, caller: Caller, 
 			return o ? { objectId: o.objectId, created: o.created } : { rejected: 'unknown' };
 		});
 		const result: CatalogIngestResult = { results, created: r.created, attached: r.attached, duplicate: false };
-		if (input.reason === 'library_import') await queueLibraryFollowUps(tx, r.outcomes.filter((o): o is IngestOutcome => o !== undefined), { profileLabels: false });
+		// A release a device names on purpose — its library's, or one it read
+		// at a store for a page its user opened (a listing's bare copy: no
+		// tracklist) — is read in full from its stores.
+		if (input.reason === 'library_import' || input.reason === 'manual_registration') await queueLibraryFollowUps(tx, r.outcomes.filter((o): o is IngestOutcome => o !== undefined), { profileLabels: false });
 		await recordBatch(tx, producer, input.idempotencyKey, input.reason, claims.length, r.created, r.attached, result);
 		deps.audit('catalog_ingested', { reason: input.reason, claims: claims.length, rejected: rejected.size, created: r.created, attached: r.attached });
 		return result;
@@ -173,9 +217,31 @@ export function get(deps: CatalogDeps, userId: string, caller: Caller, input: { 
 
 export function browse(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogBrowseInput): Promise<CatalogBrowseResult> {
 	return gated(deps, userId, caller, input.deviceId, async (tx) => {
-		const v = await browseForClient(tx, input.id);
+		const v = await browseForClient(tx, input.id, { brief: input.brief });
 		if (!v) throw new CloudError('NOT_FOUND', 'catalog_not_found');
-		return v;
+		// Someone is looking at this artist (a page header, either side of it):
+		// its audience is read for its Reach score, if not this month already.
+		if (v.object.kind === 'artist') await queueAudience(tx, v.object.id);
+		// The caller's own watch, read as the caller (RLS): a page header shows
+		// follow state for one object without the whole watch list.
+		const [mine] = await tx.asUser(userId, (q) => q.query<{ muted: boolean }>(`select muted from curator.catalog_watch where object_id = $1`, [v.object.id]));
+		return { ...v, watch: mine ? { muted: mine.muted } : null };
+	});
+}
+
+export function tracks(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogTracksInput): Promise<CatalogTracksResult> {
+	return gated(deps, userId, caller, input.deviceId, async (tx) => {
+		const shortCredits: string[] = [];
+		const page = await pageTracks(tx, input.id, { cursor: input.cursor, limit: input.limit, shortCredits });
+		if (!page) throw new CloudError('NOT_FOUND', 'catalog_not_found');
+		// Tracks on this page that only Deezer credited (one artist where the
+		// other stores name three): their releases' Spotify or Beatport pages
+		// are read for the full credits by the next pass (credits.ts).
+		await queueCredits(tx, shortCredits);
+		// Someone is looking at this artist: a Deezer page of theirs nobody
+		// checked yet is checked by the next pass (artist-validation.ts).
+		if (page.object.kind === 'artist' && !input.cursor) await queueValidation(tx, page.object.id);
+		return page;
 	});
 }
 
@@ -208,8 +274,17 @@ export function unwatch(deps: CatalogDeps, userId: string, caller: Caller, input
 // A device asks the catalogue to profile labels it holds and read their
 // releases once (profile/label-profiler.ts, trackers/backfill.ts): no watch,
 // no events. Only labels; other kinds are ignored, as are unknown ids.
+// `need: 'audience'`: the artists it holds instead, their audience read at
+// their stores for their Reach score (audience.ts) — what a library holds
+// the cloud cannot see otherwise.
 export function enrich(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogEnrichInput): Promise<CatalogEnrichResult> {
 	return gated(deps, userId, caller, input.deviceId, async (tx) => {
+		if (input.need === 'audience') {
+			let queued = 0;
+			for (const id of input.objectIds) queued += await queueAudience(tx, id);
+			deps.audit('catalog_enrich_requested', { need: 'audience', artists: input.objectIds.length, queued });
+			return { queued };
+		}
 		const rows = await tx.query(
 			`insert into curator.catalog_enrich_task (object_id, need, provider)
 			select o.id, 'profile', 'catalog' from curator.catalog_object o

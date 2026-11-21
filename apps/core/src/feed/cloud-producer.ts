@@ -159,6 +159,8 @@ function trackDraft(e: CatalogEvent, card: TrackCard): FeedItemDraft {
 			isrc: card.isrc,
 			artists: card.artists.map((a) => a.name),
 			artistIds,
+			artistCatalogIds: card.artists.map((a) => a.id),
+			labelCatalogId: card.label?.id ?? null,
 			coverUrl: card.coverUrl,
 			albumTitle: card.albumTitle,
 			releaseDate: card.releaseDate,
@@ -183,6 +185,7 @@ function trackDraft(e: CatalogEvent, card: TrackCard): FeedItemDraft {
 function releaseDraft(e: CatalogEvent, card: ReleaseCard, watched: ReadonlySet<string>): FeedItemDraft {
 	const albumId = spotifyId(card.handles);
 	const idByName = new Map(card.artists.map((a) => [nameFold(a.name), artistKeyOf(a)] as const));
+	const catalogIdByName = new Map(card.artists.map((a) => [nameFold(a.name), a.id] as const));
 	const tracks: FeedTrackRef[] = card.tracks.map((t, i) => {
 		const sid = spotifyId(t.handles);
 		return {
@@ -194,6 +197,7 @@ function releaseDraft(e: CatalogEvent, card: ReleaseCard, watched: ReadonlySet<s
 			title: t.title,
 			artists: t.artists,
 			artistIds: t.artists.map((n) => idByName.get(nameFold(n)) ?? ''),
+			artistCatalogIds: t.artists.map((n) => catalogIdByName.get(nameFold(n)) ?? null),
 			durationSec: t.durationSec,
 			trackNumber: i + 1,
 			isrc: t.isrc,
@@ -229,6 +233,8 @@ function releaseDraft(e: CatalogEvent, card: ReleaseCard, watched: ReadonlySet<s
 			title: card.title,
 			artists: card.artists.map((a) => a.name),
 			artistIds,
+			artistCatalogIds: card.artists.map((a) => a.id),
+			labelCatalogId: card.label?.id ?? null,
 			label: card.label?.name ?? null,
 			coverUrl: card.coverUrl,
 			releaseDate: card.releaseDate,

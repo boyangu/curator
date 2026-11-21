@@ -53,6 +53,22 @@ export interface MainPaneTracklistProps {
 	remoteCount: Accessor<number>;
 	hideRemote: Accessor<boolean>;
 	onHideRemoteToggle: () => void;
+	// An artist / label / album page is open: which side its list shows.
+	// The switch stands where "This device" does elsewhere — on a page that
+	// chip has nothing to say (Owned IS the files on disk), and this is the
+	// control that decides what the list holds. Null off a page.
+	page: Accessor<PageScopeView | null>;
+	onPageScope: (scope: 'owned' | 'world') => void;
+}
+
+export interface PageScopeView {
+	scope: 'owned' | 'world';
+	// Local files of the entity; null until the header answers.
+	owned: number | null;
+	// Releases (an album: tracks) the catalogue holds; null when unknown.
+	world: number | null;
+	// Tooltip of the World side: what it lists, or why it cannot be read.
+	worldHint: string;
 }
 
 export interface MainPaneProps {
@@ -143,18 +159,52 @@ export function MainPane(props: MainPaneProps) {
 							<span class="tl-chip__value">{GROUP_LABELS[props.tracklist.groupBy()]}</span>
 						</Show>
 					</button>
-					<Show when={props.tracklist.remoteCount() > 0 || props.tracklist.hideRemote()}>
-						<button
-							type="button"
-							class="tl-chip"
-							classList={{ 'is-active': props.tracklist.hideRemote() }}
-							aria-pressed={props.tracklist.hideRemote() ? 'true' : 'false'}
-							title={remoteChipTitle(props.tracklist.remoteCount(), props.tracklist.hideRemote())}
-							onClick={() => props.tracklist.onHideRemoteToggle()}
-						>
-							<svg class="tl-chip__icon" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="2.5" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 11.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-							<span class="tl-chip__label">This device</span>
-						</button>
+					<Show
+						when={props.tracklist.page()}
+						fallback={
+							<Show when={props.tracklist.remoteCount() > 0 || props.tracklist.hideRemote()}>
+								<button
+									type="button"
+									class="tl-chip"
+									classList={{ 'is-active': props.tracklist.hideRemote() }}
+									aria-pressed={props.tracklist.hideRemote() ? 'true' : 'false'}
+									title={remoteChipTitle(props.tracklist.remoteCount(), props.tracklist.hideRemote())}
+									onClick={() => props.tracklist.onHideRemoteToggle()}
+								>
+									<svg class="tl-chip__icon" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="2.5" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 11.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+									<span class="tl-chip__label">This device</span>
+								</button>
+							</Show>
+						}
+					>
+						{(pg) => (
+							<div class="tl-seg" role="tablist" aria-label="What the list shows">
+								<button
+									type="button"
+									role="tab"
+									class="tl-chip tl-seg__btn"
+									classList={{ 'is-active': pg().scope === 'owned' }}
+									aria-selected={pg().scope === 'owned' ? 'true' : 'false'}
+									title="Your local files"
+									onClick={() => props.tracklist.onPageScope('owned')}
+								>
+									<span class="tl-chip__label">Owned</span>
+									<Show when={pg().owned !== null}><span class="tl-chip__value">{pg().owned!.toLocaleString('en-US')}</span></Show>
+								</button>
+								<button
+									type="button"
+									role="tab"
+									class="tl-chip tl-seg__btn"
+									classList={{ 'is-active': pg().scope === 'world' }}
+									aria-selected={pg().scope === 'world' ? 'true' : 'false'}
+									title={pg().worldHint}
+									onClick={() => props.tracklist.onPageScope('world')}
+								>
+									<span class="tl-chip__label">World</span>
+									<Show when={pg().world !== null}><span class="tl-chip__value">{pg().world!.toLocaleString('en-US')}</span></Show>
+								</button>
+							</div>
+						)}
 					</Show>
 					{/* Row mode toggle — the player-size button's idiom: a borderless
 					    icon showing the CURRENT mode (one slim line per row vs two
@@ -230,6 +280,15 @@ export function MainPane(props: MainPaneProps) {
 			    headers, column-resize handles, and event delegation. Per-
 			    instance state means a future split-deck layout can mount
 			    multiple lists into different hosts without collision. */}
+			{/* Entity page header — an artist's / label's / album's page sits in
+			    the tracks region: this header over the top of the same track
+			    list (it takes its own height back out of the flow, the list
+			    keeps that much room at the top of its content, and the header
+			    closes as the list scrolls — features/entityHeaderCollapse.ts).
+			    Filled by mountEntityHeader(...) in main.ts/boot(); shown by the
+			    region effect while a page is open. Keep it right before
+			    #tracks-view: the overlap is with the next sibling. */}
+			<div class="entity-header-host" id="entity-header" hidden></div>
 			<div class="table-wrap" id="tracks-view"></div>
 		</>
 	);

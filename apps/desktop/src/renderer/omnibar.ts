@@ -15,16 +15,23 @@
 // analyzer-scalar comparisons). The "Syntax" button at top-right swaps
 // the body for a static cheatsheet of the full grammar.
 //
-// Online searches (Spotify Web API / Tidal search) are deliberately out of
-// scope for this iteration; the source-pill prefixes still work, they just
-// narrow the local DB to that source.
+// The Spotify / Tidal / Rekordbox pills narrow the local DB to that source.
+// The World pill (`w/`) leaves the library: it searches the user's streaming
+// service, the Global Catalog and the stores for artists, albums, labels and
+// tracks (core entity/world-search.ts). The three are asked side by side and
+// the list fills in as each answers — the streaming service first, usually —
+// merged into one row per thing (worldHits.ts). A pick opens the entity's
+// page; a track plays through the streaming service. The query grammar does
+// not apply there: the text is the search.
 //
 // Lifecycle: mountOmnibar() wires the DOM once at boot. open()/close()
 // toggle visibility. State (last query, "keep between sessions" toggle) is
 // persisted to localStorage so a re-open feels like a continuation.
 
-import type { Track, Playlist, PlaylistFolder } from '@curator/shared';
+import type { EntityTracksPage, Track, Playlist, PlaylistFolder, WorldHit, WorldSearchPart, WorldSearchResult } from '@curator/shared';
 import { searchFold } from '@curator/shared';
+import { isCatalogRow } from './catalogRows.js';
+import { mergeWorldHits, worldSourcesText, worldStatusText } from './worldHits.js';
 import * as tagsStore from './stores/tagsStore.js';
 import { keyChipHtml, formatBpmInt } from './music-utils.js';
 import { parseQuery, matchTrack, extractSqlPrefilter, extractFolderSyntax, isEmptyExpr, collectTagNames } from './query.js';
@@ -33,7 +40,7 @@ import { attachTagSuggest, type TagSuggestHandle } from './tagSuggest.js';
 import { registerModalOpenSignal, isModalOpen } from './modalGate.js';
 import { log } from './data/log.js';
 
-export type OmnibarSource = 'all' | 'spotify' | 'tidal' | 'rekordbox';
+export type OmnibarSource = 'all' | 'spotify' | 'tidal' | 'rekordbox' | 'world';
 
 export interface OmnibarDeps {
 	// Map of every playlist the renderer knows about. We re-read this on open
@@ -63,6 +70,14 @@ export interface OmnibarDeps {
 	// follow-up Enter in the tracklist starts playback. Caller closes
 	// the omnibar after the swap.
 	onLoadAsJit(query: string, name: string, selectTrackId: string | null): void | Promise<void>;
+	// One part of a World search (`world:search`), and its track hits as list
+	// rows (the library's own row where the library holds the recording).
+	searchWorld(query: string, part: WorldSearchPart): Promise<WorldSearchResult>;
+	worldRows(page: EntityTracksPage): Promise<Track[]>;
+	// Fired when the user picks a World hit. `row` is set for a track (with
+	// the other track hits as `list`): the caller plays it, or — `newTab` —
+	// opens its album's page. Every other hit opens the entity's page.
+	onPickWorld(hit: WorldHit, pick: { newTab: boolean; row: Track | null; list: Track[] }): void | Promise<void>;
 }
 
 // Persisted across sessions. `q` is only restored if `keep` is true at the
@@ -82,18 +97,26 @@ const MAX_RESULTS = 10;
 // pills still fire below this threshold (they have their own indexes /
 // equality filters).
 const MIN_FREETEXT_CHARS = 2;
+// World scope: every settled keystroke is a call to the streaming service
+// and to the catalogue, so it waits a little longer than the local search;
+// the stores (pages a browser would open) are asked only once the typing has
+// plainly stopped.
+const WORLD_DEBOUNCE_MS = 250;
+const WORLD_STORES_DELAY_MS = 700;
 
 const PILL_DEFS: { src: OmnibarSource; label: string; prefix: string | null }[] = [
 	{ src: 'all',       label: 'All',       prefix: null },
 	{ src: 'spotify',   label: 'Spotify',   prefix: 's/' },
 	{ src: 'tidal',     label: 'Tidal',     prefix: 't/' },
 	{ src: 'rekordbox', label: 'Rekordbox', prefix: 'r/' },
+	{ src: 'world',     label: 'World',     prefix: 'w/' },
 ];
 
 type Result =
 	| { kind: 'track'; track: Track }
 	| { kind: 'playlist'; playlist: Playlist }
-	| { kind: 'folder'; folder: PlaylistFolder; path: string };
+	| { kind: 'folder'; folder: PlaylistFolder; path: string }
+	| { kind: 'world'; hit: WorldHit };
 
 let mounted = false;
 let deps: OmnibarDeps;
@@ -106,6 +129,14 @@ let lastTracksFetch: Track[] = [];
 let fetchSeq = 0;
 let debounceHandle: ReturnType<typeof setTimeout> | null = null;
 let escClearedOnce = false; // tracks single-vs-double Esc when keep=true
+
+// World scope: what each part answered for the query on screen, which are
+// still out, and the track hits as rows (by recording id).
+let worldQuery = '';
+let worldParts = new Map<WorldSearchPart, WorldSearchResult>();
+let worldPending = new Set<WorldSearchPart>();
+let worldRows = new Map<string, Track>();
+let worldStoresTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Cached DOM lookups, wired in mount(). null until then.
 let overlayEl: HTMLElement | null = null;
@@ -226,7 +257,16 @@ export function mountOmnibar(d: OmnibarDeps): void {
 		const row = (e.target as HTMLElement).closest<HTMLElement>('[data-result-idx]');
 		if (!row) return;
 		const idx = Number(row.dataset.resultIdx);
-		if (Number.isFinite(idx)) pick(idx);
+		if (Number.isFinite(idx)) pick(idx, { newTab: e.ctrlKey || e.metaKey });
+	});
+	// Middle-click a World hit: its page in a new tab.
+	resultsEl.addEventListener('auxclick', (e) => {
+		if (e.button !== 1) return;
+		const row = (e.target as HTMLElement).closest<HTMLElement>('[data-result-idx]');
+		const idx = Number(row?.dataset.resultIdx);
+		if (!row || !Number.isFinite(idx) || results[idx]?.kind !== 'world') return;
+		e.preventDefault();
+		pick(idx, { newTab: true });
 	});
 
 	resultsEl.addEventListener('mousemove', (e) => {
@@ -398,7 +438,7 @@ function updateScopeChip(): void {
 // Splits raw input into a prefix + remaining searchable term, but does NOT
 // touch `scope`. Used by both prefix-detection and scope-sync paths.
 function parseInputRaw(raw: string): { prefix: string | null; term: string } {
-	const m = raw.match(/^([sltr])\/(.*)$/i);
+	const m = raw.match(/^([sltrw])\/(.*)$/i);
 	if (m && m[1] !== undefined) return { prefix: m[1].toLowerCase(), term: m[2] ?? '' };
 	return { prefix: null, term: raw };
 }
@@ -411,7 +451,7 @@ function applyPrefixFromInput(): void {
 	if (!inputEl) return;
 	const { prefix } = parseInputRaw(inputEl.value);
 	if (!prefix) return;
-	const map: Record<string, OmnibarSource> = { s: 'spotify', t: 'tidal', r: 'rekordbox' };
+	const map: Record<string, OmnibarSource> = { s: 'spotify', t: 'tidal', r: 'rekordbox', w: 'world' };
 	const next = map[prefix];
 	if (next && next !== scope && deps.isSourceEnabled(next as Exclude<OmnibarSource, 'all'>)) {
 		scope = next;
@@ -440,7 +480,10 @@ function onInputKeydown(e: KeyboardEvent): void {
 		cycleScope(e.shiftKey ? -1 : 1);
 	} else if (e.key === 'Enter') {
 		e.preventDefault();
-		if (e.shiftKey) {
+		if (scope === 'world') {
+			// A page in a new tab with Shift or Ctrl held (a track: its album's).
+			if (results.length > 0) pick(activeIdx, { newTab: e.shiftKey || e.ctrlKey || e.metaKey });
+		} else if (e.shiftKey) {
 			// Shift+Enter — load the current query as a JIT scope in the
 			// main tracklist and start playback from the highlighted track
 			// (if any). Falls through to a no-op when neither query text
@@ -480,7 +523,7 @@ function cycleScope(dir: 1 | -1): void {
 
 function scheduleQuery(): void {
 	if (debounceHandle) clearTimeout(debounceHandle);
-	debounceHandle = setTimeout(runQuery, 150);
+	debounceHandle = setTimeout(runQuery, scope === 'world' ? WORLD_DEBOUNCE_MS : 150);
 }
 
 // Query parsing — full grammar lives in query.ts (shared with the tracklist
@@ -567,6 +610,12 @@ async function runQuery(): Promise<void> {
 	if (!isOpen || !inputEl || !resultsEl) return;
 	const seq = ++fetchSeq;
 	const { term: rawTerm } = parseInputRaw(inputEl.value);
+	if (worldStoresTimer) { clearTimeout(worldStoresTimer); worldStoresTimer = null; }
+	if (scope === 'world') {
+		saveState();
+		runWorldQuery(seq, rawTerm);
+		return;
+	}
 	// Parse to AST, then peel off the omnibar-specific folder-path syntax
 	// (`zen/up/track`) which predates the boolean grammar and doesn't
 	// compose with it. What remains is a regular Expr that we evaluate
@@ -833,6 +882,118 @@ async function runQuery(): Promise<void> {
 	render();
 }
 
+// ─── World scope ─────────────────────────────────────────────────────────
+// The parts are asked side by side and each lands when it lands. A part
+// already answered for this exact text is not asked again (reopening the
+// omnibar, or Tab away and back, shows what is known at once).
+function runWorldQuery(seq: number, term: string): void {
+	const q = term.trim();
+	if (q !== worldQuery) {
+		worldQuery = q;
+		worldParts = new Map();
+		worldRows = new Map();
+	}
+	worldPending = new Set();
+	if (q.length < MIN_FREETEXT_CHARS) {
+		results = [];
+		activeIdx = 0;
+		render();
+		return;
+	}
+	const ask = (part: WorldSearchPart): void => {
+		if (worldParts.has(part)) return;
+		worldPending.add(part);
+		void deps.searchWorld(q, part)
+			.catch((err: unknown): WorldSearchResult => {
+				log.for('omnibar').warn('world search failed', { part }, err);
+				return { part, hits: [], note: 'failed' };
+			})
+			.then(async (r) => {
+				// The track hits as rows before the part shows: a pick plays at once.
+				const rows = r.rows ? await deps.worldRows(r.rows).catch(() => [] as Track[]) : [];
+				if (seq !== fetchSeq) return;
+				for (const t of rows) if (t.catalog) worldRows.set(t.catalog.recordingId, t);
+				worldParts.set(part, r);
+				worldPending.delete(part);
+				showWorld();
+			});
+	};
+	ask('streaming');
+	ask('catalog');
+	if (!worldParts.has('stores')) {
+		worldPending.add('stores');
+		worldStoresTimer = setTimeout(() => {
+			worldStoresTimer = null;
+			if (seq === fetchSeq && isOpen) ask('stores');
+		}, WORLD_STORES_DELAY_MS);
+	}
+	showWorld();
+}
+
+// The merged list, with the highlight kept on the hit it was on when the
+// user had moved it (a late part adds rows above and below); otherwise the
+// top hit stays the one Enter opens.
+function showWorld(): void {
+	const prev = results[activeIdx];
+	const held = activeIdx > 0 && prev?.kind === 'world' ? prev.hit.keys[0] : null;
+	results = mergeWorldHits(worldParts, worldQuery).map((hit) => ({ kind: 'world', hit } as Result));
+	const at = held ? results.findIndex((r) => r.kind === 'world' && r.hit.keys.includes(held)) : -1;
+	activeIdx = at >= 0 ? at : 0;
+	render();
+}
+
+const WORLD_KIND: Record<WorldHit['kind'], { glyph: string; word: string }> = {
+	artist: { glyph: 'AR', word: 'Artist' },
+	label: { glyph: 'LB', word: 'Label' },
+	album: { glyph: 'AL', word: 'Album' },
+	track: { glyph: '♪', word: 'Track' },
+};
+
+// A remote image as a CSS url() inside a double-quoted style attribute.
+const cssUrl = (u: string): string => `url('${escapeHtml(u.replace(/['"\\()\s]/g, (c) => `%${c.charCodeAt(0).toString(16).padStart(2, '0')}`))}')`;
+
+function worldRowHtml(h: WorldHit, idx: number, q: string): string {
+	const active = idx === activeIdx ? ' is-active' : '';
+	const k = WORLD_KIND[h.kind];
+	const row = h.recordingId ? worldRows.get(h.recordingId) : undefined;
+	// A track the library already holds plays from the library.
+	const owned = row && !isCatalogRow(row) ? ' · in your library' : '';
+	const sub = h.kind === 'track' ? (h.detail ?? k.word) : [k.word, h.detail].filter(Boolean).join(' · ');
+	const art = h.imageUrl ? cssUrl(h.imageUrl) : 'linear-gradient(135deg,var(--bg-3),var(--bg-2))';
+	return `
+		<div class="omnibar__row omnibar__row--world${active}" data-result-idx="${idx}" data-kind="world" role="option" aria-selected="${idx === activeIdx}">
+			<div class="omnibar__row-kind" title="${k.word}">${k.glyph}</div>
+			<div class="omnibar__row-art${h.kind === 'artist' ? ' omnibar__row-art--round' : ''}" style="background-image: ${art};"></div>
+			<div class="omnibar__row-main">
+				<div class="omnibar__row-title">${highlight(h.name, q)}</div>
+				<div class="omnibar__row-sub">${highlight(sub, q)}${owned}</div>
+			</div>
+			<div class="omnibar__row-src">${escapeHtml(worldSourcesText(h))}</div>
+			<div class="omnibar__row-key"></div>
+		</div>`;
+}
+
+function renderWorld(): void {
+	if (!resultsEl) return;
+	const status = worldStatusText(worldParts, worldPending);
+	const foot = status ? `<div class="omnibar__status" role="status">${escapeHtml(status)}</div>` : '';
+	if (worldQuery.length < MIN_FREETEXT_CHARS) {
+		resultsEl.innerHTML = `
+			<div class="omnibar__empty">
+				<strong>Search beyond your library</strong><br/>
+				Type an artist, an album, a label or a track. Spotify answers first; the catalogue and the stores fill in after.
+			</div>`;
+		return;
+	}
+	if (results.length === 0) {
+		resultsEl.innerHTML = worldPending.size > 0
+			? foot
+			: `<div class="omnibar__empty"><strong>No matches</strong><br/>Nothing by that name on Spotify, in the catalogue or at the stores.</div>${foot}`;
+		return;
+	}
+	resultsEl.innerHTML = results.map((r, idx) => (r.kind === 'world' ? worldRowHtml(r.hit, idx, worldQuery) : '')).join('') + foot;
+}
+
 function highlight(s: string, q: string): string {
 	if (!q) return escapeHtml(s);
 	const needle = q.toLowerCase();
@@ -850,6 +1011,7 @@ function escapeHtml(s: string): string {
 
 function render(): void {
 	if (!resultsEl || !inputEl) return;
+	if (scope === 'world') { renderWorld(); return; }
 	const { term: rawTerm } = parseInputRaw(inputEl.value);
 	// Highlight needle for matched text spans. The SQL prefilter's longest
 	// FREE term — or the folder-path leaf when in folder mode — is the
@@ -899,7 +1061,7 @@ function render(): void {
 					<div class="omnibar__row-bpm"></div>
 					<div class="omnibar__row-key"></div>
 				</div>`);
-		} else {
+		} else if (r.kind === 'folder') {
 			const f = r.folder;
 			rows.push(`
 				<div class="omnibar__row${active}" data-result-idx="${idx}" data-kind="folder" role="option" aria-selected="${idx === activeIdx}">
@@ -932,10 +1094,14 @@ function highlightActive(scrollIntoView = false): void {
 	}
 }
 
-function pick(idx: number): void {
+function pick(idx: number, opts: { newTab?: boolean } = {}): void {
 	const r = results[idx];
 	if (!r) return;
-	if (r.kind === 'track') {
+	if (r.kind === 'world') {
+		const rowOf = (h: WorldHit): Track | null => (h.recordingId ? worldRows.get(h.recordingId) ?? null : null);
+		const list = results.flatMap((x) => (x.kind === 'world' ? [rowOf(x.hit)] : [])).filter((t): t is Track => t !== null);
+		void deps.onPickWorld(r.hit, { newTab: opts.newTab === true, row: rowOf(r.hit), list });
+	} else if (r.kind === 'track') {
 		const list = lastTracksFetch.length > 0 ? lastTracksFetch : results.filter((x): x is Extract<Result, { kind: 'track' }> => x.kind === 'track').map((x) => x.track);
 		void deps.onPickTrack(r.track, list);
 	} else if (r.kind === 'playlist') {

@@ -166,8 +166,11 @@ export async function getInbox(tx: Queryable, id: number): Promise<InboxRow | nu
 }
 
 export type InboxChoice = { action: 'attach' | 'merge' | 'not_same'; candidate: number };
-// `except`: on approving a twins item, the pairs (by index) the operator rules not twins.
-export type InboxDecision = { action: 'approve' | 'reject'; choice?: InboxChoice; except?: number[]; note?: string | null; by: string };
+// On approving a twins item, by pair index: `except` are ruled not twins,
+// `leave` are not decided — the rest merge and the item stays open holding
+// only the left pairs (one unread store page must not hold back, or force a
+// ruling on, the pairs that were read).
+export type InboxDecision = { action: 'approve' | 'reject'; choice?: InboxChoice; except?: number[]; leave?: number[]; note?: string | null; by: string };
 
 // Resolves an open item: a held action is applied or discarded, a done one
 // acknowledged or undone. One transaction; a throw leaves the item as it was
@@ -177,10 +180,11 @@ export async function decideInbox(tx: SystemTx, id: number, d: InboxDecision): P
 	if (!item) throw new Error(`inbox item ${id} not found`);
 	if (item.status !== 'open') throw new Error(`inbox item ${id} is ${item.status}`);
 	let resolution: string;
-	if (d.except?.length && (d.action !== 'approve' || !['mergeReleases', 'mergeArtists'].includes(item.apply?.op ?? ''))) throw new Error('--except names pairs of a twins item being approved');
+	if ((d.except?.length || d.leave?.length) && (d.action !== 'approve' || !['mergeReleases', 'mergeArtists'].includes(item.apply?.op ?? ''))) throw new Error('--except and --leave name pairs of a twins item being approved');
 	if (d.action === 'approve') {
 		if (item.apply) {
 			await runApply(tx, item, d);
+			if (d.leave?.length) return leaveOpen(tx, item, d);
 			resolution = d.except?.length ? `applied except pair${d.except.length > 1 ? 's' : ''} ${d.except.join(', ')} (not twins)` : 'applied';
 		} else resolution = 'acknowledged';
 	} else if (item.apply) {
@@ -195,6 +199,53 @@ export async function decideInbox(tx: SystemTx, id: number, d: InboxDecision): P
 		[String(id), d.action === 'approve' ? 'approved' : 'rejected', d.by, resolution, d.note ?? null],
 	);
 	return (await getInbox(tx, id))!;
+}
+
+// A twins item approved in part. The decided pairs are split off as their own
+// resolved item — the log, and the regression set (agent/evals.ts), read it as
+// any approved twins item, its merges found under the original's id (`of`) —
+// and the item goes on, open, with the pairs left, renumbered from 0.
+async function leaveOpen(tx: SystemTx, item: InboxItem, d: InboxDecision): Promise<InboxRow> {
+	const pairs = item.apply!.args.pairs as Pair[];
+	const left = new Set(d.leave);
+	const split = <T>(v: unknown, stay: boolean): T[] | undefined => (Array.isArray(v) && v.length === pairs.length ? (v as T[]).filter((_, i) => left.has(i) === stay) : undefined);
+	const part = (stay: boolean) => {
+		const ps = pairs.filter((_, i) => left.has(i) === stay);
+		const [ev, vs] = [split(item.evidence.pairs, stay), split(item.evidence.verdicts, stay)];
+		return { pairs: ps, ids: new Set(ps.flatMap((p) => [p.keep, p.fold])), evidence: { ...item.evidence, ...(ev ? { pairs: ev } : {}), ...(vs ? { verdicts: vs } : {}) } };
+	};
+	const [rest, gone] = [part(true), part(false)];
+	// The excepted pairs' indexes among the decided ones.
+	const decided = pairs.flatMap((_, i) => (left.has(i) ? [] : [i]));
+	const except = (d.except ?? []).map((i) => decided.indexOf(i)).sort((x, y) => x - y);
+	// The count a twins title leads with ("Merge 11 twin releases…").
+	const counted = (n: number) => item.title.replace(/\d+/, String(n)).slice(0, 300);
+	const done = await raise(tx, {
+		kind: item.kind,
+		severity: item.severity,
+		title: counted(gone.pairs.length),
+		// A subject that is no pair's (the label of a detector's item) stays on both.
+		subjects: item.subjects.filter((s) => gone.ids.has(s) || !rest.ids.has(s)),
+		evidence: { ...gone.evidence, of: item.id },
+		apply: { op: item.apply!.op, args: { ...item.apply!.args, pairs: gone.pairs } },
+		actor: item.actor,
+		reviewId: item.reviewId,
+	});
+	await tx.query(`update curator.catalog_inbox set status = 'approved', resolved_at = now(), resolved_by = $2, resolution = $3, note = $4 where id = $1::bigint`, [
+		String(done),
+		d.by,
+		except.length ? `applied except pair${except.length > 1 ? 's' : ''} ${except.join(', ')} (not twins)` : 'applied',
+		d.note ?? null,
+	]);
+	await tx.query(`update curator.catalog_inbox set title = $2, subjects = $3::uuid[], evidence = $4::text::jsonb, apply = $5::text::jsonb, note = $6, last_error = null where id = $1::bigint`, [
+		String(item.id),
+		counted(rest.pairs.length),
+		`{${item.subjects.filter((s) => rest.ids.has(s) || !gone.ids.has(s)).join(',')}}`,
+		JSON.stringify(rest.evidence),
+		JSON.stringify({ op: item.apply!.op, args: { ...item.apply!.args, pairs: rest.pairs } }),
+		`${gone.pairs.length} pair${gone.pairs.length > 1 ? 's' : ''} decided by ${d.by} as #${done}; ${rest.pairs.length} left open`,
+	]);
+	return (await getInbox(tx, item.id))!;
 }
 
 export async function snoozeInbox(tx: Queryable, id: number, until: Date | null): Promise<InboxRow> {
@@ -241,13 +292,16 @@ async function runApply(tx: SystemTx, item: InboxItem, d: InboxDecision): Promis
 		case 'mergeArtists': {
 			const pairs = a.pairs as Pair[];
 			const except = new Set(d.except ?? []);
-			for (const i of except) if (!Number.isInteger(i) || i < 0 || i >= pairs.length) throw new Error(`no pair ${i}: this item has pairs 0–${pairs.length - 1}`);
+			const leave = new Set(d.leave ?? []);
+			for (const i of [...except, ...leave]) if (!Number.isInteger(i) || i < 0 || i >= pairs.length) throw new Error(`no pair ${i}: this item has pairs 0–${pairs.length - 1}`);
+			for (const i of leave) if (except.has(i)) throw new Error(`pair ${i} is both excepted and left`);
+			if (leave.size === pairs.length) throw new Error('every pair is left open: nothing to decide (snooze the item instead)');
 			// The rulings first: a release twinned twice (one keep, two folds) must
 			// not reach the excluded fold through the merged one.
 			for (const i of except) await notSame(tx, pairs[i]!.keep, pairs[i]!.fold, d.by, d.note ?? 'not twins (inbox)');
 			const merged: string[] = [];
 			for (const [i, p] of pairs.entries()) {
-				if (except.has(i)) continue;
+				if (except.has(i) || leave.has(i)) continue;
 				const live = await tx.query<{ id: string }>(`select id from curator.catalog_object where id = any($1::uuid[]) and merged_into is null`, [`{${p.keep},${p.fold}}`]);
 				if (live.length !== 2) continue;
 				await mergeObjects(tx, p.fold, p.keep, d.by, `twin ${item.apply!.op === 'mergeArtists' ? 'artist' : 'release'} (inbox ${item.id})${d.note ? `: ${d.note}` : ''}`, { inbox: item.id });
@@ -259,7 +313,7 @@ async function runApply(tx: SystemTx, item: InboxItem, d: InboxDecision): Promis
 			if (item.apply!.op === 'mergeReleases' && merged.length) {
 				const winners = [...new Set(merged)];
 				await artistTwinsOn(tx, winners, d.by);
-				for (const id of winners) await dedupeRelease(tx, id, d.by);
+				for (const id of winners) await dedupeRelease(tx, id, d.by, { twins: true });
 			}
 			return;
 		}

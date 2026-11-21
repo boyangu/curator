@@ -1,6 +1,6 @@
 // AgentResultView — renders an agent result set as a compact, playable
-// track list in Discover's main area (the third Discover mode next to
-// Feed/Journeys). Rows carry source badges (library / feed / kb / web),
+// track list in Discover's main area (the second Discover mode, beside the
+// feed). Rows carry source badges (library / feed / kb / web),
 // metadata chips, the agent's one-line note, and citation links. Rows with
 // a Spotify play ref play through the same path feed cards use.
 

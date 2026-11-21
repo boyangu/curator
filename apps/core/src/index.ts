@@ -8,8 +8,9 @@ export { LibraryScanner, normalizePath, isCloudSyncPath, type ScanProgress, type
 export type { AnalysisJobEvent } from './analyzer/queue.js';
 export type { AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings } from './analyzer/flags.js';
 export { DEFAULT_AUTO_ANALYZE_SETTINGS, DEFAULT_AUTO_FLAGS, DEFAULT_MANUAL_FLAGS, analysisFlagsToOptions } from './analyzer/flags.js';
-export type { ProgressEvent as AnalyzerProgressEvent, PartialEvent as AnalyzerPartialEvent, AnalyzeOptions, AdvancedFeature } from './analyzer/sidecar.js';
+export type { ProgressEvent as AnalyzerProgressEvent, PartialEvent as AnalyzerPartialEvent, AnalyzeOptions, AdvancedFeature, AnalyzerHealth } from './analyzer/sidecar.js';
 export { ADVANCED_FEATURES } from './analyzer/sidecar.js';
+export { probeWsl } from './analyzer/wsl.js';
 export type { RekordboxImportEvent, RekordboxFlags, ImportTotals as RekordboxImportTotals } from './rekordbox/importer.js';
 export { DEFAULT_REKORDBOX_FLAGS } from './rekordbox/importer.js';
 export type { RekordboxExportEvent, ExportFlags, ExportResult as RekordboxExportResult, RemovalHold as RekordboxRemovalHold } from './rekordbox/exporter.js';
@@ -37,7 +38,7 @@ export type { FollowCandidate, FollowCandidateKind } from './catalog-client/libr
 export type { ConnectSearch, ConnectSubject } from './catalog-client/connect.js';
 export type { CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectCandidate, CatalogConnectItem, CatalogConnectOutcome, CatalogConnectQueueResult, PageKind } from '@curator/protocol';
 export type { CatalogWorkerStatus } from './catalog-worker/service.js';
-export type { CatalogReadSources, CatalogReadSourcesPatch } from './catalog-worker/settings.js';
+export type { CatalogReadCadence, CatalogReadSources, CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 export type { CatalogObjectRef, TrackCatalogRefs } from './catalog-client/catalog-refs.js';
 export type { CatalogWatch, CatalogClaim, CatalogHandle, CatalogKind } from '@curator/protocol';
 export type { FeedStore } from './feed/store.js';

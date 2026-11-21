@@ -38,6 +38,16 @@ import { itemArtists } from './lenses.js';
 // "screen" of a typical feed, enough to be noticed without burying news.
 const MULTI_SOURCE_BOOST_MS = 3 * 24 * 60 * 60 * 1000;
 
+// A draft's date as the feed stores it (published_at, origin seen_at): never
+// after `now`. Sources do date things ahead — Spotify's release_date can run
+// weeks ahead of a release that already plays, and the catalogue announces
+// premieres — and a future date would hold the card at the top of the feed,
+// reading "today", until that day came. The source's own date stays in
+// payload.releaseDate.
+function surfacedAt(d: FeedItemDraft, now: number): number | null {
+	return d.publishedAt == null ? null : Math.min(d.publishedAt, now);
+}
+
 // Item states the user has acted on — a recording carried by one of these
 // TRACK items is "handled", so a later release made up only of handled
 // recordings stays hidden (see reconcile).
@@ -165,7 +175,7 @@ export interface FeedStore {
 	close(): void;
 }
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS feed_meta (
@@ -562,6 +572,30 @@ export class SqliteFeedStore implements FeedStore {
 				}
 			})();
 		}
+		// v9 → v10: no row is dated after the moment it reached the feed
+		// (surfacedAt, from here on). Rows a source dated ahead before that sat
+		// at the top of the feed until their day came: pull them, and the origin
+		// sightings stamped with the same date, back to their fetch time.
+		if (priorVersion < 10) {
+			this.db.transaction(() => {
+				const now = Date.now();
+				const rows = this.db.prepare(`
+					SELECT id, covered_by FROM feed_item WHERE published_at > fetched_at
+					UNION
+					SELECT i.id, i.covered_by FROM feed_item_origin o JOIN feed_item i ON i.id = o.item_id WHERE o.seen_at > ?
+				`).all(now) as { id: string; covered_by: string | null }[];
+				if (rows.length === 0) return;
+				this.db.prepare(`
+					UPDATE feed_item_origin SET seen_at = (SELECT i.fetched_at FROM feed_item i WHERE i.id = feed_item_origin.item_id)
+					WHERE seen_at > ? OR EXISTS (
+						SELECT 1 FROM feed_item i
+						WHERE i.id = feed_item_origin.item_id AND i.published_at > i.fetched_at AND feed_item_origin.seen_at = i.published_at
+					)
+				`).run(now);
+				this.db.exec(`UPDATE feed_item SET published_at = fetched_at WHERE published_at > fetched_at`);
+				this.rerank(new Set(rows.flatMap((r) => (r.covered_by ? [r.id, r.covered_by] : [r.id]))));
+			})();
+		}
 		this.db
 			.prepare(`INSERT OR REPLACE INTO feed_meta (key, value) VALUES ('schema_version', ?)`)
 			.run(String(SCHEMA_VERSION));
@@ -657,6 +691,7 @@ export class SqliteFeedStore implements FeedStore {
 					continue;
 				}
 				const id = randomUUID();
+				const publishedAt = surfacedAt(d, now);
 				const res = insertItem.run(
 					id,
 					d.type,
@@ -665,9 +700,9 @@ export class SqliteFeedStore implements FeedStore {
 					d.dedupeKey,
 					JSON.stringify(d.payload),
 					d.origin ? JSON.stringify(d.origin) : null,
-					d.publishedAt,
+					publishedAt,
 					now,
-					d.publishedAt ?? now,
+					publishedAt ?? now,
 				);
 				let itemId: string = id;
 				if (res.changes === 0) {
@@ -738,7 +773,7 @@ export class SqliteFeedStore implements FeedStore {
 					name = excluded.name,
 					seen_at = MAX(COALESCE(feed_item_origin.seen_at, 0), excluded.seen_at)
 			`)
-			.run(itemId, d.origin.kind, d.origin.id, d.origin.name, d.publishedAt ?? now);
+			.run(itemId, d.origin.kind, d.origin.id, d.origin.name, surfacedAt(d, now) ?? now);
 	}
 
 	// ── Collapse + ranking: the single writer of covered_by and order_ts ──────

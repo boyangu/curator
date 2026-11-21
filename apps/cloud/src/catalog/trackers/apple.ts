@@ -77,6 +77,17 @@ export class AppleLookup {
 		return { claim: null, calls };
 	}
 
+	// Apple's own name for each artist id, in one call (the lookup takes a
+	// list). A song's `artistName` is its whole credit line beside the id of
+	// one of its artists, so this is the only read that names an id.
+	async artistNames(ids: string[], signal?: AbortSignal): Promise<Map<string, string>> {
+		const out = new Map<string, string>();
+		if (!ids.length) return out;
+		const results = await this.lookup({ id: ids.join(',') }, this.countries[0] ?? 'us', signal);
+		for (const r of results) if (r.wrapperType === 'artist' && r.artistId && r.artistName) out.set(String(r.artistId), r.artistName);
+		return out;
+	}
+
 	async trackByIsrc(isrc: string, signal?: AbortSignal): Promise<{ claim: CatalogClaim | null; calls: number }> {
 		let calls = 0;
 		for (const country of this.countries) {

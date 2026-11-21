@@ -77,7 +77,7 @@ export function createArtistPages(deps: ArtistPagesDeps): ArtistPagesReader {
 
 		const spotifyId = pages.get('spotify')?.sourceId ?? null;
 		const lookup = t.catalogId
-			? fetchKnown(`id:${t.catalogId}`, async (c) => (await c.browse(t.catalogId!)).object)
+			? fetchKnown(`id:${t.catalogId}`, async (c) => (await c.browse(t.catalogId!, { brief: true })).object)
 			: spotifyId
 				? fetchKnown(`spotify:${spotifyId}`, async (c) => (await c.resolve([{ provider: 'spotify', kind: 'artist', providerId: spotifyId }]))[0] ?? null)
 				: null;

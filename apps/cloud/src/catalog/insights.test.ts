@@ -113,4 +113,39 @@ describe('twins approved in part', () => {
 		const [x, y] = [k1, f1].sort();
 		expect(await app.db.query(`select reason from curator.catalog_not_same where object_a = $1 and object_b = $2`, [x!, y!])).toEqual([{ reason: 'Say Hello: two releases' }]);
 	});
+
+	it('leaves the pairs it is told to open on the item, and splits the decided ones off as a resolved item', async () => {
+		const app = await createTestApp();
+		const { label, ids } = await labelWith(app, [
+			release('spotify', 's1', 'Glass Rivers', '2026-03-01', 2),
+			release('bandcamp', 'b1', 'Glass Rivers', '2026-03-08'),
+			release('spotify', 's2', 'Say Hello', '2026-03-01', 1),
+			release('deezer', 'd2', 'Say Hello', '2026-03-15', 1),
+			release('spotify', 's3', 'Drift', '2026-03-01', 1),
+			release('bandcamp', 'b3', 'Drift', '2026-03-10'),
+		]);
+		const [k0, f0, k1, f1, k2, f2] = ids as [string, string, string, string, string, string];
+		const pairs = [{ keep: k0, fold: f0 }, { keep: k1, fold: f1 }, { keep: k2, fold: f2 }];
+		const id = await withSystemTx(app.db, (tx) =>
+			raise(tx, { kind: 'release.twins', severity: 'approval', title: '3 twin release(s) on «Northfold»', subjects: [label], evidence: { pairs: pairs.map((p) => ({ keep: { id: p.keep }, fold: { id: p.fold } })), verdicts: ['same', 'same', 'unsure'] }, apply: { op: 'mergeReleases', args: { pairs } }, actor: 'worker' }),
+		);
+		const ops = adminOps(app.db, {});
+		await expect(ops.inboxDecide({ id: id!, action: 'approve', leave: [0, 1, 2], by: 'guy' })).rejects.toThrow(/every pair is left/);
+		await expect(ops.inboxDecide({ id: id!, action: 'approve', except: [1], leave: [1], by: 'guy' })).rejects.toThrow(/both excepted and left/);
+		await expect(ops.inboxDecide({ id: id!, action: 'reject', leave: [2], by: 'guy' })).rejects.toThrow(/--leave/);
+		const r = await ops.inboxDecide({ id: id!, action: 'approve', except: [1], leave: [2], note: 'Beatport side unread', by: 'guy' });
+		// Still open, holding only the pair left, renumbered.
+		expect(r).toMatchObject({ status: 'open', title: '1 twin release(s) on «Northfold»', apply: { args: { pairs: [{ keep: k2, fold: f2 }] } }, evidence: { pairs: [{ keep: { id: k2 } }], verdicts: ['unsure'] } });
+		expect(await mergedInto(app, f0)).toBe(k0);
+		expect(await mergedInto(app, f1)).toBeNull();
+		expect(await mergedInto(app, f2)).toBeNull();
+		const [x, y] = [k2, f2].sort();
+		expect(await app.db.query(`select 1 from curator.catalog_not_same where object_a = $1 and object_b = $2`, [x!, y!])).toEqual([]);
+		// The decided part: a resolved item of its own, its except renumbered.
+		const done = (await ops.inboxList({ status: 'all', kind: 'release.twins' })).rows.find((i) => i.evidence.of === id);
+		expect(done).toMatchObject({ status: 'approved', resolution: 'applied except pair 1 (not twins)', resolvedBy: 'guy', note: 'Beatport side unread', title: '2 twin release(s) on «Northfold»', evidence: { verdicts: ['same', 'same'] } });
+		// The left pair is decided later like any item.
+		expect(await ops.inboxDecide({ id: id!, action: 'approve', by: 'guy' })).toMatchObject({ status: 'approved', resolution: 'applied' });
+		expect(await mergedInto(app, f2)).toBe(k2);
+	});
 });

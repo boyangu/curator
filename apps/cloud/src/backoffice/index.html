@@ -528,11 +528,11 @@ function evidenceHtml(it) {
 	}
 	if (Array.isArray(e.pairs)) {
 		const side = (r) => `${objLink({ id: r.id, name: r.title })}${r.artists?.length ? ` — ${esc(r.artists.join(', '))}` : ''}<span class="l"> ${esc(r.date ?? '')} [${esc((r.providers ?? []).join(','))}] ${fmtN(r.tracks)} tr</span>`;
-		// Open: a box per pair, ticked = merge; an unticked pair is ruled not twins (`except`).
+		// Open: a choice per pair — merge, rule not twins (`except`), or leave it open on the item (`leave`).
 		const pick = it.status === 'open' && mergesPairs(it);
-		// The model's per-pair answer beside the pair (unsure proposals: tick the twins, untick the rest).
+		// The model's per-pair answer beside the pair; a pair it was unsure of starts as left open.
 		const said = Array.isArray(e.verdicts) ? e.verdicts : null;
-		parts.push(`<table><thead><tr>${pick ? '<th title="Merge this pair">Merge</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th>${said ? '<th>Agent</th>' : ''}</tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><input type="checkbox" data-pair="${i}" ${said?.[i] === 'unsure' ? '' : 'checked'} aria-label="Merge pair ${i}"></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td>${said ? `<td class="l">${esc(said[i] ?? '')}</td>` : ''}</tr>`).join('')}</tbody></table>`);
+		parts.push(`<table><thead><tr>${pick ? '<th>Decide</th>' : ''}<th>#</th><th>Keep</th><th>Fold in</th>${said ? '<th>Agent</th>' : ''}</tr></thead><tbody>${e.pairs.map((p, i) => `<tr>${pick ? `<td><select data-pair="${i}" aria-label="Pair ${i}"><option value="merge">Merge</option><option value="except">Not twins</option><option value="leave" ${said?.[i] === 'unsure' ? 'selected' : ''}>Leave open</option></select></td>` : ''}<td class="dim">${i}</td><td>${side(p.keep)}</td><td>${side(p.fold)}${p.on?.length ? `<div class="l">both on: ${esc(p.on.join(' | '))}</div>` : ''}</td>${said ? `<td class="l">${esc(said[i] ?? '')}</td>` : ''}</tr>`).join('')}</tbody></table>`);
 	}
 	// A user's "connect the dots" answer (catalog/connect.ts): what the cloud read on the page, and what the device said it read.
 	if (it.kind.startsWith('connect.')) {
@@ -551,14 +551,14 @@ function evidenceHtml(it) {
 	return parts.length ? `<div class="ev">${parts.join('')}</div>` : '';
 }
 
-// Items whose approve merges pairs: a box per pair, an unticked one is `except`.
+// Items whose approve merges pairs: a choice per pair (merge / not twins / leave open).
 const mergesPairs = (it) => it.apply?.op === 'mergeReleases' || it.apply?.op === 'mergeArtists';
 
 // The buttons word what approve / reject do for this item.
 function actionWords(it) {
 	if (it.apply) {
 		if (it.kind === 'review.escalated') return ['Decide', 'Leave it'];
-		if (mergesPairs(it)) return ['Merge ticked', 'None are twins'];
+		if (mergesPairs(it)) return ['Apply choices', 'None are twins'];
 		if (it.kind.startsWith('page.')) return ['Unlink', 'Keep the page'];
 		if (it.apply.op === 'blockSource') return ['Block the id', 'Keep the id'];
 		if (it.apply.op === 'connectAttach') return ['Connect the page', 'Not their page'];
@@ -619,10 +619,11 @@ function wireItem(card) {
 			const chosen = card.querySelector(`input[name="cand-${id}"]:checked`);
 			let choice;
 			if (b.dataset.do === 'approve' && chosen) choice = { action: card.querySelector('[data-choice]')?.value ?? 'merge', candidate: Number(chosen.value) };
-			const unticked = [...card.querySelectorAll('input[data-pair]')].filter((x) => !x.checked).map((x) => Number(x.dataset.pair));
-			const except = b.dataset.do === 'approve' && unticked.length ? unticked : undefined;
+			const picked = (v) => (b.dataset.do === 'approve' ? [...card.querySelectorAll('select[data-pair]')].filter((x) => x.value === v).map((x) => Number(x.dataset.pair)) : []);
+			const except = picked('except').length ? picked('except') : undefined;
+			const leave = picked('leave').length ? picked('leave') : undefined;
 			try {
-				await admin('inboxDecide', { id, action: b.dataset.do, choice, except, note, by: 'guy' });
+				await admin('inboxDecide', { id, action: b.dataset.do, choice, except, leave, note, by: 'guy' });
 				await refresh();
 			} catch (e) {
 				fail(e);
@@ -791,7 +792,8 @@ function workerLine(w) {
 // The desktops reading for their users this week (catalog_worker): the live
 // ones take the cursors of their users' follows on the providers they offer,
 // for the trackers their users checked in the Refresh menu (null: never
-// said, everything); a silent one is read around by the cloud after six hours.
+// said, everything), as often as their users chose; a silent one is read
+// around by the cloud after six hours.
 function workersLine(workers) {
 	if (!workers?.length) return '<div class="tr-sub">No desktop is reading for the catalogue: the cloud reads everything it has a key for.</div>';
 	const chosen = (w) => {
@@ -803,7 +805,10 @@ function workersLine(workers) {
 		}
 		return [...byKind].map(([kind, providers]) => `${esc(kindTitle(kind).toLowerCase())} on ${providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')}`).join(', ') || '<span class="warn">nothing (every source unchecked)</span>';
 	};
-	return workers.map((w) => `<div class="tr-sub">${w.live ? '<span class="chip now">reading</span>' : '<span class="chip">silent</span>'} <b>${esc(w.name)}</b> can read ${w.providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')} · its user checked ${chosen(w)} · checked in ${ago(w.checkedInAt)} · week of ${esc(w.weekOf)}</div>`).join('');
+	// How often its user wants each kind read (Settings → Discover): 'source'
+	// is the tracker's own cadence; null, a desktop from before the choice.
+	const often = (w) => (w.cadence ? Object.entries(w.cadence).map(([kind, c]) => `${esc(kindTitle(kind).toLowerCase())} ${esc(c === 'source' ? 'as often as the source allows' : c)}`).join(', ') : 'weekly (never said)');
+	return workers.map((w) => `<div class="tr-sub">${w.live ? '<span class="chip now">reading</span>' : '<span class="chip">silent</span>'} <b>${esc(w.name)}</b> can read ${w.providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')} · its user checked ${chosen(w)} · read ${often(w)} · checked in ${ago(w.checkedInAt)} · week of ${esc(w.weekOf)}</div>`).join('');
 }
 const workerReads = (w, kind, provider) => w.live && w.providers.includes(provider) && (w.trackers === null || w.trackers.includes(`${kind}/${provider}`));
 const readBy = (workers, kind, provider) => (workers ?? []).filter((w) => workerReads(w, kind, provider)).map((w) => w.name);

@@ -5,7 +5,7 @@ import { withSystemTx } from '../db/system-tx.js';
 import { asUser, createTestApp, createTestDb, errorReason, ROLES_SQL } from '../test/harness.js';
 import { createLogger } from '../log.js';
 import { ingestClaims } from './ingest.js';
-import { nextDueAt, spreadOf } from './trackers/cadence.js';
+import { nextDueAt, nextDueFor, spreadOf } from './trackers/cadence.js';
 import { runTrackers } from './trackers/sweep.js';
 import type { TrackerAdapter, TrackerPoll, TrackerTarget } from '@curator/catalog-readers';
 const DAY = 86400_000;
@@ -517,6 +517,28 @@ describe('quota and cadence', () => {
 		expect(spreadOf('a')).not.toBe(spreadOf('b'));
 		for (const id of ['a', 'b', '2f0c']) expect(spreadOf(id)).toBeGreaterThanOrEqual(0);
 		for (const id of ['a', 'b', '2f0c']) expect(spreadOf(id)).toBeLessThan(1);
+	});
+
+	// The followers' choice (Settings → Discover): it only ever slows a tracker.
+	it('slows a tracker to a day, or to one read in the Friday window', () => {
+		const hourly = { everyMin: 60, friday: { fromUtc: '00:00', toUtc: '12:00', everyMin: 30 } };
+		const at = (t: number, choice: 'source' | 'daily' | 'weekly', spread = 0) => new Date(nextDueFor(t, hourly, choice, spread)).toISOString();
+		const thursdayNoon = Date.UTC(2026, 9, 22, 12);
+		expect(at(thursdayNoon, 'source')).toBe('2026-10-22T13:00:00.000Z');
+		expect(at(thursdayNoon, 'daily')).toBe('2026-10-23T12:00:00.000Z');
+		// Weekly: the window that opens next, each cursor at its own place in
+		// its first interval.
+		expect(at(thursdayNoon, 'weekly')).toBe('2026-10-23T00:00:00.000Z');
+		expect(at(thursdayNoon, 'weekly', 0.5)).toBe('2026-10-23T00:15:00.000Z');
+		// A read inside the window is this week's read; so is one after it.
+		expect(at(Date.UTC(2026, 9, 23, 2), 'weekly')).toBe('2026-10-30T00:00:00.000Z');
+		expect(at(Date.UTC(2026, 9, 23, 13), 'weekly')).toBe('2026-10-30T00:00:00.000Z');
+		expect(at(Date.UTC(2026, 9, 24, 9), 'weekly')).toBe('2026-10-30T00:00:00.000Z');
+		// A tracker that is weekly itself stays weekly under 'daily', and its
+		// weekly read lands inside its window however long its Friday interval.
+		const weekly = { everyMin: 10080, friday: { fromUtc: '02:00', toUtc: '12:00', everyMin: 10080 } };
+		expect(new Date(nextDueFor(thursdayNoon, weekly, 'daily')).toISOString()).toBe('2026-10-29T12:00:00.000Z');
+		expect(new Date(nextDueFor(thursdayNoon, weekly, 'weekly', 0.5)).toISOString()).toBe('2026-10-23T07:00:00.000Z');
 	});
 });
 

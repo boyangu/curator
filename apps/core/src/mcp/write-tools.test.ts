@@ -21,8 +21,12 @@ const PLAYLISTS = [
 
 function makeFakeSvc() {
 	return {
-		getTracks: vi.fn(async (filter?: { ids?: string[] }) =>
-			TRACKS.filter((t) => !filter?.ids || filter.ids.includes(t.id))),
+		// A playlist's rows: t1 is in twice, and the positions have gaps.
+		getTracks: vi.fn(async (filter?: { ids?: string[]; playlistId?: string }) =>
+			filter?.playlistId
+				? [{ ...TRACKS[0]!, playlistPosition: 0 }, { ...TRACKS[1]!, playlistPosition: 5 }, { ...TRACKS[0]!, playlistPosition: 7 }]
+				: TRACKS.filter((t) => !filter?.ids || filter.ids.includes(t.id))),
+		reorderPlaylistTracks: vi.fn(async () => ({ upstream: 'pushed' as const })),
 		getPlaylists: vi.fn(async () => PLAYLISTS),
 		createLocalPlaylistFromTracks: vi.fn(async (name: string) => ({ id: 'new-local', name, source: 'local' })),
 		createStreamingPlaylist: vi.fn(async (_src: string, name: string, trackIds: string[]) =>
@@ -64,7 +68,7 @@ describe('MCP write tools', () => {
 	it('exposes specs for every tool', () => {
 		expect(tools.specs().map((s) => s.name)).toEqual([
 			'list_playlists', 'get_playlist_tracks', 'create_playlist', 'add_tracks_to_playlist',
-			'remove_tracks_from_playlist', 'rename_playlist', 'tag_tracks', 'set_rating',
+			'remove_tracks_from_playlist', 'rename_playlist', 'reorder_playlist_tracks', 'tag_tracks', 'set_rating',
 			'set_track_source_links', 'update_track_fields', 'set_play_session_kind',
 		]);
 	});
@@ -138,6 +142,28 @@ describe('MCP write tools', () => {
 		expect(confirms).toHaveLength(0);
 		await tools.execute('rename_playlist', { playlistId: 'pl-sp', newName: 'Y' });
 		expect(confirms).toHaveLength(1);
+	});
+
+	it('reorder names rows by position (a track in twice is two rows), gates streaming, toasts local', async () => {
+		const res = await tools.execute('reorder_playlist_tracks', { playlistId: 'pl-local', trackIds: ['t2', 't1', 't1'] });
+		expect(svc.reorderPlaylistTracks).toHaveBeenCalledWith('pl-local', [5, 0, 7]);
+		expect(res).toMatchObject({ ok: true, moved: 2, upstream: 'pushed' });
+		expect(confirms).toHaveLength(0);
+		expect(toasts.some((t) => t.includes('Crate'))).toBe(true);
+		await tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t1', 't1', 't2'] });
+		expect(confirms).toHaveLength(1);
+		expect(confirms[0]).toMatchObject({ kind: 'streaming-playlist-write', title: 'Reorder spotify playlist "Melodic" (2 of 3 tracks move)' });
+		expect(svc.reorderPlaylistTracks).toHaveBeenLastCalledWith('pl-sp', [0, 7, 5]);
+	});
+
+	it('reorder refuses a list that is not the playlist, does nothing for the order it has, and a deny writes nothing', async () => {
+		await expect(tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t1', 't2'] })).rejects.toThrow('must list all 3 tracks');
+		await expect(tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t2', 't2', 't1'] })).rejects.toThrow('not in the playlist that many times');
+		await expect(tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t1', 't2', 'ghost'] })).rejects.toThrow('track ghost is not in the playlist');
+		expect(await tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t1', 't2', 't1'] })).toEqual({ ok: true, moved: 0, upstream: 'none' });
+		confirmAnswer = false;
+		await expect(tools.execute('reorder_playlist_tracks', { playlistId: 'pl-sp', trackIds: ['t2', 't1', 't1'] })).rejects.toThrow('declined');
+		expect(svc.reorderPlaylistTracks).not.toHaveBeenCalled();
 	});
 
 	it('rejects unknown track and playlist ids before any write', async () => {

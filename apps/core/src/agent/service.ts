@@ -124,11 +124,18 @@ export interface AgentViewContext {
 	// The feed's standing lenses (id + chip label), so "drop that filter" can
 	// name one.
 	discover?: { mode: string; lenses?: { id: string; label: string }[] };
+	// An artist's / a label's / an album's page (whichever tab hosts it),
+	// showing the library's local files ('owned') or the catalogue ('world').
+	page?: { kind: string; name: string; scope: string };
 }
 
 // One readable line, appended to the wire user message (and stripped for
 // display by the store). Readable beats JSON here — it's model-facing prose.
 export function describeViewContext(ctx: AgentViewContext): string {
+	if (ctx.page) {
+		const side = ctx.page.scope === 'world' ? 'the whole catalogue' : 'the local files in the library';
+		return `the ${ctx.page.kind} page of "${ctx.page.name}", listing ${side}`;
+	}
 	if (ctx.view === 'discover') {
 		const d = ctx.discover;
 		if (d?.mode === 'journeys') return 'Discover tab, Journeys view';

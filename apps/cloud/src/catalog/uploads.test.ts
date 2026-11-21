@@ -125,6 +125,12 @@ describe('YouTubeTracker', () => {
 });
 
 describe('SoundCloudTracker', () => {
+	// The release day the uploads carry: a couple of days back, so it stays
+	// inside the tracker's announcement window whenever the test runs (a fixed
+	// date aged out of it).
+	const released = new Date(Date.now() - 2 * DAY);
+	const releasedOn = { release_year: released.getUTCFullYear(), release_month: released.getUTCMonth() + 1, release_day: released.getUTCDate() };
+
 	function api(calls: string[]): FetchLike {
 		return async (input, init) => {
 			const u = new URL(input);
@@ -142,9 +148,7 @@ describe('SoundCloudTracker', () => {
 							title: 'Northfold 034 - Kaske - Drift EP',
 							playlist_type: 'ep',
 							created_at: at(1),
-							release_year: 2026,
-							release_month: 11,
-							release_day: 6,
+							...releasedOn,
 							label_name: 'Northfold Records',
 							genre: 'Melodic House & Techno',
 							permalink_url: 'https://soundcloud.com/northfold/sets/drift-ep',
@@ -158,6 +162,8 @@ describe('SoundCloudTracker', () => {
 						// Teasers, and a loose playlist: not releases.
 						{ id: 5002, title: 'Northfold 034 - Kaske - Drift EP - Snippets', playlist_type: 'ep', created_at: at(3), tracks: [] },
 						{ id: 5003, title: 'Northfold Records Radio', playlist_type: 'PLAYLIST', created_at: at(3), tracks: [] },
+						// A mix series filed as an album: DJ sets, not a release.
+						{ id: 5004, title: 'Northfold Sessions', playlist_type: 'album', created_at: at(3), tracks: [{ id: 990, title: 'Northfold Sessions 012 - Kaske', duration: 3_720_000 }] },
 					],
 				});
 			}
@@ -165,9 +171,10 @@ describe('SoundCloudTracker', () => {
 				expect(init?.headers).toMatchObject({ authorization: 'OAuth tok' });
 				return json({
 					collection: [
-						{ id: 901, title: 'Northfold - Drift (Extended Mix)', created_at: at(1), duration: 402_000, isrc: 'GBAAA2600009', label_name: 'Northfold Records', genre: 'Melodic House & Techno', release_year: 2026, release_month: 11, release_day: 6, permalink_url: 'https://soundcloud.com/northfold/drift', artwork_url: 'https://i1.sndcdn.com/artworks-x-large.jpg' },
+						{ id: 901, title: 'Northfold - Drift (Extended Mix)', created_at: at(1), duration: 402_000, isrc: 'GBAAA2600009', label_name: 'Northfold Records', genre: 'Melodic House & Techno', ...releasedOn, permalink_url: 'https://soundcloud.com/northfold/drift', artwork_url: 'https://i1.sndcdn.com/artworks-x-large.jpg' },
 						{ id: 902, title: 'Northfold - Glass Rivers', created_at: at(3), duration: 401_000, permalink_url: 'https://soundcloud.com/northfold/glass-rivers' },
-						{ id: 903, title: 'Northfold Records Radio 012', created_at: at(4), duration: 3_600_000 },
+						// An hour's mix, coded and credited like a release: a DJ set all the same.
+						{ id: 903, title: 'Northfold Records Radio 012', created_at: at(4), duration: 3_600_000, isrc: 'GBAAA2600099', metadata_artist: 'Kaske' },
 					],
 				});
 			}
@@ -192,7 +199,7 @@ describe('SoundCloudTracker', () => {
 		// SoundCloud's genre is free text: kept as the source's fact, not forced onto the taxonomy.
 		const single = events.find((e) => (e.card as { title: string }).title === 'Drift (Extended Mix)')!;
 		const card = single.card as { label: { name: string }; releaseDate: string; tracks: { isrc: string | null; handles: { provider: string }[] }[] };
-		expect(card).toMatchObject({ label: { name: 'Northfold Records' }, releaseDate: '2026-11-06' });
+		expect(card).toMatchObject({ label: { name: 'Northfold Records' }, releaseDate: released.toISOString().slice(0, 10) });
 		expect(card.tracks[0]).toMatchObject({ isrc: 'GBAAA2600009', handles: [{ provider: 'soundcloud' }] });
 		// The EP: numbered, credited off its title, two tracks (one the upload above), the teasers and the radio playlist left alone.
 		// Named without the "EP" its type already says, so the stores' "Drift" joins it.
