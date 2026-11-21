@@ -13,10 +13,8 @@
 // bucket's insert policy), so the server sees exactly what a real upload
 // leaves behind.
 
-import { promisify } from 'node:util';
-import { gunzip } from 'node:zlib';
 import { createTestApp, uploadBlob, type TestApp } from '@curator/cloud/testing';
-import { CloudTransportError, decodeLibraryStateSnapshot, readStorageSnapshotBody, type CloudTransport, type SnapshotBlobStore } from '@curator/core';
+import { CloudTransportError, createFetchCloudTransport, inflateSnapshotText, readStorageSnapshotBody, type CloudTransport, type SnapshotBlobStore } from '@curator/core';
 import {
 	CALL_ERROR_REASONS,
 	type BatchAbortInput,
@@ -31,7 +29,6 @@ import {
 	type RegisterDeviceInput,
 } from '@curator/protocol';
 
-const gunzipAsync = promisify(gunzip);
 const MAX_INFLATED_BYTES = 1024 * 1024 * 1024;
 
 type ErrorData = { httpStatus?: number; reason?: string | null; retryAfterSec?: number | null };
@@ -128,13 +125,12 @@ export function harnessTransport(app: TestApp, userId: string, token: string, sn
 		},
 		// As the desktop's: always `storage: true`; the manifest's parts are
 		// read from the bucket and checked (core snapshot-storage.ts) before
-		// anything is inflated.
+		// anything is inflated, and the text is handed over in pieces.
 		async bootstrap(input?: BootstrapInput) {
 			const res = await call<{ snapshotSeq: number; baseSeq: number; storage?: Parameters<typeof readStorageSnapshotBody>[0] | null }>('bootstrap', () => api.sync.bootstrap.query({ ...(input ?? {}), storage: true }));
-			if (!res.storage) return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: null };
+			if (!res.storage) return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, snapshot: null };
 			const body = await readStorageSnapshotBody(res.storage, (p) => snapshots.download(p), { maxBytes: MAX_INFLATED_BYTES });
-			const json = await gunzipAsync(body, { maxOutputLength: MAX_INFLATED_BYTES });
-			return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
+			return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, snapshot: inflateSnapshotText(body, { maxBytes: MAX_INFLATED_BYTES }) };
 		},
 		account: {
 			registerDevice: (input: RegisterDeviceInput) => call('registerDevice', () => api.account.registerDevice.mutate(input)),
@@ -145,11 +141,32 @@ export function harnessTransport(app: TestApp, userId: string, token: string, sn
 	return t;
 }
 
+// The same session through core's plain-HTTP transport (sync-log/
+// fetch-transport.ts) — what a phone syncs through: its requests, as it
+// writes them, go to the server's handler.
+export function plainHttpTransport(app: TestApp, userId: string, token: string, snapshots: SnapshotBlobStore): CloudTransport {
+	let signedIn = true;
+	return createFetchCloudTransport({
+		apiUrl: 'http://local.test',
+		request: async (req) => {
+			const res = await app.handler(new Request(req.url, { method: req.method, headers: req.headers, ...(req.body === undefined ? {} : { body: req.body }) }));
+			return { status: res.status, body: await res.text() };
+		},
+		session: () => (signedIn ? { userId, email: null } : null),
+		accessToken: async () => token,
+		signOut: async () => { signedIn = false; },
+		snapshots,
+		inflate: (body, opts) => inflateSnapshotText(body, opts),
+		client: 'e2e/0',
+	});
+}
+
 export type LocalCloud = {
 	app: TestApp;
 	// A session for `userId` (created in auth.users if new): its transport
-	// and its bucket. Tokens live long enough for a run on the real library.
-	session(userId: string): Promise<{ transport: HarnessTransport; snapshots: HarnessSnapshotStore }>;
+	// and its bucket, and the same session over the plain-HTTP transport.
+	// Tokens live long enough for a run on the real library.
+	session(userId: string): Promise<{ transport: HarnessTransport; plain: CloudTransport; snapshots: HarnessSnapshotStore }>;
 	// The account's head seq and newest published snapshot, read as the
 	// owner (no RLS), for the run's wait loops and the report.
 	head(userId: string): Promise<number>;
@@ -170,7 +187,7 @@ export async function startLocalCloud(): Promise<LocalCloud> {
 			const token = await app.sign(userId, { exp: '24h' });
 			let snapshots = buckets.get(userId);
 			if (!snapshots) buckets.set(userId, (snapshots = harnessSnapshotStore(app, userId)));
-			return { transport: harnessTransport(app, userId, token, snapshots), snapshots };
+			return { transport: harnessTransport(app, userId, token, snapshots), plain: plainHttpTransport(app, userId, token, snapshots), snapshots };
 		},
 		async head(userId) {
 			const r = await app.pg.query<{ n: number | null }>(`select max(seq)::float8 as n from curator.library_op where user_id = $1`, [userId]);

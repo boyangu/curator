@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseOp, SCHEMA_VERSION, type Op } from './ops.js';
 import { applyOp } from './reduce.js';
-import { compareSnapshotKeys, deserializeLibraryState, LIBRARY_STATE_MAPS, serializeLibraryState, serializeLibraryStateChunks, type LibraryStateMapName } from './snapshot.js';
+import { compareSnapshotKeys, deserializeLibraryState, LIBRARY_STATE_MAPS, serializeLibraryState, serializeLibraryStateChunks, SnapshotEntryScanner, type LibraryStateMapName } from './snapshot.js';
 import { createLibraryState, materialize, type LibraryState } from './state.js';
 
 let n = 0;
@@ -161,5 +161,60 @@ describe('streaming snapshot writer', () => {
 		[...serializeLibraryStateChunks((m) => { asked.push(m); return []; })];
 		expect(asked).toEqual([...LIBRARY_STATE_MAPS]);
 		expect(asked).toEqual(Object.keys((JSON.parse(serializeLibraryState(createLibraryState())) as { maps: object }).maps));
+	});
+});
+
+describe('reading a snapshot as it arrives', () => {
+	// The document cut into pieces of every size, entries put back together.
+	const scan = (json: string, piece: (i: number) => number): Map<string, Array<[string, unknown]>> => {
+		const scanner = new SnapshotEntryScanner();
+		const maps = new Map<string, Array<[string, unknown]>>();
+		for (let at = 0, i = 0; at < json.length; i++) {
+			const n = Math.max(1, piece(i));
+			for (const e of scanner.push(json.slice(at, at + n))) {
+				let list = maps.get(e.map);
+				if (!list) maps.set(e.map, (list = []));
+				list.push(JSON.parse(e.json) as [string, unknown]);
+			}
+			at += n;
+		}
+		scanner.end();
+		return maps;
+	};
+	const expected = (json: string): Map<string, Array<[string, unknown]>> =>
+		new Map(Object.entries((JSON.parse(json) as { maps: Record<string, Array<[string, unknown]>> }).maps).filter(([, v]) => v.length > 0));
+
+	it('gives back every entry of random states, whatever the pieces', () => {
+		for (let seed = 1; seed <= 120; seed++) {
+			const json = serializeLibraryState(randomState(seed));
+			const r = rng(seed * 7);
+			for (const piece of [() => 1, () => 7, () => 1 + Math.floor(r() * 400), () => json.length]) {
+				expect(scan(json, piece), `seed ${seed}`).toEqual(expected(json));
+			}
+		}
+	});
+
+	it('is not fooled by values that look like the end of an entry, a map or the document', () => {
+		const clock = { ts: 1, device: 'd', op: 'o' };
+		const state = createLibraryState();
+		// Text of the three tails, and nested arrays that really produce them.
+		state.settings.set('a', { value: '],["x",1]],"maps":{}}]]}}', clock });
+		state.settings.set('b', { value: [[1, 2]], clock });
+		state.settings.set('c', { value: { rows: [['k', [1]], ['m', [[2]]]], last: [[3]] }, clock });
+		state.settings.set('d', { value: [[{ x: [[1]] }]], clock });
+		state.pinnedSearches.set('p', { id: 'p', created: clock, fields: { name: { value: [['"]],"', ']]}}']], clock } } });
+		const json = serializeLibraryState(state);
+		for (const piece of [() => 1, () => 3, () => 16, () => json.length]) expect(scan(json, piece)).toEqual(expected(json));
+	});
+
+	it('refuses text that is not a snapshot, or one cut short', () => {
+		const json = serializeLibraryState(randomState(5));
+		expect(() => new SnapshotEntryScanner().push('{"format":"other"')).toThrow(/not a curator.library-state/);
+		expect(() => new SnapshotEntryScanner().push('[1,2,3]'.padEnd(80, ' '))).toThrow(/not a curator.library-state/);
+		const cut = new SnapshotEntryScanner();
+		cut.push(json.slice(0, json.length - 3));
+		expect(() => cut.end()).toThrow(/ends before/);
+		const more = new SnapshotEntryScanner();
+		expect(() => more.push(`${json}x`)).toThrow(/after its end/);
 	});
 });

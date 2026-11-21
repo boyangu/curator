@@ -121,10 +121,11 @@ import { BATCH_LABELS, CLOCK_KEY, observeServerTs, onOutboxAppend, OUTBOX_RETENT
 import { healAfterApply, streamingDedupeSwept, type DedupeResult, sweepStreamingDuplicatesAsync } from './playlist-dedupe.js';
 import { normalizePollPolicy, samePollPolicy, type SyncPollPolicy } from './poll-policy.js';
 import { remintDeviceForDetach } from './remint.js';
-import { derivePendingCount, drainTrackDerivationsAsync, materializeSwept, remotePendingCount } from './remote-rows.js';
+import { DERIVE_SLICE_ROWS, derivePendingCount, drainTrackDerivationsAsync, materializeSwept, remotePendingCount } from './remote-rows.js';
 import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
 import { claimLinkPendingCount, claimLinksSwept, drainClaimLinksAsync, sweepClaimLinksAsync } from './claim-links.js';
-import { loadSnapshot, type SnapshotRecord } from './snapshot.js';
+import { setSliceScale, sliceMs, sliceRows } from './slice-budget.js';
+import { loadSnapshotText, type SnapshotText } from './snapshot.js';
 import type { SnapshotBuilder, SnapshotBuildOk } from './snapshot-build.js';
 import type { SnapshotBlobStore } from './snapshot-storage.js';
 import { healPlayHistoryAsync, playHealPending } from './play-heal.js';
@@ -148,17 +149,18 @@ export type CloudSession = { userId: string; email: string | null };
 
 // The protocol's `sync` + `account` procedures and who is signed in (the
 // session lives with the transport, in desktop main). `sync.bootstrap` is
-// lifted out and returned decoded: the transport reads the master-published
-// snapshot out of Storage and inflates it (node:zlib, off the JS thread) —
-// the client only needs the records, their seq and the account's base.
+// lifted out: the transport reads the master-published snapshot out of
+// Storage, checks it, and hands its JSON over as text in pieces, inflated as
+// the client asks for them (snapshot-storage.ts inflateSnapshotText) — never
+// the document or its records whole (snapshot.ts loadSnapshotText).
 export interface CloudTransport {
 	// The batch procedures ('batches') are optional: a transport without them
 	// pushes everything plainly, whatever the server offers. Likewise
 	// publishSnapshot ('snapshot_storage'), which also needs `snapshots`.
 	sync: Pick<CloudService['sync'], 'push' | 'pull'> & Partial<Pick<CloudService['sync'], 'batchBegin' | 'batchPush' | 'batchCommit' | 'batchAbort' | 'publishSnapshot'>>;
 	account: CloudService['account'];
-	// `records` null: the account holds no snapshot yet (`snapshotSeq` 0).
-	bootstrap(input?: BootstrapInput): Promise<{ snapshotSeq: number; baseSeq: number; records: readonly SnapshotRecord[] | null }>;
+	// `snapshot` null: the account holds no snapshot yet (`snapshotSeq` 0).
+	bootstrap(input?: BootstrapInput): Promise<{ snapshotSeq: number; baseSeq: number; snapshot: SnapshotText | null }>;
 	session(): CloudSession | null;
 	// Ends this install's session (Supabase scope 'local'; other devices stay
 	// signed in). `unlink` calls it so the detached library cannot re-bind on
@@ -366,6 +368,12 @@ export type SyncClientOptions = {
 	// The master's snapshot publish ('snapshot_storage'). Without it this
 	// device never publishes.
 	snapshot?: SnapshotPublishOptions;
+	// How much longer than the desktop's a slice of background work may hold
+	// the thread (slice-budget.ts). Leave unset where this client shares the
+	// app's main loop; a host that syncs on a thread of its own sets it. On a
+	// phone joining a 39k-track library (measured 2026-11-20): 251 s at 1,
+	// 234 s at 3, 202 s at 6, 191 s at 12 — most of the gain is in by 6.
+	sliceScale?: number;
 };
 
 export type SnapshotPublishOptions = {
@@ -645,6 +653,7 @@ function writeDigestRecord(raw: Raw, rec: DigestRecord): void {
 // ── client ──────────────────────────────────────────────────────────────────
 
 export function createSyncClient(opts: SyncClientOptions): SyncClient {
+	setSliceScale(opts.sliceScale);
 	const raw = opts.db;
 	const transport = opts.transport;
 	const slog = opts.logger ?? log.for('cloud-sync');
@@ -1176,7 +1185,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// The apply size (PULL_SLICE_MS), carried across pages and pulls: the
 	// cost of the next ops is best guessed from the last ones. A test's
 	// `pullApplyChunk` pins it.
-	const [applyMin, applyMax] = opts.pullApplyChunk ? [Math.max(1, opts.pullApplyChunk), Math.max(1, opts.pullApplyChunk)] : [PULL_APPLY_MIN, PULL_APPLY_MAX];
+	const [applyMin, applyMax] = opts.pullApplyChunk ? [Math.max(1, opts.pullApplyChunk), Math.max(1, opts.pullApplyChunk)] : [PULL_APPLY_MIN, sliceRows(PULL_APPLY_MAX)];
 	let applyStep = opts.pullApplyChunk ? applyMin : PULL_APPLY_START;
 	// Whether the last pull read up to the head (an empty page): the publish
 	// stage runs only after a cycle whose final pull did.
@@ -1308,7 +1317,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 						// Only a full batch says what a batch of this size costs
 						// (a page's short tail is mostly the fixed part).
 						if (batch.length === applyStep) {
-							applyStep = Math.max(applyMin, Math.min(applyMax, applyStep * 2, Math.round(applyStep * PULL_SLICE_MS / Math.max(ms, 1))));
+							applyStep = Math.max(applyMin, Math.min(applyMax, applyStep * 2, Math.round(applyStep * sliceMs(PULL_SLICE_MS) / Math.max(ms, 1))));
 						}
 						const o = outcome as ApplyOutcome | null;
 						if (o && o.restamped > 0) patchClientState({ needsRepair: true });
@@ -1380,24 +1389,27 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		if (baseSeq !== (readClientState(raw).baseSeq ?? 0)) patchClientState({ baseSeq });
 	};
 
-	// Loads `records` (the snapshot at `snapshotSeq`) onto this device.
+	// Loads the snapshot at `snapshotSeq` onto this device from its text.
 	// `resetCursor`: replay from the snapshot's seq even when the cursor is
 	// past it (a repair), instead of keeping the further cursor.
-	const loadRecords = async (records: readonly SnapshotRecord[], snapshotSeq: number, bopts: { resetCursor?: boolean } = {}): Promise<void> => {
-		if (tally) { tally.bootstrapped = true; tally.snapshotRecords += records.length; }
-		slog.info('bootstrap: loading snapshot', { records: records.length, snapshotSeq });
-		bootstrapProgress = { done: 0, total: records.length };
+	const loadBase = async (text: SnapshotText, snapshotSeq: number, bopts: { resetCursor?: boolean } = {}): Promise<void> => {
+		if (tally) tally.bootstrapped = true;
+		slog.info('bootstrap: loading snapshot', { snapshotSeq });
+		// The total is only known once the text is in: until then it is what
+		// has arrived so far.
+		bootstrapProgress = { done: 0, total: 0 };
 		emitStatus();
 		try {
-			const res = await loadSnapshot(raw, records, {
+			const res = await loadSnapshotText(raw, text, {
 				onProgress: (p) => { bootstrapProgress = p; emitStatus({ progress: true }); },
 			});
+			if (tally) tally.snapshotRecords += res.records;
 			const cursor = readCursor(raw);
 			raw.transaction(() => {
 				writeCursor(raw, bopts.resetCursor ? snapshotSeq : Math.max(cursor.lastSeq, snapshotSeq), snapshotSeq);
 				markFirstPull(raw);
 			})();
-			slog.info('bootstrap: done', { changed: res.changed, chunks: res.chunks, maxSliceMs: Math.round(res.maxSliceMs) });
+			slog.info('bootstrap: done', { records: res.records, changed: res.changed, chunks: res.chunks, maxSliceMs: Math.round(res.maxSliceMs) });
 			emitApplied(res.tracksTouched, res.playlistsTouched, res.changedRefs);
 		} finally {
 			bootstrapProgress = null;
@@ -1412,7 +1424,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	const bootstrap = async (bopts: { resetCursor?: boolean } = {}): Promise<boolean> => {
 		const b = await fetchSnapshot();
 		rememberBase(b.baseSeq);
-		if (b.records === null) {
+		if (b.snapshot === null) {
 			if (b.baseSeq > 0) {
 				slog.warn('bootstrap: the account has no published snapshot', { baseSeq: b.baseSeq });
 				return false;
@@ -1420,7 +1432,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			if (bopts.resetCursor) raw.transaction(() => { writeCursor(raw, 0); markFirstPull(raw); })();
 			return true;
 		}
-		await loadRecords(b.records, b.snapshotSeq, bopts);
+		await loadBase(b.snapshot, b.snapshotSeq, bopts);
 		return true;
 	};
 
@@ -1508,8 +1520,8 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 		if (!firstPullDone(raw)) {
 			const b = await fetchSnapshot();
 			rememberBase(b.baseSeq);
-			if (b.records !== null) {
-				await loadRecords(b.records, b.snapshotSeq);
+			if (b.snapshot !== null) {
+				await loadBase(b.snapshot, b.snapshotSeq);
 			} else {
 				const head = b.baseSeq === 0 ? (probed ?? await probeHead()) : null;
 				const devices = await transport.account.devices();
@@ -1695,7 +1707,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 			for (const p of r.playlistsTouched) playlists.add(p);
 		}
 		if (derivePendingCount(raw) > 0) {
-			const d = await drainTrackDerivationsAsync(raw);
+			const d = await drainTrackDerivationsAsync(raw, { chunk: sliceRows(DERIVE_SLICE_ROWS) });
 			for (const t of d.tracks) tracks.add(t);
 			if (d.tracks.length > 0) slog.info('remote rows: artists and albums derived', { rows: d.tracks.length, chunks: d.chunks, maxSliceMs: Math.round(d.maxSliceMs) });
 		}

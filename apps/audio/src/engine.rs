@@ -222,6 +222,20 @@ impl EngineStateHandle {
 /// written by the control thread on transport commands.
 struct TransportState {
     cursor: AtomicU64,
+    /// The part of a frame the output callback was past `cursor` when it
+    /// last stored it (f64 bits), and the cursor value that fraction belongs
+    /// to. The callback steps through the track by `source rate / device
+    /// rate` per output frame, which is rarely a whole number of frames per
+    /// callback: 96 device frames of a 44.1 kHz track on a 48 kHz device are
+    /// 88.2. Storing a whole frame and starting the next callback from it
+    /// dropped that 0.2 every time — the track ran 0.227 % slow on a phone's
+    /// 2 ms callbacks, with a step in the wave at each one (measured
+    /// 2026-11-20; the desktop's 10 ms callbacks happen to land on 441.0).
+    /// Anyone else who moves `cursor` (seek, jump, load) leaves these
+    /// alone: the fraction applies only while the cursor is still the value
+    /// it was stored with.
+    cursor_frac_bits: AtomicU64,
+    cursor_frac_at: AtomicU64,
     volume_bits: AtomicU32,
     /// Source sample rate — the rate the track was decoded at and the rate
     /// `cursor` is measured in. Position reporting, seek, and beat-aligned
@@ -337,6 +351,8 @@ impl Engine {
     pub fn new(event_tx: Sender<Event>) -> Self {
         let state = Arc::new(TransportState {
             cursor: AtomicU64::new(0),
+            cursor_frac_bits: AtomicU64::new(0),
+            cursor_frac_at: AtomicU64::new(u64::MAX),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             sample_rate: AtomicU32::new(0),
             stream_sample_rate: AtomicU32::new(0),
@@ -1212,11 +1228,8 @@ fn build_output_stream(
     } else {
         // Fallback: ask cpal for the device's default config (whatever
         // rate the OS exposes — 48 kHz on most Windows boxes). The
-        // callback will linear-interpolate from source frames to this
-        // rate. Linear interp is the cheapest resampler that doesn't
-        // alias; for DJ-grade quality at rate-mismatch we'll swap it
-        // for a windowed-sinc/rubato implementation later, but that
-        // costs more CPU than is justified before we hear an artefact.
+        // callback converts from source frames to this rate with a
+        // windowed-sinc read of the decoded track (resample.rs).
         let cfg = device
             .default_output_config()
             .context("query default output config")?;
@@ -1257,6 +1270,8 @@ fn build_output_stream(
 
     let channel_count = config.channels as usize;
     let state_clone = state.clone();
+    // Built here, on the control thread, so the callback never is the first to ask.
+    let kernel = crate::resample::kernel();
 
     let stream = device.build_output_stream(
         &config,
@@ -1449,8 +1464,13 @@ fn build_output_stream(
             }
 
             // Fractional source position in source frames. Starts at the
-            // integer cursor; each output frame steps it by `ratio`.
+            // cursor, plus the part of a frame the last callback ended
+            // past it when nobody has moved the cursor since; each output
+            // frame steps it by `ratio`.
             let mut source_pos = cursor_start as f64;
+            if state_clone.cursor_frac_at.load(Ordering::Acquire) == cursor_start {
+                source_pos += f64::from_bits(state_clone.cursor_frac_bits.load(Ordering::Acquire));
+            }
 
             // Snapshot the active loop region once per callback. ArcSwap
             // makes this wait-free; reading `**guard` copies the Option
@@ -1585,31 +1605,22 @@ fn build_output_stream(
                 }
 
                 let src_floor = source_pos.floor() as u64;
-                let frac = (source_pos - src_floor as f64) as f32;
 
-                // We always read floor AND floor+1 for interpolation,
-                // even on the exact-rate path where frac is 0 — the +1
-                // slot exists because ProgressiveBuffer pre-allocates
-                // FRAME_SAFETY_MARGIN extra frames (zero-filled). Gate
-                // on `src_floor + 1 < decoded` to avoid reading a slot
-                // the decoder hasn't reached yet; the tiny extra
-                // latency vs. `src_floor < decoded` (one source-frame ≈
-                // 22 μs at 44.1 kHz) is well below audibility.
+                // Gate on `src_floor + 1 < decoded`: the read needs the
+                // frame after the position too, and must not touch a slot
+                // the decoder hasn't reached yet; the tiny extra latency
+                // vs. `src_floor < decoded` (one source-frame ≈ 22 μs at
+                // 44.1 kHz) is well below audibility.
                 let in_bounds = src_floor < total_frames && src_floor + 1 < decoded;
                 let dst_off = f * channel_count;
                 if in_bounds {
-                    let i0 = (src_floor as usize) * 2;
-                    let i1 = i0 + 2;
-                    // SAFETY: both i0 and i1 are below decoded_frames*2,
-                    // which was Acquire-loaded above. The decoder
-                    // Release-stored decoded_frames after writing both
-                    // slots, so they're fully initialised.
-                    let l0 = unsafe { *samples[i0].get() };
-                    let r0 = unsafe { *samples[i0 + 1].get() };
-                    let l1 = unsafe { *samples[i1].get() };
-                    let r1 = unsafe { *samples[i1 + 1].get() };
-                    let mut l = l0 + (l1 - l0) * frac;
-                    let mut r = r0 + (r1 - r0) * frac;
+                    // The frame at source_pos: the file's own samples on the
+                    // exact-rate path, a band-limited read between frames
+                    // otherwise. It reads only below `decoded`, which was
+                    // Acquire-loaded above; the decoder Release-stored it
+                    // after writing those slots, so they're fully
+                    // initialised (resample.rs holds the bounds).
+                    let (mut l, mut r) = crate::resample::frame(kernel, samples, decoded, source_pos, ratio);
 
                     // Loop-seam crossfade: when source_pos is in
                     // [out_frames − xfade_frames, out_frames), mix the
@@ -1625,7 +1636,6 @@ fn build_output_stream(
                             let ghost_pos =
                                 source_pos - lr.out_frames as f64 + lr.in_frames as f64;
                             let g_floor = ghost_pos.floor() as u64;
-                            let g_frac = (ghost_pos - g_floor as f64) as f32;
                             // Ghost is below in_frames (verified by the
                             // xfade_active gate); decoder has long
                             // since passed it in normal playback. Skip
@@ -1633,14 +1643,7 @@ fn build_output_stream(
                             // forward seek into the crossfade zone) —
                             // one missed crossfade per seek is fine.
                             if g_floor + 1 < decoded {
-                                let gi0 = (g_floor as usize) * 2;
-                                let gi1 = gi0 + 2;
-                                let gl0 = unsafe { *samples[gi0].get() };
-                                let gr0 = unsafe { *samples[gi0 + 1].get() };
-                                let gl1 = unsafe { *samples[gi1].get() };
-                                let gr1 = unsafe { *samples[gi1 + 1].get() };
-                                let gl = gl0 + (gl1 - gl0) * g_frac;
-                                let gr = gr0 + (gr1 - gr0) * g_frac;
+                                let (gl, gr) = crate::resample::frame(kernel, samples, decoded, ghost_pos, ratio);
                                 let alpha = (dist / xfade_frames as f64) as f32;
                                 l = alpha * l + (1.0 - alpha) * gl;
                                 r = alpha * r + (1.0 - alpha) * gr;
@@ -1665,16 +1668,8 @@ fn build_output_stream(
                             let ghost_pos =
                                 source_pos - pt.trigger_at_frames as f64 + pt.seek_to_frames as f64;
                             let g_floor = ghost_pos.floor() as u64;
-                            let g_frac = (ghost_pos - g_floor as f64) as f32;
                             if g_floor + 1 < decoded {
-                                let gi0 = (g_floor as usize) * 2;
-                                let gi1 = gi0 + 2;
-                                let gl0 = unsafe { *samples[gi0].get() };
-                                let gr0 = unsafe { *samples[gi0 + 1].get() };
-                                let gl1 = unsafe { *samples[gi1].get() };
-                                let gr1 = unsafe { *samples[gi1 + 1].get() };
-                                let gl = gl0 + (gl1 - gl0) * g_frac;
-                                let gr = gr0 + (gr1 - gr0) * g_frac;
+                                let (gl, gr) = crate::resample::frame(kernel, samples, decoded, ghost_pos, ratio);
                                 let alpha = (dist / xfade_frames as f64) as f32;
                                 l = alpha * l + (1.0 - alpha) * gl;
                                 r = alpha * r + (1.0 - alpha) * gr;
@@ -1761,12 +1756,15 @@ fn build_output_stream(
                 }
             }
 
-            // Cursor stays in source-frame units (integer rounded).
-            // Sub-frame drift across callbacks is bounded by 1 source
-            // frame, well below audible.
-            state_clone
-                .cursor
-                .store(source_pos.round() as u64, Ordering::Release);
+            // Cursor stays in whole source frames (what seek, the reporter
+            // and the beat math read); the part of a frame past it is kept
+            // beside it for the next callback (see cursor_frac_bits). The
+            // fraction and its owner go first: once the cursor itself is
+            // stored, a control-thread move makes them stale, never wrong.
+            let whole = source_pos.floor();
+            state_clone.cursor_frac_bits.store((source_pos - whole).to_bits(), Ordering::Release);
+            state_clone.cursor_frac_at.store(whole as u64, Ordering::Release);
+            state_clone.cursor.store(whole as u64, Ordering::Release);
             state_clone.envelope_gain_bits.store(envelope_gain.to_bits(), Ordering::Release);
             state_clone.last_output_l_bits.store(last_l.to_bits(), Ordering::Release);
             state_clone.last_output_r_bits.store(last_r.to_bits(), Ordering::Release);

@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto';
 import { applyRemixers, artistKey, normalizeArtistList, searchFold, type ArtistProtect } from '@curator/shared';
 import type { ArtistsBase, TrackArtist, TrackOverrides } from '@curator/shared/schema';
 import type { Db } from '../db/client.js';
+import { mapCredits } from './artist-alias.js';
 
 type Raw = Database.Database;
 
@@ -208,11 +209,21 @@ export function artistsBaseOf(row: { artists: ArtistsJson; artists_base?: Artist
 }
 
 // Write-input normalisation for every path that accepts artists from
-// outside: split packed credits (protected by the artist table), then
-// substitute the curated spelling / merge target for names the user has
-// renamed or merged, then dedupe by fold, then read remixers off the title.
+// outside: split packed credits (protected by the artist table), dedupe by
+// fold, read remixers off the title, and only then substitute the curated
+// spelling / merge target for names the user has renamed or merged.
 // Pure w.r.t. the tables — it never mints artist rows; syncTrackArtists
 // does that after the write.
+//
+// The order is the contract with every other device: a row's credits are
+// mapCredits(source credits, rules) — what a device that only holds the
+// account's records derives (sync-log/remote-rows.ts columnsOf), and what a
+// rule change re-derives here (artist-alias.ts rederiveCredits). The title
+// names its remixers in the source's spelling, so they are read against the
+// source credits. Substituting first left the title's "Maz" unmatched by a
+// credit already renamed "Maz (EG)": the row kept a main "Maz (EG)" beside
+// a remixer "Maz", while every other device showed one remixer "Maz (EG)"
+// (found 2026-11-20 comparing a joined replica with this library).
 //
 // This is also where a rename made on ANOTHER device reaches new credits:
 // a pulled artist_alias rule is projected onto the artist table in the
@@ -235,32 +246,25 @@ export function normalizeIncomingCreditsRaw(raw: Raw, list: readonly TrackArtist
 	const split = opts.split === false
 		? (list ?? []).filter((a) => a && typeof a.name === 'string' && a.name.trim()).map((a) => (a.role ? { name: a.name.trim(), role: a.role } : { name: a.name.trim() }))
 		: normalizeArtistList(list ?? [], { protect: artistProtectRaw(raw) });
-	const out: TrackArtist[] = [];
-	const base: TrackArtist[] = [];
-	const seen = new Set<string>();
+	let base: TrackArtist[] = [];
 	const seenBase = new Set<string>();
 	const s = stmts(raw);
 	for (const a of split) {
 		const baseKey = searchFold(a.name);
-		if (baseKey && !seenBase.has(baseKey)) {
-			seenBase.add(baseKey);
-			base.push(a.role ? { name: a.name, role: a.role } : { name: a.name });
-		}
-		// Direct hit = the row for this exact fold; live = after aliases. Take
-		// the live spelling when the user curated it or when the direct row
-		// is an alias (its target is the name the library shows).
-		const direct = s.byFold.get(artistKey(a.name));
-		const live = direct ? resolveAlias(s, direct) : null;
-		const name = live && (live.name_curated_at != null || live.id !== direct!.id) ? live.name : a.name;
-		const key = searchFold(name);
-		if (!key || seen.has(key)) continue;
-		seen.add(key);
-		out.push(a.role ? { name, role: a.role } : { name });
+		if (!baseKey || seenBase.has(baseKey)) continue;
+		seenBase.add(baseKey);
+		base.push(a.role ? { name: a.name, role: a.role } : { name: a.name });
 	}
-	if (!opts.title) return { artists: out, artistsBase: artistsBaseCell(base, out) };
-	const known = (fold: string): boolean => s.byFold.get(artistKey(fold)) != null;
-	const artists = applyRemixers(out, opts.title, { known });
-	return { artists, artistsBase: artistsBaseCell(applyRemixers(base, opts.title, { known }), artists) };
+	if (opts.title) base = applyRemixers(base, opts.title, { known: (fold) => s.byFold.get(artistKey(fold)) != null });
+	// Direct hit = the row for this exact fold; live = after aliases. Take
+	// the live spelling when the user curated it or when the direct row
+	// is an alias (its target is the name the library shows).
+	const artists = mapCredits(base, (key) => {
+		const direct = s.byFold.get(key);
+		const live = direct ? resolveAlias(s, direct) : null;
+		return live && (live.name_curated_at != null || live.id !== direct!.id) ? live.name : undefined;
+	}).list;
+	return { artists, artistsBase: artistsBaseCell(base, artists) };
 }
 
 export function normalizeIncomingCredits(db: Db, list: readonly TrackArtist[] | null | undefined, opts: NormalizeArtistsOptions = {}): { artists: TrackArtist[]; artistsBase: ArtistsBase | null } {

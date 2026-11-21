@@ -106,12 +106,17 @@ describe('normalizeIncomingArtists', () => {
 		expect(artistProtect(db)(searchFold('Tyler, The Creator'))).toBe(true);
 	});
 
-	it('substitutes the curated spelling and the merge target, then dedupes', () => {
+	// One artist credited twice in different roles keeps both (mapCredits,
+	// decided 2026-10-21): the same list a device deriving the row from the
+	// account's records gets. Same-role duplicates still collapse.
+	it('substitutes the curated spelling and the merge target, then dedupes per role', () => {
 		const keep = upsertArtistRaw(sqlite, 'Ben Böhmer');
 		sqlite.prepare(`UPDATE artist SET name_curated_at = ? WHERE id = ?`).run(Date.now(), keep.id);
 		const drop = upsertArtistRaw(sqlite, 'Ben Boehmer');
 		sqlite.prepare(`UPDATE artist SET merged_into = ? WHERE id = ?`).run(keep.id, drop.id);
 		expect(normalizeIncomingArtists(db, [{ name: 'ben bohmer' }, { name: 'Ben Boehmer', role: 'featured' }, { name: 'X' }]))
+			.toEqual([{ name: 'Ben Böhmer' }, { name: 'Ben Böhmer', role: 'featured' }, { name: 'X' }]);
+		expect(normalizeIncomingArtists(db, [{ name: 'ben bohmer' }, { name: 'Ben Boehmer' }, { name: 'X' }]))
 			.toEqual([{ name: 'Ben Böhmer' }, { name: 'X' }]);
 	});
 

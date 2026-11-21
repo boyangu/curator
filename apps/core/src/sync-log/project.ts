@@ -92,7 +92,15 @@ export function project(
 	// (remote-rows.ts settlePlaylistsAsync): restamping a 700-row playlist in
 	// every slice that adds one of its rows is what made the remote-row drain
 	// hold the loop for 846 ms (2026-10-21 audit).
-	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string>; remoteCreateBudget?: number; deferPositions?: Set<string> } = {},
+	// deferDerivations: remote rows made here get their artists and album
+	// from the client's drain, never inline. A snapshot load sets it: a
+	// track's release is derived from what the account says about that
+	// release too (the `albums` records, library/albums.ts), and those load
+	// last. Derived inline, a row made in an early slice was filed before
+	// its release's record was there — which rows depended on how the load
+	// happened to be sliced, and two loads of one snapshot ended with
+	// different album artists on a few dozen compilations (2026-11-20).
+	hooks: { mergeRows?: MergeRowsHook; containersCreated?: ReadonlySet<string>; remoteCreateBudget?: number; deferPositions?: Set<string>; deferDerivations?: boolean } = {},
 ): ProjectSummary {
 	const state = store.state;
 	const now = Date.now();
@@ -601,7 +609,7 @@ export function project(
 	}
 	// Remote rows made above: their artist junction and album, inline for a
 	// handful, else left to the client's yielding drain (remote-rows.ts).
-	if (derivePendingCount(raw) <= INLINE_DERIVE_ROWS) drainTrackDerivations(raw, { max: INLINE_DERIVE_ROWS });
+	if (!hooks.deferDerivations && derivePendingCount(raw) <= INLINE_DERIVE_ROWS) drainTrackDerivations(raw, { max: INLINE_DERIVE_ROWS });
 	// Mirror the local mutators: a tag or cue edit bumps the track so the
 	// rekordbox exporter's incremental sweep carries it.
 	const bump = raw.prepare(`UPDATE track SET updated_at = ? WHERE id = ?`);

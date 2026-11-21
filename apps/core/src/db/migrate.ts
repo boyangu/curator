@@ -10,7 +10,7 @@ import { normalizeIsrc } from '@curator/library-logic';
 import { upsertArtistLinksRaw } from '../library/artist-links.js';
 import { keyToCamelot } from '../enrich/keys.js';
 import { syncTrackArtistsRaw } from '../library/artists.js';
-import { queueRoleMergeRederive } from '../library/artist-alias.js';
+import { queueCreditOrderRederive, queueRoleMergeRederive } from '../library/artist-alias.js';
 import { albumBackfillOrderRaw, repairAlbumTablesRaw, syncTrackAlbumsRaw } from '../library/albums.js';
 import type { Logger } from '@curator/shared/log';
 import { log, setCoreLogger } from '../log.js';
@@ -2601,6 +2601,8 @@ export function migrate(dbPath: string, opts: { logger?: Logger } = {}): void {
 	// Credits re-derived once under the role-merging alias map (library/
 	// artist-alias.ts mapCredits): queued here, drained by the sync client.
 	queueRoleMergeRederive(sqlite);
+	// And once more for rows ingested since, now that ingest derives them the same way.
+	queueCreditOrderRederive(sqlite);
 	sqlite.close();
 }
 

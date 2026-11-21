@@ -33,7 +33,7 @@ function cloud(userId: string, catServer: FakeCatalogueServer, offered = { catal
 			push: async (input: PushInput) => ({ accepted: input.ops.length, maxSeq: 0, rejected: [], features: feats() }),
 			pull: async (input: PullInput) => ({ ops: [], nextSeq: input.afterSeq, features: feats() }),
 		},
-		bootstrap: async () => ({ snapshotSeq: 0, records: [] }),
+		bootstrap: async () => ({ snapshotSeq: 0, baseSeq: 0, snapshot: null }),
 		account: {
 			registerDevice: async () => ({ ok: true as const }),
 			devices: async () => [],

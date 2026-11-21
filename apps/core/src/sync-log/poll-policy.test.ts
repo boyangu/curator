@@ -48,7 +48,7 @@ function stubTransport(): StubTransport {
 				return { ops: [], nextSeq: input.afterSeq };
 			},
 		},
-		bootstrap: async () => ({ snapshotSeq: 0, baseSeq: 0, records: null }),
+		bootstrap: async () => ({ snapshotSeq: 0, baseSeq: 0, snapshot: null }),
 		account: {
 			registerDevice: async () => ({ ok: true as const }),
 			devices: async () => [],

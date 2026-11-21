@@ -87,8 +87,7 @@ import {
 	SYNC_FEATURES,
 } from '@curator/protocol';
 import { CloudTransportError, type CloudTransport } from '../sync-log/client.js';
-import { decodeLibraryStateSnapshot } from '../sync-log/snapshot.js';
-import { readStorageSnapshotBody, type SnapshotBlobStore } from '../sync-log/snapshot-storage.js';
+import { inflateSnapshotText, readStorageSnapshotBody, type SnapshotBlobStore } from '../sync-log/snapshot-storage.js';
 
 export type FakePublished = { seq: number; deviceId: string; manifest: SnapshotManifest };
 
@@ -649,10 +648,10 @@ export class FakeCloud {
 				const asked: BootstrapInput = { ...(input ?? {}), storage: true };
 				if (!asked.storage) throw new CloudTransportError('update_required', 'update_required');
 				const pub = cloud.published.at(-1);
-				if (!pub) return { snapshotSeq: 0, baseSeq: cloud.baseSeq, records: null };
+				if (!pub) return { snapshotSeq: 0, baseSeq: cloud.baseSeq, snapshot: null };
 				cloud.calls.storageBootstraps++;
 				const body = await readStorageSnapshotBody(pub.manifest, (p) => snapshots.download(p), { maxBytes: 1 << 30 });
-				return { snapshotSeq: pub.seq, baseSeq: cloud.baseSeq, records: decodeLibraryStateSnapshot(gunzipSync(body).toString('utf8')) };
+				return { snapshotSeq: pub.seq, baseSeq: cloud.baseSeq, snapshot: inflateSnapshotText(body, { maxBytes: 1 << 30 }) };
 			},
 			account: {
 				registerDevice: async (input: { deviceId: string; name: string; platform: DeviceInfo['platform'] }) => {

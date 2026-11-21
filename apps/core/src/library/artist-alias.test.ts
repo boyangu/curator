@@ -21,7 +21,7 @@ import { initialPush } from '../sync-log/initial-push.js';
 import { readOutbox } from '../sync-log/outbox.js';
 import { recordingIdForTrack } from '../sync-log/recording-id.js';
 import { artistCreditRewritePending, drainArtistCreditRewrites, drainArtistCreditRewritesAsync, loadArtistAliasMap, mapCredits } from './artist-alias.js';
-import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from './artists.js';
+import { normalizeIncomingArtistsRaw, normalizeIncomingCreditsRaw, syncTrackArtistsByIdRaw } from './artists.js';
 import { budgetMs } from '../test-support/timing.js';
 import { removeDir } from '../test-support/tmp.js';
 
@@ -137,6 +137,22 @@ describe('pulled rules on the artist table', () => {
 		// A stale set (earlier than the remove) changes nothing.
 		applyOps(r, [rule('Old', 'Newer', 1500)]);
 		expect(normalizeIncomingArtistsRaw(r, [{ name: 'Old' }])).toEqual([{ name: 'Old' }]);
+	});
+
+	it('ingest under a standing rule reads the remixers in the title against the source spelling', () => {
+		// The title names its remixers as the source spells them. Substituting
+		// the rule first left "Mazz" unmatched by the renamed credit: a main
+		// "Mazz (EG)" beside a remixer "Mazz" here, one remixer "Mazz (EG)" on
+		// every device that derives the row from the account's records.
+		const r = freshDb('remix-order');
+		seed(r, [['t0', [{ name: 'Mazz' }]]]);
+		applyOps(r, [rule('Mazz', 'Mazz (EG)', 1000)]);
+		const got = normalizeIncomingCreditsRaw(r, [{ name: 'Lena Alto' }, { name: 'Antdott' }, { name: 'Mazz' }], { title: 'Landing Soft - Antdott & Mazz Remix' });
+		expect(got.artists).toEqual([{ name: 'Lena Alto' }, { name: 'Antdott', role: 'remixer' }, { name: 'Mazz (EG)', role: 'remixer' }]);
+		expect(got.artistsBase?.list).toEqual([{ name: 'Lena Alto' }, { name: 'Antdott', role: 'remixer' }, { name: 'Mazz', role: 'remixer' }]);
+		// What a device holding only the records derives from those source credits.
+		const alias = loadArtistAliasMap(r);
+		expect(mapCredits(got.artistsBase!.list, (k) => alias.get(k)?.name).list).toEqual(got.artists);
 	});
 
 	it('a cycle A→B then B→A ends with B renamed back to A, in either arrival order', () => {

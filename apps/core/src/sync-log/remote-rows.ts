@@ -298,8 +298,9 @@ export function derivePendingCount(raw: Raw): number {
 // queued remote row. Returns the rows done.
 // 75 rows per slice: deriving the artist junction and the album is ~1 ms a
 // row on the real library (measured 2026-10-20: 250 rows took up to 312 ms).
+export const DERIVE_SLICE_ROWS = 75;
 export function drainTrackDerivations(raw: Raw, opts: { max?: number } = {}): string[] {
-	const max = Math.max(1, opts.max ?? 75);
+	const max = Math.max(1, opts.max ?? DERIVE_SLICE_ROWS);
 	return raw.transaction((): string[] => {
 		const ids = raw.prepare(`SELECT track_id FROM track_derive_pending LIMIT ?`).pluck().all(max) as string[];
 		if (ids.length === 0) return [];

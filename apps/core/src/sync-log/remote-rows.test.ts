@@ -26,12 +26,13 @@ import { recordingIdForTrack } from './recording-id.js';
 import { FIRST_PULL_KEY } from './role.js';
 import { INLINE_CREATE_ROWS, MATERIALIZE_KEY, materializeSwept, remotePendingCount, remoteRowCount } from './remote-rows.js';
 import { drainRemotePendingAsync, sweepRemoteRowsAsync } from './remote-sweep.js';
-import { loadSnapshot, recordsFromState } from './snapshot.js';
+import { compareDumps, dumpLibrary } from './dump.js';
+import { loadSnapshot, loadSnapshotText, recordsFromState } from './snapshot.js';
 import { remoteTrackId } from './stable-ids.js';
 import {
 	defaultMasterDevice, drainTrackMeta, masterDevice, queueTrackMetaBackfillAsync, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount, trackMetaOf, TRACK_META_BACKFILL_KEY,
 } from './track-meta.js';
-import { applyOp, createLibraryState, parseOp } from '@curator/protocol';
+import { applyOp, createLibraryState, parseOp, serializeLibraryState } from '@curator/protocol';
 
 const R = recordingIdForTrack;
 
@@ -356,6 +357,46 @@ describe('remote rows', () => {
 		const r = await sweepRemoteRowsAsync(raw);
 		expect(r.created).toBe(1);
 		expect(rowsOf(raw, rec).map((x) => x.title)).toEqual(['From Snapshot']);
+	});
+
+	it('loads the same library from the snapshot text in pieces as from its records, and leaves no scratch behind', async () => {
+		const state = createLibraryState();
+		const recs = Array.from({ length: 60 }, (_, i) => remoteRec(300 + i));
+		for (const o of [
+			op('dev-x', 'tag', 'tg', 'create', { name: 'Peak', kind: 'user', color: null }),
+			...recs.flatMap((r, i) => [created('dev-x', r), setMeta('dev-x', r, meta(`T${i}`)), op('dev-x', 'track_tag', `${r}:tg`, 'add', {})]),
+			op('dev-x', 'tag', 'gone', 'create', { name: 'Gone', kind: 'user', color: null }),
+			op('dev-x', 'tag', 'gone', 'delete', {}),
+		]) applyOp(state, parseOp(o));
+		const json = serializeLibraryState(state);
+		const cut = (n: number): string[] => Array.from({ length: Math.ceil(json.length / n) }, (_, i) => json.slice(i * n, (i + 1) * n));
+		// The records as content: the snapshot's text has its keys sorted, a state built in memory has them as written.
+		const sorted = (v: unknown): unknown => (Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted((v as Record<string, unknown>)[k])])) : v);
+		const records = (raw: Database.Database): unknown[] => (raw.prepare(`SELECT map, key, value FROM sync_state ORDER BY map, key`).all() as Array<{ map: string; key: string; value: string }>).map((r) => ({ ...r, value: sorted(JSON.parse(r.value)) }));
+		const attached = (raw: Database.Database): string[] => (raw.pragma('database_list') as Array<{ name: string }>).map((d) => d.name);
+
+		const whole = freshDb('whole').raw;
+		const a = await loadSnapshot(whole, recordsFromState(state));
+		// Pieces that cut entries, keys and escapes anywhere; reads of 16 records at a time.
+		const pieces = freshDb('pieces').raw;
+		const b = await loadSnapshotText(pieces, cut(97), { chunk: 16 });
+		expect({ records: b.records, changed: b.changed }).toEqual({ records: a.records, changed: a.changed });
+		expect(records(pieces)).toEqual(records(whole));
+		// How many rows a load makes itself and how many it leaves to the client's
+		// drain depends on its slices; after the drain the libraries are one.
+		for (const raw of [whole, pieces]) await drainRemotePendingAsync(raw);
+		expect(compareDumps(dumpLibrary(whole), dumpLibrary(pieces)).filter((t) => !t.equal)).toEqual([]);
+		expect(remoteRowCount(pieces)).toBe(remoteRowCount(whole));
+		expect(attached(pieces)).not.toContain('snapshot_scratch');
+
+		// A text cut short loads nothing it should not, and the library is as usable after.
+		const broken = freshDb('broken').raw;
+		await expect(loadSnapshotText(broken, cut(97).slice(0, -2))).rejects.toThrow(/ends before/);
+		expect(attached(broken)).not.toContain('snapshot_scratch');
+		expect(records(broken)).toEqual([]);
+		await loadSnapshotText(broken, [json]);
+		await drainRemotePendingAsync(broken);
+		expect(compareDumps(dumpLibrary(whole), dumpLibrary(broken)).filter((t) => !t.equal)).toEqual([]);
 	});
 });
 

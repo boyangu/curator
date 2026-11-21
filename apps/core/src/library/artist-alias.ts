@@ -350,7 +350,20 @@ export function queueArtistCreditRewrite(raw: Raw, keys: readonly string[]): voi
 // again, on every device.
 export const ROLE_MERGE_REDERIVE_KEY = 'artist.rederive_role_merge_v1_at';
 export function queueRoleMergeRederive(raw: Raw): number {
-	if (raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(ROLE_MERGE_REDERIVE_KEY)) return 0;
+	return queueEveryRuleOnce(raw, ROLE_MERGE_REDERIVE_KEY);
+}
+
+// Once more (2026-11-20): the first pass repaired the rows, but ingest went
+// on substituting before it read the title's remixers (artists.ts
+// normalizeIncomingCreditsRaw, since fixed), so rows written after it
+// drifted the same way.
+export const CREDIT_ORDER_REDERIVE_KEY = 'artist.rederive_credit_order_v2_at';
+export function queueCreditOrderRederive(raw: Raw): number {
+	return queueEveryRuleOnce(raw, CREDIT_ORDER_REDERIVE_KEY);
+}
+
+function queueEveryRuleOnce(raw: Raw, gate: string): number {
+	if (raw.prepare(`SELECT 1 FROM app_setting WHERE key = ?`).get(gate)) return 0;
 	const keys = new Set<string>();
 	for (const r of raw.prepare(`SELECT key, value FROM sync_state WHERE map = 'artistAliases'`).all() as Array<{ key: string; value: string }>) {
 		keys.add(r.key);
@@ -358,7 +371,7 @@ export function queueRoleMergeRederive(raw: Raw): number {
 		if (to) keys.add(to);
 	}
 	queueArtistCreditRewrite(raw, [...keys]);
-	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`).run(ROLE_MERGE_REDERIVE_KEY, JSON.stringify(Date.now()), Date.now());
+	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO NOTHING`).run(gate, JSON.stringify(Date.now()), Date.now());
 	return keys.size;
 }
 

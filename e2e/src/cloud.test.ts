@@ -1,4 +1,5 @@
-// The e2e's CloudTransport against the real server on PGlite: every
+// The e2e's CloudTransport, and core's plain-HTTP one (the phone's), each
+// against the real server on PGlite: every
 // procedure the sync client uses goes through it and comes back in the
 // shapes core expects — push, pull, a batch, a master publish of a real
 // gzip body through the snapshots bucket, the storage bootstrap — and the
@@ -9,23 +10,27 @@ import { createHash, randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { masterOp, sampleLibrary } from '@curator/cloud/testing';
 import { CloudTransportError } from '@curator/core';
-import { applyOp, createLibraryState, serializeLibraryState, SNAPSHOT_STORAGE_ENCODING, snapshotPartPath, type SnapshotManifest } from '@curator/protocol';
+import { applyOp, createLibraryState, serializeLibraryState, SnapshotEntryScanner, SNAPSHOT_STORAGE_ENCODING, snapshotPartPath, type SnapshotManifest } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startLocalCloud, type LocalCloud } from './cloud.js';
-
-let cloud: LocalCloud;
-beforeAll(async () => { cloud = await startLocalCloud(); });
-afterAll(async () => { await cloud.close(); });
 
 const kindOf = async (p: Promise<unknown>): Promise<string> => {
 	try { await p; } catch (e) { if (e instanceof CloudTransportError) return e.kind; throw e; }
 	throw new Error('expected the call to fail');
 };
 
-describe('harness transport', () => {
+// Both speak to the same server; the second writes its own HTTP requests.
+describe.each(['transport', 'plain'] as const)('%s against the real server', (which) => {
+	// A server of its own each: the scenario counts on the log starting empty.
+	let cloud: LocalCloud;
+	beforeAll(async () => { cloud = await startLocalCloud(); });
+	afterAll(async () => { await cloud.close(); });
+
 	it('pushes, pulls, batches, publishes and bootstraps', async () => {
 		const userId = randomUUID();
-		const { transport, snapshots } = await cloud.session(userId);
+		const s = await cloud.session(userId);
+		const transport = s[which];
+		const snapshots = s.snapshots;
 		const deviceId = `dev-${randomUUID()}`;
 		await transport.account.registerDevice({ deviceId, name: 'e2e', platform: 'win32' });
 		expect((await transport.account.devices()).map((d) => d.deviceId)).toEqual([deviceId]);
@@ -63,21 +68,26 @@ describe('harness transport', () => {
 
 		const boot = await transport.bootstrap({ deviceId });
 		expect(boot.snapshotSeq).toBe(head);
-		expect(boot.records!.length).toBeGreaterThan(10);
+		// The snapshot comes back as text in pieces: its entries, counted.
+		const scanner = new SnapshotEntryScanner();
+		let entries = 0;
+		for await (const piece of boot.snapshot!) entries += scanner.push(piece).length;
+		scanner.end();
+		expect(entries).toBeGreaterThan(10);
 		const ops = await cloud.opCounts(userId);
 		expect(ops.reduce((n, r) => n + r.n, 0)).toBe(head);
 	});
 
 	it('an account with no snapshot bootstraps to nothing', async () => {
-		const { transport } = await cloud.session(randomUUID());
+		const transport = (await cloud.session(randomUUID()))[which];
 		const deviceId = `dev-${randomUUID()}`;
 		await transport.account.registerDevice({ deviceId, name: 'e2e', platform: 'win32' });
-		expect(await transport.bootstrap({ deviceId })).toEqual({ snapshotSeq: 0, baseSeq: 0, records: null });
+		expect(await transport.bootstrap({ deviceId })).toEqual({ snapshotSeq: 0, baseSeq: 0, snapshot: null });
 	});
 
 	it('maps the server refusals onto the client error kinds', async () => {
 		const userId = randomUUID();
-		const { transport } = await cloud.session(userId);
+		const transport = (await cloud.session(userId))[which];
 		expect(await kindOf(transport.sync.push({ deviceId: 'never-registered', ops: [] }))).toBe('device_not_registered');
 		const a = `dev-${randomUUID()}`;
 		const b = `dev-${randomUUID()}`;

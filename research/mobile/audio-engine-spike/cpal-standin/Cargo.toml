@@ -1,0 +1,10 @@
+[package]
+name = "curator-cpal-standin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The part of cpal's API the Curator audio engine uses, over AAudio (Android) or rendered by hand (elsewhere), with measurement hooks."
+
+[lib]
+name = "cpal"
+path = "src/lib.rs"

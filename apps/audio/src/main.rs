@@ -16,6 +16,7 @@ mod decode;
 mod engine;
 mod mmcss;
 mod protocol;
+mod resample;
 mod wav_writer;
 
 use anyhow::Result;

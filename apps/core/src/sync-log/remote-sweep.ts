@@ -12,6 +12,7 @@ import type Database from 'better-sqlite3';
 import { log } from '../log.js';
 import { project } from './project.js';
 import { MATERIALIZE_KEY, settlePlaylistsAsync } from './remote-rows.js';
+import { sliceMs, sliceRows } from './slice-budget.js';
 import { SyncStateStore } from './store.js';
 
 type Raw = Database.Database;
@@ -21,6 +22,9 @@ const rlog = log.for('remote-rows');
 export type SweepResult = { records: number; created: number; tracksTouched: string[]; playlistsTouched: string[]; chunks: number; maxSliceMs: number };
 
 const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+// The budgets and caps below are the desktop's; slice-budget.ts scales them
+// for a host whose sync has a thread to itself.
 
 export async function sweepRemoteRowsAsync(raw: Raw, opts: { page?: number } = {}): Promise<SweepResult> {
 	// Sized by time unless `page` pins it (tests): 400 records took up to
@@ -51,7 +55,7 @@ export async function sweepRemoteRowsAsync(raw: Raw, opts: { page?: number } = {
 		})();
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
-		if (!fixed) page = Math.max(10, Math.min(400, Math.ceil(page * 1.5), Math.round(batch.length * 40 / Math.max(ms, 1))));
+		if (!fixed) page = Math.max(10, Math.min(sliceRows(400), Math.ceil(page * 1.5), Math.round(batch.length * sliceMs(40) / Math.max(ms, 1))));
 		out.records += batch.length;
 		out.chunks++;
 		await yieldToLoop();
@@ -99,7 +103,7 @@ export async function drainRemotePendingAsync(raw: Raw, opts: { chunk?: number }
 		})();
 		const ms = performance.now() - t0;
 		out.maxSliceMs = Math.max(out.maxSliceMs, ms);
-		if (!fixed) chunk = Math.max(1, Math.min(100, Math.ceil(chunk * 1.5), Math.round(batch.length * DRAIN_SLICE_MS / Math.max(ms, 1))));
+		if (!fixed) chunk = Math.max(1, Math.min(sliceRows(100), Math.ceil(chunk * 1.5), Math.round(batch.length * sliceMs(DRAIN_SLICE_MS) / Math.max(ms, 1))));
 		out.records += batch.length;
 		out.chunks++;
 		await yieldToLoop();

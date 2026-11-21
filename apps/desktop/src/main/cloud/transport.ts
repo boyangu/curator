@@ -21,11 +21,9 @@
 // read actually needs, and it says nothing an absent error line does not.
 
 import { randomUUID } from 'node:crypto';
-import { gunzip } from 'node:zlib';
-import { promisify } from 'node:util';
 import { app, net } from 'electron';
 import { createTRPCUntypedClient, httpLink, TRPCClientError } from '@trpc/client';
-import { CatalogueBlobError, CloudTransportError, decodeLibraryStateSnapshot, readStorageSnapshotBody, type CloudTransport } from '@curator/core';
+import { CatalogueBlobError, CloudTransportError, inflateSnapshotText, readStorageSnapshotBody, type CloudTransport } from '@curator/core';
 import {
 	CALL_ERROR_REASONS,
 	type BatchAbortInput,
@@ -100,7 +98,6 @@ import { mainLog } from '../log.js';
 import { createSnapshotBlobStore } from './blobs.js';
 import type { CloudAccount } from './account.js';
 
-const gunzipAsync = promisify(gunzip);
 const clog = mainLog.for('cloud-api');
 
 // Procedure paths and kinds as apps/cloud's router mounts them (the
@@ -368,19 +365,21 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 		// The account's base ('snapshot_storage'): the bootstrap names the
 		// master-published snapshot's manifest, downloaded from Storage with this
 		// user's session, every part and the joined body checked against the
-		// manifest before anything inflates (core snapshot-storage.ts); gunzip
-		// runs on libuv's pool, and the JSON parse and flatten are the one
-		// synchronous step (~100–300 ms for a 40k-track library, once). Always
+		// manifest before anything inflates (core snapshot-storage.ts). The
+		// body is then handed over as text, inflated about a megabyte at a time
+		// as the sync client loads it: the document is ~250 MB for a 40k-track
+		// library and is never held whole (parsed in one go it took 2–3 s on
+		// this thread and a gigabyte of memory, measured 2026-11-20). Always
 		// `storage: true` (a server that holds no other kind refuses a call
 		// without it); `deviceId` when the sync client says the server reads it.
 		// A part pruned meanwhile (not_found: a newer snapshot replaced it
 		// mid-read) starts over from the newer one, a few times at most. No
-		// snapshot (an account without a base yet) is `records: null` with the
+		// snapshot (an account without a base yet) is `snapshot: null` with the
 		// account's baseSeq, for the client to found or wait.
 		async bootstrap(input?: BootstrapInput) {
 			for (let attempt = 0; ; attempt++) {
 				const res = await call<BootstrapResult>(PROCS.bootstrap, { ...(input ?? {}), storage: true });
-				if (!res.storage) return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: null };
+				if (!res.storage) return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, snapshot: null };
 				let body: Buffer;
 				try {
 					const t0 = performance.now();
@@ -393,8 +392,7 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 					}
 					throw err;
 				}
-				const json = await gunzipAsync(body, { maxOutputLength: MAX_INFLATED_BYTES });
-				return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, records: decodeLibraryStateSnapshot(json.toString('utf8')) };
+				return { snapshotSeq: res.snapshotSeq, baseSeq: res.baseSeq, snapshot: inflateSnapshotText(body, { maxBytes: MAX_INFLATED_BYTES }) };
 			}
 		},
 		account: {

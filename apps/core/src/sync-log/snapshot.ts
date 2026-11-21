@@ -8,8 +8,17 @@
 // Wire format: @curator/protocol snapshot.ts (`serializeLibraryState` JSON,
 // gzipped, in parts in Storage, published by the account's master;
 // `sync.bootstrap` names the manifest). The transport downloads, checks and
-// inflates (snapshot-storage.ts); `decodeLibraryStateSnapshot` parses with
-// the protocol's decoder and flattens the state into records.
+// inflates (snapshot-storage.ts) and hands the JSON over as text in pieces.
+//
+// The document is never held whole (`loadSnapshotText`). The main library's
+// is ~250 MB of JSON, ~310k records: parsed in one go and loaded from memory,
+// a join peaked at 3 GB on the desktop and could not run on a phone at all
+// (measured 2026-11-20). Instead the text is cut into its entries as it
+// arrives (the protocol's SnapshotEntryScanner) and each entry is put, still
+// as text, into a scratch database SQLite keeps in a temporary file; the
+// loader then reads it back map by map, a couple of thousand records at a
+// time. The scratch is needed because the document's map order is not the
+// load order below, and that order is not negotiable.
 //
 // Loading is a state join (store.ts joinRecord), then the same projection
 // applyOps uses, for every record that changed. Merges replay first, as
@@ -21,13 +30,14 @@
 
 import type Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { applyOp, deserializeLibraryState, opSchemaVersion, type ArtistAliasRecord, type Clock, type Entity, type EntityRef, type LibraryState, type MergeRecord, type Op } from '@curator/protocol';
+import { applyOp, deserializeLibraryState, opSchemaVersion, SnapshotEntryScanner, type ArtistAliasRecord, type Clock, type Entity, type EntityRef, type LibraryState, type MergeRecord, type Op, type SnapshotEntry } from '@curator/protocol';
 import * as schema from '@curator/shared/schema';
 import { drainArtistCreditRewritesAsync } from '../library/artist-alias.js';
 import { applyTrackMerge } from '../library/merge-tracks.js';
 import { markRecordsComplete } from './apply.js';
 import { project } from './project.js';
 import { settlePlaylistsAsync } from './remote-rows.js';
+import { sliceMs } from './slice-budget.js';
 import { STATE_MAPS, SyncStateStore, type StateMap } from './store.js';
 
 type Raw = Database.Database;
@@ -49,11 +59,17 @@ export function recordsFromState(state: LibraryState): SnapshotRecord[] {
 	return out;
 }
 
-// Inflated snapshot JSON → records. Throws the protocol's
-// SnapshotFormatError on a format/version this build cannot read.
+// Inflated snapshot JSON → records, all at once: for tests and tools over
+// small states. The sync client loads a snapshot with `loadSnapshotText`.
+// Throws the protocol's SnapshotFormatError on a format/version this build
+// cannot read.
 export function decodeLibraryStateSnapshot(json: string): SnapshotRecord[] {
 	return recordsFromState(deserializeLibraryState(json));
 }
+
+// The inflated snapshot JSON in pieces of any size, in order: what a
+// transport's bootstrap hands the client.
+export type SnapshotText = AsyncIterable<string> | Iterable<string>;
 
 // Projection order: containers before the rows they gate, so a child's
 // visibility check finds its container's row already written.
@@ -121,6 +137,105 @@ function artistAliasOp(key: string, r: ArtistAliasRecord): Op {
 		: { ...base, schema_version: opSchemaVersion({ entity: 'artist_alias', kind: 'set' }), kind: 'set', payload: { ...r.value } };
 }
 
+// Where the loader takes its records from: everything in memory (tests,
+// tools), or the scratch a snapshot's text was put into.
+type RecordSource = {
+	total: number;
+	// The merges and artist alias rules, whole: a few thousand, replayed first.
+	rules(): SnapshotRecord[];
+	// Everything else in LOAD_ORDER, a piece at a time; a piece holds one map's records.
+	pieces(): Iterable<SnapshotRecord[]>;
+};
+
+function recordsSource(records: readonly SnapshotRecord[]): RecordSource {
+	const rank = new Map(LOAD_ORDER.map((m, i) => [m, i]));
+	return {
+		total: records.length,
+		rules: () => records.filter((r) => r.map === 'merges' || r.map === 'artistAliases'),
+		pieces: () => [records.filter((r) => r.map !== 'merges' && r.map !== 'artistAliases').sort((a, b) => (rank.get(a.map) ?? 99) - (rank.get(b.map) ?? 99))],
+	};
+}
+
+// ── the scratch ─────────────────────────────────────────────────────────────
+// `ATTACH DATABASE ''` is a private database in a temporary file that SQLite
+// deletes when it is detached or the connection closes: nothing to clean up
+// after a crash, and no file API for a phone to supply. Entries keep the
+// order the document had within their map (`n`).
+
+const SCRATCH = 'snapshot_scratch';
+
+function entryRecord(map: StateMap | 'tombstones', json: string): SnapshotRecord {
+	const [key, value] = JSON.parse(json) as [string, unknown];
+	return { map, key, value } as SnapshotRecord;
+}
+
+function scratchSource(raw: Raw, counts: ReadonlyMap<string, number>, piece: number): RecordSource {
+	const all = raw.prepare(`SELECT json FROM ${SCRATCH}.entry WHERE map = ? ORDER BY n`).pluck();
+	const page = raw.prepare(`SELECT json FROM ${SCRATCH}.entry WHERE map = ? AND n > ? ORDER BY n LIMIT ?`).pluck();
+	return {
+		total: [...counts.values()].reduce((a, b) => a + b, 0),
+		rules: () => (['merges', 'artistAliases'] as const).flatMap((map) => (all.all(map) as string[]).map((json) => entryRecord(map, json))),
+		*pieces() {
+			for (const map of LOAD_ORDER) {
+				const n = counts.get(map) ?? 0;
+				for (let at = 0; at < n; at += piece) yield (page.all(map, at, piece) as string[]).map((json) => entryRecord(map, json));
+			}
+		},
+	};
+}
+
+// The text, entry by entry, into the scratch. Returns how many entries each
+// loaded map holds. One transaction per piece of text, a yield after each:
+// a transport that hands over about a megabyte at a time keeps each under
+// the slice budget.
+async function spillText(raw: Raw, text: SnapshotText, onEntries: (n: number) => void): Promise<Map<string, number>> {
+	raw.exec(`CREATE TABLE ${SCRATCH}.entry (map TEXT NOT NULL, n INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (map, n)) WITHOUT ROWID`);
+	const put = raw.prepare(`INSERT INTO ${SCRATCH}.entry (map, n, json) VALUES (?, ?, ?)`);
+	// `recordingAlias` and `artistAlias` are derived (recordsFromState), and
+	// a map a newer writer added is not this build's to load.
+	const loaded = new Set<string>([...STATE_MAPS, 'tombstones']);
+	const counts = new Map<string, number>();
+	let total = 0;
+	const store = raw.transaction((entries: SnapshotEntry[]): void => {
+		for (const e of entries) {
+			if (!loaded.has(e.map)) continue;
+			const n = (counts.get(e.map) ?? 0) + 1;
+			counts.set(e.map, n);
+			put.run(e.map, n, e.json);
+			total++;
+		}
+	});
+	const scanner = new SnapshotEntryScanner();
+	for await (const piece of text) {
+		const entries = scanner.push(piece);
+		if (entries.length > 0) {
+			store(entries);
+			onEntries(total);
+		}
+		await yieldToLoop();
+	}
+	scanner.end();
+	return counts;
+}
+
+// Loads the account's snapshot from its inflated JSON text without ever
+// holding the document or its records whole (see the header). Same result
+// and the same slices as `loadSnapshot` over the same records.
+export async function loadSnapshotText(
+	raw: Raw,
+	text: SnapshotText,
+	opts: { chunk?: number; onProgress?: (p: { done: number; total: number }) => void; onSlice?: (s: SnapshotSlice) => void } = {},
+): Promise<SnapshotLoadResult> {
+	raw.exec(`ATTACH DATABASE '' AS ${SCRATCH}`);
+	try {
+		// While the text is still arriving the total is what has arrived.
+		const counts = await spillText(raw, text, (n) => opts.onProgress?.({ done: 0, total: n }));
+		return await loadFrom(raw, scratchSource(raw, counts, Math.max(1, opts.chunk ?? 2_000)), opts);
+	} finally {
+		raw.exec(`DETACH DATABASE ${SCRATCH}`);
+	}
+}
+
 export type SnapshotLoadResult = {
 	records: number;
 	changed: number;
@@ -137,17 +252,27 @@ const yieldToLoop = (): Promise<void> => new Promise((resolve) => setImmediate(r
 // a slice may take: a record's cost varies within a map too (a commit that
 // checkpoints the WAL). Fixed chunks of 2,000 records measured 3.0-3.7 s for
 // one slice on the real library (2026-10-21 audit): the cost per record
-// differs a hundredfold between maps.
+// differs a hundredfold between maps. The desktop's budget: a host with a
+// sync thread of its own scales it (slice-budget.ts).
 const SNAPSHOT_SLICE_MS = 40;
 const FIRST_CHUNK = 100;
 const MIN_CHUNK = 10;
 
 export type SnapshotSlice = { phase: 'merges' | 'records'; map: string; records: number; ms: number };
 
+// The same load from records already in memory (tests, tools, small states).
 export async function loadSnapshot(
 	raw: Raw,
 	records: readonly SnapshotRecord[],
 	opts: { chunk?: number; onProgress?: (p: { done: number; total: number }) => void; onSlice?: (s: SnapshotSlice) => void } = {},
+): Promise<SnapshotLoadResult> {
+	return loadFrom(raw, recordsSource(records), opts);
+}
+
+async function loadFrom(
+	raw: Raw,
+	source: RecordSource,
+	opts: { chunk?: number; onProgress?: (p: { done: number; total: number }) => void; onSlice?: (s: SnapshotSlice) => void },
 ): Promise<SnapshotLoadResult> {
 	// `chunk`: the most records one transaction takes (tests pin it small).
 	const chunk = Math.max(1, opts.chunk ?? 2_000);
@@ -163,16 +288,23 @@ export async function loadSnapshot(
 
 	// Playlist positions and counts are restamped once per playlist after the
 	// last slice (remote-rows.ts settlePlaylistsAsync), not in every slice
-	// that adds one of their rows.
+	// that adds one of their rows. The artists and albums of the remote rows
+	// made here are likewise left whole to the client's drain, which runs
+	// once every record is in (project.ts deferDerivations).
 	const deferred = new Set<string>();
 
 	// Slices sized by time: the next one's size aims at SNAPSHOT_SLICE_MS
 	// from the last one's cost, never spans two maps (a tombstone join is a
 	// clock compare, a playlist row a projection), and each map starts small.
+	// The size carries over from one call to the next while the map stays
+	// the same: a map arrives in several pieces from the scratch.
+	let size = FIRST_CHUNK;
+	let sizedFor: string | null = null;
 	const sliced = async <T>(items: readonly T[], mapOf: (t: T) => string, phase: SnapshotSlice['phase'], run: (slice: readonly T[]) => void): Promise<void> => {
-		let size = FIRST_CHUNK;
+		if (items.length > 0 && mapOf(items[0]!) !== sizedFor) size = FIRST_CHUNK;
 		for (let i = 0; i < items.length;) {
 			const map = mapOf(items[i]!);
+			sizedFor = map;
 			let end = i + 1;
 			while (end < items.length && end - i < size && mapOf(items[end]!) === map) end++;
 			const slice = items.slice(i, end);
@@ -183,11 +315,11 @@ export async function loadSnapshot(
 			done += slice.length;
 			maxSliceMs = Math.max(maxSliceMs, ms);
 			opts.onSlice?.({ phase, map, records: slice.length, ms });
-			opts.onProgress?.({ done, total: records.length });
+			opts.onProgress?.({ done, total: source.total });
 			i = end;
 			size = i < items.length && mapOf(items[i]!) !== map
 				? FIRST_CHUNK
-				: Math.max(MIN_CHUNK, Math.min(chunk, Math.ceil(size * 1.5), Math.round(slice.length * SNAPSHOT_SLICE_MS / Math.max(ms, 1))));
+				: Math.max(MIN_CHUNK, Math.min(chunk, Math.ceil(size * 1.5), Math.round(slice.length * sliceMs(SNAPSHOT_SLICE_MS) / Math.max(ms, 1))));
 			await yieldToLoop();
 		}
 	};
@@ -197,9 +329,10 @@ export async function loadSnapshot(
 	// transaction (3,521 merges on the real library: one transaction for
 	// all of them held the loop for seconds). The rules' credit rewrite is
 	// queued and drained after.
+	const rules = source.rules();
 	const ops = [
-		...records.filter((r) => r.map === 'merges').map((r) => mergeOp(r.key, r.value as MergeRecord)),
-		...records.filter((r) => r.map === 'artistAliases').map((r) => artistAliasOp(r.key, r.value as ArtistAliasRecord)),
+		...rules.filter((r) => r.map === 'merges').map((r) => mergeOp(r.key, r.value as MergeRecord)),
+		...rules.filter((r) => r.map === 'artistAliases').map((r) => artistAliasOp(r.key, r.value as ArtistAliasRecord)),
 	];
 	await sliced(ops, (o) => o.entity, 'merges', (slice) => {
 		raw.transaction(() => {
@@ -211,7 +344,7 @@ export async function loadSnapshot(
 				refs.push(...applyOp(store.state, op).changed);
 			}
 			const flushed = store.flush();
-			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred });
+			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred, deferDerivations: true });
 			for (const t of s.tracksTouched) tracks.add(t);
 			for (const p of s.playlistsTouched) playlists.add(p);
 			changedRefs.push(...refs);
@@ -220,9 +353,7 @@ export async function loadSnapshot(
 	});
 
 	// 2. Everything else, in projection order.
-	const rank = new Map(LOAD_ORDER.map((m, i) => [m, i]));
-	const rest = records.filter((r) => r.map !== 'merges' && r.map !== 'artistAliases').sort((a, b) => (rank.get(a.map) ?? 99) - (rank.get(b.map) ?? 99));
-	await sliced(rest, (r) => r.map, 'records', (slice) => {
+	for (const rest of source.pieces()) await sliced(rest, (r) => r.map, 'records', (slice) => {
 		raw.transaction(() => {
 			const store = new SyncStateStore(raw);
 			const refs: EntityRef[] = [];
@@ -238,7 +369,7 @@ export async function loadSnapshot(
 				}
 			}
 			const flushed = store.flush();
-			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred });
+			const s = project(raw, store, refs, flushed, { mergeRows, deferPositions: deferred, deferDerivations: true });
 			for (const t of s.tracksTouched) tracks.add(t);
 			for (const p of s.playlistsTouched) playlists.add(p);
 			changedRefs.push(...refs);
@@ -251,5 +382,5 @@ export async function loadSnapshot(
 	markRecordsComplete(raw);
 	// Credits the snapshot's alias rules rename, in yielding chunks.
 	await drainArtistCreditRewritesAsync(raw);
-	return { records: records.length, changed, chunks, maxSliceMs, tracksTouched: [...tracks], playlistsTouched: [...playlists], changedRefs };
+	return { records: source.total, changed, chunks, maxSliceMs, tracksTouched: [...tracks], playlistsTouched: [...playlists], changedRefs };
 }

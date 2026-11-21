@@ -10,6 +10,7 @@
 // exercises the same checks the app runs.
 
 import { createHash } from 'node:crypto';
+import { createGunzip } from 'node:zlib';
 import { MAX_SNAPSHOT_PARTS, SNAPSHOT_STORAGE_ENCODING, type SnapshotManifest } from '@curator/protocol';
 import { CloudTransportError } from './client.js';
 
@@ -21,6 +22,27 @@ export interface SnapshotBlobStore {
 	upload(path: string, bytes: Uint8Array): Promise<void>;
 	download(path: string): Promise<Uint8Array>;
 	remove(paths: string[]): Promise<void>;
+}
+
+// The checked gzip body as the snapshot's JSON text, in pieces of about a
+// megabyte, inflated as they are asked for: what `bootstrap` hands the sync
+// client (snapshot.ts loadSnapshotText). The body is tens of megabytes; its
+// text is a quarter of a gigabyte and is never held whole. `maxBytes` bounds
+// what a hostile body may inflate to.
+export async function* inflateSnapshotText(body: Uint8Array, opts: { maxBytes: number }): AsyncGenerator<string, void, undefined> {
+	const gz = createGunzip({ chunkSize: 1 << 20 });
+	// The stream's decoder keeps a character cut by a piece's end for the next piece.
+	gz.setEncoding('utf8');
+	gz.end(body);
+	let chars = 0;
+	for await (const piece of gz as AsyncIterable<string>) {
+		chars += piece.length;
+		if (chars > opts.maxBytes) {
+			gz.destroy();
+			throw new CloudTransportError('bad_request', `snapshot inflates past ${opts.maxBytes} bytes`);
+		}
+		yield piece;
+	}
 }
 
 // Parts in flight at once: a 37 MB body is five 8 MB parts.
