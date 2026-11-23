@@ -84,6 +84,24 @@ export interface Enricher {
 	// title + artist; an analysis enricher additionally needs localAudio.
 	applicableTo(target: EnrichmentTarget): boolean;
 	enrich(target: EnrichmentTarget, signal?: AbortSignal): Promise<EnricherOutput | null>;
+	// When this enricher's store stops refusing us (a Cloudflare block's
+	// cooldown), or null when it isn't blocked. Lets the runner tell "skipped
+	// because blocked" apart from "not applicable" — only the first is worth
+	// coming back for.
+	blockedUntil?(): number | null;
+	// Why it is blocked, while it is ("Cloudflare challenge", or our own route
+	// to the store being down) — shown to the user next to the retry time.
+	blockedReason?(): string | null;
+}
+
+// What one store said about one lookup, kept on the feed row so its N/A / ERR
+// marker can say which store answered what. `until` is when a blocked store
+// can be asked again.
+export interface EnricherOutcome {
+	enricher: string;
+	result: 'hit' | 'miss' | 'blocked' | 'error';
+	detail?: string;
+	until?: number;
 }
 
 // The aggregate of every enricher over one target — what a sink persists.
@@ -93,8 +111,22 @@ export interface Enricher {
 // (nothing on Beatport) apart from a failed lookup it should retry later,
 // instead of collapsing both into a null patch. A run can both error AND
 // produce a partial patch (one enricher threw, a fallback filled some fields).
+//
+// `deferredUntil` is set when the patch is still incomplete (or provisional) AND an enricher
+// that could have filled it was blocked (skipped, or blocked mid-lookup): the
+// earliest time one reopens. A miss with it set is not a no-match — the
+// caller should come back then, and not before. `asked` lists the enrichers
+// that answered (hit or clean miss), so that retry can skip them.
+// `provisional`: a store ranked above every one that answered was blocked, so
+// the whole patch is a fallback's — complete or not, `deferredUntil` stays set,
+// and the caller lets that store's later answer replace these values.
+// `outcomes` has one entry per store this run asked or found blocking us.
 export interface EnrichmentResult {
 	patch: DjMetadataPatch | null;
 	sourceLinks: SourceLinkDraft[];
 	errored: boolean;
+	deferredUntil?: number | null;
+	asked?: string[];
+	provisional?: boolean;
+	outcomes?: EnricherOutcome[];
 }

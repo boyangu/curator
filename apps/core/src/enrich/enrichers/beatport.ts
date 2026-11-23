@@ -25,6 +25,14 @@ export class BeatportEnricher implements Enricher {
 		return !!target.query.title && !!target.query.artists?.[0] && !this.client.isCoolingDown();
 	}
 
+	blockedUntil(): number | null {
+		return this.client.blockedUntil();
+	}
+
+	blockedReason(): string | null {
+		return this.client.blockedReason();
+	}
+
 	async enrich(target: EnrichmentTarget): Promise<EnricherOutput | null> {
 		const q = target.query;
 		const bp = await this.client.lookup({

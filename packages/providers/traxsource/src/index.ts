@@ -20,6 +20,7 @@ import {
 	ProviderBlockedError,
 	Cooldown,
 	cloudflareChallengeReason,
+	retryAfterMs,
 	type Trace,
 } from '@curator/matcher';
 
@@ -29,6 +30,7 @@ const DEBUG = (typeof process !== 'undefined' ? process?.env?.CURATOR_TX_DEBUG :
 
 // See @curator/beatport for the rationale — same Cloudflare, same backoff.
 const BLOCK_COOLDOWN_MS = 5 * 60 * 1000;
+const BLOCK_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000;
 
 export interface TraxsourceTrack {
 	id: number;
@@ -74,7 +76,7 @@ const HEADERS = {
 
 export class TraxsourceClient {
 	private readonly fetchImpl: FetchLike;
-	private readonly cooldown = new Cooldown(BLOCK_COOLDOWN_MS);
+	private readonly cooldown = new Cooldown(BLOCK_COOLDOWN_MS, undefined, BLOCK_COOLDOWN_MAX_MS);
 
 	constructor(opts: TraxsourceClientOptions = {}) {
 		this.fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
@@ -86,13 +88,17 @@ export class TraxsourceClient {
 		return this.cooldown.active;
 	}
 
-	private _blocked(status: number, reason: string): never {
+	blockedUntil(): number | null {
+		return this.cooldown.releaseAt;
+	}
+
+	private _blocked(res: Response, reason: string): never {
 		const firstHit = !this.cooldown.active;
-		this.cooldown.trip();
+		const window = this.cooldown.trip(retryAfterMs(res.headers));
 		if (firstHit) {
-			console.warn(`[traxsource] Cloudflare challenge (${reason}, HTTP ${status}) — backing off ${BLOCK_COOLDOWN_MS / 1000}s`);
+			console.warn(`[traxsource] Cloudflare challenge (${reason}, HTTP ${res.status}) — backing off ${Math.round(window / 1000)}s`);
 		}
-		throw new ProviderBlockedError('traxsource', status, reason);
+		throw new ProviderBlockedError('traxsource', res.status, reason);
 	}
 
 	async lookup(target: TraxsourceTarget): Promise<TraxsourceTrack | null> {
@@ -169,14 +175,15 @@ export class TraxsourceClient {
 		});
 		if (!res) return [];
 		const cfHeader = cloudflareChallengeReason(res.status, res.headers, null);
-		if (cfHeader) this._blocked(res.status, cfHeader);
+		if (cfHeader) this._blocked(res, cfHeader);
 		if (!res.ok) {
 			const body = await res.text().catch(() => '');
 			const reason = cloudflareChallengeReason(res.status, res.headers, body);
-			if (reason) this._blocked(res.status, reason);
+			if (reason) this._blocked(res, reason);
 			if (DEBUG) console.warn(`[traxsource] non-OK response (${res.status}), bailing`);
 			return [];
 		}
+		this.cooldown.clear();
 		const html = await res.text();
 		return parseTraxsourceRows(html);
 	}

@@ -36,19 +36,10 @@ type BcTralbum = {
 	tracks?: { track_id: number; title: string; track_num?: number; duration?: number; track_url?: string }[];
 	release_date?: number;
 	label?: string;
-	// Free tags, a mix of genres, artist names and the location (isloc).
-	tags?: { name: string; isloc?: boolean }[];
+	// Free tags are not read as genres (sql/0035): a release carries several,
+	// alphabetised, with nothing marking the main one, and "ambient" rides on
+	// most electronic releases — a deep house EP became Ambient / Experimental.
 };
-
-// The genre tags of a release: whatever is not a place or a name already on
-// it (labels tag their own artists). Mapped to the taxonomy by genre_alias
-// (sql/0018), the rest kept as the source's 'genres' fact.
-function genreTags(t: BcTralbum, names: string[]): string[] {
-	const taken = new Set(names.map(nameFold));
-	return (t.tags ?? [])
-		.filter((g) => !g.isloc && g.name && !taken.has(nameFold(g.name)))
-		.map((g) => g.name);
-}
 
 const art = (id?: number): string | undefined => (id ? `https://f4.bcbits.com/img/a${id}_16.jpg` : undefined);
 const isoDate = (d?: string | number): string | undefined => {
@@ -156,7 +147,6 @@ export class BandcampTracker implements TrackerAdapter {
 		// The item's own page says who it is by; the listing's text when the
 		// page does not (the same label-account rule either way).
 		const artists = this.artist({ band_id: t.band?.band_id ?? i.band_id, artist_name: t.tralbum_artist ?? i.artist_name, band_name: t.band?.name ?? i.band_name }, labelBandId);
-		const genres = genreTags(t, [label.name, t.label ?? '', ...artists.map((a) => a.name)]);
 		return {
 			provider: 'bandcamp',
 			kind: 'release',
@@ -178,11 +168,8 @@ export class BandcampTracker implements TrackerAdapter {
 				name: tr.title,
 				url: tr.track_url ?? null,
 				facts: { trackNumber: tr.track_num ?? k + 1, ...(tr.duration ? { durationSec: Math.round(tr.duration) } : {}) },
-				// The release's tags: Bandcamp has none per track.
-				...(genres.length ? { genres } : {}),
 			})),
 			label,
-			...(genres.length ? { genres } : {}),
 			publishedAt: t.release_date ? t.release_date * 1000 : null,
 		};
 	}

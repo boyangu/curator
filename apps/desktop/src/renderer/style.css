@@ -5089,6 +5089,12 @@ col.c-pq { width: 52px; }
 	font-family: var(--mono); font-size: 9px; letter-spacing: 0.08em; vertical-align: 1px;
 	color: var(--fg-3); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-left: 6px;
 }
+/* Beatport access: FlareSolverr's state line; a failure reads in the warning
+   colour so "why it's down" stands out from the hint text around it. */
+.settings-discover__fs-state { font-size: 12px; color: var(--fg-1); margin-bottom: 6px; overflow-wrap: anywhere; }
+.settings-discover__fs-state--running { color: var(--accent); }
+.settings-discover__fs-state--failed { color: var(--warn); }
+.settings-discover__fs-actions { display: flex; gap: 8px; margin-bottom: 8px; }
 
 /* ─── Entity page header (components/EntityHeader.tsx) ───────────────────────
    An artist's / label's / album's page: this header above the track list.

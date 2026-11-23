@@ -17,6 +17,8 @@ export function inLane(enricher: Enricher, minGapMs: number): Enricher {
 		id: enricher.id,
 		produces: enricher.produces,
 		applicableTo: (target) => enricher.applicableTo(target),
+		...(enricher.blockedUntil ? { blockedUntil: () => enricher.blockedUntil!() } : {}),
+		...(enricher.blockedReason ? { blockedReason: () => enricher.blockedReason!() } : {}),
 		enrich(target: EnrichmentTarget, signal?: AbortSignal): Promise<EnricherOutput | null> {
 			const run = tail.then(async () => {
 				if (signal?.aborted) return null;

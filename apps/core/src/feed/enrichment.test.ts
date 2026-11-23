@@ -32,9 +32,10 @@ class FakeStore {
 	readonly items = new Map<string, FeedItem>();
 	add(...items: FeedItem[]): void { for (const i of items) this.items.set(i.id, i); }
 	async getItem(id: string): Promise<FeedItem | null> { return this.items.get(id) ?? null; }
-	async listUnenriched(limit: number): Promise<FeedItem[]> {
+	async listUnenriched(limit: number, exclude: readonly string[] = []): Promise<FeedItem[]> {
 		return [...this.items.values()].filter((i) =>
-			(i.enrichStatus == null || i.enrichStatus === 'err')
+			!exclude.includes(i.id)
+			&& (i.enrichStatus == null || i.enrichStatus === 'err')
 			&& ['fresh', 'seen', 'expanded'].includes(i.state)
 			&& (i.type === 'track' || (i.type === 'album' && (i.payload.tracks?.length ?? 0) > 0)),
 		).slice(0, limit);
@@ -225,6 +226,138 @@ describe('FeedEnrichmentQueue — outcome status (ok / na / err)', () => {
 		const al = store.items.get('al')!;
 		expect(al.enrichStatus).toBe('ok');
 		expect(al.payload.tracks?.[0]?.enrichStatus).toBe('ok');
+	});
+});
+
+// A store behind a block until `until` (its cooldown), answering `fn` once open.
+function blockable(id: string, state: { until: number }, fn: (title: string) => DjMetadataPatch | null): Enricher & { calls: number } {
+	const e = {
+		id,
+		produces: 'metadata' as const,
+		calls: 0,
+		applicableTo: () => Date.now() >= state.until,
+		blockedUntil: () => (Date.now() < state.until ? state.until : null),
+		async enrich(t: EnrichmentTarget): Promise<EnricherOutput | null> {
+			e.calls++;
+			const out = fn(t.query.title);
+			return out ? { kind: 'metadata', patch: out, sourceLink: { source: id, sourceTrackId: id } } : null;
+		},
+	};
+	return e;
+}
+
+describe('FeedEnrichmentQueue — a blocked store parks, never settles for na', () => {
+	it('a fallback miss behind a block stays err and is parked; the retry asks only the blocked store', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'x'));
+		const bp = { until: Date.now() + 60_000 };
+		const beatport = blockable('beatport', bp, () => FULL);
+		const trax = blockable('traxsource', { until: 0 }, () => null);
+		const q = new FeedEnrichmentQueue(store as unknown as FeedStore, [beatport, trax], 0);
+
+		const out = await q.enrichItem('t1');
+		expect(out?.enrichStatus).toBe('err');
+		expect(out?.payload.enrichAsked).toEqual(['traxsource']);
+		expect(beatport.calls).toBe(0);
+		expect(trax.calls).toBe(1);
+
+		// Still inside the window: the on-view path doesn't spend a lookup.
+		await q.enrichItem('t1');
+		expect(trax.calls).toBe(1);
+
+		// The block lifts: Beatport alone is asked, and the item settles.
+		bp.until = 0;
+		(q as unknown as { parked: Map<string, number> }).parked.clear();
+		const done = await q.enrichItem('t1');
+		expect(done?.enrichStatus).toBe('ok');
+		expect(done?.payload.bpm).toBe(120);
+		expect(done?.payload.enrichAsked).toBeUndefined();
+		expect(beatport.calls).toBe(1);
+		expect(trax.calls).toBe(1);
+	});
+
+	it('a fallback hit with every fact behind a blocked primary is shown but provisional; the primary replaces it', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'x'));
+		const bp = { until: Date.now() + 60_000 };
+		const beatport = blockable('beatport', bp, () => ({ bpm: 93, keyCamelot: '3A', genre: 'Organic House', label: null }));
+		const trax = blockable('traxsource', { until: 0 }, () => ({ bpm: 124, keyCamelot: '3A', genre: 'Electronica', label: 'Kotori' }));
+		const q = new FeedEnrichmentQueue(store as unknown as FeedStore, [beatport, trax], 0);
+
+		const out = await q.enrichItem('t1');
+		expect(out?.enrichStatus).toBe('err');
+		expect(out?.payload).toMatchObject({ genre: 'Electronica', bpm: 124, enrichAsked: ['traxsource'] });
+		expect(out?.payload.enrichProvisional).toEqual(['bpm', 'keyCamelot', 'genre', 'label']);
+
+		bp.until = 0;
+		(q as unknown as { parked: Map<string, number> }).parked.clear();
+		const done = await q.enrichItem('t1');
+		expect(done?.enrichStatus).toBe('ok');
+		// Beatport's answer wins; what it doesn't carry keeps Traxsource's.
+		expect(done?.payload).toMatchObject({ genre: 'Organic House', bpm: 93, keyCamelot: '3A', label: 'Kotori' });
+		expect(done?.payload.enrichProvisional).toBeUndefined();
+		expect(done?.payload.enrichAsked).toBeUndefined();
+		expect(trax.calls).toBe(1);
+	});
+
+	it('a primary that still misses on the retry leaves the fallback values, settled', async () => {
+		const store = new FakeStore();
+		store.add(albumItem('al', [{ sourceTrackId: 'a', title: 'y' }]));
+		const bp = { until: Date.now() + 60_000 };
+		const beatport = blockable('beatport', bp, () => null);
+		const trax = blockable('traxsource', { until: 0 }, () => ({ ...FULL, genre: 'Electronica' }));
+		const q = new FeedEnrichmentQueue(store as unknown as FeedStore, [beatport, trax], 0);
+
+		const first = await q.enrichItem('al');
+		expect(first?.payload.genre).toBe('Electronica');
+		expect(first?.payload.enrichProvisional).toEqual(['genre', 'label']);
+		expect(first?.payload.tracks![0]!.enrichStatus).toBe('err');
+
+		bp.until = 0;
+		(q as unknown as { parked: Map<string, number> }).parked.clear();
+		const done = await q.enrichItem('al');
+		const ref = done!.payload.tracks![0]!;
+		expect(ref).toMatchObject({ enrichStatus: 'ok', genre: 'Electronica' });
+		expect(ref.enrichProvisional).toBeUndefined();
+		expect(done?.payload.enrichProvisional).toBeUndefined();
+		expect(done?.enrichStatus).toBe('ok');
+	});
+
+	it('an album genre derived from provisional tracks follows the primary’s answer', async () => {
+		const store = new FakeStore();
+		store.add(albumItem('al', [{ sourceTrackId: 'a', title: 'y' }, { sourceTrackId: 'b', title: 'z' }]));
+		const bp = { until: Date.now() + 60_000 };
+		const beatport = blockable('beatport', bp, () => ({ ...FULL, genre: 'Organic House' }));
+		const trax = blockable('traxsource', { until: 0 }, () => ({ ...FULL, genre: 'Electronica' }));
+		const q = new FeedEnrichmentQueue(store as unknown as FeedStore, [beatport, trax], 0);
+
+		expect((await q.enrichItem('al'))?.payload.genre).toBe('Electronica');
+		bp.until = 0;
+		(q as unknown as { parked: Map<string, number> }).parked.clear();
+		const done = await q.enrichItem('al');
+		expect(done?.payload.genre).toBe('Organic House');
+		expect(done?.payload.tracks!.map((t) => t.genre)).toEqual(['Organic House', 'Organic House']);
+		expect(done?.payload.enrichProvisional).toBeUndefined();
+	});
+
+	it('the drain tries a parked item once, then stops instead of spinning', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'x'), albumItem('al', [{ sourceTrackId: 'a', title: 'y' }]));
+		const beatport = blockable('beatport', { until: Date.now() + 60_000 }, () => FULL);
+		const trax = blockable('traxsource', { until: 0 }, () => null);
+		const q = new FeedEnrichmentQueue(store as unknown as FeedStore, [beatport, trax], 0);
+		q.kick();
+		await vi.waitFor(() => { expect((q as unknown as { running: boolean }).running).toBe(false); });
+		expect(trax.calls).toBe(2);
+		expect(store.items.get('t1')!.enrichStatus).toBe('err');
+		const ref = store.items.get('al')!.payload.tracks![0]!;
+		expect(ref.enrichStatus).toBe('err');
+		expect(ref.enrichAsked).toEqual(['traxsource']);
+		// A producer's kick inside the window asks nobody.
+		q.kick();
+		await vi.waitFor(() => { expect((q as unknown as { running: boolean }).running).toBe(false); });
+		expect(trax.calls).toBe(2);
+		q.stop();
 	});
 });
 

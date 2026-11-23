@@ -26,6 +26,7 @@ import type { CloudAccount } from './cloud/account.js';
 import type { CoreSidecarHost } from './core-sidecar/host.js';
 import type { AudioSidecarHost } from './audio-sidecar.js';
 import type { SpotifySidecarHost } from './spotify-sidecar.js';
+import type { FlareSolverrHost } from './flaresolverr-host.js';
 import type { McpConfirmBroker } from './mcp/confirm.js';
 
 export interface HandlerContext {
@@ -58,6 +59,9 @@ export interface HandlerContext {
 	// land in the real ~/Music library folder, and a Google connect would arm
 	// a backup target the profile has no engine for.
 	profileBlocks?: { downloads: string | null; googleBackup: string | null };
+	// FlareSolverr supervisor (Beatport past Cloudflare). Always present; it
+	// reports enabled:false when turned off.
+	flareSolverr: FlareSolverrHost;
 }
 
 export type Handlers = {
@@ -381,6 +385,11 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 			}
 			return ctx.spotifySidecar.request(method, params);
 		},
+
+		'flaresolverr:status':         async (refresh) => ctx.flareSolverr.status(refresh),
+		'flaresolverr:start':          async ()        => ctx.flareSolverr.start(),
+		'flaresolverr:stop':           async ()        => ctx.flareSolverr.stop(),
+		'flaresolverr:set-auto-start': async (on)      => ctx.flareSolverr.setAutoStart(on),
 
 		'shell:show-in-folder': async (filePath) => {
 			// `showItemInFolder` opens the OS file manager with the file

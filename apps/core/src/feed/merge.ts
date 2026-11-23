@@ -66,7 +66,7 @@ function mergeRef(have: FeedTrackRef, add: FeedTrackRef): boolean {
 
 // The fields a row's track keeps when the catalogue's card replaces the
 // tracklist: what this device found or chose for it.
-const REF_CARRY_FIELDS = [...REF_FILL_FIELDS, 'enrichStatus', 'sourceLinks'] as const satisfies readonly (keyof FeedTrackRef)[];
+const REF_CARRY_FIELDS = [...REF_FILL_FIELDS, 'enrichStatus', 'enrichAsked', 'enrichProvisional', 'enrichReport', 'sourceLinks'] as const satisfies readonly (keyof FeedTrackRef)[];
 
 // The draft is the catalogue's own card for the row's release: the same
 // catalogue id, and every track a catalogue recording.

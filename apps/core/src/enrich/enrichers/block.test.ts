@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ProviderBlockedError } from '@curator/matcher';
+import { ProviderBlockedError, ProviderUnavailableError } from '@curator/matcher';
 import type { FetchLike } from '@curator/beatport';
 import { BeatportEnricher } from './beatport.js';
 import { enrichOne } from '../runner.js';
@@ -45,6 +45,23 @@ describe('BeatportEnricher — Cloudflare block handling', () => {
 	});
 });
 
+describe('BeatportEnricher — our route down is not a block', () => {
+	it('passes the unavailable reason up, pauses, and the skipped calls keep that reason', async () => {
+		let calls = 0;
+		const down: FetchLike = async () => { calls++; throw new ProviderUnavailableError('beatport', 'FlareSolverr at http://localhost:8191: connection refused'); };
+		const enricher = new BeatportEnricher(down);
+		const err = await enricher.enrich(target).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(ProviderUnavailableError);
+		expect((err as Error).message).toContain('connection refused');
+		expect(enricher.applicableTo(target)).toBe(false);
+		expect(enricher.blockedUntil()).toBeGreaterThan(Date.now());
+		// A direct lookup during the pause reports the route, not Cloudflare.
+		const again = await enricher.enrich(target).catch((e: unknown) => e);
+		expect(again).toBeInstanceOf(ProviderUnavailableError);
+		expect(calls).toBe(1);
+	});
+});
+
 describe('enrichOne — block falls through to the fallback', () => {
 	it('records errored AND lets Traxsource fill when Beatport is challenged', async () => {
 		const blocked = new BeatportEnricher(challengeFetch);
@@ -61,5 +78,21 @@ describe('enrichOne — block falls through to the fallback', () => {
 		const res = await enrichOne(target, [blocked, traxStub]);
 		expect(res.errored).toBe(false);
 		expect(res.patch).toMatchObject(FULL);
+		// Every fact, but Traxsource's: Beatport is asked once it reopens.
+		expect(res.provisional).toBe(true);
+		expect(res.deferredUntil).toBe(blocked.blockedUntil());
+	});
+
+	it('a fallback miss behind the block is deferred until Beatport reopens, not a clean miss', async () => {
+		const blocked = new BeatportEnricher(challengeFetch);
+		const miss: Enricher = { ...traxStub, enrich: async () => null };
+		const first = await enrichOne(target, [blocked, miss]);
+		expect(first.patch).toBeNull();
+		expect(first.deferredUntil).toBe(blocked.blockedUntil());
+		expect(first.asked).toEqual(['traxsource']);
+		// Skipped (cooling down) on the next track: still deferred, never 'na'.
+		const second = await enrichOne(target, [blocked, miss]);
+		expect(second.errored).toBe(false);
+		expect(second.deferredUntil).toBeGreaterThan(Date.now());
 	});
 });

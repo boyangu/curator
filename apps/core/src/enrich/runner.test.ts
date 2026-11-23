@@ -77,3 +77,59 @@ describe('enrichOne — primary + fallback chain', () => {
 		expect(partial.errored).toBe(true);
 	});
 });
+
+describe('enrichOne — per-store outcomes', () => {
+	it('says what each store answered: blocked with its reason and reopen time, a miss, a failure', async () => {
+		const ran = { ids: [] as string[] };
+		const until = Date.now() + 60_000;
+		const blocked: Enricher = {
+			id: 'beatport',
+			produces: 'metadata',
+			applicableTo: () => false,
+			enrich: async () => null,
+			blockedUntil: () => until,
+			blockedReason: () => 'FlareSolverr starting',
+		};
+		const thrower: Enricher = {
+			id: 'broken',
+			produces: 'metadata',
+			applicableTo: () => true,
+			enrich: async () => { throw new Error('HTTP 500'); },
+		};
+		const res = await enrichOne(target, [blocked, stub('traxsource', null, ran), thrower]);
+		expect(res.outcomes).toEqual([
+			{ enricher: 'beatport', result: 'blocked', until, detail: 'FlareSolverr starting' },
+			{ enricher: 'traxsource', result: 'miss' },
+			{ enricher: 'broken', result: 'error', detail: 'HTTP 500' },
+		]);
+		expect(res.deferredUntil).toBe(until);
+	});
+
+	it('records a hit and nothing for a store left unasked once the patch is complete', async () => {
+		const ran = { ids: [] as string[] };
+		const res = await enrichOne(target, [stub('beatport', FULL, ran), stub('traxsource', FULL, ran)]);
+		expect(res.outcomes).toEqual([{ enricher: 'beatport', result: 'hit' }]);
+	});
+});
+
+describe('enrichOne — a blocked primary', () => {
+	const until = Date.now() + 60_000;
+	const blockedPrimary = (ran: { ids: string[] }): Enricher => ({ ...stub('beatport', FULL, ran), applicableTo: () => false, blockedUntil: () => until });
+
+	it('a fallback’s complete patch is provisional and stays deferred until the primary reopens', async () => {
+		const ran = { ids: [] as string[] };
+		const res = await enrichOne(target, [blockedPrimary(ran), stub('traxsource', FULL, ran)]);
+		expect(res.patch).toEqual(FULL);
+		expect(res.provisional).toBe(true);
+		expect(res.deferredUntil).toBe(until);
+		expect(res.asked).toEqual(['traxsource']);
+	});
+
+	it('a fallback blocked after the primary answered is not provisional', async () => {
+		const ran = { ids: [] as string[] };
+		const partial = { ...FULL, keyCamelot: null };
+		const res = await enrichOne(target, [stub('beatport', partial, ran), { ...stub('traxsource', FULL, ran), applicableTo: () => false, blockedUntil: () => until }]);
+		expect(res.provisional).toBeUndefined();
+		expect(res.deferredUntil).toBe(until);
+	});
+});

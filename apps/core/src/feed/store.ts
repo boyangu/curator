@@ -24,11 +24,13 @@ import type {
 	FeedSignalInput,
 	FeedSuppressionScope,
 	FeedDecisionsDump,
+	FeedTrackRef,
 	SyncedFeedItem,
 	SyncedFeedSuppression,
 } from './types.js';
 import { recordingKeysFor } from './recording.js';
 import { mergeFeedPayload } from './merge.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 import { itemArtists } from './lenses.js';
 
 // Ranking lift per EXTRA source (beyond the first) that surfaced an item —
@@ -151,8 +153,9 @@ export interface FeedStore {
 	accrueSources(drafts: FeedItemDraft[]): Promise<void>;
 	// Enrichment worklist, newest first: visible track items, plus album items
 	// whose tracklist is resolved (per-track enrichment), that the enricher
-	// pass hasn't touched yet.
-	listUnenriched(limit: number): Promise<FeedItem[]>;
+	// pass hasn't touched yet. `exclude`: ids the drain already tried this pass
+	// or parked until a blocked store reopens.
+	listUnenriched(limit: number, exclude?: readonly string[]): Promise<FeedItem[]>;
 	// Record an enrichment attempt: stamp enriched_at + set enrich_status (the
 	// outcome), and persist the merged payload when an enricher produced one.
 	// 'ok'/'na' are terminal; 'err' leaves the row eligible for the next drain.
@@ -175,7 +178,7 @@ export interface FeedStore {
 	close(): void;
 }
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 13;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS feed_meta (
@@ -594,6 +597,107 @@ export class SqliteFeedStore implements FeedStore {
 				`).run(now);
 				this.db.exec(`UPDATE feed_item SET published_at = fetched_at WHERE published_at > fetched_at`);
 				this.rerank(new Set(rows.flatMap((r) => (r.covered_by ? [r.id, r.covered_by] : [r.id]))));
+			})();
+		}
+		// v10 → v11: from 2026-11-08 Cloudflare blocked every Beatport lookup,
+		// and a Traxsource miss behind the block was stamped 'na' — terminal, so
+		// those tracks would never be asked again. Reopen them as 'err', marked
+		// as already answered by Traxsource: the drain retries them against
+		// Beatport alone, parking them while it's still blocked.
+		if (priorVersion < 11) {
+			this.db.transaction(() => {
+				const since = Date.UTC(2026, 10, 8);
+				const asked = ['traxsource'];
+				const reopen = this.db.prepare(`UPDATE feed_item SET payload_json = ?, enrich_status = 'err' WHERE id = ?`);
+				const rows = this.db.prepare(`
+					SELECT id, type, enrich_status, payload_json FROM feed_item
+					WHERE enriched_at >= ? AND (enrich_status = 'na' OR type = 'album')
+				`).all(since) as { id: string; type: string; enrich_status: string | null; payload_json: string }[];
+				for (const r of rows) {
+					const payload = JSON.parse(r.payload_json) as FeedItemPayload;
+					if (r.type === 'album') {
+						let n = 0;
+						for (const ref of payload.tracks ?? []) {
+							if (ref.enrichStatus !== 'na' || ref.sourceLinks?.length) continue;
+							ref.enrichStatus = 'err';
+							ref.enrichAsked = asked;
+							n++;
+						}
+						if (n) reopen.run(JSON.stringify(payload), r.id);
+					} else if (!payload.sourceLinks?.length) {
+						payload.enrichAsked = asked;
+						reopen.run(JSON.stringify(payload), r.id);
+					}
+				}
+			})();
+		}
+		// v11 → v12: the catalogue stopped reading Bandcamp tags as genres
+		// (apps/cloud sql/0035) — alphabetised free tags made deep house
+		// releases "Ambient / Experimental". A card that carries a Bandcamp
+		// page may have its genre from them, and fill-only enrichment never
+		// replaces one: clear the genres and send the card back through
+		// enrichment from scratch, so the stores' genres fill them.
+		if (priorVersion < 12) {
+			this.db.transaction(() => {
+				const onBandcamp = (hs?: { provider: string }[]) => !!hs?.some((h) => h.provider === 'bandcamp');
+				const reset = this.db.prepare(`UPDATE feed_item SET payload_json = ?, enrich_status = NULL, enriched_at = NULL WHERE id = ?`);
+				const rows = this.db.prepare(`SELECT id, payload_json FROM feed_item WHERE payload_json LIKE '%"bandcamp"%'`).all() as { id: string; payload_json: string }[];
+				for (const r of rows) {
+					const payload = JSON.parse(r.payload_json) as FeedItemPayload;
+					const tracks = payload.tracks ?? [];
+					if (!onBandcamp(payload.handles) && !tracks.some((t) => onBandcamp(t.handles))) continue;
+					payload.genre = null;
+					delete payload.enrichAsked;
+					for (const ref of tracks) {
+						ref.genre = null;
+						delete ref.enrichStatus;
+						delete ref.enrichAsked;
+					}
+					reset.run(JSON.stringify(payload), r.id);
+				}
+			})();
+		}
+		// v12 → v13: while Cloudflare blocked Beatport, a Traxsource answer that
+		// filled every field settled the track for good, so Traxsource's genres
+		// ("Electronica" for Organic House), BPMs and keys stuck. Mark the values
+		// that are Traxsource's as provisional on tracks Beatport never matched
+		// and send them back to Beatport alone (enrichment.ts applyLookup).
+		if (priorVersion < 13) {
+			this.db.transaction(() => {
+				type Ref = Pick<FeedTrackRef, 'bpm' | 'keyCamelot' | 'genre' | 'sourceLinks' | 'enrichAsked' | 'enrichProvisional'>;
+				const reopenRef = (r: Ref): boolean => {
+					const links = r.sourceLinks ?? [];
+					const tx = links.find((l) => l.source === 'traxsource');
+					if (!tx || links.some((l) => l.source === 'beatport')) return false;
+					const raw = tx.payload as { genre?: string | null } | undefined;
+					const prov: string[] = [];
+					if (r.bpm != null && r.bpm === tx.bpm) prov.push('bpm');
+					if (r.keyCamelot && r.keyCamelot === keyToCamelot(tx.key ?? null)) prov.push('keyCamelot');
+					if (r.genre && r.genre === raw?.genre) prov.push('genre');
+					if (!prov.length) return false;
+					r.enrichProvisional = prov;
+					r.enrichAsked = ['traxsource'];
+					return true;
+				};
+				const reopen = this.db.prepare(`UPDATE feed_item SET payload_json = ?, enrich_status = 'err' WHERE id = ?`);
+				const rows = this.db.prepare(`SELECT id, type, payload_json FROM feed_item WHERE payload_json LIKE '%"traxsource"%'`).all() as { id: string; type: string; payload_json: string }[];
+				for (const r of rows) {
+					const payload = JSON.parse(r.payload_json) as FeedItemPayload;
+					if (r.type !== 'album') {
+						if (reopenRef(payload)) reopen.run(JSON.stringify(payload), r.id);
+						continue;
+					}
+					const reopened: FeedTrackRef[] = [];
+					for (const ref of payload.tracks ?? []) {
+						if (!reopenRef(ref)) continue;
+						ref.enrichStatus = 'err';
+						reopened.push(ref);
+					}
+					if (!reopened.length) continue;
+					// The album's genre came from these tracks: re-derived once they settle.
+					if (payload.genre && reopened.some((t) => t.genre === payload.genre && t.enrichProvisional?.includes('genre'))) payload.enrichProvisional = ['genre'];
+					reopen.run(JSON.stringify(payload), r.id);
+				}
 			})();
 		}
 		this.db
@@ -1343,7 +1447,7 @@ export class SqliteFeedStore implements FeedStore {
 		return txn();
 	}
 
-	async listUnenriched(limit: number): Promise<FeedItem[]> {
+	async listUnenriched(limit: number, exclude: readonly string[] = []): Promise<FeedItem[]> {
 		// Worklist = never-attempted (enrich_status IS NULL) OR last attempt
 		// errored (status 'err' — retryable; a WAF/network blip shouldn't strand
 		// the row like the old enriched_at stamp did). 'ok'/'na' are terminal.
@@ -1360,9 +1464,10 @@ export class SqliteFeedStore implements FeedStore {
 					AND covered_by IS NULL
 					AND (type = 'track'
 						OR (type = 'album' AND json_extract(payload_json, '$.tracks') IS NOT NULL))
+					AND id NOT IN (SELECT value FROM json_each(?))
 				ORDER BY order_ts DESC LIMIT ?
 			`)
-			.all(Math.max(1, limit)) as ItemRow[];
+			.all(JSON.stringify(exclude), Math.max(1, limit)) as ItemRow[];
 		return rows.map(rowToItem);
 	}
 

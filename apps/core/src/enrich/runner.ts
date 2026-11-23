@@ -12,7 +12,7 @@
 // batch at ~350ms — both are properties of the caller, passed through here so
 // the delay lands between the actual lookups rather than around them.
 
-import type { DjMetadataPatch, Enricher, EnrichmentResult, EnrichmentTarget } from './contract.js';
+import type { DjMetadataPatch, Enricher, EnricherOutcome, EnrichmentResult, EnrichmentTarget } from './contract.js';
 import { log } from '@curator/sync-core/log';
 
 const elog = log.for('enrich');
@@ -51,16 +51,48 @@ export async function enrichOne(
 	let patch: EnrichmentResult['patch'] = null;
 	const sourceLinks: EnrichmentResult['sourceLinks'] = [];
 	let errored = false;
+	let deferredUntil: number | null = null;
+	const asked: string[] = [];
+	const outcomes: EnricherOutcome[] = [];
+	// A store sat out before anything was found: what the fallbacks fill is
+	// theirs alone, and the primary still has to be asked (Traxsource files
+	// Organic House as "Electronica"; its BPMs and keys differ too).
+	let primarySatOut = false;
+	// A store that sat this lookup out because it's blocking us (cooling down
+	// before the call, or blocked during it — a lane can also turn it away
+	// while queued) may well have the track: remember when it reopens.
+	const noteBlocked = (enricher: Enricher): number | null => {
+		const until = enricher.blockedUntil?.() ?? null;
+		if (until == null || until <= Date.now()) return null;
+		deferredUntil = deferredUntil == null ? until : Math.min(deferredUntil, until);
+		return until;
+	};
+	const blocked = (enricher: Enricher, until: number): EnricherOutcome => {
+		const reason = enricher.blockedReason?.() ?? null;
+		return { enricher: enricher.id, result: 'blocked', until, ...(reason ? { detail: reason } : {}) };
+	};
 
 	for (const enricher of enrichers) {
 		if (opts.signal?.aborted) break;
 		// Every core field already filled by a higher-priority enricher — the
 		// remaining fallbacks have nothing to add, so skip their network calls.
 		if (isComplete(patch)) break;
-		if (!enricher.applicableTo(target)) continue;
+		if (!enricher.applicableTo(target)) {
+			const until = noteBlocked(enricher);
+			if (until != null) {
+				outcomes.push(blocked(enricher, until));
+				if (!patch) primarySatOut = true;
+			}
+			continue;
+		}
 
+		let outcome: EnricherOutcome;
 		try {
 			const out = await enricher.enrich(target, opts.signal);
+			// A lane hands back null without asking when the store blocked us
+			// while the lookup queued — that's not an answer.
+			const answered = !!out || !enricher.blockedUntil?.();
+			if (answered) asked.push(enricher.id);
 			if (out?.kind === 'metadata') {
 				patch = fillGaps(patch, out.patch);
 				if (out.sourceLink) sourceLinks.push(out.sourceLink);
@@ -68,6 +100,7 @@ export async function enrichOne(
 			// 'analysis' outputs carry no metadata patch — the analyzer queue
 			// persists track_analysis rows + peaks itself. enrichOne drives only
 			// metadata enrichers; the analysis enricher runs via its own queue.
+			outcome = { enricher: enricher.id, result: out ? 'hit' : answered ? 'miss' : 'blocked' };
 		} catch (err) {
 			// One flaky enricher must not abort the rest — log and move on. Record
 			// that a lookup failed so the caller can distinguish a transient error
@@ -75,10 +108,22 @@ export async function enrichOne(
 			// null patch.
 			errored = true;
 			elog.warn('enricher failed', { enricher: enricher.id }, err);
+			outcome = { enricher: enricher.id, result: 'error', detail: err instanceof Error ? err.message : String(err) };
 		}
+		const until = noteBlocked(enricher);
+		if (until != null && outcome.result !== 'hit') outcome = outcome.result === 'blocked' ? blocked(enricher, until) : { ...outcome, until };
+		// Blocked or failed into a block: it never answered, so a retry asks it.
+		if (until != null && !patch && (outcome.result === 'blocked' || outcome.result === 'error')) primarySatOut = true;
+		outcomes.push(outcome);
 
 		if (opts.pacingMs) await new Promise((r) => setTimeout(r, opts.pacingMs));
 	}
 
-	return { patch, sourceLinks, errored };
+	const provisional = primarySatOut && !!patch;
+	return {
+		patch, sourceLinks, errored,
+		deferredUntil: isComplete(patch) && !primarySatOut ? null : deferredUntil,
+		asked, outcomes,
+		...(provisional ? { provisional } : {}),
+	};
 }

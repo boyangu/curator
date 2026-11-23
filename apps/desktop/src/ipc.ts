@@ -171,6 +171,12 @@ export interface IpcChannels {
 	// 'track_unavailable' is surfaced as a recognizable message so player.ts can
 	// rethrow SpotifyTrackUnavailableError for the Discover auto-skip path.
 	'spotify:rpc': { args: [method: string, params?: unknown]; ret: unknown };
+
+	// FlareSolverr — Beatport's way past Cloudflare (main/flaresolverr-host.ts).
+	'flaresolverr:status':         { args: [refresh?: boolean]; ret: FlareSolverrStatus };
+	'flaresolverr:start':          { args: []; ret: FlareSolverrStatus };
+	'flaresolverr:stop':           { args: []; ret: FlareSolverrStatus };
+	'flaresolverr:set-auto-start': { args: [on: boolean]; ret: FlareSolverrStatus };
 	// ─── Tags (Interested / Basket / future user tags) ────────────────────
 	'tags:list': { args: []; ret: Tag[] };
 	'tags:counts': { args: []; ret: Record<string, number> };
@@ -480,6 +486,20 @@ export interface AccountDevice extends DeviceInfo {
 	current: boolean;
 }
 
+// The FlareSolverr service that carries Beatport lookups past Cloudflare
+// (main/flaresolverr-host.ts). `reason` says why it is stopped/failed;
+// `managed` is true when this session started it (and stops it on quit).
+export interface FlareSolverrStatus {
+	enabled: boolean;
+	url: string;
+	state: 'unknown' | 'starting' | 'running' | 'stopping' | 'stopped' | 'failed';
+	autoStart: boolean;
+	managed: boolean;
+	version: string | null;
+	reason: string | null;
+	since: number;
+}
+
 // BYOK agent config as the renderer sees it — provider + models in the
 // clear, the API key reduced to presence. The full key exists only inside
 // main (safeStorage-encrypted on disk, decrypted into the sidecar RPC).
@@ -532,6 +552,8 @@ export type EventChannels = {
 	// union emitted by apps/spotify-player. Renderer's player.ts subscribes to
 	// drive reactive position/track updates + queue advance on natural end.
 	'spotify:event': SpotifyEvent;
+	// FlareSolverr service state changes (starting → running, failed + why).
+	'flaresolverr:event': FlareSolverrStatus;
 	// One feed item finished enrichment (background drain or on-view). Carries
 	// the updated FeedItem so the Discover view can fold fresh genre/label/bpm
 	// chips onto the card live, without a manual refresh.
@@ -609,6 +631,7 @@ export const EVENT_CATALOG = {
 	onWavConvertEvent: 'wav:convert-event',
 	onAudioEvent: 'audio:event',
 	onSpotifyEvent: 'spotify:event',
+	onFlareSolverrStatus: 'flaresolverr:event',
 	onFeedEnriched: 'feed:enriched',
 	onFeedActivity: 'feed:activity',
 	onFeedLensesChanged: 'feed:lenses-changed',
@@ -856,6 +879,10 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'player:tidal:token': { description: 'Return the sniffed Tidal bearer + countryCode + clientId for the renderer player.' },
 	'audio:rpc': { description: 'Forward a JSON-RPC call to the native audio engine sidecar. Methods: load, play, pause, seek, seek_with_xfade, arm_trigger, set_beatgrid, jump_beats, set_volume, set_loop, position, stop, scrub_begin, scrub_to, scrub_end.' },
 	'spotify:rpc': { description: 'Forward a JSON-RPC call to the Spotify playback sidecar. Methods: ensure, play, pause, resume, toggle, seek, set_volume, stop.' },
+	'flaresolverr:status': { description: 'State of the FlareSolverr service (a Docker container in WSL) that loads Beatport pages past Cloudflare: running / starting / stopped / failed with the reason, version, whether Curator starts it at launch. `refresh` probes the service first.' },
+	'flaresolverr:start': { description: 'Start the FlareSolverr container (creates it on first run) and wait until it answers. Returns the resulting state, with the reason when it fails.' },
+	'flaresolverr:stop': { description: 'Stop the FlareSolverr container. Beatport lookups then pause with "FlareSolverr unavailable" until it is started again.' },
+	'flaresolverr:set-auto-start': { description: 'Whether Curator starts FlareSolverr when it loads (and restarts it when a lookup finds it down).' },
 	'tags:list': { description: 'List all tags (system + user). System tags include the seeded "interested" and "basket" workflow tags.' },
 	'tags:counts': { description: 'Return a per-tag count of how many tracks carry each tag.' },
 	'tracks:tags': { description: 'List the tag ids currently applied to a track.' },

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cloudflareChallengeReason, Cooldown, ProviderBlockedError } from './block.js';
+import { cloudflareChallengeReason, Cooldown, ProviderBlockedError, retryAfterMs } from './block.js';
 
 // Minimal case-insensitive Headers stand-in.
 const H = (obj: Record<string, string>) => ({
@@ -41,6 +41,37 @@ describe('Cooldown', () => {
 		expect(cd.active).toBe(true);
 		now = 1000 + 5000; // window elapsed (exclusive)
 		expect(cd.active).toBe(false);
+	});
+
+	it('doubles the window per consecutive block up to the max, and clear() resets it', () => {
+		let now = 0;
+		const cd = new Cooldown(1000, () => now, 3000);
+		expect(cd.trip()).toBe(1000);
+		expect(cd.releaseAt).toBe(1000);
+		expect(cd.trip()).toBe(2000);
+		expect(cd.trip()).toBe(3000);
+		expect(cd.trip()).toBe(3000);
+		cd.clear();
+		expect(cd.active).toBe(false);
+		expect(cd.releaseAt).toBeNull();
+		expect(cd.trip()).toBe(1000);
+	});
+
+	it('a Retry-After replaces the guess', () => {
+		const now = 0;
+		const cd = new Cooldown(1000, () => now, 3000);
+		expect(cd.trip(90_000)).toBe(90_000);
+		expect(cd.releaseAt).toBe(90_000);
+	});
+});
+
+describe('retryAfterMs', () => {
+	it('reads delta-seconds and HTTP dates; null when absent', () => {
+		expect(retryAfterMs(H({ 'retry-after': '120' }))).toBe(120_000);
+		const now = Date.parse('2026-11-23T10:00:00Z');
+		expect(retryAfterMs(H({ 'retry-after': 'Mon, 23 Nov 2026 10:05:00 GMT' }), now)).toBe(300_000);
+		expect(retryAfterMs(H({}))).toBeNull();
+		expect(retryAfterMs(H({ 'retry-after': 'soon' }))).toBeNull();
 	});
 });
 

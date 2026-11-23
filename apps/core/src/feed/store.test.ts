@@ -19,6 +19,127 @@ function draft(type: 'track' | 'album', sourceId: string, dedupeKey: string, ext
 	};
 }
 
+describe('SqliteFeedStore v10 → v11: reopen misses stamped behind the Beatport block', () => {
+	it('reopens na tracks and refs enriched since 2026-11-08 as err, already answered by Traxsource', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v11-'));
+		const path = join(dir, 'feed.db');
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([
+				draft('track', 'blocked', 'spotify:track:blocked'),
+				draft('track', 'old', 'spotify:track:old'),
+				draft('track', 'linked', 'spotify:track:linked', { sourceLinks: [{ source: 'traxsource', sourceTrackId: '1' }] }),
+				draft('album', 'al', 'spotify:album:al', { tracks: [
+					{ sourceTrackId: 'r1', title: 'miss', artists: ['A'], durationSec: 1, enrichStatus: 'na' },
+					{ sourceTrackId: 'r2', title: 'hit', artists: ['A'], durationSec: 1, enrichStatus: 'ok', bpm: 120 },
+				] }),
+			]);
+			s.close();
+			const during = Date.UTC(2026, 10, 16);
+			const raw = new Database(path);
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'na', enriched_at = ? WHERE source_id IN ('blocked', 'linked')`).run(during);
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'na', enriched_at = ? WHERE source_id = 'old'`).run(Date.UTC(2026, 9, 1));
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'ok', enriched_at = ? WHERE source_id = 'al'`).run(during);
+			raw.exec(`UPDATE feed_meta SET value = '10' WHERE key = 'schema_version'`);
+			raw.close();
+
+			const s2 = new SqliteFeedStore(path);
+			const byId = new Map((await s2.listUnenriched(50)).map((i) => [i.sourceId, i]));
+			expect([...byId.keys()].sort()).toEqual(['al', 'blocked']);
+			expect(byId.get('blocked')!.enrichStatus).toBe('err');
+			expect(byId.get('blocked')!.payload.enrichAsked).toEqual(['traxsource']);
+			const [r1, r2] = byId.get('al')!.payload.tracks!;
+			expect(r1).toMatchObject({ enrichStatus: 'err', enrichAsked: ['traxsource'] });
+			expect(r2!.enrichStatus).toBe('ok');
+			expect(r2!.enrichAsked).toBeUndefined();
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('SqliteFeedStore v11 → v12: Bandcamp-tag genres cleared for re-enrichment', () => {
+	it('clears genres and enrich state on cards with a Bandcamp page, leaves the rest', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v12-'));
+		const path = join(dir, 'feed.db');
+		const bc = { provider: 'bandcamp' as const, id: '1', url: 'https://x.bandcamp.com/album/a' };
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([
+				draft('album', 'al', 'catalog:release:al', { genre: 'Ambient / Experimental', handles: [bc], tracks: [
+					{ sourceTrackId: 'r1', title: 'one', artists: ['A'], durationSec: 1, genre: 'Ambient / Experimental', bpm: 128, enrichStatus: 'ok', enrichAsked: ['traxsource'], sourceLinks: [{ source: 'traxsource', sourceTrackId: '9' }] },
+				] }),
+				draft('track', 'tr', 'catalog:recording:tr', { genre: 'House', handles: [{ ...bc, url: 'https://x.bandcamp.com/track/t' }] }),
+				draft('track', 'plain', 'spotify:track:plain', { genre: 'Techno' }),
+			]);
+			s.close();
+			const raw = new Database(path);
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'ok', enriched_at = 1`).run();
+			raw.exec(`UPDATE feed_meta SET value = '11' WHERE key = 'schema_version'`);
+			raw.close();
+
+			const s2 = new SqliteFeedStore(path);
+			const byId = new Map((await s2.listUnenriched(50)).map((i) => [i.sourceId, i]));
+			expect([...byId.keys()].sort()).toEqual(['al', 'tr']);
+			const al = byId.get('al')!;
+			expect(al.enrichStatus).toBeNull();
+			expect(al.payload.genre).toBeNull();
+			const [r1] = al.payload.tracks!;
+			expect(r1!.genre).toBeNull();
+			expect(r1!.enrichStatus).toBeUndefined();
+			expect(r1!.enrichAsked).toBeUndefined();
+			// What the stores already said stays: the re-run merges into it.
+			expect(r1!).toMatchObject({ bpm: 128, sourceLinks: [{ source: 'traxsource', sourceTrackId: '9' }] });
+			expect(byId.get('tr')!.payload.genre).toBeNull();
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('SqliteFeedStore v12 → v13: Traxsource-only facts sent back to Beatport', () => {
+	it('marks the values that are Traxsource’s provisional and reopens the track for Beatport alone', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v13-'));
+		const path = join(dir, 'feed.db');
+		const tx = (bpm: number, key: string, genre: string) => ({ source: 'traxsource', sourceTrackId: '9', bpm, key, payload: { genre } });
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([
+				draft('album', 'al', 'catalog:release:al', { genre: 'Electronica', tracks: [
+					// The card's own key (from the catalogue) differs from Traxsource's: it stands.
+					{ sourceTrackId: 'r1', title: 'one', artists: ['A'], durationSec: 1, genre: 'Electronica', bpm: 124, keyCamelot: '8A', enrichStatus: 'ok', sourceLinks: [tx(124, 'C#maj', 'Electronica')] },
+					{ sourceTrackId: 'r2', title: 'two', artists: ['A'], durationSec: 1, genre: 'Organic House', bpm: 93, enrichStatus: 'ok', sourceLinks: [{ source: 'beatport', sourceTrackId: '7' }, tx(124, 'A#min', 'Electronica')] },
+				] }),
+				draft('track', 'tr', 'spotify:track:tr', { genre: 'Melodic / Progressive House', bpm: 122, keyCamelot: '3A', sourceLinks: [tx(122, 'A#min', 'Melodic / Progressive House')] }),
+				draft('track', 'plain', 'spotify:track:plain', { genre: 'Techno' }),
+			]);
+			s.close();
+			const raw = new Database(path);
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'ok', enriched_at = 1`).run();
+			raw.exec(`UPDATE feed_meta SET value = '12' WHERE key = 'schema_version'`);
+			raw.close();
+
+			const s2 = new SqliteFeedStore(path);
+			const byId = new Map((await s2.listUnenriched(50)).map((i) => [i.sourceId, i]));
+			expect([...byId.keys()].sort()).toEqual(['al', 'tr']);
+			const al = byId.get('al')!;
+			expect(al.enrichStatus).toBe('err');
+			expect(al.payload.enrichProvisional).toEqual(['genre']);
+			const [r1, r2] = al.payload.tracks!;
+			expect(r1).toMatchObject({ enrichStatus: 'err', enrichAsked: ['traxsource'], enrichProvisional: ['bpm', 'genre'], keyCamelot: '8A' });
+			// Beatport already matched it: settled.
+			expect(r2!.enrichStatus).toBe('ok');
+			expect(r2!.enrichProvisional).toBeUndefined();
+			expect(byId.get('tr')!.payload).toMatchObject({ enrichAsked: ['traxsource'], enrichProvisional: ['bpm', 'keyCamelot', 'genre'] });
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe('SqliteFeedStore filter probes', () => {
 	it('existingDedupeKeys returns only stored keys', async () => {
 		const s = new SqliteFeedStore(':memory:');

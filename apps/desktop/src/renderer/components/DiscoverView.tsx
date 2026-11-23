@@ -13,7 +13,7 @@
 
 import { For, Show, createSignal, createEffect, createRoot, type JSX } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
+import type { FeedEnrichReport, FeedItem, FeedItemDetail, FeedTrackRef, FeedSuppressionScope, FeedOrigin, EnrichStatus, FeedLens, FeedRefreshKind, FeedRefreshResult, FeedRefreshScope } from '@curator/core';
 import { openContextMenu, type ContextMenuItem } from './ContextMenu.jsx';
 import { ArtistCredits } from './ArtistCredits.jsx';
 import { artistOpenSubmenu } from '../features/artistOpenMenu.js';
@@ -252,6 +252,29 @@ function sourcesTooltip(item: FeedItem): string {
 // attempted yet) so the caller renders nothing.
 function enrichMarker(status: EnrichStatus | null | undefined): string {
 	return status === 'na' ? 'N/A' : status === 'err' ? 'ERR' : '';
+}
+
+const ENRICH_STORE: Record<string, string> = { beatport: 'Beatport', traxsource: 'Traxsource' };
+const clock = (at: number) => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+// The marker's tooltip: what each store said on the last lookup (rows
+// looked up before stores' outcomes were kept have only the status).
+function enrichTooltip(status: EnrichStatus | null | undefined, report: FeedEnrichReport | undefined): string {
+	const head = status === 'na'
+		? 'No store had this track.'
+		: 'Not settled yet: a lookup failed or a store was blocking us. Retried automatically.';
+	if (!report?.outcomes.length) return head;
+	const lines = report.outcomes.map((o) => {
+		const store = ENRICH_STORE[o.enricher] ?? o.enricher;
+		const retry = o.until ? (o.until > Date.now() ? ` — retry after ${clock(o.until)}` : ' — retrying') : '';
+		switch (o.result) {
+			case 'hit': return `${store}: found`;
+			case 'miss': return `${store}: no match`;
+			case 'blocked': return `${store}: blocked${o.detail ? ` (${o.detail})` : ''}${retry}`;
+			case 'error': return `${store}: failed${o.detail ? ` — ${o.detail}` : ''}${retry}`;
+		}
+	});
+	return [head, '', ...lines, '', `Last lookup ${clock(report.at)}`].join('\n');
 }
 
 // Sample a cover's left edge into a smooth vertical CSS gradient, used as each
@@ -1735,7 +1758,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 									// No DJ metadata landed — show the Beatport outcome (N/A no-match /
 									// ERR failed) so the empty line reads as a known state, not loading.
 									: (!item().payload.bpm && !item().payload.genre && !item().payload.label && enrichMarker(item().enrichStatus))
-										? <span class={`feed-meta-enrich feed-meta-enrich--${item().enrichStatus}`}>{enrichMarker(item().enrichStatus)}</span>
+										? <span class={`feed-meta-enrich feed-meta-enrich--${item().enrichStatus}`} title={enrichTooltip(item().enrichStatus, item().payload.enrichReport ?? item().payload.tracks?.find((t) => t.enrichStatus === item().enrichStatus && t.enrichReport)?.enrichReport)}>{enrichMarker(item().enrichStatus)}</span>
 										: null,
 							]} />
 							<div class="feed-card__meta-line">
@@ -1951,7 +1974,7 @@ export function mountDiscoverView(host: HTMLElement, props: DiscoverViewProps): 
 											</span>
 											<span class="feed-track__genre" title={t.genre ?? ''}>{t.genre ?? ''}</span>
 											<span class="feed-track__bpm">
-												<Show when={t.bpm} fallback={<span class={`feed-meta-enrich feed-meta-enrich--${t.enrichStatus}`}>{enrichMarker(t.enrichStatus)}</span>}>{Math.round(t.bpm!)}</Show>
+												<Show when={t.bpm} fallback={<span class={`feed-meta-enrich feed-meta-enrich--${t.enrichStatus}`} title={enrichMarker(t.enrichStatus) ? enrichTooltip(t.enrichStatus, t.enrichReport) : ''}>{enrichMarker(t.enrichStatus)}</span>}>{Math.round(t.bpm!)}</Show>
 											</span>
 											<span class="feed-track__key"><KeyChip keyCamelot={t.keyCamelot} /></span>
 											<span class="feed-track__dur">{fmtDuration(t.durationSec)}</span>

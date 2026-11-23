@@ -7,7 +7,7 @@
 
 import type { StreamingSource } from '@curator/shared';
 import type { CatalogHandle } from '@curator/protocol';
-import type { SourceLinkDraft } from '../enrich/contract.js';
+import type { EnricherOutcome, SourceLinkDraft } from '../enrich/contract.js';
 
 export type FeedItemType = 'track' | 'album' | 'playlist' | 'set';
 
@@ -74,6 +74,14 @@ export type FeedSuppressionScope = 'artist' | 'label' | 'playlist' | 'source';
 // it on the next pass. The UI shows `N/A` / `ERR` so an empty row reads as a
 // known outcome rather than "still loading". Absent/null = not yet attempted.
 export type EnrichStatus = 'ok' | 'na' | 'err';
+
+// The last lookup, store by store — what the N/A / ERR marker's tooltip
+// says. A retry asks only the stores that haven't answered; the ones it
+// skipped keep their earlier outcome.
+export interface FeedEnrichReport {
+	at: number;
+	outcomes: EnricherOutcome[];
+}
 
 // The lazy Spotify match of an item that arrived without a Spotify id
 // (feed/spotify-match.ts): found and upgraded in place ('ok'), not on
@@ -150,6 +158,13 @@ export interface FeedTrackRef {
 	// Per-track enrichment outcome (drives the row's N/A / ERR marker). Set by
 	// the album drain after this ref's Beatport lookup; absent until attempted.
 	enrichStatus?: EnrichStatus;
+	// Stores that already answered this ref while another was blocking us; the
+	// retry asks only the rest (see FeedEnrichmentQueue). Cleared once settled.
+	enrichAsked?: string[];
+	// Fields a fallback store filled while the primary (Beatport) was blocking
+	// us: shown, but the primary's answer on the retry replaces them.
+	enrichProvisional?: string[];
+	enrichReport?: FeedEnrichReport;
 	// The catalogue recording and its provider handles, for refs from a
 	// catalogue card. `sourceTrackId` is the Spotify id when a handle has one,
 	// else the catalogue recording id (feed/handles.ts spotifyIdOf tells them
@@ -192,6 +207,12 @@ export interface FeedItemPayload {
 	// carry it per-ref on FeedTrackRef instead). Same shape the LibrarySink
 	// persists as a source_link; carried so promotion mirrors a direct enrich.
 	sourceLinks?: SourceLinkDraft[];
+	// Track items: as FeedTrackRef.enrichAsked / enrichProvisional /
+	// enrichReport. Album items: enrichProvisional names the album-level
+	// genre/label derived from provisional track values.
+	enrichAsked?: string[];
+	enrichProvisional?: string[];
+	enrichReport?: FeedEnrichReport;
 	tracks?: FeedTrackRef[];
 	// The catalogue object (release / recording) and its provider handles,
 	// for items the cloud raised: identity across producers and where the

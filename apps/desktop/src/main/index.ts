@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, extname, join, normalize as normalizePath } from 'node:path';
 import { createHash } from 'node:crypto';
 import { appendFile, existsSync, promises as fsp, statSync } from 'node:fs';
-import { applyPendingRestore, buildMcpWriteTools, createCoreService, migrate, probeWsl, readRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
+import { applyPendingRestore, buildMcpWriteTools, createCoreService, flareSolverrFetch, migrate, probeWsl, readRestoreApplied, remapLocalPathsAt, remintAfterRestoreAt, type CoreService, type MirProvisionSpec, type MirSidecarSpec } from '@curator/core';
 import { cpus, hostname } from 'node:os';
 import { mainLog, attachFileSink } from './log.js';
 import { isLogLevel } from '@curator/shared/log';
@@ -35,6 +35,7 @@ import { createHttpCloudTransport, withLocalCatalog } from './cloud/transport.js
 import { shareSpotifyLogin } from './cloud/local-catalog-login.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
 import { createUtilityReplicaBuilder, createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
+import { createFlareSolverrHost, type FlareSolverrHost } from './flaresolverr-host.js';
 import { catalogApiUrl, cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import { PROFILE_NAME_RE, decideRails, parseProfileEnv, profileAppUserModelId, profileDeviceName, profileRailsSummary, profileTitleSuffix, profileUserDataDir } from './profile.js';
 import type { CloudTransport } from '@curator/core';
@@ -646,6 +647,7 @@ let ingestPool: IngestPool | null = null;
 let coreSidecar: CoreSidecarHost | null = null;
 let audioSidecar: AudioSidecarHost | null = null;
 let spotifySidecar: SpotifySidecarHost | null = null;
+let flareSolverr: FlareSolverrHost | null = null;
 let mcpHost: McpBridgeHost | null = null;
 let cloudAccount: CloudAccount | null = null;
 let cloudTransport: CloudTransport | null = null;
@@ -817,6 +819,9 @@ function createWindow(): void {
 			} catch (err) {
 				mainLog.for('analyzer').error('startAnalyzer failed', err);
 			}
+			// FlareSolverr runs in WSL too: same post-load gate, so a cold WSL
+			// boot can't blank the window. Before the feed drain needs Beatport.
+			flareSolverr?.boot();
 			try {
 				core?.startFeedPolling();
 			} catch (err) {
@@ -860,6 +865,7 @@ function registerIpc(svc: CoreService): void {
 	// the catalog without a matching handler (or vice-versa).
 	const handlers = buildHandlers(svc, {
 		getMainWindow: () => mainWindow, coreSidecar, audioSidecar, spotifySidecar, mcpConfirm, cloudAccount, cloudTransport,
+		flareSolverr: flareSolverr!,
 		profileBlocks: {
 			downloads: rails.downloadsBlocked,
 			googleBackup: rails.backup ? null : `Backup is off in profile "${PROFILE}".`,
@@ -1183,9 +1189,23 @@ app.whenReady().then(async () => {
 	// CURATOR_BP_DUMP=<path> dumps the raw __NEXT_DATA__ JSON from every
 	// /track/<slug>/<id> response to <path> so we can inspect the actual
 	// schema when label/genre parsing falls through. Disabled by default.
+	//
+	// beatport.com pages go through the FlareSolverr browser (core
+	// enrich/flaresolverr.ts; supervised by flaresolverr-host.ts) — the way past
+	// a long Cloudflare block. CURATOR_DISABLE_FLARESOLVERR=1 = direct, as before.
+	// A lookup made while the container is starting waits for it (a warm start
+	// takes ~7 s), but not through a first-run image pull: past this it fails
+	// with the supervisor's reason and Beatport pauses as before.
+	const FLARESOLVERR_READY_WAIT_MS = 90_000;
 	const bpDumpPath = process.env['CURATOR_BP_DUMP'] ?? null;
+	flareSolverr = createFlareSolverrHost(app.getPath('userData'));
+	const fsHost = flareSolverr;
+	const pageFetch = fsHost.enabled
+		? flareSolverrFetch({ baseUrl: fsHost.url, fallback: (u, i) => net.fetch(u, i), describe: () => fsHost.describe(), onDown: () => fsHost.noteDown(), ready: () => fsHost.whenReady(FLARESOLVERR_READY_WAIT_MS) })
+		: (u: string, i?: RequestInit) => net.fetch(u, i);
+	bootLog.info('beatport route', { via: fsHost.enabled ? 'flaresolverr' : 'direct', url: fsHost.enabled ? fsHost.url : null });
 	const beatportFetch = async (url: string, init?: RequestInit): Promise<Response> => {
-		const res = await net.fetch(url, init);
+		const res = await pageFetch(url, init);
 		if (bpDumpPath && res.ok && /\/track\/[^/]+\/\d+(?:\?|$)/.test(url)) {
 			const body = await res.clone().text();
 			const m = body.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
@@ -1490,6 +1510,7 @@ let shutdownPromise: Promise<void> | null = null;
 function gracefulShutdown(): Promise<void> {
 	if (shutdownPromise) return shutdownPromise;
 	core?.close();
+	flareSolverr?.shutdown();
 	const shutdowns = Promise.allSettled([
 		ingestPool?.shutdown(),
 		coreSidecar?.shutdown(),

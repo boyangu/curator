@@ -225,6 +225,16 @@ export const catalogApi = {
 	followMany: (...args: Parameters<typeof window.api['catalog:follow-many']>) => api()['catalog:follow-many'](...args),
 };
 
+// FlareSolverr — the browser service Beatport lookups go through (Settings →
+// Discover). Main supervises the container; these read and steer it.
+export const flareSolverrApi = {
+	status: (refresh?: boolean) => api()['flaresolverr:status'](refresh),
+	start: () => api()['flaresolverr:start'](),
+	stop: () => api()['flaresolverr:stop'](),
+	setAutoStart: (on: boolean) => api()['flaresolverr:set-auto-start'](on),
+	onStatus: (cb: Parameters<typeof window.api.onFlareSolverrStatus>[0]) => api().onFlareSolverrStatus(cb),
+};
+
 // Entity pages (artist / label / album): the header and the World side's
 // track pages (core entity/service.ts). The Owned side is `tracks:list` with
 // the header's filter; `primary` is the service catalogue rows play through.

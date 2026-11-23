@@ -32,6 +32,8 @@ export type { SyncPollPolicy, SyncPollSettings } from '@curator/sync-core/sync-l
 export { CatalogueBlobError, DEFAULT_CATALOGUE_SETTINGS, CATALOGUE_KBPS_LIMITS, type CatalogueBlobStore, type CatalogueTransport, type CatalogueStatus, type CatalogueSettings, type CatalogueSettingsPatch, type CatalogueBackfillAction, type CatalogueBackfillState, type CatalogueEvent } from './catalogue/types.js';
 export type { CreatePhaseSummary as RekordboxCreateSummary } from './rekordbox/create-phase.js';
 export { config } from './config.js';
+export { flareSolverrFetch } from './enrich/flaresolverr.js';
+export type { EnricherOutcome } from './enrich/contract.js';
 export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/index.js';
 export * from './feed/types.js';
 export type { CatalogClientStatus, CatalogEnrichReport, CatalogFollowManyReport, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit } from './catalog-client/service.js';

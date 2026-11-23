@@ -13,8 +13,10 @@
 import {
 	sharedScorer,
 	ProviderBlockedError,
+	ProviderUnavailableError,
 	Cooldown,
 	cloudflareChallengeReason,
+	retryAfterMs,
 	type Trace,
 } from '@curator/matcher';
 
@@ -25,8 +27,14 @@ const DEBUG = (typeof process !== 'undefined' ? process?.env?.CURATOR_BP_DEBUG :
 // After Cloudflare hands us a challenge, skip Beatport for this long before
 // probing again — long enough that a multi-thousand-track batch stops hammering
 // the wall and lets the Traxsource fallback carry it, short enough that a
-// transient block self-heals within one sitting. Per-client (see Cooldown).
+// transient block self-heals within one sitting. Each further block in a row
+// doubles it, up to the max: a block that holds for weeks costs a few probes a
+// day, not one every five minutes. Per-client (see Cooldown).
 const BLOCK_COOLDOWN_MS = 5 * 60 * 1000;
+const BLOCK_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000;
+// How long to wait before trying again when our own FlareSolverr route is
+// down — short: Curator restarts it, and nothing on Beatport's side is wrong.
+const UNAVAILABLE_PAUSE_MS = 2 * 60 * 1000;
 
 export interface BeatportTrack {
 	id: number;
@@ -102,7 +110,10 @@ export class BeatportClient {
 	private static structureLogged = false;
 	private static detailStructureLogged = false;
 	private readonly fetchImpl: FetchLike;
-	private readonly cooldown = new Cooldown(BLOCK_COOLDOWN_MS);
+	private readonly cooldown = new Cooldown(BLOCK_COOLDOWN_MS, undefined, BLOCK_COOLDOWN_MAX_MS);
+	// Set while the pause is "our route is down", not "Cloudflare said no", so
+	// the calls skipped during it report the real reason.
+	private down: ProviderUnavailableError | null = null;
 
 	constructor(opts: BeatportClientOptions = {}) {
 		this.fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
@@ -115,15 +126,42 @@ export class BeatportClient {
 		return this.cooldown.active;
 	}
 
+	// When the current block window ends (null when not blocked) — callers
+	// park work that needs Beatport until then instead of settling for less.
+	blockedUntil(): number | null {
+		return this.cooldown.releaseAt;
+	}
+
+	// Why, while blocked: our route being down carries its own reason.
+	blockedReason(): string | null {
+		if (!this.cooldown.active) return null;
+		return this.down?.message ?? 'Cloudflare challenge';
+	}
+
 	// Trip the cooldown and raise a typed error. Called the moment a response
 	// is identified as a Cloudflare challenge — never continues past here.
-	private _blocked(status: number, reason: string): never {
+	private _blocked(res: Response, reason: string): never {
 		const firstHit = !this.cooldown.active;
-		this.cooldown.trip();
+		this.down = null;
+		const window = this.cooldown.trip(retryAfterMs(res.headers));
 		if (firstHit) {
-			console.warn(`[beatport] Cloudflare challenge (${reason}, HTTP ${status}) — backing off ${BLOCK_COOLDOWN_MS / 1000}s; falling back to Traxsource`);
+			console.warn(`[beatport] Cloudflare challenge (${reason}, HTTP ${res.status}) — backing off ${Math.round(window / 1000)}s; falling back to Traxsource`);
 		}
-		throw new ProviderBlockedError('beatport', status, reason);
+		throw new ProviderBlockedError('beatport', res.status, reason);
+	}
+
+	// Our route (FlareSolverr) is down: pause briefly — no backoff strike, it
+	// says nothing about Cloudflare — and pass the detailed reason up.
+	private _unavailable(err: ProviderUnavailableError): never {
+		if (!this.down) console.warn(`[beatport] ${err.message} — pausing ${UNAVAILABLE_PAUSE_MS / 1000}s`);
+		this.down = err;
+		this.cooldown.hold(UNAVAILABLE_PAUSE_MS);
+		throw err;
+	}
+
+	// What a call skipped during a pause throws: the route-down reason, or a block.
+	private _paused(): never {
+		throw this.down ?? new ProviderBlockedError('beatport', 0, 'cooldown');
 	}
 
 	async lookup(target: BeatportTarget): Promise<BeatportTrack | null> {
@@ -230,6 +268,8 @@ export class BeatportClient {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 			},
 		}).catch((err: unknown) => {
+			// Our own route to Beatport is down (FlareSolverr): not a miss, not a block.
+			if (err instanceof ProviderUnavailableError) this._unavailable(err);
 			if (DEBUG) console.warn('[beatport] fetchById threw', err instanceof Error ? err.message : err);
 			return null;
 		});
@@ -238,14 +278,16 @@ export class BeatportClient {
 		// modal shows "Beatport is blocked, try later" instead of the misleading
 		// "track not found or page parse failed". Header first, then body sniff.
 		const cfHeader = cloudflareChallengeReason(res.status, res.headers, null);
-		if (cfHeader) this._blocked(res.status, cfHeader);
+		if (cfHeader) this._blocked(res, cfHeader);
 		if (!res.ok) {
 			const body = await res.text().catch(() => '');
 			const reason = cloudflareChallengeReason(res.status, res.headers, body);
-			if (reason) this._blocked(res.status, reason);
+			if (reason) this._blocked(res, reason);
 			if (DEBUG) console.warn(`[beatport] fetchById non-OK ${res.status}`);
 			return null;
 		}
+		this.cooldown.clear();
+		this.down = null;
 		const html = await res.text();
 		const candidates = this._extractCandidates(html);
 		// The track-detail page yields a single track in tracks.data (or the
@@ -265,7 +307,7 @@ export class BeatportClient {
 		// spending a request (and a 350ms pace) on a wall. Throwing keeps the
 		// runner's `errored` accounting honest for direct lookup() callers; the
 		// batch path never reaches here because applicableTo() is already false.
-		if (this.cooldown.active) throw new ProviderBlockedError('beatport', 0, 'cooldown');
+		if (this.cooldown.active) this._paused();
 		const url = `https://www.beatport.com/search/tracks?q=${encodeURIComponent(query)}`;
 		if (DEBUG) console.log(`[beatport] GET ${url}`);
 		const res = await this.fetchImpl(url, {
@@ -276,6 +318,8 @@ export class BeatportClient {
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 			},
 		}).catch((err: unknown) => {
+			// Our own route to Beatport is down (FlareSolverr): not a miss, not a block.
+			if (err instanceof ProviderUnavailableError) this._unavailable(err);
 			if (DEBUG) console.warn('[beatport] fetch threw', err instanceof Error ? err.message : err);
 			return null;
 		});
@@ -287,14 +331,17 @@ export class BeatportClient {
 		// ProviderBlockedError so the runner records `errored` and moves to the
 		// fallback, instead of mistaking the WAF wall for "not in the catalog".
 		const cfHeader = cloudflareChallengeReason(res.status, res.headers, null);
-		if (cfHeader) this._blocked(res.status, cfHeader);
+		if (cfHeader) this._blocked(res, cfHeader);
 		if (!res.ok) {
 			const body = await res.text().catch(() => '');
 			const reason = cloudflareChallengeReason(res.status, res.headers, body);
-			if (reason) this._blocked(res.status, reason);
+			if (reason) this._blocked(res, reason);
 			if (DEBUG) console.warn(`[beatport] non-OK response (${res.status}), bailing`);
 			return [];
 		}
+		// Got past the wall: the next block starts the backoff from the bottom.
+		this.cooldown.clear();
+		this.down = null;
 		const html = await res.text();
 		if (DEBUG) console.log(`[beatport] body bytes=${html.length} has __NEXT_DATA__=${html.includes('__NEXT_DATA__')} has cloudflare=${html.toLowerCase().includes('cloudflare')}`);
 		return this._extractCandidates(html);
