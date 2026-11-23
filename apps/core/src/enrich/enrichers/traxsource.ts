@@ -7,7 +7,7 @@
 
 import { TraxsourceClient, type FetchLike as TraxsourceFetch } from '@curator/traxsource';
 import type { Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
-import { keyToCamelot } from '../keys.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 
 export class TraxsourceEnricher implements Enricher {
 	readonly id = 'traxsource';

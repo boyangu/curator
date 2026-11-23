@@ -11,12 +11,20 @@
 // digestOnly } → { id, ok, result | message }; log records as { kind: 'log' }.
 // The database is opened read-only; the parts are written under `outDir`
 // (userData), none for a digest-only build.
+//
+// And the ready-made library ('replica_storage'; core sync-log/replica.ts):
+// { id, op: 'replica', outDir, userId, masterDeviceId, snapshotSeq,
+// snapshotFiles } joins the snapshot whose parts were just built into an
+// empty library of its own under `outDir` and cuts it into parts there. The
+// user's library is not opened at all.
 
 import { setPriority, constants as osConstants } from 'node:os';
-import { buildSnapshotDigest, buildSnapshotParts, setCoreLogger } from '@curator/core';
+import { buildReplica, buildSnapshotDigest, buildSnapshotParts, setCoreLogger } from '@curator/core';
 import { createLogger, isLogLevel } from '@curator/shared/log';
 
-type BuildRequest = { id: number; op: 'build'; dbPath: string; outDir: string; userId: string; digestOnly?: boolean };
+type BuildRequest =
+	| { id: number; op: 'build'; dbPath: string; outDir: string; userId: string; digestOnly?: boolean }
+	| { id: number; op: 'replica'; outDir: string; userId: string; masterDeviceId: string; snapshotSeq: number; snapshotFiles: string[] };
 
 function post(frame: Record<string, unknown>): void {
 	process.parentPort.postMessage(frame);
@@ -34,10 +42,12 @@ try { setPriority(osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* not 
 
 process.parentPort.on('message', (e) => {
 	const msg = e.data as BuildRequest;
-	if (msg?.op !== 'build') return;
+	if (msg?.op !== 'build' && msg?.op !== 'replica') return;
 	void (async () => {
 		try {
-			const result = msg.digestOnly ? await buildSnapshotDigest({ dbPath: msg.dbPath }) : await buildSnapshotParts({ dbPath: msg.dbPath, outDir: msg.outDir, userId: msg.userId });
+			const result = msg.op === 'replica'
+				? await buildReplica({ outDir: msg.outDir, userId: msg.userId, masterDeviceId: msg.masterDeviceId, snapshotSeq: msg.snapshotSeq, snapshotFiles: msg.snapshotFiles })
+				: msg.digestOnly ? await buildSnapshotDigest({ dbPath: msg.dbPath }) : await buildSnapshotParts({ dbPath: msg.dbPath, outDir: msg.outDir, userId: msg.userId });
 			// Peak resident set of this process (KiB on every platform).
 			const peakRssBytes = process.resourceUsage().maxRSS * 1024;
 			post({ id: msg.id, ok: true, result: result.ok ? { ...result, peakRssBytes } : result });

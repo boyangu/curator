@@ -36,18 +36,18 @@
 import { existsSync, promises as fsp } from 'node:fs';
 import { extname, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
-import { bindByClaim, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { bindByClaim, projectAdoptedRecordings } from '@curator/sync-core/sync-log/claim-bind';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { and, desc, eq, inArray, isNull, like, lt, sql } from 'drizzle-orm';
 import { track, sourceLink, libraryFolder, trackAnalysis } from '@curator/shared/schema';
 import type { LibraryFolder, NewTrack, NewSourceLink, TrackArtist } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
-import { normalizeIncomingCredits, rawOf, syncTrackArtists } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
-import { addClaims, recordTrackCreated, type Claim } from '../library/mutators.js';
+import { normalizeIncomingCredits, rawOf, syncTrackArtists } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
+import { addClaims, recordTrackCreated, type Claim } from '@curator/sync-core/library/mutators';
 import { sharedScorer, type Candidate, type Target } from '@curator/matcher';
 import type { ParseFn, ParseResult } from '../ingest/types.js';
 

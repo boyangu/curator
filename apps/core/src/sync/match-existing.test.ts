@@ -8,8 +8,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { findExistingByContent } from './match-existing.js';
 import type Database from 'better-sqlite3';
 

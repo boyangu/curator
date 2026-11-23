@@ -15,9 +15,9 @@ import type { PlayRecordUpsert } from '@curator/shared/schema';
 import { normalizePath } from '../local/scanner.js';
 import { RekordboxImporter } from '../rekordbox/importer.js';
 import type { RekordboxSidecar } from '../rekordbox/sidecar.js';
-import { readCursor } from './client.js';
-import { dumpLibrary } from './dump.js';
-import { recordingIdForTrack } from './recording-id.js';
+import { readCursor } from '@curator/sync-core/sync-log/client';
+import { dumpLibrary } from '@curator/sync-core/sync-log/dump';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import {
 	historyDump,
 	replicaDiff,

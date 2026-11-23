@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { productionFlags } from '@curator/library-logic';
 import type { ProductionMeasurements, SegmentRecord } from '@curator/shared/schema';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { AUDIOBOX_MODEL_KEY } from '../mir/types.js';
 import { PRODUCTION_FEATURES, PROBE_FEATURE_KEYS, probeVector } from './features.js';
 import { fitProbe, MIN_PAIRS_TO_FIT, scoreRow, type JudgmentRow } from './model.js';

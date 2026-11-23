@@ -56,7 +56,7 @@ import type { CatalogClient } from '../catalog-client/service.js';
 import type { Enricher } from '../enrich/contract.js';
 import { enrichOne } from '../enrich/runner.js';
 import { findSpotifyAlbum, pairTracks, type SpotifyMatchClient } from '../feed/spotify-match.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { normalizeEntityRef, type StreamingCatalog } from './streaming.js';
 
 const wlog = log.for('entity-work');

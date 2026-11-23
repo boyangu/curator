@@ -23,7 +23,9 @@ import {
 	type BatchPushInput,
 	type BootstrapInput,
 	type CallErrorReason,
+	type PublishReplicaInput,
 	type PublishSnapshotInput,
+	type ReplicaOffer,
 	type PullInput,
 	type PushInput,
 	type RegisterDeviceInput,
@@ -57,7 +59,7 @@ export function mapError(err: unknown): CloudTransportError {
 		if (reason === 'server_outdated') return new CloudTransportError('server', reason, retryMs);
 		if (reason === 'batch_gone') return new CloudTransportError('batch_gone', reason);
 		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
-		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
+		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid' || reason === 'replica_without_snapshot') return new CloudTransportError(reason, reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
 		if (status >= 500) return new CloudTransportError('server', `HTTP ${status}: ${e.message}`);
 		if (status >= 400) return new CloudTransportError('bad_request', reason ?? `HTTP ${status}: ${e.message}`);
@@ -122,6 +124,12 @@ export function harnessTransport(app: TestApp, userId: string, token: string, sn
 			batchCommit: (input: BatchCommitInput) => call('batchCommit', () => api.sync.batchCommit.mutate(input)),
 			batchAbort: (input: BatchAbortInput) => call('batchAbort', () => api.sync.batchAbort.mutate(input)),
 			publishSnapshot: (input: PublishSnapshotInput) => call('publishSnapshot', () => api.sync.publishSnapshot.mutate(input)),
+			publishReplica: (input: PublishReplicaInput) => call('publishReplica', () => api.sync.publishReplica.mutate(input)),
+		},
+		// The bootstrap answer's replica alone, as the plain transport asks it.
+		async replica(schema: number) {
+			const res = await call<{ replica?: ReplicaOffer }>('bootstrap', () => api.sync.bootstrap.query({ storage: true, replicaSchema: schema }));
+			return res.replica ?? null;
 		},
 		// As the desktop's: always `storage: true`; the manifest's parts are
 		// read from the bucket and checked (core snapshot-storage.ts) before

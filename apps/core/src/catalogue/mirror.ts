@@ -8,7 +8,7 @@ import { compareVersions, parseVersionString, type CatalogueInventoryEntry } fro
 import type { CatalogueLocalState } from '@curator/shared/schema';
 import { CATALOGUE_KBPS_LIMITS, DEFAULT_CATALOGUE_SETTINGS, type CatalogueBackfillState, type CatalogueSettings } from './types.js';
 import { keyId, type UnitKey } from './local.js';
-import { stmt } from './stmt.js';
+import { stmt } from '@curator/sync-core/db/stmt';
 
 type Raw = Database.Database;
 

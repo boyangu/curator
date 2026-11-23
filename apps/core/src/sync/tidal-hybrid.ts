@@ -18,11 +18,11 @@ import { track, sourceLink, playlistTrack, playlist, claimLink } from '@curator/
 import { TidalApiClient, type TidalTrackV2 } from '@curator/tidal';
 import { sharedScorer } from '@curator/matcher';
 import { config } from '../config.js';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import type { AuthService } from '../auth/service.js';
 import type { ProgressFn } from './spotify.js';
-import { addClaims } from '../library/mutators.js';
-import { log } from '../log.js';
+import { addClaims } from '@curator/sync-core/library/mutators';
+import { log } from '@curator/sync-core/log';
 
 const hlog = log.for('tidal-hybrid');
 

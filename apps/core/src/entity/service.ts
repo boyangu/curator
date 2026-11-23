@@ -32,9 +32,9 @@ import type { CatalogBrowseResult, CatalogHandle, CatalogTracksResult } from '@c
 import { nameFold } from '@curator/library-logic';
 import { searchFold, track, type Track, type AlbumSummary, type ArtistLink, type EntityChip, type EntityHeader, type EntityRef, type EntityRowPatch, type EntityTracksPage, type EntityWorldReason, type ZTrackFilterT } from '@curator/shared';
 import { isDistributor } from '../catalog-client/library-claims.js';
-import { keyToCamelot } from '../enrich/keys.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 import { findSpotifyAlbum, findSpotifyTrack, type SpotifyMatchClient } from '../feed/spotify-match.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { matchLibraryTracks, type OwnershipProbe } from './ownership.js';
 import { findArtistPicture, type ArtistPicture, type FetchLike } from './artist-picture.js';
 import { artistBadges } from './badges.js';

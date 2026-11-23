@@ -6,7 +6,7 @@
 
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
 import type { Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
-import { keyToCamelot } from '../keys.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 
 export class BeatportEnricher implements Enricher {
 	readonly id = 'beatport';

@@ -60,6 +60,16 @@ apps/mcp/dist-mcpb/
 # Claude Design exports (design work stays private, like briefs).
 *.dc.html
 
+# Android app: fetched toolchain inputs (scripts/fetch-vendor.mjs), Gradle's
+# and CMake's state, the SDK path, and the generated core bundle.
+apps/mobile/vendor/
+apps/mobile/android/.gradle/
+apps/mobile/android/.kotlin/
+apps/mobile/android/local.properties
+apps/mobile/android/app/.cxx/
+apps/mobile/android/app/src/main/assets/core.hbc
+apps/mobile/android/app/src/main/res/font/
+
 # promptfoo runs of the catalogue reasoner regression set
 apps/cloud/evals/out/
 apps/cloud/evals/catalog/

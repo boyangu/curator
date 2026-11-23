@@ -21,7 +21,7 @@ import type { TrackArtist } from '@curator/shared/schema';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
-import * as mut from '../library/mutators.js';
+import * as mut from '@curator/sync-core/library/mutators';
 import {
 	track,
 	sourceLink,
@@ -50,21 +50,21 @@ import {
 	type TrackOverrides,
 } from '@curator/shared/schema';
 import { searchFold, type CueUnit, type FieldsSeen } from '@curator/shared';
-import { keyToCamelot } from '../enrich/keys.js';
-import type { Db } from '../db/client.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
+import type { Db } from '@curator/sync-core/db/client';
 import { mergeCues, mergeTrackFields } from '@curator/library-logic';
 import { curatorFieldsView } from '../sync/curator-view.js';
 import { applyCueOpsToTrack, buildPullPatch } from '../sync/apply.js';
-import { artistProtect, normalizeIncomingCredits, rawOf, syncTrackArtistsById } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
+import { artistProtect, normalizeIncomingCredits, rawOf, syncTrackArtistsById } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
 import { RekordboxSidecar, type SidecarError, type RekordboxScope } from './sidecar.js';
 import { advanceRbBaselineAfterPull, eqArr, seqIn } from './order-util.js';
-import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from './rb-slot.js';
-import { log } from '../log.js';
+import { float32Buffer, rbIntroOutro, readRbSlot, writeRbSlot } from '@curator/sync-core/rekordbox/rb-slot';
+import { log } from '@curator/sync-core/log';
 import { CUES_EDITED_CELL, CURATION_CELL_PREFIX, resolveTrackMeta, type Cell, type LwwRecord } from '@curator/protocol';
-import { commentFreeText } from '../sync-log/track-curation.js';
-import { OVERRIDE_FIELD_OF, rbUnitMirrors } from '../sync-log/rows.js';
-import { masterDevice } from '../sync-log/role.js';
+import { commentFreeText } from '@curator/sync-core/sync-log/track-curation';
+import { OVERRIDE_FIELD_OF, rbUnitMirrors } from '@curator/sync-core/sync-log/rows';
+import { masterDevice } from '@curator/sync-core/sync-log/role';
 
 const ilog = log.for('rekordbox-import');
 

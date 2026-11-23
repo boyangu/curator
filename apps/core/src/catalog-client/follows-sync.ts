@@ -13,7 +13,7 @@
 
 import type { CatalogClaim } from '@curator/protocol';
 import { SpotifyClient } from '@curator/spotify';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { CatalogClient } from './service.js';
 
 const clog = log.for('catalog');

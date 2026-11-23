@@ -5,7 +5,7 @@
 
 import { and, asc, count, countDistinct, desc, eq, exists, gte, inArray, isNotNull, isNull, like, lte, ne, notExists, or, sql, type SQL } from 'drizzle-orm';
 import { scoreCandidates, type CandidateCounts, type RecommendColumnCounts, type ScoredRecommendation } from './recommend.js';
-import { createDb, type Db } from './db/client.js';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import {
 	track,
 	playlist,
@@ -42,7 +42,7 @@ import {
 	type TrackState,
 } from '@curator/shared/schema';
 import { LibraryScanner, isCloudSyncPath, normalizePath, type ScanProgress, type ScanProgressFn } from './local/scanner.js';
-import { log, setCoreLogger } from './log.js';
+import { log, setCoreLogger } from '@curator/sync-core/log';
 import type { Logger } from '@curator/shared/log';
 import { parseInline } from './ingest/parser.js';
 import type { ParseFn } from './ingest/types.js';
@@ -56,9 +56,9 @@ import { BeatportEnricher } from './enrich/enrichers/beatport.js';
 import { TraxsourceEnricher } from './enrich/enrichers/traxsource.js';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflict, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, AlbumSummary, EntityHeader, EntityRef, EntityTracksPage, EntityWorkEvent, StreamingService, WorldSearchPart, WorldSearchResult } from '@curator/shared';
 import { DEFAULT_SOURCE_SYNC_SETTINGS, artistKey, asciify, asciifyArtists, searchFold, type ArtistCreditFormat } from '@curator/shared';
-import { loadArtistAliasMap, mapCredits, rederiveTrackCreditsRaw } from './library/artist-alias.js';
-import { lookupArtistRaw, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from './library/artists.js';
-import { healAlbumArtistAliasesRaw, liveAlbumIdRaw, syncTrackAlbumsById } from './library/albums.js';
+import { loadArtistAliasMap, mapCredits, rederiveTrackCreditsRaw } from '@curator/sync-core/library/artist-alias';
+import { lookupArtistRaw, normalizeIncomingArtists, rawOf, syncTrackArtistsById } from '@curator/sync-core/library/artists';
+import { healAlbumArtistAliasesRaw, liveAlbumIdRaw, syncTrackAlbumsById } from '@curator/sync-core/library/albums';
 import { createAlbumEnricher } from './library/album-enrich.js';
 import { SpotifyAdapter } from './sources/spotify-adapter.js';
 import { SourceSyncScheduler } from './sources/scheduler.js';
@@ -70,19 +70,20 @@ import { AuthService, type AuthStatus } from './auth/service.js';
 import { randomUUID } from 'node:crypto';
 import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
-import { recomputePositions } from './library/playlist-order.js';
-import * as mut from './library/mutators.js';
+import { recomputePositions } from '@curator/sync-core/library/playlist-order';
+import * as mut from '@curator/sync-core/library/mutators';
 import { runRemixerPrefixRepair } from './library/remixer-prefix-repair.js';
-import { inlineSnapshotBuilder, type SnapshotBuilder } from './sync-log/snapshot-build.js';
-import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from './sync-log/client.js';
-import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from './sync-log/poll-policy.js';
-import { remoteRowCount, requestRematerialize } from './sync-log/remote-rows.js';
-import { requestRestatement } from './sync-log/restate.js';
-import { claimLinksOf, claimLinkUrl, dismissClaimLink } from './sync-log/claim-links.js';
-import { masterDevice, serverReadsTrackMeta, setMasterDevice } from './sync-log/track-meta.js';
-import { getDeviceId as getSyncDeviceId } from './sync-log/device.js';
+import type { ReplicaBuilder } from '@curator/sync-core/sync-log/replica';
+import { inlineSnapshotBuilder, type SnapshotBuilder } from '@curator/sync-core/sync-log/snapshot-build';
+import { createSyncClient, firstPullDone, type CloudSyncEvent, type CloudSyncStatus, type CloudTransport, type SyncClient, type UnlinkOutcome, type WakeReason } from '@curator/sync-core/sync-log/client';
+import { readPollPolicy, readPollSettings, writePollPolicy, type SyncPollPolicy, type SyncPollSettings } from '@curator/sync-core/sync-log/poll-policy';
+import { remoteRowCount, requestRematerialize } from '@curator/sync-core/sync-log/remote-rows';
+import { requestRestatement } from '@curator/sync-core/sync-log/restate';
+import { claimLinksOf, claimLinkUrl, dismissClaimLink } from '@curator/sync-core/sync-log/claim-links';
+import { masterDevice, serverReadsTrackMeta, setMasterDevice } from '@curator/sync-core/sync-log/track-meta';
+import { getDeviceId as getSyncDeviceId } from '@curator/sync-core/sync-log/device';
 import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectQueueResult, CatalogProvider, CatalogWatch, DevicePlatform } from '@curator/protocol';
-import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from './library/merge-tracks.js';
+import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from '@curator/sync-core/library/merge-tracks';
 
 export type SourceLinkError = {
 	source: string;
@@ -93,8 +94,8 @@ export type SourceLinkError = {
 };
 export type SetSourceLinksResult = { updated: string[]; refetched: string[]; errors: SourceLinkError[] };
 
-export type { TrackMergeSide, TrackMergePlan, TrackMergeResult } from './library/merge-tracks.js';
-export { TrackMergeBlockedError } from './library/merge-tracks.js';
+export type { TrackMergeSide, TrackMergePlan, TrackMergeResult } from '@curator/sync-core/library/merge-tracks';
+export { TrackMergeBlockedError } from '@curator/sync-core/library/merge-tracks';
 export interface TrackMergePreview {
 	a: TrackMergeSide;
 	b: TrackMergeSide;
@@ -169,7 +170,7 @@ export interface PlaylistUpstreamDrift {
 		artists: string;
 	}>;
 }
-import { keyToCamelot } from './enrich/keys.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 import { SqliteFeedStore } from './feed/store.js';
 import { createFeedService } from './feed/service.js';
 import { FEED_LENSES_SETTING, normalizeLenses, parseRule, serializeLenses, withLens, withoutLens, type FeedLens } from './feed/lenses.js';
@@ -428,7 +429,7 @@ export interface CoreServiceOptions {
 	// sidecars). The desktop main injects its root logger so core records
 	// land in the session log file; the core-sidecar entry injects a
 	// port-forwarding logger. Swapping the sink is the hosted-mode seam —
-	// call sites never change (see apps/core/src/log.ts).
+	// call sites never change (see packages/sync-core/src/log.ts).
 	logger?: Logger;
 	// Backup & restore (planning/tech/backup.md). `host` runs the engine —
 	// the desktop injects a utilityProcess-backed host so VACUUM INTO,
@@ -483,8 +484,11 @@ export interface CoreServiceOptions {
 		// (tests, CLI) — same injection pattern as parseAudio. It only ever
 		// runs on the account's master, against a server that offers the
 		// feature, with a transport that has `snapshots`. The cadence knobs
-		// default to sync-log/client.ts SNAPSHOT_EVERY_*.
-		snapshot?: { builder?: SnapshotBuilder; everyOps?: number; everyMs?: number; retryMs?: number };
+		// default to sync-log/client.ts SNAPSHOT_EVERY_*. `replica` likewise builds
+		// the ready-made library from a published snapshot ('replica_storage',
+		// sync-log/replica.ts): the desktop injects its utility process's; a
+		// host without one publishes no replica (inlineReplicaBuilder in tests).
+		snapshot?: { builder?: SnapshotBuilder; everyOps?: number; everyMs?: number; retryMs?: number; replica?: ReplicaBuilder; replicaEveryMs?: number };
 	};
 }
 

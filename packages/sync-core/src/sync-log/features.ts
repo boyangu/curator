@@ -1,0 +1,88 @@
+// What the server reads, as the emit side needs to know it (protocol v4, the
+// 2026-10-21 zero-loss release). A v3 server answers a v4 op with
+// `server_outdated` for the WHOLE push, so nothing v4 may reach the outbox
+// before the server says it reads it ('zero_loss_v4' in SYNC_FEATURES).
+//
+// The sync client learns the features from every push and pull answer; the
+// writers that emit inline (a cue edit, a play, a feed decision, the album
+// fill) run outside it, in mutators that only hold the database. So the
+// client keeps the verdict in a device-local app_setting row and the writers
+// read that: a v4 shape when the server reads it, the v3 shape (or nothing,
+// for a kind with no v3 form) otherwise. What a writer could not state yet
+// is stated once by the v4 backfills (sync-log/v4-backfill.ts) when the
+// feature first shows up, so the gap closes either way.
+//
+// The push loop is the second guard (client.ts): an op stamped above what the
+// server reads stays pending instead of failing the batch.
+//
+// Protocol v5 (2026-10-23, `library_track.set-analysis`) is gated the same
+// way at the push ('analysis_v5'), but needs no device-local copy: its only
+// writer is the sync client's own drain stage (track-analysis.ts), which
+// reads the features directly. The founder's fold states analysis into the
+// records whatever the server reads (records carry no protocol version).
+
+import type Database from 'better-sqlite3';
+import type { SyncFeature } from '@curator/protocol';
+
+type Raw = Database.Database;
+
+export const ZERO_LOSS_FEATURE: SyncFeature = 'zero_loss_v4';
+export const ANALYSIS_FEATURE: SyncFeature = 'analysis_v5';
+export const FEED_LENSES_FEATURE: SyncFeature = 'feed_lenses_v6';
+export const MOBILE_SETTINGS_FEATURE: SyncFeature = 'mobile_settings_v7';
+
+// Device-local (never an account key): '1' while the last answer named the
+// feature. Cleared when an answer stops naming it (a rolled-back server).
+export const SERVER_READS_V4_KEY = 'sync.server_reads_v4';
+
+export function featuresReadV4(features: readonly SyncFeature[] | null | undefined): boolean {
+	return !!features?.includes(ZERO_LOSS_FEATURE);
+}
+
+// v5 only on a server that reads v4 too (every server that reads a version
+// reads the older ones; a list naming v5 without v4 is not one to trust).
+export function featuresReadV5(features: readonly SyncFeature[] | null | undefined): boolean {
+	return featuresReadV4(features) && !!features?.includes(ANALYSIS_FEATURE);
+}
+
+// v6 (the `feed.lenses` setting) only on a server that reads v5 too.
+export function featuresReadV6(features: readonly SyncFeature[] | null | undefined): boolean {
+	return featuresReadV5(features) && !!features?.includes(FEED_LENSES_FEATURE);
+}
+
+// v7 (the `tracklist.rows` and `home.pins` settings) only on a server that
+// reads v6 too.
+export function featuresReadV7(features: readonly SyncFeature[] | null | undefined): boolean {
+	return featuresReadV6(features) && !!features?.includes(MOBILE_SETTINGS_FEATURE);
+}
+
+// The highest op version the push loop may send: v4 only once the server
+// said it reads it, v5 to v7 likewise. v3 ops were always sent ungated (their
+// emitters wait for 'track_meta' themselves), so below v4 nothing changes.
+export function pushableSchemaVersion(features: readonly SyncFeature[] | null | undefined): number {
+	return featuresReadV7(features) ? 7 : featuresReadV6(features) ? 6 : featuresReadV5(features) ? 5 : featuresReadV4(features) ? 4 : 3;
+}
+
+const STMTS = new WeakMap<Raw, { get: Database.Statement<[string], { value: string }> }>();
+
+// Whether a writer may emit a v4 op now. One primary-key read; writers call
+// it once per transaction, not per row.
+export function emitV4(raw: Raw): boolean {
+	let s = STMTS.get(raw);
+	if (!s) {
+		s = { get: raw.prepare(`SELECT value FROM app_setting WHERE key = ?`) };
+		STMTS.set(raw, s);
+	}
+	return s.get.get(SERVER_READS_V4_KEY)?.value === '1';
+}
+
+// The client's record of the server's answer. Writes only on a change.
+export function recordServerV4(raw: Raw, reads: boolean): boolean {
+	if (emitV4(raw) === reads) return false;
+	if (reads) {
+		raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, '1', ?) ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at`).run(SERVER_READS_V4_KEY, Date.now());
+	} else {
+		raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(SERVER_READS_V4_KEY);
+	}
+	return true;
+}

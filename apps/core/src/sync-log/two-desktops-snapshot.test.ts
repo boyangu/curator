@@ -17,9 +17,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { serializeLibraryState } from '@curator/protocol';
-import { CloudTransportError, readCursor } from './client.js';
-import { buildSnapshotParts, type SnapshotBuildOk } from './snapshot-build.js';
-import { recordingIdForTrack } from './recording-id.js';
+import { CloudTransportError, readCursor } from '@curator/sync-core/sync-log/client';
+import { buildSnapshotParts, type SnapshotBuildOk } from '@curator/sync-core/sync-log/snapshot-build';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import { replicaDiff, tick, TRACKS, TwoDesktopRig, USER, type Desktop, type DesktopOpts } from '../test-support/two-desktops.js';
 
 let rig: TwoDesktopRig;

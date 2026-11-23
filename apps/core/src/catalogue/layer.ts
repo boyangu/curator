@@ -63,20 +63,20 @@ import {
 	type SyncFeature,
 } from '@curator/protocol';
 import type { AreaLogger } from '@curator/shared/log';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
-import { CPK_HEADER_SIZE_V1, CPK_HEADER_SIZE_V2, CPK_MAGIC, CPK_NUM_BANDS, CPK_VERSION } from '../analyzer/cpk.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
+import { CPK_VERSION } from '../analyzer/cpk.js';
+import { claimedHashes, cpkVersionOf } from '@curator/sync-core/catalogue/peaks';
 import { persistAnalysisResult } from '../analyzer/persist.js';
 import type { AnalysisCatalogueHook, CataloguePrepared } from '../analyzer/queue.js';
 import type { AnalyzeOptions } from '../analyzer/sidecar.js';
-import { CloudTransportError } from '../sync-log/client.js';
-import { masterDevice } from '../sync-log/track-meta.js';
+import { CloudTransportError } from '@curator/sync-core/sync-log/client';
+import { masterDevice } from '@curator/sync-core/sync-log/track-meta';
 import {
 	PEAKS_HI,
 	PEAKS_LO,
 	acceptable,
 	allowedKeys,
-	claimedHashes,
 	durationMatches,
 	hasPeaks,
 	inlineItemsFor,
@@ -110,8 +110,8 @@ import {
 	writeInventoryRev,
 	type MirrorCounts,
 } from './mirror.js';
-import { stmt as stmtCache } from './stmt.js';
-import { markCatalogueFill } from '../sync-log/track-attrs.js';
+import { stmt as stmtCache } from '@curator/sync-core/db/stmt';
+import { markCatalogueFill } from '@curator/sync-core/sync-log/track-attrs';
 import { coverage, jobNeeds, remainingWork, skipCovered } from './needs.js';
 import {
 	CatalogueBlobError,
@@ -277,27 +277,6 @@ function describe(f: Failure): string {
 	}
 }
 
-// ── .cpk header ─────────────────────────────────────────────────────────────
-
-// The format version when `buf` is a whole .cpk (header sane, body at least
-// as long as the header says), else null. Header only: decodePeaks would
-// split an 8 MB hi tier into arrays just to say yes.
-export function cpkVersionOf(buf: Uint8Array): number | null {
-	if (buf.byteLength < CPK_HEADER_SIZE_V1) return null;
-	for (let i = 0; i < CPK_MAGIC.length; i++) if (buf[i] !== CPK_MAGIC[i]) return null;
-	const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-	const version = dv.getUint8(8);
-	if (version < 1 || version > 3 || dv.getUint8(9) !== CPK_NUM_BANDS) return null;
-	const channels = version === 1 ? 1 : dv.getUint8(10);
-	if (channels !== 1 && channels !== 2) return null;
-	const spsOff = version === 1 ? 10 : 11;
-	if (buf.byteLength < spsOff + 10) return null;
-	const detail = dv.getUint32(spsOff + 2, true);
-	const overview = dv.getUint32(spsOff + 6, true);
-	const header = version === 1 ? CPK_HEADER_SIZE_V1 : CPK_HEADER_SIZE_V2;
-	const metrics = version === 3 ? 2 : 1;
-	return buf.byteLength >= header + (detail + overview) * CPK_NUM_BANDS * metrics * channels ? version : null;
-}
 
 // sha256 in 1 MB steps with a yield between, so a hi tier never holds the
 // loop for one long hash.

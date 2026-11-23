@@ -7,9 +7,14 @@
 // branches on.
 
 import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { masterOp, sampleLibrary } from '@curator/cloud/testing';
-import { CloudTransportError } from '@curator/core';
+import { masterOp, opsFor, sampleLibrary } from '@curator/cloud/testing';
+import Database from 'better-sqlite3';
+import { buildReplica, CloudTransportError, joinFromReplica, migrate, REPLICA_SCHEMA } from '@curator/core';
+import { compareDumps, createSyncClient, dumpLibrary, readCursor } from '@curator/core/e2e';
 import { applyOp, createLibraryState, serializeLibraryState, SnapshotEntryScanner, SNAPSHOT_STORAGE_ENCODING, snapshotPartPath, type SnapshotManifest } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startLocalCloud, type LocalCloud } from './cloud.js';
@@ -76,6 +81,70 @@ describe.each(['transport', 'plain'] as const)('%s against the real server', (wh
 		expect(entries).toBeGreaterThan(10);
 		const ops = await cloud.opCounts(userId);
 		expect(ops.reduce((n, r) => n + r.n, 0)).toBe(head);
+	});
+
+	it('publishes a ready-made library built from the snapshot, and a new device installs it', async () => {
+		const userId = randomUUID();
+		const s = await cloud.session(userId);
+		const transport = s[which];
+		const deviceId = `dev-${randomUUID()}`;
+		await transport.account.registerDevice({ deviceId, name: 'e2e', platform: 'win32' });
+		// The two system tags every library is created with (core migrate.ts):
+		// a desktop master states them with its library, so a real account
+		// holds them and a fresh join has nothing of its own to send.
+		const op = opsFor(deviceId);
+		const systemTags = [op('tag', 'create', 'interested', { name: 'Interested', kind: 'system' }), op('tag', 'create', 'basket', { name: 'Basket', kind: 'system' })];
+		const head = (await transport.sync.push({ deviceId, ops: [...systemTags, ...sampleLibrary(deviceId), masterOp(deviceId, deviceId)] })).maxSeq;
+		const state = createLibraryState();
+		for (const o of (await transport.sync.pull({ afterSeq: 0, deviceId })).ops) applyOp(state, o);
+		const json = Buffer.from(serializeLibraryState(state), 'utf8');
+		const body = gzipSync(json);
+		const sha = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
+		const path = snapshotPartPath(userId, sha(body));
+		await s.snapshots.upload(path, body);
+		await transport.sync.publishSnapshot!({ deviceId, snapshotSeq: head, manifest: { encoding: SNAPSHOT_STORAGE_ENCODING, parts: [{ path, bytes: body.length, sha256: sha(body) }], totalBytes: body.length, sha256: sha(body), stateSha256: sha(json) } });
+
+		// The master's half, with the product's builder: the join of that
+		// snapshot into an empty library, cut into parts.
+		const work = mkdtempSync(join(tmpdir(), 'curator-e2e-replica-'));
+		try {
+			const snapshotFile = join(work, 'snapshot.cgz');
+			writeFileSync(snapshotFile, body);
+			const built = await buildReplica({ userId, masterDeviceId: deviceId, snapshotSeq: head, snapshotFiles: [snapshotFile], outDir: join(work, 'build') });
+			for (let i = 0; i < built.files.length; i++) await s.snapshots.upload(built.manifest.parts[i]!.path, readFileSync(built.files[i]!));
+			expect(await transport.sync.publishReplica!({ deviceId, snapshotSeq: head, manifest: built.manifest })).toMatchObject({ status: 'stored', latestSeq: head });
+
+			// The new device's half: offered by the bootstrap, read from the bucket.
+			expect(await transport.replica!(REPLICA_SCHEMA)).toMatchObject({ snapshotSeq: head, manifest: built.manifest });
+			const target = join(work, 'phone.db');
+			const installed = await joinFromReplica(transport, target);
+			expect(installed).toMatchObject({ snapshotSeq: head, parts: built.manifest.parts.length, rawBytes: built.manifest.rawBytes });
+			// The same library a device gets by joining the snapshot itself.
+			const joined = join(work, 'joined.db');
+			migrate(joined);
+			const jdb = new Database(joined);
+			jdb.pragma('journal_mode = WAL');
+			jdb.pragma('foreign_keys = ON');
+			const client = createSyncClient({ db: jdb, transport: (await cloud.session(userId))[which], device: { name: 'joiner', platform: 'android' } });
+			try {
+				for (let i = 0; i < 6; i++) await client.syncNow();
+				expect(client.status().lastError).toBeNull();
+			} finally {
+				client.stop();
+			}
+			const db = new Database(target, { readonly: true });
+			try {
+				expect(readCursor(db)).toMatchObject({ lastSeq: head });
+				expect(db.prepare(`SELECT value FROM app_setting WHERE key = 'device.id'`).pluck().get()).not.toBe(JSON.stringify(deviceId));
+				expect(compareDumps(dumpLibrary(jdb), dumpLibrary(db)).filter((t) => !t.equal)).toEqual([]);
+				expect(db.prepare(`SELECT count(*) FROM sync_state`).pluck().get()).toBeGreaterThan(10);
+			} finally {
+				db.close();
+				jdb.close();
+			}
+		} finally {
+			rmSync(work, { recursive: true, force: true });
+		}
 	});
 
 	it('an account with no snapshot bootstraps to nothing', async () => {

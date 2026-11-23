@@ -1,5 +1,6 @@
 // The driver's view of the machine; shim/platform.node.ts and
-// shim/platform.qjs.ts implement it (the bundler picks one).
+// shim/platform.host.ts (QuickJS or Hermes, over the host's `__host`)
+// implement it (the bundler picks one).
 
 export type Mem = { rssKb: number; peakRssKb: number; jsHeapKb?: number; jsObjects?: number; jsStringsKb?: number };
 
@@ -10,6 +11,12 @@ export type Platform = {
 	readGzipText(path: string): string;
 	readBytes(path: string): Uint8Array;
 	writeText(path: string, text: string): void;
+	// Bytes added to the end of a file (created when absent).
+	appendBytes(path: string, bytes: Uint8Array): void;
+	// A whole gzip body (or several gzip members back to back), inflated.
+	gunzip(bytes: Uint8Array): Uint8Array;
+	// SHA-256 of bytes, as hex.
+	sha256(bytes: Uint8Array): string;
 	// A gzip body as its text in pieces, inflated as they are asked for;
 	// absent where the product's own inflater runs (Node).
 	inflateText?(body: Uint8Array): Iterable<string>;

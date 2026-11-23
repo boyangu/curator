@@ -11,15 +11,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { createCoreService } from '../service.js';
 import { LibraryScanner, normalizePath } from './scanner.js';
 import type { ParseResult } from '../ingest/types.js';
 import { audioHash } from '../ingest/audio-hash.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
-import { applyOps } from '../sync-log/apply.js';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
+import { applyOps } from '@curator/sync-core/sync-log/apply';
 import { opSchemaVersion, type NewOp } from '@curator/protocol';
 import type Database from 'better-sqlite3';
 

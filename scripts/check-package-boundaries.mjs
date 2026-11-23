@@ -60,6 +60,20 @@ const RULES = {
 		allow: ['@curator/protocol', '@curator/library-logic'],
 		allowExact: ['@curator/shared/artist-credit'],
 	},
+	// The device sync client and the library writers it cycles with (op
+	// builders, mutators, migrate), shared by the desktop and the phone. It is
+	// SQLite-bound and Node-shaped on purpose: the phone runs it in an embedded
+	// engine whose bundle aliases better-sqlite3 and node:* to host shims
+	// (apps/mobile/js/shim), so the source stays the desktop's, unchanged.
+	// Never app code: no electron, no apps/*, no provider SDKs.
+	'sync-core': {
+		dir: 'packages/sync-core/src',
+		allow: ['@curator/protocol', '@curator/shared', '@curator/library-logic'],
+		ownDeps: 'packages/sync-core/package.json',
+		allowNode: true,
+		testDirs: ['packages/sync-core/src/test-support/'],
+		deny: [/^@curator\/(core|desktop|mcp|agent|cloud|spotify|tidal)(\/|$)/, /^electron/],
+	},
 	// The cloud API (plan D11): the shared contract packages and its own npm
 	// dependencies, never desktop code. apps/core is SQLite-bound end to end,
 	// so one import of it (or of a SQLite driver or dialect) would put the

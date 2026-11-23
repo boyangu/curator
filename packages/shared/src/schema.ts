@@ -59,7 +59,7 @@ export const track = sqliteTable(
 		// Catalogue identity (cloud design: "Identifiers"). `id` stays per
 		// device — eleven tables and the peaks files hang off it — while sync
 		// ops and catalogue claims address the recording. Minted by the device
-		// that creates the row (recordingIdForTrack in apps/core/src/sync-log);
+		// that creates the row (recordingIdForTrack in packages/sync-core/src/sync-log);
 		// rewritten only when the catalogue aliases two recordings into one.
 		// Nullable in SQLite (an ADD COLUMN), but every migrate fills any null
 		// and every writer sets it, so it is typed notNull here: tsc then
@@ -120,7 +120,7 @@ export const track = sqliteTable(
 		// Folded name of the EFFECTIVE primary artist (overrides.artists ??
 		// artists)[0], materialized so the Artist column sort hits an index
 		// instead of a json_extract over every row. Maintained by the
-		// track_artist seam (apps/core/src/library/artists.ts) at every
+		// track_artist seam (packages/sync-core/src/library/artists.ts) at every
 		// write that touches artists or overrides.
 		artistSort: text('artist_sort'),
 		// Analyzer-only scalars mirrored from track_analysis so the virtualized
@@ -212,7 +212,7 @@ export const track = sqliteTable(
 		// A track the account holds but THIS device has no source for: no
 		// file, no streaming link, no rekordbox entry — "not on this device".
 		// Materialised from another device's `library_track.set-meta`
-		// (apps/core/src/sync-log/remote-rows.ts) so every device shows the
+		// (packages/sync-core/src/sync-log/remote-rows.ts) so every device shows the
 		// account's whole library; its columns are that meta, its tags, cues,
 		// playlist rows and rating come through the op log like any row's.
 		// It is a projection: every device-local writer (scanner and import
@@ -229,7 +229,7 @@ export const track = sqliteTable(
 		// sourceMembership).
 		remoteSource: text('remote_source'),
 		// Track attributes this row took from the account (protocol v4
-		// set-attrs; apps/core/src/sync-log/track-attrs.ts): { field: { v, from } }
+		// set-attrs; packages/sync-core/src/sync-log/track-attrs.ts): { field: { v, from } }
 		// per adopted field, "from" = 'account' (another device's winning
 		// value, written into a field this row's own source left empty) or
 		// 'catalogue' (the hydrate's analyzer fill). The row states such a
@@ -251,7 +251,7 @@ export const track = sqliteTable(
 		// it would fold the copy back into the original.
 		derivedFromTrackId: text('derived_from_track_id'),
 		// The release this recording belongs to — DERIVED by the album seam
-		// (apps/core/src/library/albums.ts) from album_title + the source
+		// (packages/sync-core/src/library/albums.ts) from album_title + the source
 		// links' album ids, like artist_sort is from artists. `album_title`
 		// stays the canonical, denormalised text (the rekordbox push, the
 		// three-way merge and the download filename template all read it).
@@ -311,7 +311,7 @@ export const track = sqliteTable(
 // The library's artist entities. `track.artists` (JSON TrackArtist[]) stays
 // the canonical write-input and the read/IPC shape; these two tables are
 // DERIVED from the effective list (overrides.artists ?? artists) by one seam
-// (apps/core/src/library/artists.ts) and exist so an artist can be scoped
+// (packages/sync-core/src/library/artists.ts) and exist so an artist can be scoped
 // by id, filtered/sorted with an index, counted, renamed across the library
 // and merged with a duplicate spelling. Same shape as knowledge.db's
 // kb_entity(kind='artist') + kb_edge(kind='track-artist').
@@ -390,7 +390,7 @@ export const trackArtist = sqliteTable(
 
 // ─── ALBUM / ALBUM_ARTIST / ALBUM_LINK ───────────────────────────────────────
 // The library's releases, artist-shaped: DERIVED by one seam
-// (apps/core/src/library/albums.ts) from each track's album title, its main
+// (packages/sync-core/src/library/albums.ts) from each track's album title, its main
 // artist and the album ids its Spotify / Tidal links carry, so a release can
 // be grouped, scoped by id and shown with real metadata. `track.album_title`
 // stays the canonical text; `track.album_id` points here.
@@ -726,7 +726,7 @@ export const trackTag = sqliteTable(
 // order-key.ts): the row's place is (order_key, id), so a drag rewrites one
 // row's key and concurrent edits from two devices merge without renumbering.
 // `position` is derived — 0..n-1 in (order_key, id) order, restamped by
-// recomputePositions (apps/core/src/library/playlist-order.ts) after every
+// recomputePositions (packages/sync-core/src/library/playlist-order.ts) after every
 // membership change — and stays because every reader (the "#" column, the
 // rekordbox exporter, Spotify's positional moves) speaks it. `id` is the
 // row's identity on the wire; (playlist_id, position) stays unique.
@@ -872,7 +872,7 @@ export const trackAnalysis = sqliteTable('track_analysis', {
 	dynamicComplexity: real('dynamic_complexity'),
 	// EBU R128 loudness range (LU). The integrated LUFS sibling and the
 	// true-peak column were dropped in analyzer 2.1.0 — see the matching
-	// DROP COLUMN entries in apps/core/src/db/migrate.ts.
+	// DROP COLUMN entries in packages/sync-core/src/db/migrate.ts.
 	loudnessRangeLu: real('loudness_range_lu'),
 	dissonance: real('dissonance'),
 	// Stored under a product name — Essentia's source value is
@@ -1461,7 +1461,7 @@ export const playEvent = sqliteTable(
 
 // ─── SYNC (cloud op log, desktop side) ───────────────────────────────────────
 // Local state for the per-user op log (cloud design: "The op", "Client apply
-// on the desktop"). Written by apps/core/src/sync-log (emitOps from every
+// on the desktop"). Written by packages/sync-core/src/sync-log (emitOps from every
 // library mutator, applyOps for incoming ops); the client that drains the
 // outbox and pulls lands in cloud plan C.
 
@@ -1653,7 +1653,7 @@ export const rekordboxUnitSeen = sqliteTable(
 
 // ─── TRACK META SYNC (device-local) ──────────────────────────────────────────
 // What lets this device's base metadata reach the others as
-// `library_track.set-meta` (apps/core/src/sync-log/track-meta.ts) without
+// `library_track.set-meta` (packages/sync-core/src/sync-log/track-meta.ts) without
 // re-reading 40k rows per sync cycle.
 //
 // `track_meta_dirty`: rows whose meta may have changed since they were last
@@ -1677,7 +1677,7 @@ export const trackMetaSeen = sqliteTable('track_meta_seen', {
 });
 
 // Track attributes on the op log (protocol v4 `library_track.set-attrs`,
-// apps/core/src/sync-log/track-attrs.ts): the same dirty set + digest
+// packages/sync-core/src/sync-log/track-attrs.ts): the same dirty set + digest
 // baseline pair as track meta above, filled by triggers on the attribute
 // columns (bpm, key, comment, colour, explicit, mbid, copyright, play
 // count, cue-edit stamp, credits) and on the provider links.
@@ -1692,7 +1692,7 @@ export const trackAttrsSeen = sqliteTable('track_attrs_seen', {
 });
 
 // The analyzer's results on the op log (protocol v5 `library_track
-// .set-analysis`, apps/core/src/sync-log/track-analysis.ts): the same pair
+// .set-analysis`, packages/sync-core/src/sync-log/track-analysis.ts): the same pair
 // again, filled by triggers on the Curator slot of track_analysis (never the
 // rb_* slot) and on the local links that make a row's analysis its own.
 export const trackAnalysisDirty = sqliteTable('track_analysis_dirty', {
@@ -1747,7 +1747,7 @@ export const catalogRef = sqliteTable(
 );
 
 // Playlist / folder details on the op log (protocol v4 `set-attrs`,
-// apps/core/src/sync-log/playlist-attrs.ts). `entity` is 'playlist' or
+// packages/sync-core/src/sync-log/playlist-attrs.ts). `entity` is 'playlist' or
 // 'playlist_folder'; `attrs` (JSON) the per-field baseline — what this
 // device last stated or projected — which both suppresses echoes and keeps
 // an unstated local change from being overwritten by an older pulled one.
@@ -1774,7 +1774,7 @@ export const feedSyncPending = sqliteTable(
 
 // A track's curation (comment free text, colour) as this row last stated
 // it or took it from the account (protocol v4 set-curation,
-// apps/core/src/sync-log/track-curation.ts): JSON, field → value, a field
+// packages/sync-core/src/sync-log/track-curation.ts): JSON, field → value, a field
 // absent = never either. The baseline that makes a received value wait for
 // an unstated local change, and an unchanged re-import state nothing.
 export const trackCurationSeen = sqliteTable('track_curation_seen', {
@@ -1820,7 +1820,7 @@ export const trackRemotePending = sqliteTable('track_remote_pending', {
 // Provider ids this device knows for a row only because the account's
 // recording claims say so (`recording_claim` spotify / tidal / beatport —
 // another device ingested or matched them), never because this device
-// ingested them (apps/core/src/sync-log/claim-links.ts). source_link is
+// ingested them (packages/sync-core/src/sync-log/claim-links.ts). source_link is
 // device-local, so without these a second desktop shows empty Spotify /
 // Tidal / Beatport URLs for every track whose link another device made.
 //

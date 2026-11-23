@@ -34,9 +34,9 @@ import {
 	type NewAnalysisJob,
 	type TrackArtist,
 } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
-import { rawOf } from '../library/artists.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
+import { rawOf } from '@curator/sync-core/library/artists';
 import { persistAnalysisResult } from './persist.js';
 import { ADVANCED_FEATURES, AnalyzerSidecar, type AnalyzeOptions, type ProgressEvent, type SidecarError } from './sidecar.js';
 

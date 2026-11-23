@@ -7,10 +7,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { rebalance } from '@curator/protocol';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService, type CoreService } from '../service.js';
-import { planReorderKeys, recomputePositions } from './playlist-order.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
+import { planReorderKeys, recomputePositions } from '@curator/sync-core/library/playlist-order';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 
 let tmp: TmpDir;
 let dir: string;

@@ -15,7 +15,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { scrubLoneSurrogates } from '@curator/shared';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const rlog = log.for('rekordbox');
 

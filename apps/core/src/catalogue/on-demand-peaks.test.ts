@@ -12,10 +12,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MASTER_DEVICE_SETTING, opSchemaVersion, type TrackAnalysis, type TrackMeta } from '@curator/protocol';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService } from '../service.js';
-import { applyOps } from '../sync-log/apply.js';
-import { remoteTrackId } from '../sync-log/stable-ids.js';
+import { applyOps } from '@curator/sync-core/sync-log/apply';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
 import { FakeCatalogueServer, POLICY_D_A, POLICY_D_B, fixedCpk, makeTestDevice, pcmMd5, seedAnalysed, sha256, waitFor, type TestDevice } from '../test-support/catalogue-fakes.js';
 
 const USER = '3c1d5e7f-2a4b-4c6d-8e0f-1a3b5c7d9e2f';

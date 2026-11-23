@@ -3,7 +3,7 @@
 // device's side: its settings, its status, and what the host injects.
 
 import type { CataloguePolicy, CloudService } from '@curator/protocol';
-import type { CloudSession } from '../sync-log/client.js';
+import type { CloudSession } from '@curator/sync-core/sync-log/client';
 
 // The `catalogue.*` procedures and who is signed in. The desktop's HTTP
 // transport (apps/desktop/src/main/cloud/transport.ts) provides both; tests

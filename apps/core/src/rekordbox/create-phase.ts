@@ -34,11 +34,11 @@ import {
 } from '@curator/shared/schema';
 import type { ArtistCreditFormat } from '@curator/shared';
 import { existsSync } from 'node:fs';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { normalizePath } from '../local/scanner.js';
 import { effectiveAlbum, effectiveArtistName, effectiveGenre, effectiveLabel, effectiveTitle } from '../sync/curator-view.js';
 import { readAudioFormat } from '../wav/audio-header.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type {
 	CreateOp,
 	CreatedVerifyOp,
@@ -47,9 +47,9 @@ import type {
 	WriteFailure,
 	WriteOpResult,
 } from './sidecar.js';
-import { rawOf } from '../library/artists.js';
-import { emitOps } from '../sync-log/outbox.js';
-import { isDeviceLocalPlaylist, memberAddOp, playlistCreateOps, recordingResolver } from '../sync-log/rows.js';
+import { rawOf } from '@curator/sync-core/library/artists';
+import { emitOps } from '@curator/sync-core/sync-log/outbox';
+import { isDeviceLocalPlaylist, memberAddOp, playlistCreateOps, recordingResolver } from '@curator/sync-core/sync-log/rows';
 
 const clog = log.for('rb-create');
 

@@ -1,7 +1,7 @@
 # Sync client inside an embedded JS engine
 
 Can a phone run the desktop's own sync client instead of a port of it? This spike runs the
-client (`apps/core/src/sync-log`, unchanged, imported from the product source) inside
+client (`packages/sync-core/src/sync-log`, unchanged, imported from the product source) inside
 QuickJS with SQLite linked beside it, joins the real library as a new device, and compares
 the resulting database with what Node + better-sqlite3 writes from the same input.
 
@@ -131,7 +131,7 @@ not in memory.
 ## After the fixes (2026-11-20, later)
 
 The sync client now takes the snapshot as text in pieces and loads it through a scratch
-database (`apps/core/src/sync-log/snapshot.ts loadSnapshotText`; the wire format did not
+database (`packages/sync-core/src/sync-log/snapshot.ts loadSnapshotText`; the wire format did not
 change), a snapshot load derives artists and albums only once every record is in, and the
 credit normalisation derives what a records-only device derives. `join` is the product's
 client end to end; the spike only supplies the phone's inflater.
@@ -157,7 +157,7 @@ thread does not share.
 
 ## A real transport and longer slices (2026-11-20, evening)
 
-**The phone's transport.** `apps/core/src/sync-log/fetch-transport.ts` is the client's
+**The phone's transport.** `packages/sync-core/src/sync-log/fetch-transport.ts` is the client's
 `CloudTransport` over plain HTTP: the server's tRPC procedures called by URL, with whatever
 HTTP the platform has. No Electron, no tRPC client, no Supabase SDK. It covers the library
 sync (push, pull, the snapshot join and publish, the account calls); the catalogue, Spotify
@@ -208,3 +208,116 @@ Peak memory is the same at every scale (421 MB on the phone), and so are the syn
 and every track's release. The phone runs were back to back, one each, the first from a
 cooler phone (35.7 °C against about 37.5 °C). The counted-clock run above (167 s) is the
 loader at its largest slices: what is left after that is the work itself.
+
+## Hermes, and where a join's time goes (2026-11-21)
+
+**Hermes V1** (Meta's 260318099.0.8, prebuilt for Android) runs the same bundle through
+`host/host-hermes.cpp`, which offers JavaScript the same `__host` as the QuickJS host
+(the engine-neutral half of both is `host/common.h`). `fetch-vendor.mjs` brings the engine,
+its compiler, the JSI sources of its tag, fbjni and a portable JDK, all pinned;
+`node scripts/build-host.mjs android-arm64 --engine hermes` and
+`node scripts/run-device.mjs adb --engine hermes …` build and run it.
+
+- Hermes on Android hands `normalize`, `localeCompare`, case conversion beyond ASCII and date
+  formatting to Java (`AndroidUnicodeUtils`, through fbjni) and attaches its finalizer thread
+  to the Java VM: it cannot run as a plain program. The host is a library run inside
+  Android's Java runtime by `app_process` (`host/java/spike/Main.java`), as an app runs it.
+- `subarray` and `slice` of a `Uint8Array` subclass return a plain `Uint8Array` (no species):
+  version-5 ids came out as lists of numbers until the shim's Buffer said so itself.
+- Async generators are unsupported (esbuild lowers them); block scoping is the compiler's
+  experimental `-Xes6-block-scoping`.
+
+Phone, counted clock, against Node: identical rows for both engines (59 tables, 775,156 rows).
+
+| Engine | Join | Pull of 5,604 ops | Peak memory |
+|---|---|---|---|
+| QuickJS | 176 s | 7.1 s | 421 MB |
+| Hermes | 172 s | 5.2 s | 449 MB (with the Java runtime) |
+
+The engine is not where the time goes. **`scripts/profile.mjs`** times every SQLite call of a
+Node join by statement and by phase. Of 145 s on the laptop, 63 s were 4,549 commits (each
+rewriting every page it touched, 32 indexes on `track`, a checkpoint every ~4 MB of WAL),
+600,000 prepares of the same statements took 8 s, and one lookup chose the wrong index
+(5–75 s). SQLite rebuilds the finished database whole (`VACUUM INTO`) in 2.7 s.
+
+The client now joins with rarer checkpoints and, on an empty library, no flush per commit
+(`enterJoinSettings`), caches its per-record statements (`packages/sync-core/src/db/stmt.ts`) and
+keeps that lookup on the right index. Same rows as before (Node, counted clock):
+
+| Join of the 8 November base | Before | After |
+|---|---|---|
+| Node on the laptop, real clock | 145 s | 82 s |
+| Phone (QuickJS), real clock, slice scale 1 | 251 s | 120 s |
+| Phone (QuickJS), real clock, slice scale 6 | 202 s | 109 s |
+
+## Joining from a ready-made replica (2026-11-21)
+
+With no disk at all (`profile.mjs --memory`) the tuned join still took 72 s on the laptop: the
+time is the per-record work, not storage. So the master builds the database once and new
+devices download it.
+
+- `scripts/build-replica.mjs` stands in for the master's background step: the join of the
+  published snapshot (here a `reference.mjs --http` run), compacted with `VACUUM INTO`, cut into
+  32 MB slices gzipped one by one (each inflates on its own as it arrives). Built from the
+  snapshot, not copied from the master's library, so nothing local to the master is in it.
+- `serve-cloud.ts` serves it under `/storage/replica/`; the driver's `replica` command
+  (`run-device.mjs adb --replica --tail`) fetches each part, checks it, inflates it onto the end
+  of the library file, takes a device identity of its own (`remint.ts`, as a restored backup
+  does), and then runs the ordinary client, which finds the account joined and pulls what came
+  after.
+
+| | Laptop | Phone (Xperia XQ-EC72) |
+|---|---|---|
+| Master: join, compact, compress (once per build) | 128 s + 4 s + 10 s | — |
+| Download 18 parts, 143 MB (loopback / USB) | 0.6 s | 3.5 s |
+| Verify (SHA-256) | 0.05 s | 1.3 s |
+| Inflate and write 571 MB | 1.8 s | 1.4 s |
+| New identity, first cycle | 0.3 s | 0.4 s |
+| **Library usable** | **2.8 s** | **6.7 s** (a normal join: 109–120 s) |
+| Then the 5,604-op tail | 3.4 s | 5.8 s |
+
+Same synced content as a normal join and every track on the same release, on the laptop, the
+emulator and the phone. The downloads here are local; over the internet 143 MB is ~11 s at
+100 Mbit/s, which is then most of the time. zstd (128 MB, faster to inflate) and a slimmer
+`sync_state` (325 of the 571 MB) would shrink it.
+
+## The replica in the product (2026-11-21, later)
+
+The prototype above is now the product's path; the spike drives it unchanged.
+
+- **Protocol:** sync feature `replica_storage`. `sync.publishReplica` (master only, its
+  snapshot must be stored), and `bootstrap` offers the newest replica when the client sends
+  `replicaSchema`. Server migration `0034_library_replica.sql`. Retention keeps the newest
+  replica and pins its snapshot.
+- **Core** (`sync-log/replica.ts`): `buildReplica` runs the real client's join of the
+  snapshot against an offline account (the build must emit no ops), then `VACUUM INTO`, then
+  cuts the file into gzip parts of up to 8 MB. `installReplica` / `joinFromReplica`
+  download the parts, check them, inflate them into a staging file, rename it, `migrate()`, and
+  re-mint the device identity. The master builds weekly, after a snapshot publish
+  (`REPLICA_EVERY_MS`). On the desktop, the build runs in the snapshot utility process.
+- **Spike:** `build-replica.mjs` calls `buildReplica`. `serve-cloud.ts` publishes the
+  replica through `sync.publishReplica`. The driver's `replica` command calls
+  `joinFromReplica`.
+
+Two fixes came out of measuring it on the device:
+
+- The hosts' `createHash` collected every update and hashed only at the end, so the replica's
+  whole file stayed in memory. It now hashes as data arrives (`hashOpen` / `hashUpdate` /
+  `hashDigest`). Emulator: install 30.7 s → 9.5 s, rss 575 → 35 MB, tail 41 → 8.7 s.
+- **`migrate()` redid work on every run.** `ALTER_MIGRATIONS` replays on each launch, and its
+  ADDs of columns that a later entry drops or renames came back each time. Each run then
+  back-filled them and rewrote `track` to drop them again. That cost ~2–3 s of every desktop
+  launch on this library, and of every replica install. The dead entries are gone, an empty
+  stray `spectral_complexity` is dropped once, and a second `migrate()` now changes nothing
+  (0.4 s).
+
+| | Laptop | Emulator (QuickJS) |
+|---|---|---|
+| Download 30 parts, 143 MB (loopback) | 0.5 s | 1.1 s |
+| Verify (SHA-256) | 0.04 s | 0.5 s |
+| Inflate and write 571 MB | 1.8 s | 4.3 s |
+| Migrate, new identity | 0.8 s | 0.4 s |
+| **Library usable** | **3.2 s** | **6.3 s** |
+| Then the 5,604-op tail | 4.9 s | 6.9 s |
+
+The phone has not run the product path yet.

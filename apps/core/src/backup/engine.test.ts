@@ -7,7 +7,7 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { normalizePath } from '../local/scanner.js';
 import { BackupEngine } from './engine.js';
 import { applyPendingRestore, remapLocalPathsAt } from './apply.js';

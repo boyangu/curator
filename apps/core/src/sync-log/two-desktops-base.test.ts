@@ -20,17 +20,17 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import * as schema from '@curator/shared/schema';
-import { createDb } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
-import * as mut from '../library/mutators.js';
-import { FakeCloud } from '../test-support/fake-cloud.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
+import * as mut from '@curator/sync-core/library/mutators';
+import { FakeCloud } from '@curator/sync-core/test-support/fake-cloud';
 import { markPreOpLog, replicaDiff, seedCatalogue, tick, TRACKS, TwoDesktopRig, type Desktop, type DesktopOpts } from '../test-support/two-desktops.js';
-import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY, recordsComplete } from './apply.js';
-import { createSyncClient, readCursor, type SyncClient } from './client.js';
-import { inlineSnapshotBuilder, type SnapshotBuilder } from './snapshot-build.js';
-import { JOIN_BIND_KEY } from './join-bind.js';
-import { CLOCK_KEY } from './outbox.js';
-import { recordingIdForTrack } from './recording-id.js';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY, recordsComplete } from '@curator/sync-core/sync-log/apply';
+import { createSyncClient, readCursor, type SyncClient } from '@curator/sync-core/sync-log/client';
+import { inlineSnapshotBuilder, type SnapshotBuilder } from '@curator/sync-core/sync-log/snapshot-build';
+import { JOIN_BIND_KEY } from '@curator/sync-core/sync-log/join-bind';
+import { CLOCK_KEY } from '@curator/sync-core/sync-log/outbox';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 
 const R = recordingIdForTrack;
 

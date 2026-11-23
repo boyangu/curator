@@ -31,12 +31,12 @@ import {
 	type SyncConflictChoice,
 	type SyncFieldKey,
 } from '@curator/shared';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { curatorFieldsView } from '../sync/curator-view.js';
 import { applyCueOpsToTrack, buildPullPatch } from '../sync/apply.js';
-import { artistProtect, creditsKey, normalizeIncomingCredits, syncTrackArtistsById } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
-import * as mut from '../library/mutators.js';
+import { artistProtect, creditsKey, normalizeIncomingCredits, syncTrackArtistsById } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import * as mut from '@curator/sync-core/library/mutators';
 
 // Read every open rekordbox conflict, resolving Curator's CURRENT value at
 // listing time (the stored row only carries base + theirs — ours is live

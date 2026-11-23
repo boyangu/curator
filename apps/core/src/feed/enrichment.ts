@@ -13,7 +13,7 @@ import type { DjMetadataPatch, Enricher, SourceLinkDraft, TrackQuery } from '../
 import { enrichOne } from '../enrich/runner.js';
 import type { EnrichStatus, FeedItem, FeedItemActivity, FeedItemPayload, FeedTrackRef } from './types.js';
 import type { FeedStore } from './store.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');
 

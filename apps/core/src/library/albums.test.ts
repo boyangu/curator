@@ -10,10 +10,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService, type CoreService } from '../service.js';
-import { syncTrackArtistsByIdRaw } from './artists.js';
-import { syncTrackAlbumsRaw } from './albums.js';
+import { syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsRaw } from '@curator/sync-core/library/albums';
 
 let dir: string;
 let dbPath: string;

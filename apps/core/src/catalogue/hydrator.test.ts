@@ -22,7 +22,7 @@ import {
 	writeFlac,
 	type TestDevice,
 } from '../test-support/catalogue-fakes.js';
-import { budgetMs } from '../test-support/timing.js';
+import { budgetMs } from '@curator/sync-core/test-support/timing';
 
 const USER = '0b6e1f3a-2c4d-4e5f-8a9b-1c2d3e4f5a6b';
 const OTHER = 'c3d4e5f6-0718-4293-a4b5-c6d7e8f9a0b1';

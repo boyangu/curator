@@ -29,19 +29,20 @@
 import Database from 'better-sqlite3';
 import { platform as P } from 'spike-platform';
 import type { Op, SnapshotManifest, StoredOp } from '../../../../packages/protocol/src/index.js';
-import { applyOps } from '../../../../apps/core/src/sync-log/apply.js';
-import { drainArtistCreditRewritesAsync } from '../../../../apps/core/src/library/artist-alias.js';
-import { createFetchCloudTransport } from '../../../../apps/core/src/sync-log/fetch-transport.js';
-import { inflateSnapshotText } from '../../../../apps/core/src/sync-log/snapshot-storage.js';
-import { createSyncClient, type CloudTransport } from '../../../../apps/core/src/sync-log/client.js';
-import { dumpLibrary } from '../../../../apps/core/src/sync-log/dump.js';
-import { claimLinkPendingCount, drainClaimLinksAsync, sweepClaimLinksAsync } from '../../../../apps/core/src/sync-log/claim-links.js';
-import { healPlayHistoryAsync } from '../../../../apps/core/src/sync-log/play-heal.js';
-import { derivePendingCount, drainTrackDerivationsAsync, remotePendingCount } from '../../../../apps/core/src/sync-log/remote-rows.js';
-import { drainRemotePendingAsync, sweepRemoteRowsAsync } from '../../../../apps/core/src/sync-log/remote-sweep.js';
-import { loadSnapshot, type SnapshotRecord } from '../../../../apps/core/src/sync-log/snapshot.js';
-import { readStorageSnapshotBody } from '../../../../apps/core/src/sync-log/snapshot-storage.js';
-import { FakeCloud } from '../../../../apps/core/src/test-support/fake-cloud.js';
+import { applyOps } from '@curator/sync-core/sync-log/apply';
+import { drainArtistCreditRewritesAsync } from '@curator/sync-core/library/artist-alias';
+import { createFetchCloudTransport } from '@curator/sync-core/sync-log/fetch-transport';
+import { inflateSnapshotText } from '@curator/sync-core/sync-log/snapshot-storage';
+import { CLIENT_STATE_KEY, createSyncClient, type CloudTransport } from '@curator/sync-core/sync-log/client';
+import { joinFromReplica } from '@curator/sync-core/sync-log/replica';
+import { dumpLibrary } from '@curator/sync-core/sync-log/dump';
+import { claimLinkPendingCount, drainClaimLinksAsync, sweepClaimLinksAsync } from '@curator/sync-core/sync-log/claim-links';
+import { healPlayHistoryAsync } from '@curator/sync-core/sync-log/play-heal';
+import { derivePendingCount, drainTrackDerivationsAsync, remotePendingCount } from '@curator/sync-core/sync-log/remote-rows';
+import { drainRemotePendingAsync, sweepRemoteRowsAsync } from '@curator/sync-core/sync-log/remote-sweep';
+import { loadSnapshot, type SnapshotRecord } from '@curator/sync-core/sync-log/snapshot';
+import { readStorageSnapshotBody } from '@curator/sync-core/sync-log/snapshot-storage';
+import { FakeCloud } from '@curator/sync-core/test-support/fake-cloud';
 
 // After every clock in the data (the library's last issued stamp, 2026-11).
 const FIXED_NOW = 1_795_200_000_000;
@@ -196,9 +197,17 @@ function httpAccount(f: Record<string, string>): Account {
 
 async function syncAs(f: Record<string, string>, account: Account, command: string): Promise<Record<string, unknown>> {
 	const t0 = P.now();
-	const raw = new Database(f['db']!);
-	// As the desktop opens its library (apps/core/src/db/client.ts).
-	raw.pragma('journal_mode = WAL');
+	// --memory (Node only): the library opened in memory from the file, and
+	// written back whole once synced — what a join costs without the disk.
+	const memory = f['memory'] === 'true';
+	// The file's header says WAL (bytes 18-19 = 2), which a copy in memory
+	// cannot open: it is set back to a rollback journal (1) in the copy.
+	const image = memory ? P.readBytes(f['db']!) : null;
+	if (image) { image[18] = 1; image[19] = 1; }
+	const raw = image ? new Database(image as unknown as string) : new Database(f['db']!);
+	// As the desktop opens its library (packages/sync-core/src/db/client.ts); a
+	// database in memory has no WAL.
+	if (!memory) raw.pragma('journal_mode = WAL');
 	raw.pragma('foreign_keys = ON');
 	const transport = account.transport;
 
@@ -256,6 +265,11 @@ async function syncAs(f: Record<string, string>, account: Account, command: stri
 		await settle('pull');
 		pull = { ops: added, ms: round(P.now() - t), firstCycleMs: cycles.find((c) => c['phase'] === 'pull')?.['ms'], pages: account.pulls() - pulls0, rssBeforeKb: before.rssKb, jsHeapBeforeKb: before.jsHeapKb, peakRssDuringKb: Math.max(peakRssKb, P.mem().rssKb) };
 		peakRssKb = Math.max(peakRssKb, joinPeakKb);
+	}
+	if (memory) {
+		const t = P.now();
+		raw.exec(`VACUUM INTO '${f['db']}.from-memory.db'`);
+		P.log(`written from memory: ${round(P.now() - t)} ms`);
 	}
 	const tSynced = P.now();
 	const afterSync = P.mem(true);
@@ -431,12 +445,42 @@ function probe(f: Record<string, string>): Record<string, unknown> {
 	return { command: 'probe', runtime: P.runtime, pages };
 }
 
+// A new device that joins from a ready-made replica instead of the snapshot,
+// through the product's own path (apps/core sync-log/replica.ts
+// joinFromReplica): the bootstrap's replica offer, each part read from the
+// bucket, checked, and inflated onto the end of a staging file, the file
+// moved into place, migrated, and given a device identity of its own. Then
+// the ordinary client, which finds the account joined and pulls what came
+// after the replica.
+//
+//   replica --db <new file> --server <server.json> --out <dir> [--tail]
+async function installReplica(f: Record<string, string>): Promise<Record<string, unknown>> {
+	const server = JSON.parse(P.readText(f['server']!)) as { userId: string };
+	const r = await joinFromReplica(httpAccount(f).transport, f['db']!);
+	if (!r) throw new Error('the server offers no replica');
+	// The replica belongs to the account it was built for; the builder here
+	// ran before this harness's account existed (one per server process), so
+	// the binding is set to it. A master builds it with the account's own id.
+	const raw = new Database(f['db']!);
+	const state = JSON.parse((raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).pluck().get(CLIENT_STATE_KEY) as string | undefined) ?? '{}') as Record<string, unknown>;
+	raw.prepare(`UPDATE app_setting SET value = ? WHERE key = ?`).run(JSON.stringify({ ...state, userId: server.userId, registeredFor: null }), CLIENT_STATE_KEY);
+	raw.close();
+	return r;
+}
+
 export async function main(args: string[]): Promise<void> {
 	const f = flags(args.slice(1));
 	if (f['fixed'] === 'true') fixTheWorld();
 	if (args[0] === 'probe') { P.log(JSON.stringify(probe(f), null, 1)); return; }
-	if (args[0] !== 'join' && args[0] !== 'sync' && args[0] !== 'stream') throw new Error(`usage: join|sync|stream --db <file> … (got ${args.join(' ')})`);
-	const result = args[0] === 'join' ? await syncAs(f, fakeAccount(f), 'join') : args[0] === 'sync' ? await syncAs(f, httpAccount(f), 'sync') : await stream(f);
+	if (!['join', 'sync', 'replica', 'stream'].includes(args[0] ?? '')) throw new Error(`usage: join|sync|replica|stream --db <file> … (got ${args.join(' ')})`);
+	let result: Record<string, unknown>;
+	if (args[0] === 'replica') {
+		const replica = await installReplica(f);
+		P.log(`replica installed: ${JSON.stringify(replica)}`);
+		result = { replica, ...(await syncAs(f, httpAccount(f), 'replica')) };
+	} else {
+		result = args[0] === 'join' ? await syncAs(f, fakeAccount(f), 'join') : args[0] === 'sync' ? await syncAs(f, httpAccount(f), 'sync') : await stream(f);
+	}
 	const text = JSON.stringify(result, null, 1);
 	P.writeText(`${f['out']}/result.json`, text);
 	P.log(text);

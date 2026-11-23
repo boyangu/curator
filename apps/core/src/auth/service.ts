@@ -18,8 +18,8 @@ import { SpotifyGateway, type SpotifyGatewayPort } from './spotify-gateway.js';
 import { TokenStore } from './store.js';
 import type { ExportedTokenRow } from '../backup/types.js';
 import { config } from '../config.js';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
 
 const alog = log.for('auth');
 

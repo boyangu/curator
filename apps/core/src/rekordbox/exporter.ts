@@ -57,7 +57,7 @@ import {
 	playlistConflict,
 } from '@curator/shared/schema';
 import type { CueUnit, FieldsSeen } from '@curator/shared';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import {
 	effectiveAlbum,
 	effectiveArtistName,
@@ -78,9 +78,9 @@ import {
 } from './sidecar.js';
 import { eqArr } from './order-util.js';
 import { planCreateForTracks, planCreatePhase, runCreatePhase, type CreatePhaseSummary } from './create-phase.js';
-import { buildTagComment, tagCommentMatches } from './tag-comment.js';
-import { log } from '../log.js';
-import { deletePlaylist } from '../library/mutators.js';
+import { buildTagComment, tagCommentMatches } from '@curator/sync-core/rekordbox/tag-comment';
+import { log } from '@curator/sync-core/log';
+import { deletePlaylist } from '@curator/sync-core/library/mutators';
 
 const xlog = log.for('rb-export');
 

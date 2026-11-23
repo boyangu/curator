@@ -18,7 +18,7 @@
 
 import { nameFold } from '@curator/library-logic';
 import type { SpotifyAlbum, SpotifySimplifiedTrack, SpotifyTrack } from '@curator/spotify';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { FeedStore } from './store.js';
 import type { FeedHandle, FeedItem, FeedItemActivity, FeedItemDraft, FeedTrackRef, MatchStatus } from './types.js';
 import { isSpotifyQuotaBackoff } from '@curator/spotify';

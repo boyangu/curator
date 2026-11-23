@@ -13,13 +13,13 @@
 
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
-import { ClaimBinder, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
-import { nextStreamingPlaylistId } from '../sync-log/stable-ids.js';
-import * as mut from '../library/mutators.js';
-import { rawOf } from '../library/artists.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { ClaimBinder, projectAdoptedRecordings } from '@curator/sync-core/sync-log/claim-bind';
+import { nextStreamingPlaylistId } from '@curator/sync-core/sync-log/stable-ids';
+import * as mut from '@curator/sync-core/library/mutators';
+import { rawOf } from '@curator/sync-core/library/artists';
 import { TidalApiClient, type TidalPlaylist, type TidalPlaylistItem, type TidalTrackV2 } from '@curator/tidal';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { AuthService } from '../auth/service.js';
 import { config } from '../config.js';
 import {
@@ -34,13 +34,13 @@ import {
 	type TrackArtist,
 } from '@curator/shared/schema';
 import { asciify, searchFold } from '@curator/shared';
-import { normalizeIncomingCredits, syncTrackArtists, syncTrackArtistsById } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
-import { upsertArtistLinks } from '../library/artist-links.js';
+import { normalizeIncomingCredits, syncTrackArtists, syncTrackArtistsById } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import { upsertArtistLinks } from '@curator/sync-core/library/artist-links';
 import { findExistingByContent } from './match-existing.js';
 import { normalizeIsrc } from '@curator/library-logic';
 import type { ProgressFn } from './spotify.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const tlog = log.for('tidal-sync');
 

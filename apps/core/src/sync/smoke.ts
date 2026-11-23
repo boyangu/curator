@@ -2,8 +2,8 @@
 // boundary so we can exercise upsert + replace-tracks + idempotency logic
 // without a live token.
 
-import { createDb } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { SpotifySync } from './spotify.js';
 import { AuthService } from '../auth/service.js';
 import { TokenStore } from '../auth/store.js';

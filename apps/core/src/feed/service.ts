@@ -49,7 +49,7 @@ import type {
 } from './types.js';
 import { resolveFeedMembership } from './types.js';
 import { spotifyIdOf, trackSpotifyIdOf } from './handles.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { CLOUD_FEED_PRODUCER_ID, CloudFeedProducer, type CatalogFeedPort } from './cloud-producer.js';
 import { matchSpotify, needsMatch } from './spotify-match.js';
 import { hasArtistLens, itemArtists, passesArtistLenses, sqlFilterOf, type ArtistSignals, type FeedLens } from './lenses.js';

@@ -5,9 +5,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService, type CoreService } from '../service.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 
 let tmp: TmpDir;
 let sqlite: Database.Database;

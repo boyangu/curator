@@ -10,11 +10,13 @@ import {
 	BATCH_LABEL_PATTERN,
 	MAX_SNAPSHOT_PARTS,
 	SNAPSHOT_PART_MAX_BYTES,
+	REPLICA_STORAGE_ENCODING,
 	SNAPSHOT_STORAGE_ENCODING,
 	type BatchAbortInput,
 	type BatchBeginInput,
 	type BatchCommitInput,
 	type BootstrapInput,
+	type PublishReplicaInput,
 	type PublishSnapshotInput,
 	type PullInput,
 } from './cloud-service.js';
@@ -45,7 +47,8 @@ export const ZPullInput = z
 // `.optional()`: a client from before 'device_reads' sends no input at all.
 // `storage` only to a server with 'snapshot_storage' (every server now; a
 // call without it is answered `update_required`).
-export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional(), storage: z.literal(true).optional() }).strict().optional();
+// `replicaSchema` only to a server with 'replica_storage'.
+export const ZBootstrapInput = z.object({ deviceId: ZDeviceId.optional(), storage: z.literal(true).optional(), replicaSchema: z.number().int().min(1).max(1_000_000).optional() }).strict().optional();
 
 // 'batches'. A batch id is the server's UUID; anything else cannot name a
 // batch and is refused before a query runs.
@@ -68,6 +71,7 @@ export const ZBatchCommitInput = z.object({ deviceId: ZDeviceId, batchId: ZBatch
 export const ZBatchAbortInput = z.object({ deviceId: ZDeviceId, batchId: ZBatchId }).strict();
 
 const ZSha256 = z.string().regex(/^[0-9a-f]{64}$/);
+const ZPart = z.object({ path: z.string().min(1).max(256), bytes: z.number().int().min(1).max(SNAPSHOT_PART_MAX_BYTES), sha256: ZSha256 }).strict();
 // The shape only; that each path is snapshotPartPath(caller, sha256) and
 // that the parts add up are the server's checks (`snapshot_part_invalid`).
 export const ZPublishSnapshotInput = z
@@ -76,10 +80,27 @@ export const ZPublishSnapshotInput = z
 		snapshotSeq: ZSeq.min(1),
 		manifest: z.object({
 			encoding: z.literal(SNAPSHOT_STORAGE_ENCODING),
-			parts: z.array(z.object({ path: z.string().min(1).max(256), bytes: z.number().int().min(1).max(SNAPSHOT_PART_MAX_BYTES), sha256: ZSha256 }).strict()).min(1).max(MAX_SNAPSHOT_PARTS),
+			parts: z.array(ZPart).min(1).max(MAX_SNAPSHOT_PARTS),
 			totalBytes: z.number().int().min(1).max(SNAPSHOT_PART_MAX_BYTES * MAX_SNAPSHOT_PARTS),
 			sha256: ZSha256,
 			stateSha256: ZSha256,
+		}).strict(),
+	})
+	.strict();
+
+// 'replica_storage'. The shape only, as for a snapshot; the paths, the sum
+// and the snapshot it stands on are the server's checks.
+export const ZPublishReplicaInput = z
+	.object({
+		deviceId: ZDeviceId,
+		snapshotSeq: ZSeq.min(1),
+		manifest: z.object({
+			encoding: z.literal(REPLICA_STORAGE_ENCODING),
+			schema: z.number().int().min(1).max(1_000_000),
+			parts: z.array(ZPart).min(1).max(MAX_SNAPSHOT_PARTS),
+			totalBytes: z.number().int().min(1).max(SNAPSHOT_PART_MAX_BYTES * MAX_SNAPSHOT_PARTS),
+			rawBytes: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+			rawSha256: ZSha256,
 		}).strict(),
 	})
 	.strict();
@@ -95,6 +116,8 @@ void _batchBeginMatches;
 void _batchCommitMatches;
 void _batchAbortMatches;
 const _publishSnapshotMatches: Same<z.infer<typeof ZPublishSnapshotInput>, PublishSnapshotInput> = true;
+const _publishReplicaMatches: Same<z.infer<typeof ZPublishReplicaInput>, PublishReplicaInput> = true;
+void _publishReplicaMatches;
 void _publishSnapshotMatches;
 void _pullInputMatches;
 void _bootstrapInputMatches;

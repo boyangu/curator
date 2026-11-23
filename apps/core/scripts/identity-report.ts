@@ -14,7 +14,7 @@
 // Electron's node with ELECTRON_RUN_AS_NODE=1).
 
 import Database from 'better-sqlite3';
-import { identityReport } from '../src/sync-log/identity-report.js';
+import { identityReport } from '@curator/sync-core/sync-log/identity-report';
 
 const args = process.argv.slice(2);
 const dbPath = args.find((a) => !a.startsWith('--'));

@@ -33,10 +33,10 @@ import type { AnalyzeParams, AnalyzeResult } from '../analyzer/sidecar.js';
 import { AnalysisQueue, EXPECTED_ANALYZER_VERSION, type AnalysisJobEvent } from '../analyzer/queue.js';
 import type { AnalyzerSidecar } from '../analyzer/sidecar.js';
 import { createCatalogueLayer, type CatalogueLayer, type CatalogueLayerDeps } from '../catalogue/layer.js';
-import { createDb, type Db } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
+import { createDb, type Db } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { audioHash } from '../ingest/audio-hash.js';
-import { CloudTransportError, type CloudSession } from '../sync-log/client.js';
+import { CloudTransportError, type CloudSession } from '@curator/sync-core/sync-log/client';
 import { CatalogueBlobError, type CatalogueBlobStore, type CatalogueTransport } from '../catalogue/types.js';
 
 export const POLICY_D_A: CataloguePolicy = {

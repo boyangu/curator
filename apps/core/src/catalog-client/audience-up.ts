@@ -14,7 +14,7 @@
 // Signed out, or a server without 'catalog_audience': tried again later.
 
 import type Database from 'better-sqlite3';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { writeRefs } from './catalog-refs.js';
 import type { CatalogArtistRef, CatalogClient } from './service.js';
 

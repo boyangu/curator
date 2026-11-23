@@ -1,11 +1,11 @@
 // Seed: ~30 mock tracks + playlists matching the Library.html design data.
 // Phase-0 stand-in until real Spotify/Tidal sync lands.
 
-import { createDb } from './client.js';
-import { migrate } from './migrate.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { randomUUID } from 'node:crypto';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
-import { replaceRows } from '../library/playlist-order.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { replaceRows } from '@curator/sync-core/library/playlist-order';
 const nanoid = (): string => randomUUID();
 import {
 	track,
@@ -16,9 +16,9 @@ import {
 	type NewPlaylist,
 } from '@curator/shared/schema';
 import { asciify, searchFold, splitArtistCredit } from '@curator/shared';
-import { syncTrackArtists } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
-import { log } from '../log.js';
+import { syncTrackArtists } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import { log } from '@curator/sync-core/log';
 
 const slog = log.for('seed');
 

@@ -30,7 +30,7 @@ import { existsSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { CatalogClaim } from '@curator/protocol';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { writeRefs, type CatalogRefRow } from '../catalog-client/catalog-refs.js';
 import { libraryClaims } from '../catalog-client/library-claims.js';
 

@@ -28,6 +28,20 @@ class SpikeBuffer extends Uint8Array {
 		return out;
 	}
 
+	// A view or a copy is a Buffer too, as Node's are. Said here, not left to
+	// the language's species rule: Hermes's subarray and slice ignore it and
+	// return a plain Uint8Array, whose toString('hex') is a list of numbers
+	// (found 2026-11-21: version-5 ids came out as "0,0,102,…").
+	override subarray(begin?: number, end?: number): SpikeBuffer {
+		const view = Uint8Array.prototype.subarray.call(this, begin, end);
+		return new SpikeBuffer(view.buffer, view.byteOffset, view.byteLength);
+	}
+
+	override slice(begin?: number, end?: number): SpikeBuffer {
+		const copy = Uint8Array.prototype.slice.call(this, begin, end);
+		return new SpikeBuffer(copy.buffer, copy.byteOffset, copy.byteLength);
+	}
+
 	static alloc(n: number): SpikeBuffer { return new SpikeBuffer(n); }
 	static isBuffer(v: unknown): v is SpikeBuffer { return v instanceof SpikeBuffer; }
 
@@ -77,6 +91,9 @@ g['clearTimeout'] = g['clearImmediate'] = (id: number) => {
 	if (i >= 0) tasks.splice(i, 1);
 };
 g['performance'] ??= { now: () => host.hrtime() };
+// Enough of `process` for a module that looks before it acts (migrate.ts's
+// command-line check): no script, no environment.
+g['process'] ??= { argv: [], env: {} };
 
 const line = (args: unknown[]): string => args.map((a) => (typeof a === 'string' ? a : a instanceof Error ? `${a.name}: ${a.message}\n${a.stack ?? ''}` : JSON.stringify(a))).join(' ');
 g['console'] ??= {

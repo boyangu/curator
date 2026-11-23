@@ -1,0 +1,24 @@
+{
+  "name": "@curator/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/fetch-vendor.mjs",
+    "bundle": "node scripts/bundle.mjs",
+    "build": "node scripts/bundle.mjs && node scripts/gradle.mjs assembleDebug",
+    "test": "node scripts/gradle.mjs testDebugUnitTest",
+    "typecheck": "tsc --noEmit",
+    "device": "node scripts/run.mjs"
+  },
+  "dependencies": {
+    "@curator/protocol": "workspace:*",
+    "@curator/sync-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.3"
+  }
+}

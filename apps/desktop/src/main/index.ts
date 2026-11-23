@@ -34,7 +34,7 @@ import { watchAppActivity } from './cloud/activity.js';
 import { createHttpCloudTransport, withLocalCatalog } from './cloud/transport.js';
 import { shareSpotifyLogin } from './cloud/local-catalog-login.js';
 import { createCatalogueBlobStore } from './cloud/blobs.js';
-import { createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
+import { createUtilityReplicaBuilder, createUtilitySnapshotBuilder } from './cloud/snapshot-host.js';
 import { catalogApiUrl, cloudAccountConfigured, cloudApiUrl } from './cloud-config.js';
 import { PROFILE_NAME_RE, decideRails, parseProfileEnv, profileAppUserModelId, profileDeviceName, profileRailsSummary, profileTitleSuffix, profileUserDataDir } from './profile.js';
 import type { CloudTransport } from '@curator/core';
@@ -1246,8 +1246,13 @@ app.whenReady().then(async () => {
 				blobs: createCatalogueBlobStore(accountForCore),
 				// The account snapshot this device publishes when it is the
 				// master: built in a utility process (DB read-only, parts under
-				// userData), uploaded by core with the user's session.
-				snapshot: { builder: createUtilitySnapshotBuilder({ workerPath: join(__dirname, 'snapshot-worker.cjs'), dbPath, tmpRoot: join(app.getPath('userData'), 'snapshot-build') }) },
+				// userData), uploaded by core with the user's session; and weekly the
+				// ready-made library a new device installs instead of joining,
+				// joined from that snapshot in the same kind of process.
+				snapshot: {
+					builder: createUtilitySnapshotBuilder({ workerPath: join(__dirname, 'snapshot-worker.cjs'), dbPath, tmpRoot: join(app.getPath('userData'), 'snapshot-build') }),
+					replica: createUtilityReplicaBuilder({ workerPath: join(__dirname, 'snapshot-worker.cjs'), tmpRoot: join(app.getPath('userData'), 'replica-build') }),
+				},
 			}
 			: undefined,
 		peaksDir,

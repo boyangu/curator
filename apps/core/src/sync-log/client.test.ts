@@ -20,23 +20,23 @@ import * as schema from '@curator/shared/schema';
 import { MAX_PULL_OPS, MAX_PUSH_OPS, rebalance, SCHEMA_VERSION, type StoredOp } from '@curator/protocol';
 import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
-import { migrate } from '../db/migrate.js';
-import { createDb } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb } from '@curator/sync-core/db/client';
 import { createCoreService, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
-import { CloudTransportError, createSyncClient, readCursor, type CloudSyncEvent, type CloudTransport, type SyncClient } from './client.js';
-import { compareDumps, dumpLibrary } from './dump.js';
-import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from './apply.js';
-import { heldCount, replayHeldOps } from './held.js';
-import { foldLibraryAsync, joinPushAsync } from './initial-push.js';
-import { inlineSnapshotBuilder } from './snapshot-build.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { remintDeviceIdentity } from './remint.js';
-import { FakeCloud } from '../test-support/fake-cloud.js';
-import { removeDir } from '../test-support/tmp.js';
-import { budgetMs } from '../test-support/timing.js';
-import * as mut from '../library/mutators.js';
-import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '../library/artists.js';
+import { CloudTransportError, createSyncClient, readCursor, type CloudSyncEvent, type CloudTransport, type SyncClient } from '@curator/sync-core/sync-log/client';
+import { compareDumps, dumpLibrary } from '@curator/sync-core/sync-log/dump';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from '@curator/sync-core/sync-log/apply';
+import { heldCount, replayHeldOps } from '@curator/sync-core/sync-log/held';
+import { foldLibraryAsync, joinPushAsync } from '@curator/sync-core/sync-log/initial-push';
+import { inlineSnapshotBuilder } from '@curator/sync-core/sync-log/snapshot-build';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { remintDeviceIdentity } from '@curator/sync-core/sync-log/remint';
+import { FakeCloud } from '@curator/sync-core/test-support/fake-cloud';
+import { removeDir } from '@curator/sync-core/test-support/tmp';
+import { budgetMs } from '@curator/sync-core/test-support/timing';
+import * as mut from '@curator/sync-core/library/mutators';
+import { normalizeIncomingArtistsRaw, syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
 
 // The fake server lives in test-support/fake-cloud.ts (shared with the
 // two-desktop scenario suites).

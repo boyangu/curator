@@ -11,8 +11,8 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import type { SpotifyPlaylist, SpotifyPlaylistTrack } from '@curator/spotify';
 import type { TidalPlaylist, TidalPlaylistItem } from '@curator/tidal';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { SpotifySync } from './spotify.js';
 import { TidalSync } from './tidal.js';
 

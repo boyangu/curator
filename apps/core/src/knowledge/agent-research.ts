@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { assemblePrompt, RESEARCH_TOOL, type DecisionLog, type ResearchResult, type WireToolSpec } from '@curator/agent-core';
 import { z } from 'zod';
 import type { AgentSidecarManager } from '../agent/sidecar.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { ResearchClaim, ResearchPort, ResearchRequest } from './research.js';
 
 const rlog = log.for('research');

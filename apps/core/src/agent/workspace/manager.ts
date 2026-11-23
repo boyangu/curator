@@ -5,7 +5,7 @@
 // refs are only accepted when HOST code loaded them, never because a
 // (model-writable) scratch table claims them.
 
-import { log } from '../../log.js';
+import { log } from '@curator/sync-core/log';
 import { ProviderHitCache, type AgentResultItemKind } from '../result-set.js';
 import { validTableName, type WorkspaceColumn, type WorkspaceQueryResult } from './engine.js';
 import { WorkspaceResetError, type WorkspaceHost } from './host.js';

@@ -22,8 +22,8 @@ import { join } from 'node:path';
 import { eq } from 'drizzle-orm';
 import { asciify } from '@curator/shared';
 import { track, type TrackArtist } from '@curator/shared/schema';
-import { createDb } from '../src/db/client.js';
-import { normalizeIncomingArtists, syncTrackArtists, syncTrackArtistsById } from '../src/library/artists.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { normalizeIncomingArtists, syncTrackArtists, syncTrackArtistsById } from '@curator/sync-core/library/artists';
 
 const KLANG_ID = '1a96f429-656b-4564-a8d1-a0bab4a9e2de';
 const SPOTIFY_LINK_ID = '9dcf710c-a7b9-45c5-a0c9-0240ed3398ca'; // spotify 06kVL2y6KhhGf7F2LG77GI

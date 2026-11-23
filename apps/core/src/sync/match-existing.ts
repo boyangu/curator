@@ -25,7 +25,7 @@ import { and, eq, isNull, like } from 'drizzle-orm';
 import { track, type TrackArtist } from '@curator/shared/schema';
 import { sharedScorer, type Candidate, type Target } from '@curator/matcher';
 import { normalizeIsrc, versionOf } from '@curator/library-logic';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 
 export interface ContentMatch {
 	trackId: string;

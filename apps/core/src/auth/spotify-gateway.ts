@@ -22,9 +22,9 @@
 import { eq } from 'drizzle-orm';
 import { appSetting } from '@curator/shared/schema';
 import type { CloudService, SpotifyProfile, SpotifyTokenResult, SyncFeature } from '@curator/protocol';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
-import { CloudTransportError } from '../sync-log/client.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
+import { CloudTransportError } from '@curator/sync-core/sync-log/client';
 import type { TokenStore } from './store.js';
 
 const glog = log.for('spotify-gateway');

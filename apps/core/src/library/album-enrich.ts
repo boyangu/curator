@@ -14,11 +14,11 @@
 
 import type Database from 'better-sqlite3';
 import type { SpotifyClient, SpotifyFullAlbum } from '@curator/spotify';
-import { upsertArtistRaw } from './artists.js';
-import { setAlbumArtistsRaw } from './albums.js';
-import { log } from '../log.js';
-import { emitAlbumMeta } from '../sync-log/album-meta.js';
-import { emitV4 } from '../sync-log/features.js';
+import { upsertArtistRaw } from '@curator/sync-core/library/artists';
+import { setAlbumArtistsRaw } from '@curator/sync-core/library/albums';
+import { log } from '@curator/sync-core/log';
+import { emitAlbumMeta } from '@curator/sync-core/sync-log/album-meta';
+import { emitV4 } from '@curator/sync-core/sync-log/features';
 
 const elog = log.for('album-enrich');
 

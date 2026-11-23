@@ -16,13 +16,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type Database from 'better-sqlite3';
 import { join } from 'node:path';
-import * as mut from '../library/mutators.js';
+import * as mut from '@curator/sync-core/library/mutators';
 import { normalizePath } from '../local/scanner.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
-import { INITIAL_PUSH_KEY } from './apply.js';
-import { planIdentityMerges } from './identity.js';
-import { CLAIMS_BACKFILL_KEY } from './initial-push.js';
-import { recordingIdForTrack } from './recording-id.js';
+import { INITIAL_PUSH_KEY } from '@curator/sync-core/sync-log/apply';
+import { planIdentityMerges } from '@curator/sync-core/sync-log/identity';
+import { CLAIMS_BACKFILL_KEY } from '@curator/sync-core/sync-log/initial-push';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import {
 	flacParse,
 	markPreOpLog,

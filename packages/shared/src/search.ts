@@ -15,7 +15,7 @@
 // pre-filter can hit them without a per-row function call.
 //
 // IMPORTANT: changing the fold rules invalidates every persisted `*_ascii`
-// value. Bump FOLD_VERSION in apps/core/src/db/migrate.ts so the one-shot
+// value. Bump FOLD_VERSION in packages/sync-core/src/db/migrate.ts so the one-shot
 // re-fold backfill re-runs over the whole library.
 
 const COMBINING_DIACRITICS_RE = /[̀-ͯ]/g;

@@ -22,10 +22,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MASTER_DEVICE_SETTING, opSchemaVersion, type TrackMeta } from '@curator/protocol';
-import { applyOps } from '../sync-log/apply.js';
-import { remoteTrackId } from '../sync-log/stable-ids.js';
+import { applyOps } from '@curator/sync-core/sync-log/apply';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
 import { FakeCatalogueServer, POLICY_D_A, makeTestDevice, pcmMd5, seedAnalysed, sha256, type TestDevice } from '../test-support/catalogue-fakes.js';
-import { budgetMs } from '../test-support/timing.js';
+import { budgetMs } from '@curator/sync-core/test-support/timing';
 
 const USER = '7a0e5d2c-1b3f-4e6a-9c8d-2f4b6a8c0e1d';
 

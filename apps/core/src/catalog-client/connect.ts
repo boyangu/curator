@@ -36,7 +36,7 @@ import {
 } from '@curator/protocol';
 import { SpotifyClient } from '@curator/spotify';
 import type { TidalApiClient } from '@curator/tidal';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { CatalogUnavailableError, type CatalogClientStatus } from './service.js';
 
 const clog = log.for('catalog');

@@ -10,7 +10,7 @@
 // is not one artist: it files every artist of a name together, and the
 // picture on such a page is whichever namesake's Deezer chose (2026-11-18).
 
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const plog = log.for('entity');
 

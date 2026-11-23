@@ -3,7 +3,7 @@
 // encryption-at-rest is the obvious next step when we deploy server-remote.
 
 import { and, eq } from 'drizzle-orm';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { token } from '@curator/shared/schema';
 
 export type TokenSource = 'spotify' | 'tidal';

@@ -6,7 +6,7 @@
 // the layer still answers seed-based similarity from vectors already in
 // mir.db; only computing new vectors and text queries need the engine.
 
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { MirLibraryPort } from './library-port.js';
 import { isProvisioned, runProvision, type MirProvisionSpec } from './provision.js';
 import { MirScheduler } from './scheduler.js';

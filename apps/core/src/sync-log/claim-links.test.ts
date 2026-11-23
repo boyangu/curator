@@ -16,20 +16,20 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { opSchemaVersion, type TrackMeta } from '@curator/protocol';
 import type { TidalApiClient, TidalTrackV2 } from '@curator/tidal';
-import { createDb, type Db } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
+import { createDb, type Db } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { MembershipClassifier } from '../library/membership.js';
 import { SpotifySync } from '../sync/spotify.js';
 import { TidalHybrid } from '../sync/tidal-hybrid.js';
-import { applyOps, INITIAL_PUSH_KEY } from './apply.js';
+import { applyOps, INITIAL_PUSH_KEY } from '@curator/sync-core/sync-log/apply';
 import {
 	CLAIM_LINKS_SWEEP_KEY, claimLinkPendingCount, claimLinksOf, claimLinksSwept, deriveClaimLinks, dismissClaimLink, drainClaimLinksAsync, sweepClaimLinksAsync,
-} from './claim-links.js';
-import { planIdentityMerges } from './identity.js';
-import { claimsBackfillAsync, CLAIMS_BACKFILL_KEY, initialPush } from './initial-push.js';
-import { readOutbox } from './outbox.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { remoteTrackId } from './stable-ids.js';
+} from '@curator/sync-core/sync-log/claim-links';
+import { planIdentityMerges } from '@curator/sync-core/sync-log/identity';
+import { claimsBackfillAsync, CLAIMS_BACKFILL_KEY, initialPush } from '@curator/sync-core/sync-log/initial-push';
+import { readOutbox } from '@curator/sync-core/sync-log/outbox';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
 
 const R = recordingIdForTrack;
 

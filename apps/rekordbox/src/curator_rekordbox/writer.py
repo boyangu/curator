@@ -277,7 +277,7 @@ def _parse_cti(color: Optional[str]) -> Optional[int]:
     """Curator's stored color tokens are now exclusively `"cti:N"` or None.
     The legacy named palette ("red"/"green"/etc) is no longer recognised on
     either the read or write side; pre-refactor rows are NULLed by the
-    migration in apps/core/src/db/migrate.ts. See [[curator-cue-editor]] +
+    migration in packages/sync-core/src/db/migrate.ts. See [[curator-cue-editor]] +
     the rb-color-refactor plan for the rationale.
 
     Returns the CTI integer, or None for "no color set" / unknown tokens.

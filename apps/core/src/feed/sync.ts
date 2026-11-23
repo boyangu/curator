@@ -34,11 +34,11 @@
 
 import type Database from 'better-sqlite3';
 import { FEED_LISTEN_PREFIX, type LwwRecord } from '@curator/protocol';
-import { log } from '../log.js';
-import { getDeviceId } from '../sync-log/device.js';
-import { emitV4 } from '../sync-log/features.js';
-import { emitOps, type EmitOp } from '../sync-log/outbox.js';
-import { masterDevice } from '../sync-log/track-meta.js';
+import { log } from '@curator/sync-core/log';
+import { getDeviceId } from '@curator/sync-core/sync-log/device';
+import { emitV4 } from '@curator/sync-core/sync-log/features';
+import { emitOps, type EmitOp } from '@curator/sync-core/sync-log/outbox';
+import { masterDevice } from '@curator/sync-core/sync-log/track-meta';
 import type { FeedStore } from './store.js';
 import type { FeedDecisionPort, FeedItemState, FeedRole, FeedSuppressionScope, SyncedFeedItem, SyncedFeedSuppression } from './types.js';
 

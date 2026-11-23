@@ -316,7 +316,6 @@ describe('protocol v3: set-meta and the master device setting', () => {
 	});
 
 	it('stamps the feed.lenses setting v6 and refuses it below (a v5 reader holds it aside)', () => {
-		expect(SCHEMA_VERSION).toBe(6);
 		expect(isAccountSettingKey('feed.lenses')).toBe(true);
 		expect(opSchemaVersion({ entity: 'setting', kind: 'set', entity_id: 'feed.lenses' })).toBe(6);
 		const s = { ...envelope('setting', 'set', 'feed.lenses', { value: [{ id: 'l1', label: 'x', rule: { kind: 'genre', value: 'House' }, by: 'user', createdAt: 1 }] }), schema_version: 5 };

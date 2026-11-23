@@ -15,7 +15,7 @@ import type { StreamingSource } from '@curator/shared';
 import type { FeedItemDraft, LibraryTier, FeedTrackRef } from './types.js';
 import type { FeedStore } from './store.js';
 import { spotifyIdOf } from './handles.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');
 

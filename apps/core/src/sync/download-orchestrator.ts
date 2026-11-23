@@ -16,9 +16,9 @@ import { downloadConfig, type DownloadConfig } from '../config.download.js';
 import { downloadFlac, type FlacMetadata } from './download-flac.js';
 import { applyOverrides } from '@curator/library-logic';
 import { DownloadError } from './download-queue.js';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import type { AuthService } from '../auth/service.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const olog = log.for('download-orch');
 const dllog = log.for('download');

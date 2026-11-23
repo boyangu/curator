@@ -14,11 +14,11 @@ import { renameSync, statSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { audioHash } from '../ingest/audio-hash.js';
-import * as mut from '../library/mutators.js';
-import { normalizeIncomingArtistsRaw } from '../library/artists.js';
+import * as mut from '@curator/sync-core/library/mutators';
+import { normalizeIncomingArtistsRaw } from '@curator/sync-core/library/artists';
 import { normalizePath } from '../local/scanner.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
-import { recordingIdForTrack } from './recording-id.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import {
 	creditDump,
 	flacParse,

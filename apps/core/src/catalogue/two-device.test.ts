@@ -29,7 +29,7 @@ import {
 	writeFlac,
 	type TestDevice,
 } from '../test-support/catalogue-fakes.js';
-import { budgetMs } from '../test-support/timing.js';
+import { budgetMs } from '@curator/sync-core/test-support/timing';
 
 const USER = '4f1c2a9e-6b1d-4c55-9a51-0d3c2f7e8a10';
 const PCM_MD5 = '0123456789abcdef0123456789abcdef';

@@ -15,7 +15,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runReplayCheck } from '../src/sync-log/replay-check.js';
+import { runReplayCheck } from '@curator/sync-core/sync-log/replay-check';
 
 const args = process.argv.slice(2);
 const dbPath = args.find((a) => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--work');

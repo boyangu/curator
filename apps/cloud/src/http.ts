@@ -5,9 +5,20 @@
 // The request id is settled here, before the body is read, so the 413s and
 // failed uploads this bridge answers itself carry one and get their own
 // request_log row (the handler logs everything else, see app.ts).
+//
+// Compression lives here too, so the handler only ever sees plain bodies.
+// An answer is gzipped for a client that accepts it: ops are JSON full of
+// repeated ids, about 5× smaller gzipped (a pull of 5,604 real ops: 2.77 MB,
+// 0.53 MB). A request body may come gzipped (`Content-Encoding: gzip`); it is
+// inflated under the same cap, which then bounds the inflated size. Every
+// answer says so (`Accept-Encoding: gzip`, RFC 7694), and a client compresses
+// what it sends only once it has seen that: a server from before never gets
+// a body it cannot read.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { performance } from 'node:perf_hooks';
+import { promisify } from 'node:util';
+import { gunzip, gzip } from 'node:zlib';
 import { MAX_PUSH_BYTES } from '@curator/protocol';
 import { logRequest, requestRow, type FetchHandler } from './app.js';
 import { REQUEST_ID_HEADER, requestIdFrom } from './audit.js';
@@ -30,6 +41,33 @@ export async function readBody(req: AsyncIterable<Buffer | string>, limit: numbe
 		chunks.push(b);
 	}
 	return Buffer.concat(chunks);
+}
+
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
+
+// Smaller than this, gzip's own framing eats most of what it saves.
+export const COMPRESS_MIN_BYTES = 1024;
+
+// Whether an Accept-Encoding value takes gzip (a `q=0` refuses it).
+export function acceptsGzip(value: string | null): boolean {
+	if (!value) return false;
+	return value.split(',').some((part) => {
+		const [name, ...params] = part.trim().toLowerCase().split(';').map((s) => s.trim());
+		if (name !== 'gzip' && name !== '*') return false;
+		const q = params.find((p) => p.startsWith('q='));
+		return !q || Number(q.slice(2)) > 0;
+	});
+}
+
+// A gzipped request body, inflated; over `limit` once inflated is too large.
+export async function inflateBody(body: Buffer, limit: number = MAX_BODY_BYTES): Promise<Buffer> {
+	try {
+		return await gunzipAsync(body, { maxOutputLength: limit });
+	} catch (e) {
+		if ((e as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE') throw new BodyTooLargeError(`inflated body over ${limit} bytes`);
+		throw e;
+	}
 }
 
 function toHeaders(req: Pick<IncomingMessage, 'headers'>): Headers {
@@ -84,6 +122,23 @@ export function toNodeListener(handler: FetchHandler, deps: Pick<AppDeps, 'log' 
 				else early(400, 'body_read_failed', null);
 				return;
 			}
+			const encoding = headers.get('content-encoding')?.trim().toLowerCase();
+			if (body && encoding && encoding !== 'identity') {
+				if (encoding !== 'gzip') {
+					early(415, 'unsupported_content_encoding', body.length, { 'accept-encoding': 'gzip' });
+					return;
+				}
+				try {
+					body = await inflateBody(body);
+				} catch (e) {
+					if (e instanceof BodyTooLargeError) early(413, 'body_too_large', MAX_BODY_BYTES, { connection: 'close' });
+					else early(400, 'body_not_gzip', body.length);
+					return;
+				}
+				// The handler sees the body as it was before compression.
+				headers.delete('content-encoding');
+				headers.delete('content-length');
+			}
 			let handed = false;
 			try {
 				// Host is only used to build an absolute URL for the Request; the
@@ -91,8 +146,15 @@ export function toNodeListener(handler: FetchHandler, deps: Pick<AppDeps, 'log' 
 				const request = new Request(new URL(req.url ?? '/', 'http://curator-api.internal'), { method, headers, body });
 				handed = true;
 				const response = await handler(request, { requestId, startedAt });
-				const out = Buffer.from(await response.arrayBuffer());
-				res.writeHead(response.status, Object.fromEntries(response.headers));
+				let out = Buffer.from(await response.arrayBuffer());
+				const outHeaders: Record<string, string> = { ...Object.fromEntries(response.headers), 'accept-encoding': 'gzip' };
+				if (out.length >= COMPRESS_MIN_BYTES && !response.headers.has('content-encoding') && acceptsGzip(headers.get('accept-encoding'))) {
+					out = await gzipAsync(out);
+					outHeaders['content-encoding'] = 'gzip';
+					outHeaders['vary'] = 'accept-encoding';
+					delete outHeaders['content-length'];
+				}
+				res.writeHead(response.status, outHeaders);
 				res.end(out);
 			} catch (e) {
 				// The handler never throws (it answers 500 itself and logs the row),

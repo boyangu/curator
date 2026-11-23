@@ -24,7 +24,7 @@ import type { CatalogObjectSummary, CatalogPageRelease, CatalogRef, CatalogTrack
 import { searchBeatport, type FetchLike } from '@curator/catalog-readers';
 import { searchFold, type EntityTracksPage, type WorldHit, type WorldSearchPart, type WorldSearchResult } from '@curator/shared';
 import type { CatalogClient } from '../catalog-client/service.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { provisionalRelease, streamObjectId, type StreamingCatalog } from './streaming.js';
 
 const slog = log.for('world-search');

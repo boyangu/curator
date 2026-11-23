@@ -11,7 +11,7 @@
 // for the machine. Cloud executor = batches of CLOUD_BATCH tracks per call.
 
 import { existsSync } from 'node:fs';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { MirLibraryPort } from './library-port.js';
 import { decodeVec, type MirAnalyzeResult, type MirSidecar, type MirSidecarError } from './sidecar.js';
 import type { SqliteMirStore } from './store.js';

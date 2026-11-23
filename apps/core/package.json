@@ -14,7 +14,7 @@
     "typecheck": "tsc --noEmit && node scripts/check-console.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "catalog:import": "tsx --env-file-if-exists=../../.env src/cli/catalog-import.ts"
   },
@@ -29,6 +29,7 @@
     "@curator/protocol": "workspace:*",
     "@curator/shared": "workspace:*",
     "@curator/spotify": "workspace:*",
+    "@curator/sync-core": "workspace:*",
     "@curator/tidal": "workspace:*",
     "@curator/traxsource": "workspace:*",
     "better-sqlite3": "^12.10.0",

@@ -16,7 +16,7 @@
 import { Buffer } from 'node:buffer';
 import { promises as fsp } from 'node:fs';
 import { dirname } from 'node:path';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const dlog = log.for('download-flac');
 

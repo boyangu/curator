@@ -8,12 +8,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import type { PlayRecordUpsert } from '@curator/shared/schema';
-import { applyOps } from '../sync-log/apply.js';
-import { readOutbox } from '../sync-log/outbox.js';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { applyOps } from '@curator/sync-core/sync-log/apply';
+import { readOutbox } from '@curator/sync-core/sync-log/outbox';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import {
 	finalizeInterruptedPlays,
 	getPlaySession,

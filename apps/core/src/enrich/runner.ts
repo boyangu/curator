@@ -13,7 +13,7 @@
 // the delay lands between the actual lookups rather than around them.
 
 import type { DjMetadataPatch, Enricher, EnrichmentResult, EnrichmentTarget } from './contract.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const elog = log.for('enrich');
 

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+	<uses-permission android:name="android.permission.INTERNET" />
+
+	<!-- networkSecurityConfig: cleartext only to the local test server
+	     (adb reverse onto 127.0.0.1); everything else is TLS. -->
+	<application
+		android:name=".CuratorApp"
+		android:label="Curator"
+		android:icon="@drawable/ic_launcher"
+		android:roundIcon="@drawable/ic_launcher"
+		android:theme="@style/Theme.Curator"
+		android:networkSecurityConfig="@xml/network_security"
+		android:supportsRtl="true">
+
+		<!-- configChanges: rotating the Track view must not rebuild the
+		     activity (the player and the core outlive a rotation); Compose
+		     relayouts from the new configuration. -->
+		<activity
+			android:name=".MainActivity"
+			android:exported="true"
+			android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+			android:windowSoftInputMode="adjustResize">
+			<intent-filter>
+				<action android:name="android.intent.action.MAIN" />
+				<category android:name="android.intent.category.LAUNCHER" />
+			</intent-filter>
+		</activity>
+	</application>
+</manifest>

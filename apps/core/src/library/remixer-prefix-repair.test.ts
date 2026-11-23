@@ -5,11 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type Database from 'better-sqlite3';
-import { createDb } from '../db/client.js';
-import type { Db } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
-import { syncTrackArtistsByIdRaw } from './artists.js';
+import { createDb } from '@curator/sync-core/db/client';
+import type { Db } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
+import { syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
 import { planRemixerPrefixRepair, runRemixerPrefixRepair } from './remixer-prefix-repair.js';
 
 let tmp: TmpDir;

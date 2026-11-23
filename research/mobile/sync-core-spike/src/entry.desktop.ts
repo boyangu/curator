@@ -3,9 +3,10 @@
 // snapshot builder and the outbox reader.
 
 export * from './entry.core.js';
-export { migrate } from '../../../../apps/core/src/db/migrate.js';
-export { buildSnapshotParts } from '../../../../apps/core/src/sync-log/snapshot-build.js';
-export { compareDumps } from '../../../../apps/core/src/sync-log/dump.js';
-export { readOutbox } from '../../../../apps/core/src/sync-log/outbox.js';
+export { migrate } from '@curator/sync-core/db/migrate';
+export { buildSnapshotParts } from '@curator/sync-core/sync-log/snapshot-build';
+export { buildReplica } from '@curator/sync-core/sync-log/replica';
+export { compareDumps } from '@curator/sync-core/sync-log/dump';
+export { readOutbox } from '@curator/sync-core/sync-log/outbox';
 export { MASTER_DEVICE_SETTING } from '../../../../packages/protocol/src/index.js';
-export { drainArtistCreditRewrites } from '../../../../apps/core/src/library/artist-alias.js';
+export { drainArtistCreditRewrites } from '@curator/sync-core/library/artist-alias';

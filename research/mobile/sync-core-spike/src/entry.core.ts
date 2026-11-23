@@ -5,7 +5,7 @@
 import { main } from './driver.js';
 
 export { main };
-export { dumpLibrary } from '../../../../apps/core/src/sync-log/dump.js';
+export { dumpLibrary } from '@curator/sync-core/sync-log/dump';
 
 // On the QuickJS host the bundle is the program: it runs the driver with the
 // host's arguments. On Node the script that imports it calls main().
@@ -18,6 +18,6 @@ if (host) {
 }
 
 // For scripts that poke at the fold directly (debugging a difference).
-export { SyncStateStore } from '../../../../apps/core/src/sync-log/store.js';
+export { SyncStateStore } from '@curator/sync-core/sync-log/store';
 export { applyOp, parseOp } from '../../../../packages/protocol/src/index.js';
 export { default as Database } from 'better-sqlite3';

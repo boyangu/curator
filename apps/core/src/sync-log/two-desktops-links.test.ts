@@ -17,10 +17,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type { TidalApiClient, TidalPlaylist, TidalPlaylistItem, TidalTrackV2 } from '@curator/tidal';
 import { TidalHybrid } from '../sync/tidal-hybrid.js';
 import { TidalSync } from '../sync/tidal.js';
-import { memberOrder } from '../test-support/playlist-track.js';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
 import { markPreOpLog, TwoDesktopRig, type Desktop } from '../test-support/two-desktops.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { remoteTrackId } from './stable-ids.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
 
 let rig: TwoDesktopRig;
 beforeEach(() => { rig = new TwoDesktopRig('curator-2desk-links-'); });

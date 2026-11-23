@@ -10,6 +10,7 @@
 // B2 lands; until then keep it honest by hand.
 
 export * from './ops.js';
+export * from './mobile-settings.js';
 export * from './order-key.js';
 export * from './rb-grid.js';
 export * from './analysis.js';

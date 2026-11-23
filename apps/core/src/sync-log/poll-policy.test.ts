@@ -19,14 +19,14 @@ import * as schema from '@curator/shared/schema';
 import { ACCOUNT_SETTING_KEYS, isAccountSettingKey, type PullInput, type PushInput } from '@curator/protocol';
 import { getSourceCapabilities } from '@curator/shared';
 import type { AreaLogger } from '@curator/shared/log';
-import { migrate } from '../db/migrate.js';
-import { createDb } from '../db/client.js';
-import { removeDir } from '../test-support/tmp.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb } from '@curator/sync-core/db/client';
+import { removeDir } from '@curator/sync-core/test-support/tmp';
 import { createCoreService, type CloudActivityWatcher, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
-import * as mut from '../library/mutators.js';
-import { CloudTransportError, createSyncClient, type CloudSyncEvent, type CloudTransport, type SyncClient, type WakeReason } from './client.js';
-import { DEFAULT_SYNC_POLL_POLICY, normalizePollPolicy, readPollSettings, SYNC_POLL_KEY } from './poll-policy.js';
+import * as mut from '@curator/sync-core/library/mutators';
+import { CloudTransportError, createSyncClient, type CloudSyncEvent, type CloudTransport, type SyncClient, type WakeReason } from '@curator/sync-core/sync-log/client';
+import { DEFAULT_SYNC_POLL_POLICY, normalizePollPolicy, readPollSettings, SYNC_POLL_KEY } from '@curator/sync-core/sync-log/poll-policy';
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 

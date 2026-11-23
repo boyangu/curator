@@ -16,7 +16,7 @@ import { CATALOG_MAX_CLAIMS } from '@curator/protocol';
 import type { CatalogBrowseResult, CatalogClaim, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogTracksResult, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { SpotifyClient } from '@curator/spotify';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const clog = log.for('catalog');
 

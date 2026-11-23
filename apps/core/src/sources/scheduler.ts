@@ -22,7 +22,7 @@
 //     auth problem the next manual sync will surface it.
 
 import type { StreamingSource, SourceSyncSettings } from '@curator/shared';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const sslog = log.for('sync-scheduler');
 

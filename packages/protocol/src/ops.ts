@@ -10,6 +10,7 @@
 import { z } from 'zod';
 import { isValidOrderKey } from './order-key.js';
 import { isRbGridValue } from './rb-grid.js';
+import { ACCOUNT_SETTING_VALUES, HOME_PINS_SETTING, TRACKLIST_ROWS_SETTING } from './mobile-settings.js';
 
 // Version 2 (2026-10-18) is additive: `library_track.set-state` and the
 // `artist_alias` entity. Nothing in v1 changed shape, so the minimum stays 1
@@ -45,7 +46,12 @@ import { isRbGridValue } from './rb-grid.js';
 // it `server_outdated`, so a desktop pushes none before the server
 // advertises 'feed_lenses_v6' (the op waits in the outbox; lenses work
 // locally meanwhile).
-export const SCHEMA_VERSION = 6;
+//
+// Version 7 (2026-11-23) adds two account setting keys the same way, for the
+// phone's views: `tracklist.rows` (the row layout of every track list) and
+// `home.pins` (mobile-settings.ts). Both are stamped 7; a desktop or phone
+// pushes neither before the server advertises 'mobile_settings_v7'.
+export const SCHEMA_VERSION = 7;
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 
 export const MAX_OP_PAYLOAD_BYTES = 16 * 1024;
@@ -139,7 +145,7 @@ export const ZTrackArtist = z
 // incident), `wav.output_dir`, `library.id`, `device.id`, backup run stamps,
 // migration gates — must never ride an op, so the key is validated here and
 // the list is the allow-list, not a deny-list.
-export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed', 'library.master_device', 'feed.lenses'] as const;
+export const ACCOUNT_SETTING_KEYS = ['credit_format', 'mir.settings', 'backup.settings', 'artist_merge_dismissed', 'library.master_device', 'feed.lenses', 'tracklist.rows', 'home.pins'] as const;
 export function isAccountSettingKey(key: string): boolean {
 	return (ACCOUNT_SETTING_KEYS as readonly string[]).includes(key);
 }
@@ -700,8 +706,13 @@ export const ZPinnedSearchDelete = defineOp('pinned_search', 'delete', empty());
 // ── setting ─────────────────────────────────────────────────────────────────
 // `entity_id` is the key.
 
-export const ZSettingSet = defineOp('setting', 'set', z.object({ value: ZJsonValue }).strict()).refine((o) => isAccountSettingKey(o.entity_id), {
-	message: 'setting key is not account-level',
+// A key with a value schema (mobile-settings.ts ACCOUNT_SETTING_VALUES) is
+// checked against it; the rest take any JSON value.
+// One refinement, not two: OP_SCHEMAS unwraps a single ZodEffects to read
+// the entity.
+export const ZSettingSet = defineOp('setting', 'set', z.object({ value: ZJsonValue }).strict()).superRefine((o, ctx) => {
+	if (!isAccountSettingKey(o.entity_id)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'setting key is not account-level' });
+	else if (ACCOUNT_SETTING_VALUES.get(o.entity_id)?.safeParse(o.payload.value).success === false) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'setting value does not fit its key' });
 });
 
 // ── recording_claim ─────────────────────────────────────────────────────────
@@ -1004,7 +1015,7 @@ const KIND_SINCE: ReadonlyMap<string, number> = new Map([
 // older client validates the key against its own allow-list and would stop
 // at one it does not know (invalid_payload) instead of holding it aside, so
 // the op carries the version that introduced its key.
-const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3], ['feed.lenses', 6]]);
+const SETTING_KEY_SINCE: ReadonlyMap<string, number> = new Map([[MASTER_DEVICE_SETTING, 3], ['feed.lenses', 6], [TRACKLIST_ROWS_SETTING, 7], [HOME_PINS_SETTING, 7]]);
 
 // Enum values added to a v1 kind's payload, by the same reasoning: a
 // `recording_claim.add` of kind traxsource, or a `set-rb-analysis` of unit

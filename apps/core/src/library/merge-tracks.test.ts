@@ -8,13 +8,13 @@ import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
-import { migrate } from '../db/migrate.js';
-import { memberOrder } from '../test-support/playlist-track.js';
-import { createDb } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
+import { createDb } from '@curator/sync-core/db/client';
 import { createCoreService, TrackMergeBlockedError, type CoreService } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
-import { planTrackMerge } from './merge-tracks.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
+import { planTrackMerge } from '@curator/sync-core/library/merge-tracks';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 
 let tmp: TmpDir;
 let dir: string;

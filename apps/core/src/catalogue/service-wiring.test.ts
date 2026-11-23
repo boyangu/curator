@@ -7,11 +7,11 @@
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SYNC_FEATURES, type PullInput, type PushInput } from '@curator/protocol';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService, type CoreService } from '../service.js';
-import type { CloudTransport } from '../sync-log/client.js';
+import type { CloudTransport } from '@curator/sync-core/sync-log/client';
 import { FakeBlobStore, FakeCatalogueServer, FakeDevice, waitFor } from '../test-support/catalogue-fakes.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 
 let tmp: TmpDir;
 let dir: string;

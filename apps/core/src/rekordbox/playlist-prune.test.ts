@@ -11,9 +11,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { memberOrder } from '../test-support/playlist-track.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { RekordboxImporter, type RunImportOptions, type ImportTotals } from './importer.js';
 import type { RekordboxSidecar } from './sidecar.js';
 

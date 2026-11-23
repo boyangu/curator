@@ -12,9 +12,9 @@
 
 import { and, count, desc, eq, gte, isNotNull, isNull, lte, max, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
-import type { Db } from '../db/client.js';
-import { recordPlayAppended, setSessionKind } from '../library/mutators.js';
-import { rawOf } from '../library/artists.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { recordPlayAppended, setSessionKind } from '@curator/sync-core/library/mutators';
+import { rawOf } from '@curator/sync-core/library/artists';
 import {
 	playEvent,
 	playSession,

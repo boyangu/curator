@@ -6,9 +6,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type Database from 'better-sqlite3';
-import { emitAlbumMeta } from './album-meta.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { canonicalSpotifyCover } from '../sync/spotify-cover.js';
+import { emitAlbumMeta } from '@curator/sync-core/sync-log/album-meta';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { canonicalSpotifyCover } from '@curator/sync-core/sync/spotify-cover';
 import { markPreOpLog, TRACKS, TwoDesktopRig, type Desktop } from '../test-support/two-desktops.js';
 
 let rig: TwoDesktopRig;

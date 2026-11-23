@@ -24,7 +24,7 @@
 //   - play history, analysis/download jobs.
 
 import { randomUUID } from 'node:crypto';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import type Database from 'better-sqlite3';
 import { and, eq, inArray, isNull, notInArray } from 'drizzle-orm';
 import {
@@ -39,9 +39,9 @@ import {
 	type TrackOverrides,
 } from '@curator/shared/schema';
 import { asciify, withFormatTag } from '@curator/shared';
-import type { Db } from '../db/client.js';
-import { syncTrackArtists } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { syncTrackArtists } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
 import { upsertLocalSourceLink } from '../local/scanner.js';
 
 export interface DerivativeRow {

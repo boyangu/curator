@@ -15,7 +15,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { normalizePath } from '../local/scanner.js';
 import { BackupStore, type RunItemRow, type SnapshotCacheRow } from './store.js';
 import { collectSets, encodingFor, resolveEntryPath, type FileEntry } from './sets.js';

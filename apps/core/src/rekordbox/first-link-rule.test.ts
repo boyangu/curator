@@ -13,12 +13,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { RekordboxImporter, type RunImportOptions } from './importer.js';
 import { RekordboxExporter } from './exporter.js';
 import type { RekordboxSidecar, WriteOp } from './sidecar.js';
-import { drainTrackAttrs } from '../sync-log/track-attrs.js';
+import { drainTrackAttrs } from '@curator/sync-core/sync-log/track-attrs';
 
 let dir: string;
 let db: Db;

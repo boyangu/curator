@@ -8,9 +8,9 @@
 
 import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { sourceLink, track, trackAnalysis, type NewTrackAnalysis } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
-import { addClaims } from '../library/mutators.js';
-import { log } from '../log.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { addClaims } from '@curator/sync-core/library/mutators';
+import { log } from '@curator/sync-core/log';
 import type { AnalyzeResult } from './sidecar.js';
 
 export type PersistOptions = {

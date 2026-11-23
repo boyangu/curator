@@ -5,8 +5,8 @@
 //
 // Run: tsx src/auth/smoke.ts
 
-import { createDb } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { AuthService } from './service.js';
 
 const DB = './curator.db';

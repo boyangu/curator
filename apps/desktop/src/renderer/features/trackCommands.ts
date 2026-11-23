@@ -33,7 +33,7 @@ import { anyCatalogRow } from '../catalogRows.js';
 import { log } from '../data/log.js';
 import { BRAND_ICONS } from './brandIcons.js';
 
-// Well-known system tag ids — seeded in apps/core/src/db/migrate.ts. Owned here
+// Well-known system tag ids — seeded in packages/sync-core/src/db/migrate.ts. Owned here
 // (the curate commands are their only remaining consumers) and re-exported from
 // contextMenus.ts for the callers that still import them from there.
 export const SYSTEM_TAG_INTERESTED = 'interested';

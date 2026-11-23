@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ProductionMeasurements } from '@curator/shared/schema';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createProductionLayer, type ProductionLayer } from './layer.js';
 import type { ProductionModelInfo } from './types.js';
 

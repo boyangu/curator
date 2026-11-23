@@ -21,10 +21,10 @@ import { join } from 'node:path';
 import { rebalance } from '@curator/protocol';
 import { normalizePath } from '../local/scanner.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
-import * as mut from '../library/mutators.js';
-import { readCursor } from './client.js';
-import { dumpLibrary } from './dump.js';
-import { recordingIdForTrack } from './recording-id.js';
+import * as mut from '@curator/sync-core/library/mutators';
+import { readCursor } from '@curator/sync-core/sync-log/client';
+import { dumpLibrary } from '@curator/sync-core/sync-log/dump';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 import {
 	flacParse,
 	markPreOpLog,

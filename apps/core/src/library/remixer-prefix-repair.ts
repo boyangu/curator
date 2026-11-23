@@ -26,12 +26,12 @@
 import type Database from 'better-sqlite3';
 import { artistKey, asciifyArtists, extractRemixers, searchFold } from '@curator/shared';
 import type { TrackArtist, TrackOverrides } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
-import { backupDatabase } from '../db/migrate.js';
-import { log } from '../log.js';
-import { syncTrackAlbumsById } from './albums.js';
-import { artistProtectRaw, artistsBaseCell, artistsBaseOf, lookupArtistRaw, rawOf, syncTrackArtistsByIdRaw } from './artists.js';
-import { recordTrackStateChanges } from './mutators.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { backupDatabase } from '@curator/sync-core/db/migrate';
+import { log } from '@curator/sync-core/log';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import { artistProtectRaw, artistsBaseCell, artistsBaseOf, lookupArtistRaw, rawOf, syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
+import { recordTrackStateChanges } from '@curator/sync-core/library/mutators';
 
 type Raw = Database.Database;
 

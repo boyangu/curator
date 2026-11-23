@@ -801,7 +801,7 @@ export class SpotifyClient {
 	// throws (SpotifyPlaylistItemsWithheldError / Error) instead.
 	async getPlaylistTracks(playlistId: string): Promise<SpotifyPlaylistTrack[]> {
 		// track_number / disc_number + the album's artists / type / size feed
-		// the album seam (apps/core/src/library/albums.ts) so a newly synced
+		// the album seam (packages/sync-core/src/library/albums.ts) so a newly synced
 		// track lands on a fully described release.
 		const trackFields = '(id,name,duration_ms,explicit,external_ids,external_urls,track_number,disc_number,artists(id,name),album(id,name,release_date,images,album_type,total_tracks,artists(id,name)))';
 		const base = `/playlists/${encodeURIComponent(playlistId)}`;

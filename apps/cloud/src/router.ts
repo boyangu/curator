@@ -29,6 +29,7 @@ import {
 	ZCatalogueInventoryInput,
 	ZCatalogueLookupInput,
 	ZDeviceId,
+	ZPublishReplicaInput,
 	ZPublishSnapshotInput,
 	ZPullInput,
 	ZSpotifyAdoptInput,
@@ -56,6 +57,7 @@ import {
 	type CataloguePolicy,
 	type CataloguePutResult,
 	type DeviceInfo,
+	type PublishReplicaResult,
 	type PublishSnapshotResult,
 	type PullResult,
 	type PushResult,
@@ -78,6 +80,7 @@ import { CloudError } from './errors.js';
 import { BaseInvariantError } from './sync/base.js';
 import { batchAbort, batchBegin, batchCommit, batchPush, type BatchDeps } from './sync/batch.js';
 import { bootstrap } from './sync/bootstrap.js';
+import { publishReplica } from './sync/publish-replica.js';
 import { publishSnapshot } from './sync/publish-snapshot.js';
 import { pull } from './sync/pull.js';
 import { push } from './sync/push.js';
@@ -297,6 +300,13 @@ export const appRouter = router({
 			ctx.call.deviceId = input.deviceId;
 			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
 			return withFeatures(ctx, await auditedWrite(ctx, 0, () => publishSnapshot(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input)));
+		}),
+		// 'replica_storage' (src/sync/publish-replica.ts): the master indexes the
+		// ready-made library it built from a snapshot. A write, about weekly.
+		publishReplica: authedProcedure.input(ZPublishReplicaInput).mutation(async ({ ctx, input }): Promise<PublishReplicaResult> => {
+			ctx.call.deviceId = input.deviceId;
+			rateLimit(ctx, 'push', `${ctx.user.id}:${input.deviceId}`);
+			return withFeatures(ctx, await auditedWrite(ctx, 0, () => publishReplica(ctx.deps.db, ctx.call.audit, ctx.user.id, callerOf(ctx), input)));
 		}),
 	}),
 

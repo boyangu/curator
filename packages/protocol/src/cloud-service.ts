@@ -154,7 +154,16 @@ export type PushInput = {
 //     desktop's library artists, read at their stores for their Reach score
 //     (catalog-service.ts CatalogReach). Before it a desktop sends none (an
 //     older server refuses the key). With 'global_catalog' only.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience'] as const;
+//   - 'replica_storage': `sync.publishReplica` exists and `sync.bootstrap`
+//     takes `replicaSchema`: beside a snapshot, the master may publish the
+//     library database a fresh device computes from it (section below), and a
+//     device with an empty library may download that instead of joining. With
+//     'snapshot_storage' only.
+//   - 'mobile_settings_v7': the server reads protocol v7 — the account
+//     settings `tracklist.rows` and `home.pins` (mobile-settings.ts). Before
+//     it a device keeps those ops in its outbox (a v6 server answers them
+//     `server_outdated`); the settings still apply on the device that set them.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -324,6 +333,60 @@ export type PublishSnapshotResult = {
 	features?: SyncFeature[];
 };
 
+// ── 'replica_storage' ───────────────────────────────────────────────────────
+// A join folds the snapshot record by record on the device: about two
+// minutes on a phone for the 39k-track library, nearly all of it per-record
+// work rather than storage (measured 2026-11-21). The master can do that
+// once: after publishing a snapshot it runs the same join, with the same
+// client code, into an empty library, and publishes the resulting database
+// beside the snapshot. A device whose library is empty downloads it, takes a
+// device identity of its own and pulls from its seq: seconds of work.
+//
+// Built from the snapshot, never copied from the master's own library, so it
+// holds the account and nothing that is one device's. Its parts sit in the
+// same bucket under the same content-addressed paths as snapshot parts
+// (snapshotPartPath); each part is a slice of the database file gzipped on
+// its own, so a reader inflates one part at a time onto the end of its file.
+// The server indexes the manifest as it indexes snapshots and never sees the
+// bytes. A replica is published only for a snapshot the account holds, and
+// that snapshot is kept for as long as the replica is the newest, so the log
+// stays replayable from the replica's seq.
+export const REPLICA_STORAGE_ENCODING = 'curator.library-db.v1+sqlite+gzip-parts';
+
+export type ReplicaManifest = {
+	encoding: typeof REPLICA_STORAGE_ENCODING;
+	// The library's replica format (core sync-log/replica.ts REPLICA_SCHEMA):
+	// an app opens a replica of its own format or an older one, which its
+	// migrations bring up to date.
+	schema: number;
+	parts: SnapshotPart[];
+	// The parts' gzip bytes, summed.
+	totalBytes: number;
+	// The database file: its size and sha256 once every part is inflated and
+	// joined (a reader checks both before it opens it).
+	rawBytes: number;
+	rawSha256: string;
+};
+
+// sync.publishReplica: the database a fresh device would build from the
+// snapshot at `snapshotSeq`. Whole-call errors: `not_master`,
+// `replica_without_snapshot`, `snapshot_part_missing`, `snapshot_part_invalid`.
+export type PublishReplicaInput = { deviceId: string; snapshotSeq: number; manifest: ReplicaManifest };
+
+export type PublishReplicaResult = {
+	// stored: indexed. exists: a replica at this seq was stored already.
+	// stale: a newer replica is stored already; nothing was done.
+	status: 'stored' | 'exists' | 'stale';
+	// The newest replica's seq after this call.
+	latestSeq: number;
+	// Part paths no kept snapshot or replica references any more; the
+	// publisher deletes them from Storage (as PublishSnapshotResult's).
+	superseded: string[];
+	features?: SyncFeature[];
+};
+
+export type ReplicaOffer = { snapshotSeq: number; manifest: ReplicaManifest };
+
 export type PullInput = {
 	afterSeq: number;
 	// At most MAX_PULL_OPS; the server caps it.
@@ -347,6 +410,10 @@ export type PullInput = {
 export type BootstrapInput = {
 	deviceId?: string;
 	storage?: true;
+	// 'replica_storage': the newest replica format the client can open. With
+	// it the answer names the newest replica of that format or older, when the
+	// account holds one the log can still be pulled from.
+	replicaSchema?: number;
 };
 
 export type PullResult = {
@@ -382,6 +449,10 @@ export type BootstrapResult = {
 	// The account's base: ops at or below it are gone from the log. 0 until
 	// the first compaction. A cursor below it must bootstrap, never pull.
 	baseSeq: number;
+	// 'replica_storage', asked for with `replicaSchema`: a ready-made library
+	// for a device whose own is empty (the section above). Its seq may be
+	// older than `snapshotSeq`; the device pulls from it.
+	replica?: ReplicaOffer;
 };
 
 // Why the server refused a whole call (as opposed to one op, which rides in
@@ -435,8 +506,12 @@ export const CALL_ERROR_REASONS = [
 	// (upload it, then publish again), or its size differs from the stated.
 	'snapshot_part_missing',
 	// sync.publishSnapshot: a part's path is not snapshotPartPath(caller,
-	// sha256), or the manifest's sizes do not add up.
+	// sha256), or the manifest's sizes do not add up. sync.publishReplica too.
 	'snapshot_part_invalid',
+	// sync.publishReplica ('replica_storage'): the account holds no snapshot
+	// at `snapshotSeq` (never published, or pruned since): a replica stands on
+	// a kept snapshot.
+	'replica_without_snapshot',
 	// spotify.token ('spotify_gateway'): the account has no Spotify grant in
 	// the cloud. Connect (or adopt the device's) first.
 	'spotify_not_connected',
@@ -486,6 +561,8 @@ export interface CloudService {
 		batchAbort(input: BatchAbortInput): Promise<BatchAbortResult>;
 		// 'snapshot_storage'.
 		publishSnapshot(input: PublishSnapshotInput): Promise<PublishSnapshotResult>;
+		// 'replica_storage'.
+		publishReplica(input: PublishReplicaInput): Promise<PublishReplicaResult>;
 	};
 	account: {
 		registerDevice(input: RegisterDeviceInput): Promise<{ ok: true }>;

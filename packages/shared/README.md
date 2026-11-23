@@ -31,5 +31,5 @@ entities:
 
 `TrackState` ∈ `unsorted | feed | backlog | progress | purchased`.
 
-Migrations live in [`apps/core/src/db/migrate.ts`](../../apps/core/src/db/migrate.ts) — when you
+Migrations live in [`packages/sync-core/src/db/migrate.ts`](../../packages/sync-core/src/db/migrate.ts) — when you
 change a table here, add the matching migration there (see the root [CLAUDE.md](../../CLAUDE.md)).

@@ -11,11 +11,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
 import { KEY_REREAD_SETTING, RekordboxImporter, type RunImportOptions } from './importer.js';
 import type { RekordboxSidecar, ScanParams } from './sidecar.js';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
 
 let dir: string;
 let db: Db;

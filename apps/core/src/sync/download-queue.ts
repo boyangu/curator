@@ -12,8 +12,8 @@ import type { TidalDownloader, DownloadProgress } from './download-orchestrator.
 import { downloadConfig } from '../config.download.js';
 import { eq } from 'drizzle-orm';
 import { downloadJob } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
-import { log } from '../log.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { log } from '@curator/sync-core/log';
 
 const vlog = log.for('verify');
 

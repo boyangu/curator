@@ -16,7 +16,7 @@ import type { StreamingSource, TrackOverrides, ZTrackSortT } from '@curator/shar
 import { splitArtistCredit, type TrackArtist } from '@curator/shared';
 import type { CoreService } from '../service.js';
 import type { ToolAnnotations, WireToolSpec } from '@curator/agent-core';
-import { keyToCamelot } from '../enrich/keys.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 
 export interface McpConfirmRequest {
 	kind: 'streaming-playlist-write' | 'destructive-write';

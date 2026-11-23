@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { migrate } from '../../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { SqliteFeedStore } from '../../feed/store.js';
 import { SqliteKnowledgeStore } from '../../knowledge/store.js';
 import { WorkspaceEngine, validTableName, type WorkspaceDbPaths } from './engine.js';

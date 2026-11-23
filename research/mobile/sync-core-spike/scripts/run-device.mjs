@@ -10,6 +10,9 @@
 //   [--http] [--tail]  sync through the plain-HTTP transport against scripts/serve-cloud.ts on this
 //                      machine (adb: reached through `adb reverse`); --tail adds the server's later ops
 //   [--scale <n>]      the client's sliceScale: longer slices for a host with its own sync thread
+//   [--engine hermes]  adb only: the Hermes host (dist/hermes-<target>/, dist/core.hbc) instead of QuickJS
+//   [--replica]        with --http: join from the server's ready-made replica (scripts/build-replica.mjs)
+//                      instead of its snapshot; --tail adds the later ops as before
 //   [--name main] [--work <dir>] [--run <name>] [--serial <adb id>]
 //
 // Sends the program, the bundle and the inputs to a scratch folder on the
@@ -21,7 +24,7 @@
 // installed beside it (README).
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,11 +33,14 @@ const args = process.argv.slice(2);
 const arg = (name, fallback) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : fallback; };
 const fixed = args.includes('--fixed');
 const stream = args.includes('--stream');
-const http = args.includes('--http');
+const http = args.includes('--http') || args.includes('--replica');
+const replica = args.includes('--replica');
 const target = args[0];
 const dir = join(resolve(arg('work', 'c:/tmp/curator-mobile-spike')), arg('name', 'main'));
 const ops = arg('ops') ? resolve(arg('ops')) : null;
-const suffix = `${stream ? '-stream' : ''}${http ? '-http' : ''}${fixed ? '-fixed' : ''}${arg('scale') ? `-x${arg('scale')}` : ''}`;
+const hermes = arg('engine') === 'hermes';
+if (arg('engine') && !hermes && arg('engine') !== 'quickjs') throw new Error(`no host for engine ${arg('engine')}`);
+const suffix = `${hermes ? '-hermes' : ''}${stream ? '-stream' : ''}${replica ? '-replica' : http ? '-http' : ''}${fixed ? '-fixed' : ''}${arg('scale') ? `-x${arg('scale')}` : ''}`;
 
 // The input files, as [local path, path under the target's data folder].
 const inputs = http
@@ -44,7 +50,7 @@ const inputs = http
 	: [['manifest.json', 'manifest.json'], ...JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')).manifest.parts.map((p) => [`parts/${p.sha256}.cgz`, `parts/${p.sha256}.cgz`])];
 const scale = arg('scale');
 const driverArgs = (t) => http
-	? `sync --db ${t}/out/replica.db --server ${t}/data/server.json --out ${t}/out${args.includes('--tail') ? ' --tail' : ''}${fixed ? ' --fixed' : ''}${scale ? ` --scale ${scale}` : ''}`
+	? `${replica ? 'replica' : 'sync'} --db ${t}/out/replica.db --server ${t}/data/server.json --out ${t}/out${args.includes('--tail') ? ' --tail' : ''}${fixed ? ' --fixed' : ''}${scale ? ` --scale ${scale}` : ''}`
 	: `${stream ? 'stream' : 'join'} --db ${t}/out/replica.db --data ${t}/data --out ${t}/out${ops ? ` --ops ${t}/ops.json` : ''}${fixed ? ' --fixed' : ''}${scale ? ` --scale ${scale}` : ''}`;
 
 const fresh = (name) => {
@@ -58,6 +64,8 @@ const finish = (run) => {
 	console.log(log.split('\n').filter((l) => /^cycle |^[a-z ]+: \d+ ms|Maximum resident|Elapsed|unhandled|Error|exit=/.test(l)).join('\n'));
 	console.log(run);
 };
+
+if (hermes && target !== 'adb') throw new Error('the Hermes host runs on adb only (Meta ships the engine for Android)');
 
 if (target === 'wsl' || target === 'wsl-node') {
 	const wsl = (p) => resolve(p).replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => `/mnt/${d.toLowerCase()}`);
@@ -91,26 +99,32 @@ if (target === 'wsl' || target === 'wsl-node') {
 	const sh = (cmd) => adb('shell', cmd).trim();
 	const abi = sh('getprop ro.product.cpu.abi');
 	const model = sh('getprop ro.product.model').replace(/[^A-Za-z0-9]+/g, '-').toLowerCase();
-	const host = join(root, 'dist', abi === 'arm64-v8a' ? 'host-android-arm64' : abi === 'x86_64' ? 'host-android-x86_64' : '');
-	if (!existsSync(host)) throw new Error(`no host built for ${abi}: node scripts/build-host.mjs android-arm64 | android-x86_64`);
+	const androidTarget = abi === 'arm64-v8a' ? 'android-arm64' : abi === 'x86_64' ? 'android-x86_64' : '';
+	const host = join(root, 'dist', hermes ? `hermes-${androidTarget}` : `host-${androidTarget}`);
+	if (!existsSync(host)) throw new Error(`no host built for ${abi}: node scripts/build-host.mjs ${androidTarget || 'android-arm64'}${hermes ? ' --engine hermes' : ''}`);
 	const run = fresh(model);
 	// The shell user's scratch folder: files there may be executed.
 	const t = '/data/local/tmp/curator-spike';
 	sh(`rm -rf ${t} && mkdir -p ${t}/data/parts ${t}/data/chunks ${t}/out`);
-	adb('push', host, `${t}/host`);
-	adb('push', join(root, 'dist', 'core.js'), `${t}/core.js`);
+	// Hermes: the host library, the libraries it loads and its dex, for app_process.
+	if (hermes) for (const f of readdirSync(host)) adb('push', join(host, f), `${t}/${f}`);
+	else { adb('push', host, `${t}/host`); sh(`chmod 755 ${t}/host`); }
+	const script = hermes ? 'core.hbc' : 'core.js';
+	adb('push', join(root, 'dist', script), `${t}/${script}`);
 	if (stream) adb('push', join(dir, 'chunks'), `${t}/data/`);
 	else for (const [from, to] of inputs) adb('push', join(dir, from), `${t}/data/${to}`);
-	adb('push', join(dir, 'empty.db'), `${t}/out/replica.db`);
+	// A replica join makes its own library file.
+	if (!replica) adb('push', join(dir, 'empty.db'), `${t}/out/replica.db`);
 	if (ops) adb('push', ops, `${t}/ops.json`);
-	sh(`chmod 755 ${t}/host`);
 	// The phone's 127.0.0.1:<port> is this machine's, for the test server.
 	if (http) { const port = new URL(JSON.parse(readFileSync(join(dir, 'server.json'), 'utf8')).apiUrl).port; adb('reverse', `tcp:${port}`, `tcp:${port}`); }
 	const device = { model: sh('getprop ro.product.model'), soc: sh('getprop ro.soc.model') || sh('getprop ro.board.platform'), android: sh('getprop ro.build.version.release'), abi, memKb: Number(/MemTotal:\s+(\d+)/.exec(sh('cat /proc/meminfo'))?.[1] ?? 0), cores: Number(sh('nproc')) };
 	console.log(JSON.stringify(device));
 	const started = Date.now();
 	// A run the system kills (out of memory) leaves no exit line of its own.
-	try { sh(`cd ${t} && ./host core.js -- ${driverArgs(t)} > ${t}/out/run.log 2>&1; echo exit=$? >> ${t}/out/run.log`); } catch (err) { console.log(`adb shell ended: ${String(err.message).split('\n')[0]}`); }
+	// Hermes inside Android's Java runtime, as an app runs it (host/java/spike/Main.java).
+	const launch = hermes ? `CLASSPATH=${t}/spike.dex app_process -Dspike.dir=${t} ${t} spike.Main ${script}` : `./host ${script}`;
+	try { sh(`cd ${t} && ${launch} -- ${driverArgs(t)} > ${t}/out/run.log 2>&1; echo exit=$? >> ${t}/out/run.log`); } catch (err) { console.log(`adb shell ended: ${String(err.message).split('\n')[0]}`); }
 	const wallMs = Date.now() - started;
 	for (const f of ['run.log', 'result.json', 'dump.json', 'replica.db']) {
 		try { adb('pull', `${t}/out/${f}`, join(run, f)); } catch { /* a failed run leaves no result */ }

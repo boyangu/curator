@@ -7,10 +7,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { createCoreService, type CoreService } from '../service.js';
 import { SqliteMirStore } from './store.js';
-import { removeDir } from '../test-support/tmp.js';
+import { removeDir } from '@curator/sync-core/test-support/tmp';
 
 const M = 'mert-v2-fullsong@1';
 const vec = (xs: number[]): Buffer => Buffer.from(new Float32Array(xs).buffer);

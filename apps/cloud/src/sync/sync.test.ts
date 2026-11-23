@@ -321,13 +321,29 @@ describe('protocol v5 kinds (analysis in the library)', () => {
 		const { deviceId, api } = await app.signIn();
 		const op = opsFor(deviceId);
 		const value = [{ id: 'l1', label: 'artists I don’t have', rule: { kind: 'library-artist', has: false }, by: 'assistant', createdAt: 1 }];
-		const set = op('setting', 'set', 'feed.lenses', { value });
-		expect(set.schema_version).toBe(6);
+		// Stamped as a v6 desktop stamps it (opsFor stamps the current version).
+		const set = { ...op('setting', 'set', 'feed.lenses', { value }), schema_version: 6 };
 		const res = await api.sync.push.mutate({ deviceId, ops: [set] });
 		expect(res).toMatchObject({ accepted: 1, rejected: [] });
 		expect(res.features).toContain('feed_lenses_v6');
 		const pulled = await api.sync.pull.query({ afterSeq: 0 });
 		expect(pulled.ops.map((o) => [o.entity_id, o.payload, o.schema_version])).toEqual([['feed.lenses', { value }, 6]]);
+	});
+
+	it('advertises mobile_settings_v7, takes tracklist.rows and home.pins stamped 7, refuses a value that does not fit', async () => {
+		const { deviceId, api } = await app.signIn();
+		const op = opsFor(deviceId);
+		const rows = { density: 1, levels: { '1': { l: [['title']], r: [['bpm']] }, '2': { l: [['title'], ['artist']], r: [[], []] }, '3': { l: [['title'], [], []], r: [[], [], []] } } };
+		const set = op('setting', 'set', 'tracklist.rows', { value: rows });
+		const pins = op('setting', 'set', 'home.pins', { value: [{ kind: 'tag', id: 'interested' }] });
+		expect([set.schema_version, pins.schema_version]).toEqual([7, 7]);
+		const bad = { ...set, op_id: randomUUID(), payload: { value: { ...rows, density: 5 } } };
+		const under = { ...set, op_id: randomUUID(), schema_version: 6 };
+		const res = await api.sync.push.mutate({ deviceId, ops: [set, pins, bad, under] });
+		expect(res).toMatchObject({ accepted: 2, rejected: [{ reason: 'invalid_payload' }, { reason: 'invalid_payload' }] });
+		expect(res.features).toContain('mobile_settings_v7');
+		const pulled = await api.sync.pull.query({ afterSeq: 0 });
+		expect(pulled.ops.map((o) => [o.entity_id, o.payload, o.schema_version])).toEqual([['tracklist.rows', { value: rows }, 7], ['home.pins', { value: [{ kind: 'tag', id: 'interested' }] }, 7]]);
 	});
 
 	it('refuses an old-scale brightness without power, and set-analysis stamped 4', async () => {

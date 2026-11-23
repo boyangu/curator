@@ -17,7 +17,7 @@
 import { and, eq, inArray, or } from 'drizzle-orm';
 import type { StreamingSource } from '@curator/shared';
 import { playlist, playlistTrack, trackTag } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 
 const CHUNK = 500;
 

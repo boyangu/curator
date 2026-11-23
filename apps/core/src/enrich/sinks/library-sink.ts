@@ -17,8 +17,8 @@ import { randomUUID } from 'node:crypto';
 import { track, sourceLink, SOURCES } from '@curator/shared/schema';
 import { asciify } from '@curator/shared';
 import { normalizeIsrc } from '@curator/library-logic';
-import type { Db } from '../../db/client.js';
-import { addClaims } from '../../library/mutators.js';
+import type { Db } from '@curator/sync-core/db/client';
+import { addClaims } from '@curator/sync-core/library/mutators';
 import type { DjMetadataPatch, EnrichmentResult } from '../contract.js';
 
 export class LibrarySink {

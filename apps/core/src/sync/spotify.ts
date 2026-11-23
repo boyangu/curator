@@ -10,18 +10,18 @@ import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { sortColumn } from './sort.js';
 import type { ZTrackSortT } from '@curator/shared';
 import { randomUUID } from 'node:crypto';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
-import { ClaimBinder, projectAdoptedRecordings } from '../sync-log/claim-bind.js';
-import { nextStreamingPlaylistId } from '../sync-log/stable-ids.js';
-import * as mut from '../library/mutators.js';
-import { rawOf } from '../library/artists.js';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { ClaimBinder, projectAdoptedRecordings } from '@curator/sync-core/sync-log/claim-bind';
+import { nextStreamingPlaylistId } from '@curator/sync-core/sync-log/stable-ids';
+import * as mut from '@curator/sync-core/library/mutators';
+import { rawOf } from '@curator/sync-core/library/artists';
 import { SpotifyClient, SpotifyPlaylistItemsWithheldError, type SpotifyPlaylist, type SpotifyPlaylistTrack, type SpotifyTrack } from '@curator/spotify';
 import type { FetchLike as BeatportFetch } from '@curator/beatport';
 import { enrichOne } from '../enrich/runner.js';
 import { BeatportEnricher } from '../enrich/enrichers/beatport.js';
 import { TraxsourceEnricher } from '../enrich/enrichers/traxsource.js';
 import { LibrarySink } from '../enrich/sinks/library-sink.js';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { AuthService } from '../auth/service.js';
 import {
 	track,
@@ -36,13 +36,13 @@ import {
 	type TrackArtist,
 } from '@curator/shared/schema';
 import { asciify, searchFold } from '@curator/shared';
-import { normalizeIncomingCredits, syncTrackArtists } from '../library/artists.js';
-import { syncTrackAlbumsById } from '../library/albums.js';
-import { upsertArtistLinks } from '../library/artist-links.js';
+import { normalizeIncomingCredits, syncTrackArtists } from '@curator/sync-core/library/artists';
+import { syncTrackAlbumsById } from '@curator/sync-core/library/albums';
+import { upsertArtistLinks } from '@curator/sync-core/library/artist-links';
 import { findExistingByContent } from './match-existing.js';
-import { canonicalSpotifyCover } from './spotify-cover.js';
+import { canonicalSpotifyCover } from '@curator/sync-core/sync/spotify-cover';
 import { normalizeIsrc } from '@curator/library-logic';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const synclog = log.for('sync');
 const bplog = log.for('beatport');

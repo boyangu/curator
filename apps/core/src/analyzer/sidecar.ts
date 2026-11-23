@@ -26,7 +26,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { isWellFormedString } from '@curator/shared';
 import type { ProductionMeasurements } from '@curator/shared/schema';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { killProcessTree } from './wsl.js';
 
 const alog = log.for('analyzer');

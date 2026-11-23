@@ -16,11 +16,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { getSourceCapabilities } from '@curator/shared';
-import { migrate } from './db/migrate.js';
-import { memberOrder } from './test-support/playlist-track.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
 import { isProviderTrackId, createCoreService, type CoreService } from './service.js';
 import type { StreamingSourceAdapter, RemoteTrackRef } from './sources/adapter.js';
-import { tmpDir, type TmpDir } from './test-support/tmp.js';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 
 let tmp: TmpDir;
 let dir: string;

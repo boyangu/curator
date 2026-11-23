@@ -1,5 +1,5 @@
-// The C host's surface (host/host.c), typed loosely: the spike's only
-// boundary between the JavaScript core and native code.
+// The host's surface (host/host.c, host/host-hermes.cpp), typed loosely: the
+// spike's only boundary between the JavaScript core and native code.
 
 export type Host = {
 	args: string[];
@@ -17,9 +17,16 @@ export type Host = {
 	stmtIterNext(stmt: unknown, mode: number): unknown;
 	stmtReset(stmt: unknown): void;
 	hash(parts: Array<string | Uint8Array>, hex: boolean, bits: number): string | Uint8Array;
+	hashOpen(bits: number): unknown;
+	hashUpdate(handle: unknown, data: string | Uint8Array): void;
+	hashDigest(handle: unknown, hex: boolean): string | Uint8Array;
 	readText(path: string): string;
 	readBytes(path: string): ArrayBuffer;
 	writeText(path: string, text: string): void;
+	writeBytes(path: string, bytes: Uint8Array | ArrayBuffer, append: boolean): void;
+	fileSize(path: string): number;
+	renameFile(from: string, to: string): void;
+	removeFile(path: string): void;
 	utf8Decode(bytes: Uint8Array | ArrayBuffer): string;
 	utf8Encode(text: string): Uint8Array;
 	gunzip(bytes: Uint8Array | ArrayBuffer): ArrayBuffer;

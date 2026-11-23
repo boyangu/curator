@@ -14,7 +14,7 @@
 import type { FeedItemDraft, FeedProducer, FeedProducerContext, FeedProducerResult, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRefreshStep } from './types.js';
 import type { FeedStore } from './store.js';
 import type { FeedStage, FeedStageContext } from './pipeline.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');
 

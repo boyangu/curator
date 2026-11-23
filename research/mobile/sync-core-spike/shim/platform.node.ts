@@ -1,7 +1,7 @@
 // What the driver asks of the machine, on Node (the desktop reference).
 
 import crypto from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { MessageChannel, Worker, receiveMessageOnPort, type MessagePort } from 'node:worker_threads';
 import { gunzipSync } from 'node:zlib';
@@ -51,6 +51,9 @@ export const platform: Platform = {
 	readGzipText: (path) => gunzipSync(readFileSync(path)).toString('utf8'),
 	readBytes: (path) => readFileSync(path),
 	writeText: (path, text) => writeFileSync(path, text),
+	appendBytes: (path, bytes) => appendFileSync(path, bytes),
+	gunzip: (bytes) => gunzipSync(bytes),
+	sha256: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 	mem: () => ({ rssKb: Math.round(process.memoryUsage().rss / 1024), peakRssKb: process.resourceUsage().maxRSS, jsHeapKb: Math.round(process.memoryUsage().heapUsed / 1024) }),
 	http: async (req) => httpBlocking(req),
 	// Not performance.now(): the comparison run replaces it (src/driver.ts).

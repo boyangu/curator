@@ -1,0 +1,756 @@
+// An in-memory Curator cloud for the sync client's tests (client.test.ts,
+// the two-desktop scenario suites). It keeps the real server's rules
+// (design: "Server API"; apps/cloud/src/sync/*): one seq per user, duplicate
+// op ids accepted and ignored, per-op rejection without failing the batch,
+// a client_ts clamp far in the future, materialisation with the protocol
+// reducer, a `snapshotSeq` hint for a cursor below the account's base
+// (`baseSeq`, set by `compact`) or too far behind the newest snapshot, the
+// 'pull_skip_own' feature (or, with `legacy`, a server from before it, strict about its pull
+// input), device revocation as the real server has it since 'device_reads'
+// (a revoked device's pushes come back `device_revoked` op by op, its pulls
+// and bootstraps are refused, and it cannot re-register; each transport is
+// one session, judged by the device it last acted as, so leaving the device
+// id out does not help), injectable transport failures, globally or per
+// device (`online`), and 'batches' as apps/cloud sync/batch.ts has them:
+// staged ops are invisible to every pull until the commit, which moves them
+// under fresh seqs (skipping op ids the log holds), takes a snapshot and
+// answers `committed`; `holdCommits` keeps a commit running (it answers
+// `committing`) until a test lets it go, and `farBehindOps` is the server's
+// far-behind rule against the newest snapshot. And 'snapshot_storage' as the
+// contract states it (protocol cloud-service.ts): the snapshot is the
+// account's base, published by the master — an in-memory `snapshots` bucket
+// each session may write only under its own prefix, publishSnapshot with
+// the server's checks (master by the log's LWW, seq at or below the head,
+// parts present at their sizes, keep-3 prune naming the superseded paths),
+// a bootstrap that takes `storage: true` only and answers the newest
+// manifest (or the empty state at 0) with `baseSeq`, and every pull naming
+// the newest snapshot (`published`) for the secondaries' digest check. The
+// server never folds: `takeSnapshot()` is a test helper that publishes the
+// fake's own fold as if the master had. Each publish is compared with the
+// fake's fold at its seq (`publishes[].stateMatches`), as the real server's
+// verifier does.
+//
+// And 'spotify_gateway' (protocol spotify-gateway.ts): the account's Spotify
+// grant in memory with a fake Spotify behind it — vends share one access
+// token until a minute before it expires, a refresh rotates the refresh
+// token and is counted (`spotifyRefreshes`), `spotifyRevoked` holds refresh
+// tokens Spotify refuses, and `revokeSpotifyGrant` is a grant it stopped
+// honouring. Its procedures refuse while the feature is not advertised.
+//
+// Nothing here leaves the process.
+
+import { createHash, randomUUID } from 'node:crypto';
+import { gunzipSync, gzipSync } from 'node:zlib';
+import {
+	applyOp,
+	clampClientTs,
+	createLibraryState,
+	deserializeLibraryState,
+	masterDeviceOf,
+	MASTER_DEVICE_SETTING,
+	MAX_PULL_OPS,
+	MAX_PUSH_OPS,
+	SNAPSHOT_PART_MAX_BYTES,
+	SNAPSHOT_STORAGE_ENCODING,
+	snapshotPartPath,
+	safeParseOp,
+	schemaVersionStatus,
+	serializeLibraryState,
+	type BatchAbortInput,
+	type BatchBeginInput,
+	type BatchBeginResult,
+	type BatchCommitInput,
+	type BatchCommitResult,
+	type BatchPushInput,
+	type BatchPushResult,
+	type BatchStatus,
+	type BootstrapInput,
+	type DeviceInfo,
+	type LibraryState,
+	type Op,
+	type PublishReplicaInput,
+	type PublishReplicaResult,
+	type PublishSnapshotInput,
+	type PublishSnapshotResult,
+	type ReplicaManifest,
+	type ReplicaOffer,
+	type PullInput,
+	type PullResult,
+	type SnapshotManifest,
+	type SpotifyAdoptInput,
+	type SpotifyConnectInput,
+	type SpotifyGrantStatus,
+	type SpotifyProfile,
+	type SpotifyTokenResult,
+	SPOTIFY_GATEWAY_SCOPES,
+	type PushInput,
+	type PushResult,
+	type RejectReason,
+	type StoredOp,
+	type SyncFeature,
+	SYNC_FEATURES,
+} from '@curator/protocol';
+import { CloudTransportError, type CloudTransport } from '../sync-log/client.js';
+import { inflateSnapshotText, readStorageSnapshotBody, type SnapshotBlobStore } from '../sync-log/snapshot-storage.js';
+
+export type FakePublished = { seq: number; deviceId: string; manifest: SnapshotManifest };
+
+export type FakeTransport = CloudTransport & { signedIn: boolean; online: boolean };
+
+type FakeBatch = { id: string; deviceId: string; label: string; status: BatchStatus; staged: Map<string, Op>; total: number; result: BatchCommitResult | null };
+
+export class FakeCloud {
+	readonly log: StoredOp[] = [];
+	private readonly byId = new Map<string, StoredOp>();
+	// A server from before 'pull_skip_own': no features, no clamp report,
+	// and a pull input with the skip fields is refused (zod `.strict()`).
+	legacy = false;
+	readonly pullInputs: PullInput[] = [];
+	// Ops sent back on pulls, all callers together.
+	opsSent = 0;
+	readonly state = createLibraryState();
+	readonly devices = new Map<string, DeviceInfo>();
+	// Ops the server refuses (as a malformed/unauthorised op would be).
+	readonly rejectIds = new Map<string, RejectReason>();
+	// Failures thrown by the next calls, in order, per procedure.
+	readonly fail: { push: CloudTransportError[]; pull: CloudTransportError[]; publish: CloudTransportError[]; upload: Error[]; spotify: CloudTransportError[] } = { push: [], pull: [], publish: [], upload: [], spotify: [] };
+	readonly calls = { push: 0, pull: 0, bootstrap: 0, register: 0, storageBootstraps: 0, batchBegin: 0, batchPush: 0, batchCommit: 0, batchAbort: 0, publish: 0, upload: 0, download: 0 };
+	// The `snapshots` bucket: path → bytes; and the paths clients removed.
+	readonly storage = new Map<string, Uint8Array>();
+	readonly removed: string[] = [];
+	// The kept master-published snapshots, oldest first (at most `keepSnapshots`).
+	readonly published: FakePublished[] = [];
+	keepSnapshots = 3;
+	// The kept ready-made libraries ('replica_storage'), oldest first: the
+	// newest only, and the snapshot it stands on stays kept (as the server's
+	// retention, apps/cloud publish-replica.ts).
+	readonly replicas: Array<{ seq: number; deviceId: string; manifest: ReplicaManifest }> = [];
+	// Every publishSnapshot call that passed the checks: who, at what seq,
+	// the outcome, and whether its JSON is the fake's own fold at that seq
+	// (`foldAt`): null when nothing before it can say — the account's first
+	// snapshot is its base, and the log alone never folds to it.
+	readonly publishes: Array<{ deviceId: string; seq: number; status: PublishSnapshotResult['status']; stateMatches: boolean | null }> = [];
+	readonly batches = new Map<string, FakeBatch>();
+	// A commit the server is still running: batchCommit answers `committing`
+	// and moves nothing while this is set.
+	holdCommits = false;
+	// The real server's far-behind rule (cloud sync/pull.ts) against the
+	// newest snapshot: more ops than this between the cursor and it, and the
+	// pull answers with the snapshot hint. Null: only `hintBelow` / `baseSeq`.
+	farBehindOps: number | null = null;
+	// The account's base: ops at or below it are gone from the log (compact).
+	baseSeq = 0;
+	// The user the single account belongs to (the last transport made), for
+	// the paths `takeSnapshot` writes under.
+	private userId = 'user';
+	readonly pushSizes: number[] = [];
+	// Every push call's device and outcome, for "a revoked device stops pushing".
+	readonly pushLog: Array<{ deviceId: string; sent: number; accepted: number }> = [];
+	pageLimit = MAX_PULL_OPS;
+	// What push and pull results advertise (not `legacy`). A suite that pins
+	// the v2 mechanics takes 'track_meta' out, so no base-metadata or master
+	// op joins its outbox counts (client.test.ts v2Cloud).
+	features: SyncFeature[] = [...SYNC_FEATURES];
+	// A pull with afterSeq below this gets the snapshot hint (a newest
+	// snapshot must exist for the hint to name).
+	hintBelow = 0;
+
+	// 'spotify_gateway': the account's grant, who it belongs to, the fake
+	// Spotify's token lifetime and refresh count, the refresh tokens it
+	// refuses, and every call by procedure (the refresh tokens adopted too).
+	spotifyGrant: { refreshToken: string; accessToken: string | null; expiresAt: number; profile: SpotifyProfile; connectedAt: number; needsReconnect: boolean } | null = null;
+	spotifyProfile: SpotifyProfile = { id: 'spotify-user', displayName: 'Test DJ', avatarUrl: null };
+	spotifyTokenTtlMs = 3_600_000;
+	spotifyRefreshes = 0;
+	readonly spotifyRevoked = new Set<string>();
+	readonly spotifyCalls = { connect: 0, adopt: 0, status: 0, token: 0, disconnect: 0 };
+	readonly spotifyAdopted: string[] = [];
+
+	// The head: the last op's seq, never below what compaction removed (a seq
+	// is never reused).
+	get maxSeq(): number { return Math.max(this.log.length === 0 ? 0 : this.log[this.log.length - 1]!.seq, this.baseSeq); }
+
+	revoke(deviceId: string): void {
+		const d = this.devices.get(deviceId);
+		if (d && d.revokedAt === null) this.devices.set(deviceId, { ...d, revokedAt: Date.now() });
+	}
+
+	isRevoked(deviceId: string): boolean {
+		return (this.devices.get(deviceId)?.revokedAt ?? null) !== null;
+	}
+
+	push(userId: string, input: PushInput): PushResult {
+		this.calls.push++;
+		const f = this.fail.push.shift();
+		if (f) throw f;
+		this.pushSizes.push(input.ops.length);
+		if (input.ops.length > MAX_PUSH_OPS) throw new CloudTransportError('bad_request', 'batch too large');
+		// apps/cloud sync/push.ts: a revoked device's whole batch comes back
+		// rejected op by op, and nothing is stored.
+		if (this.isRevoked(input.deviceId)) {
+			this.pushLog.push({ deviceId: input.deviceId, sent: input.ops.length, accepted: 0 });
+			return {
+				accepted: 0,
+				maxSeq: this.maxSeq,
+				rejected: input.ops.map((o) => ({ opId: (o as { op_id?: string }).op_id ?? '?', reason: 'device_revoked' as const })),
+				clamped: [],
+				batchMaxSeq: 0,
+				features: [...this.features],
+			};
+		}
+		// apps/cloud sync/push.ts: an op from a newer protocol than this server
+		// reads fails the whole call (`server_outdated`, a 'server' error on the
+		// desktop transport). A fake that does not advertise 'zero_loss_v4'
+		// stands for a v3 server, one without 'analysis_v5' for a v4 server.
+		this.refuseAhead(input.ops);
+		const rejected: PushResult['rejected'] = [];
+		const clamped: NonNullable<PushResult['clamped']> = [];
+		const batchIds = new Set<string>();
+		let batchMaxSeq = 0;
+		let accepted = 0;
+		for (const raw of input.ops) {
+			const v = safeParseOp(raw);
+			const opId = (raw as { op_id?: string }).op_id ?? '?';
+			if (!v.ok) { rejected.push({ opId, reason: v.error.reason }); continue; }
+			if (schemaVersionStatus(v.op.schema_version) === 'update_required') { rejected.push({ opId, reason: 'update_required' }); continue; }
+			// apps/cloud sync/push.ts: an op stamped with another device's id is
+			// refused, so a cloned identity (a restored backup that was not
+			// re-minted) shows up in tests exactly as it would in production.
+			if (v.op.device_id !== input.deviceId) { rejected.push({ opId, reason: 'not_owner' }); continue; }
+			const refused = this.rejectIds.get(opId);
+			if (refused) { rejected.push({ opId, reason: refused }); continue; }
+			accepted++;
+			batchIds.add(opId);
+			let stored = this.byId.get(opId); // a re-push: accepted and ignored
+			if (!stored) {
+				const now = Date.now();
+				const op = { ...v.op, client_ts: clampClientTs(v.op.client_ts, now).clientTs } as Op;
+				stored = { ...op, seq: this.maxSeq + 1, user_id: userId, received_at: now } as StoredOp;
+				this.byId.set(opId, stored);
+				this.log.push(stored);
+				applyOp(this.state, op);
+			}
+			batchMaxSeq = Math.max(batchMaxSeq, stored.seq);
+			if (stored.client_ts !== v.op.client_ts && !clamped.some((c) => c.opId === opId)) clamped.push({ opId, clientTs: stored.client_ts });
+		}
+		this.pushLog.push({ deviceId: input.deviceId, sent: input.ops.length, accepted });
+		if (this.legacy) return { accepted, maxSeq: this.maxSeq, rejected };
+		const prior = this.log.filter((o) => o.device_id === input.deviceId && !batchIds.has(o.op_id)).reduce((m, o) => Math.max(m, o.seq), 0);
+		return {
+			accepted, maxSeq: this.maxSeq, rejected, clamped, batchMaxSeq,
+			...(accepted > 0 ? { priorOwnMaxSeq: prior } : {}),
+			features: [...this.features],
+		};
+	}
+
+	pull(input: PullInput): PullResult {
+		this.calls.pull++;
+		this.pullInputs.push({ ...input });
+		const f = this.fail.pull.shift();
+		if (f) throw f;
+		if ((input.deviceId !== undefined || input.ownThroughSeq !== undefined) && this.legacy) throw new CloudTransportError('bad_request', 'unrecognized keys in pull input');
+		const skip = input.ownThroughSeq !== undefined;
+		const newest = this.published.at(-1) ?? null;
+		const features = {
+			...(this.legacy ? {} : { features: [...this.features] }),
+			...(newest ? { published: { seq: newest.seq, stateSha256: newest.manifest.stateSha256 } } : {}),
+		};
+		// As the real server's: a cursor below the base, or too far behind the
+		// newest snapshot, is told to bootstrap; the hint names that snapshot.
+		if (newest && (input.afterSeq < this.baseSeq || input.afterSeq < this.hintBelow)) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: newest.seq, ...features };
+		if (newest && this.farBehindOps !== null && input.afterSeq < newest.seq) {
+			const gap = this.log.filter((o) => o.seq > input.afterSeq && o.seq <= newest.seq && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!)).length;
+			if (gap > this.farBehindOps) return { ops: [], nextSeq: input.afterSeq, snapshotSeq: newest.seq, ...features };
+		}
+		const limit = Math.min(input.limit ?? MAX_PULL_OPS, this.pageLimit);
+		const ops = this.log
+			.filter((o) => o.seq > input.afterSeq && !(skip && o.device_id === input.deviceId && o.seq <= input.ownThroughSeq!))
+			.slice(0, limit);
+		// The real server's cursor rule (cloud sync/pull.ts): a full page stops
+		// at its last op; a short one reached the head.
+		const nextSeq = !skip ? (ops.length ? ops[ops.length - 1]!.seq : input.afterSeq)
+			: ops.length === limit ? ops[ops.length - 1]!.seq : Math.max(input.afterSeq, this.maxSeq);
+		this.opsSent += ops.length;
+		return { ops, nextSeq, ...features };
+	}
+
+	// ── 'batches' (apps/cloud sync/batch.ts) ────────────────────────────────
+
+	private liveBatch(id: string, deviceId: string): FakeBatch {
+		const b = this.batches.get(id);
+		if (!b || b.deviceId !== deviceId || b.status === 'aborted' || b.status === 'expired' || b.status === 'committed') {
+			if (b?.status === 'committed' && b.deviceId === deviceId) return b;
+			throw new CloudTransportError('batch_gone', 'batch_gone');
+		}
+		return b;
+	}
+
+	batchBegin(input: BatchBeginInput): BatchBeginResult {
+		this.calls.batchBegin++;
+		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+		const live = [...this.batches.values()].find((b) => b.deviceId === input.deviceId && b.label === input.label && (b.status === 'open' || b.status === 'committing'));
+		if (live) return { batchId: live.id, status: live.status as 'open' | 'committing', resumed: true, stagedOps: live.staged.size, features: [...this.features] };
+		const b: FakeBatch = { id: randomUUID(), deviceId: input.deviceId, label: input.label, status: 'open', staged: new Map(), total: 0, result: null };
+		this.batches.set(b.id, b);
+		return { batchId: b.id, status: 'open', resumed: false, stagedOps: 0, features: [...this.features] };
+	}
+
+	// The protocol version this fake reads, by what it advertises.
+	get readsVersion(): number {
+		if (!this.features.includes('zero_loss_v4')) return 3;
+		return this.features.includes('analysis_v5') ? 5 : 4;
+	}
+
+	// apps/cloud sync/push.ts validate: an op stamped above what the server
+	// reads fails the whole call (push and batchPush alike).
+	private refuseAhead(ops: readonly unknown[]): void {
+		const reads = this.readsVersion;
+		if (ops.some((o) => typeof (o as { schema_version?: unknown }).schema_version === 'number' && (o as { schema_version: number }).schema_version > reads)) {
+			throw new CloudTransportError('server', 'server_outdated');
+		}
+	}
+
+	batchPush(input: BatchPushInput): BatchPushResult {
+		this.calls.batchPush++;
+		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+		if (input.ops.length > MAX_PUSH_OPS) throw new CloudTransportError('bad_request', 'batch too large');
+		this.refuseAhead(input.ops);
+		const b = this.liveBatch(input.batchId, input.deviceId);
+		if (b.status === 'committing') throw new CloudTransportError('batch_committing', 'batch_committing');
+		if (b.status !== 'open') throw new CloudTransportError('batch_gone', 'batch_gone');
+		const rejected: BatchPushResult['rejected'] = [];
+		const clamped: NonNullable<BatchPushResult['clamped']> = [];
+		let accepted = 0;
+		for (const raw of input.ops) {
+			const v = safeParseOp(raw);
+			const opId = (raw as { op_id?: string }).op_id ?? '?';
+			if (!v.ok) { rejected.push({ opId, reason: v.error.reason }); continue; }
+			if (schemaVersionStatus(v.op.schema_version) === 'update_required') { rejected.push({ opId, reason: 'update_required' }); continue; }
+			if (v.op.device_id !== input.deviceId) { rejected.push({ opId, reason: 'not_owner' }); continue; }
+			const refused = this.rejectIds.get(opId);
+			if (refused) { rejected.push({ opId, reason: refused }); continue; }
+			accepted++;
+			let stored = b.staged.get(opId);
+			if (!stored) {
+				stored = { ...v.op, client_ts: clampClientTs(v.op.client_ts, Date.now()).clientTs } as Op;
+				b.staged.set(opId, stored);
+			}
+			if (stored.client_ts !== v.op.client_ts && !clamped.some((c) => c.opId === opId)) clamped.push({ opId, clientTs: stored.client_ts });
+		}
+		return { accepted, rejected, clamped, stagedOps: b.staged.size, features: [...this.features] };
+	}
+
+	batchCommit(userId: string, input: BatchCommitInput): BatchCommitResult {
+		this.calls.batchCommit++;
+		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+		const b = this.liveBatch(input.batchId, input.deviceId);
+		if (b.result) return b.result;
+		if (b.status === 'open') { b.status = 'committing'; b.total = b.staged.size; }
+		if (this.holdCommits) return { status: 'committing', movedOps: 0, totalOps: b.total, committedSeq: 0, rejected: [], features: [...this.features] };
+		const prior = this.log.filter((o) => o.device_id === b.deviceId && !b.staged.has(o.op_id)).reduce((m, o) => Math.max(m, o.seq), 0);
+		let committedSeq = 0;
+		const now = Date.now();
+		for (const op of b.staged.values()) {
+			let stored = this.byId.get(op.op_id);
+			if (!stored) {
+				stored = { ...op, seq: this.maxSeq + 1, user_id: userId, received_at: now } as StoredOp;
+				this.byId.set(op.op_id, stored);
+				this.log.push(stored);
+				applyOp(this.state, op);
+			}
+			committedSeq = Math.max(committedSeq, stored.seq);
+		}
+		const moved = b.staged.size;
+		b.staged.clear();
+		b.status = 'committed';
+		b.result = { status: 'committed', movedOps: moved, totalOps: b.total, committedSeq, priorOwnMaxSeq: prior, rejected: [], features: [...this.features] };
+		return b.result;
+	}
+
+	batchAbort(input: BatchAbortInput): { status: BatchStatus } {
+		this.calls.batchAbort++;
+		const b = this.batches.get(input.batchId);
+		if (!b || b.deviceId !== input.deviceId) throw new CloudTransportError('batch_gone', 'batch_gone');
+		if (b.status === 'committing') throw new CloudTransportError('batch_committing', 'batch_committing');
+		if (b.status === 'open') { b.status = 'aborted'; b.staged.clear(); }
+		return { status: b.status };
+	}
+
+	// The server's sweep, a day later: an open batch expires, its staged ops
+	// deleted.
+	expireBatch(id: string): void {
+		const b = this.batches.get(id);
+		if (b && b.status === 'open') { b.status = 'expired'; b.staged.clear(); }
+	}
+
+	// A published snapshot's state, read back out of the bucket.
+	private stateOf(pub: FakePublished): LibraryState {
+		const body = Buffer.concat(pub.manifest.parts.map((p) => Buffer.from(this.storage.get(p.path)!)));
+		return deserializeLibraryState(gunzipSync(body).toString('utf8'));
+	}
+
+	// The state through `seq` as a verifier can build it: the newest published
+	// snapshot at or below `seq` (the base — the founder's fold is in it and
+	// nowhere in the log) plus the log after it. `base` false: no snapshot
+	// at or below `seq` exists, and the fold is of the log alone (an account
+	// that was never founded by a fold: the pre-base rig scenarios).
+	foldAt(seq: number): LibraryState {
+		const base = [...this.published].filter((p) => p.seq <= seq).at(-1) ?? null;
+		const state = base ? this.stateOf(base) : createLibraryState();
+		for (const o of this.log) {
+			if (o.seq <= (base?.seq ?? 0)) continue;
+			if (o.seq > seq) break;
+			const { seq: _s, user_id: _u, received_at: _r, ...op } = o;
+			applyOp(state, op as Op);
+		}
+		return state;
+	}
+
+	// Whether a verifier can say anything about a snapshot at `seq`: a base
+	// at or below it exists (foldAt).
+	verifiable(seq: number): boolean {
+		return this.published.some((p) => p.seq <= seq);
+	}
+
+	// ── 'snapshot_storage' (protocol cloud-service.ts) ──────────────────────
+
+	publishSnapshot(userId: string, input: PublishSnapshotInput): PublishSnapshotResult {
+		this.calls.publish++;
+		const f = this.fail.publish.shift();
+		if (f) throw f;
+		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+		if (masterDeviceOf(this.state.settings) !== input.deviceId) throw new CloudTransportError('not_master', 'not_master');
+		if (input.snapshotSeq > this.maxSeq) throw new CloudTransportError('snapshot_ahead', 'snapshot_ahead');
+		const m = input.manifest;
+		if (m.parts.some((p) => p.path !== snapshotPartPath(userId, p.sha256)) || m.parts.reduce((n, p) => n + p.bytes, 0) !== m.totalBytes) {
+			throw new CloudTransportError('snapshot_part_invalid', 'snapshot_part_invalid');
+		}
+		for (const p of m.parts) {
+			if (this.storage.get(p.path)?.byteLength !== p.bytes) throw new CloudTransportError('snapshot_part_missing', 'snapshot_part_missing');
+		}
+		const stateMatches = this.verifiable(input.snapshotSeq) ? createHash('sha256').update(serializeLibraryState(this.foldAt(input.snapshotSeq))).digest('hex') === m.stateSha256 : null;
+		let status: PublishSnapshotResult['status'];
+		if (this.published.some((s) => s.seq === input.snapshotSeq)) status = 'exists';
+		else if ((this.published.at(-1)?.seq ?? 0) > input.snapshotSeq) status = 'stale';
+		else {
+			this.published.push({ seq: input.snapshotSeq, deviceId: input.deviceId, manifest: m });
+			status = 'stored';
+		}
+		// Pruned snapshots' parts, and on 'exists' / 'stale' the caller's own
+		// just-uploaded parts (a publish that lost a race): whatever no kept
+		// manifest references. A retry of a stored snapshot names nothing.
+		const pruned = this.pruneSnapshots();
+		const kept = this.keptParts();
+		const candidates = [...pruned.flatMap((s) => s.manifest.parts.map((p) => p.path)), ...(status === 'stored' ? [] : m.parts.map((p) => p.path))];
+		const superseded = [...new Set(candidates)].filter((p) => !kept.has(p));
+		this.publishes.push({ deviceId: input.deviceId, seq: input.snapshotSeq, status, stateMatches });
+		return { status, latestSeq: this.published.at(-1)!.seq, superseded, features: [...this.features] };
+	}
+
+	// Every snapshot but the newest `keepSnapshots` and the one the newest
+	// replica stands on.
+	private pruneSnapshots(): FakePublished[] {
+		const pinned = this.replicas.at(-1)?.seq;
+		const out: FakePublished[] = [];
+		for (let i = this.published.length - this.keepSnapshots - 1; i >= 0; i--) {
+			if (this.published[i]!.seq === pinned) continue;
+			out.push(...this.published.splice(i, 1));
+		}
+		return out;
+	}
+
+	private keptParts(): Set<string> {
+		return new Set([...this.published, ...this.replicas].flatMap((s) => s.manifest.parts.map((p) => p.path)));
+	}
+
+	publishReplica(userId: string, input: PublishReplicaInput): PublishReplicaResult {
+		if (this.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+		if (masterDeviceOf(this.state.settings) !== input.deviceId) throw new CloudTransportError('not_master', 'not_master');
+		const m = input.manifest;
+		if (m.parts.some((p) => p.path !== snapshotPartPath(userId, p.sha256)) || new Set(m.parts.map((p) => p.path)).size !== m.parts.length || m.parts.reduce((n, p) => n + p.bytes, 0) !== m.totalBytes) {
+			throw new CloudTransportError('snapshot_part_invalid', 'snapshot_part_invalid');
+		}
+		for (const p of m.parts) {
+			if (this.storage.get(p.path)?.byteLength !== p.bytes) throw new CloudTransportError('snapshot_part_missing', 'snapshot_part_missing');
+		}
+		if (!this.published.some((s) => s.seq === input.snapshotSeq)) throw new CloudTransportError('replica_without_snapshot', 'replica_without_snapshot');
+		let status: PublishReplicaResult['status'];
+		if (this.replicas.some((r) => r.seq === input.snapshotSeq)) status = 'exists';
+		else if ((this.replicas.at(-1)?.seq ?? 0) > input.snapshotSeq) status = 'stale';
+		else {
+			this.replicas.push({ seq: input.snapshotSeq, deviceId: input.deviceId, manifest: m });
+			status = 'stored';
+		}
+		const pruned = [...this.replicas.splice(0, Math.max(0, this.replicas.length - 1)), ...this.pruneSnapshots()];
+		const kept = this.keptParts();
+		const candidates = [...pruned.flatMap((s) => s.manifest.parts.map((p) => p.path)), ...(status === 'stored' ? [] : m.parts.map((p) => p.path))];
+		return { status, latestSeq: this.replicas.at(-1)!.seq, superseded: [...new Set(candidates)].filter((p) => !kept.has(p)), features: [...this.features] };
+	}
+
+	// The newest replica of format `schema` or older, while the log can still
+	// be pulled from it.
+	replicaOffer(schema: number): ReplicaOffer | null {
+		const r = [...this.replicas].reverse().find((x) => x.manifest.schema <= schema && x.seq >= this.baseSeq);
+		return r ? { snapshotSeq: r.seq, manifest: r.manifest } : null;
+	}
+
+	// Test helper: the fake's own fold at the head, published into the bucket
+	// as if the master had (no device named: `deviceId` 'fake-master'), so a
+	// scenario can hand a device a snapshot without a master publishing one.
+	// `userId`: whose bucket prefix the parts go under (default: the user of
+	// the last transport made). Returns its seq.
+	takeSnapshot(userId: string = this.userId): number {
+		this.userId = userId;
+		const seq = this.maxSeq;
+		const json = Buffer.from(serializeLibraryState(this.foldAt(seq)), 'utf8');
+		const body = gzipSync(json);
+		const parts: SnapshotManifest['parts'] = [];
+		for (let off = 0; off < body.length; off += SNAPSHOT_PART_MAX_BYTES) {
+			const piece = body.subarray(off, off + SNAPSHOT_PART_MAX_BYTES);
+			const sha256 = createHash('sha256').update(piece).digest('hex');
+			const path = snapshotPartPath(this.userId, sha256);
+			if (!this.storage.has(path)) this.storage.set(path, Uint8Array.from(piece));
+			parts.push({ path, bytes: piece.length, sha256 });
+		}
+		const manifest: SnapshotManifest = { encoding: SNAPSHOT_STORAGE_ENCODING, parts, totalBytes: body.length, sha256: createHash('sha256').update(body).digest('hex'), stateSha256: createHash('sha256').update(json).digest('hex') };
+		const i = this.published.findIndex((p) => p.seq === seq);
+		if (i >= 0) this.published[i] = { seq, deviceId: 'fake-master', manifest };
+		else this.published.push({ seq, deviceId: 'fake-master', manifest });
+		return seq;
+	}
+
+	// The server's compaction, a week after a snapshot: the log forgets every
+	// op at or below `through` (the master setting op stays, as the real
+	// sweep keeps it so a fresh fold still names the master), and the base
+	// moves there. A cursor below it is told to bootstrap.
+	compact(through: number): void {
+		const keep = (o: StoredOp): boolean => o.seq > through || (o.entity === 'setting' && o.entity_id === MASTER_DEVICE_SETTING);
+		for (const o of this.log) if (!keep(o)) this.byId.delete(o.op_id);
+		this.log.splice(0, this.log.length, ...this.log.filter(keep));
+		this.baseSeq = Math.max(this.baseSeq, through);
+	}
+
+	// ── 'spotify_gateway' (protocol spotify-gateway.ts) ─────────────────────
+
+	spotifyStatus(): SpotifyGrantStatus {
+		const g = this.spotifyGrant;
+		return g
+			? { connected: true, profile: g.profile, scopes: [...SPOTIFY_GATEWAY_SCOPES], connectedAt: g.connectedAt, needsReconnect: g.needsReconnect }
+			: { connected: false, profile: null, scopes: [], connectedAt: null, needsReconnect: false };
+	}
+
+	// Spotify stops honouring the grant (revoked in the user's account page).
+	revokeSpotifyGrant(): void {
+		if (this.spotifyGrant) this.spotifyRevoked.add(this.spotifyGrant.refreshToken);
+	}
+
+	private spotifyGate(): void {
+		const f = this.fail.spotify.shift();
+		if (f) throw f;
+		if (!this.features.includes('spotify_gateway')) throw new CloudTransportError('bad_request', 'spotify_gateway_off');
+	}
+
+	private spotifyRefresh(refreshToken: string): { refreshToken: string; accessToken: string; expiresAt: number } {
+		if (this.spotifyRevoked.has(refreshToken)) throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		const n = ++this.spotifyRefreshes;
+		// Spotify may rotate the refresh token on every refresh; this one always does.
+		return { refreshToken: `cloud-rt-${n}`, accessToken: `cloud-at-${n}`, expiresAt: Date.now() + this.spotifyTokenTtlMs };
+	}
+
+	spotifyConnect(input: SpotifyConnectInput): SpotifyGrantStatus {
+		this.spotifyCalls.connect++;
+		this.spotifyGate();
+		if (input.code === 'expired-code') throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		this.spotifyGrant = { refreshToken: `cloud-rt-code-${input.code}`, accessToken: `cloud-at-code-${input.code}`, expiresAt: Date.now() + this.spotifyTokenTtlMs, profile: this.spotifyProfile, connectedAt: Date.now(), needsReconnect: false };
+		return this.spotifyStatus();
+	}
+
+	spotifyAdopt(input: SpotifyAdoptInput): SpotifyGrantStatus {
+		this.spotifyCalls.adopt++;
+		this.spotifyGate();
+		// The real gateway proves the token with a refresh before storing it.
+		const r = this.spotifyRefresh(input.refreshToken);
+		this.spotifyAdopted.push(input.refreshToken);
+		this.spotifyGrant = { ...r, profile: this.spotifyProfile, connectedAt: Date.now(), needsReconnect: false };
+		return this.spotifyStatus();
+	}
+
+	spotifyToken(): SpotifyTokenResult {
+		this.spotifyCalls.token++;
+		this.spotifyGate();
+		const g = this.spotifyGrant;
+		if (!g) throw new CloudTransportError('spotify_not_connected', 'spotify_not_connected');
+		if (g.needsReconnect) throw new CloudTransportError('spotify_reconnect_required', 'spotify_reconnect_required');
+		if (!g.accessToken || g.expiresAt - 60_000 <= Date.now()) {
+			try {
+				Object.assign(g, this.spotifyRefresh(g.refreshToken));
+			} catch (e) {
+				g.needsReconnect = true;
+				g.accessToken = null;
+				throw e;
+			}
+		}
+		return { accessToken: g.accessToken!, expiresAt: g.expiresAt, scopes: [...SPOTIFY_GATEWAY_SCOPES], profile: g.profile };
+	}
+
+	spotifyDisconnect(): SpotifyGrantStatus {
+		this.spotifyCalls.disconnect++;
+		this.spotifyGate();
+		this.spotifyGrant = null;
+		return this.spotifyStatus();
+	}
+
+	// Test-only: an op stored as a newer client would have sent it.
+	appendRaw(op: StoredOp): void { this.log.push(op); }
+
+	// One device's connection. `online = false` fails every sync call with a
+	// network error (the device is offline; the others are not).
+	transport(userId: string, email = `${userId}@example.test`): FakeTransport {
+		const cloud = this;
+		cloud.userId = userId;
+		const offline = (): void => { if (!t.online) throw new CloudTransportError('network', 'net::ERR_INTERNET_DISCONNECTED'); };
+		// The device this session last acted as (apps/cloud device-gate.ts).
+		let actsAs: string | null = null;
+		const revokedSession = (): boolean => actsAs !== null && cloud.isRevoked(actsAs);
+		// A read: refused for a revoked session or a revoked device named.
+		const gateRead = (deviceId: string | undefined): void => {
+			if (revokedSession() || (deviceId !== undefined && cloud.isRevoked(deviceId))) throw new CloudTransportError('device_revoked', 'device_revoked');
+			if (deviceId !== undefined && cloud.devices.has(deviceId)) actsAs = deviceId;
+		};
+		// The bucket's policies (apps/cloud sql/storage.sql): this session's own
+		// `<uid>/` prefix only, insert only (an existing object is success:
+		// content-addressed bytes), never an update.
+		const own = (path: string): void => { if (!path.startsWith(`${userId.toLowerCase()}/`)) throw new Error('denied: another user prefix'); };
+		const snapshots: SnapshotBlobStore = {
+			upload: async (path, bytes) => {
+				offline();
+				own(path);
+				cloud.calls.upload++;
+				const f = cloud.fail.upload.shift();
+				if (f) throw f;
+				if (!cloud.storage.has(path)) cloud.storage.set(path, Uint8Array.from(bytes));
+			},
+			download: async (path) => {
+				offline();
+				own(path);
+				cloud.calls.download++;
+				const o = cloud.storage.get(path);
+				if (!o) throw new Error('not_found');
+				return Uint8Array.from(o);
+			},
+			remove: async (paths) => {
+				offline();
+				for (const p of paths) own(p);
+				for (const p of paths) { cloud.storage.delete(p); cloud.removed.push(p); }
+			},
+		};
+		const t: FakeTransport = {
+			signedIn: true,
+			online: true,
+			session: () => (t.signedIn ? { userId, email } : null),
+			snapshots,
+			// The next sign-in is a new session, bound to nothing yet.
+			signOut: async () => { t.signedIn = false; actsAs = null; },
+			sync: {
+				push: async (input: PushInput) => {
+					offline();
+					if (revokedSession()) return cloud.push(userId, { ...input, deviceId: actsAs! });
+					const r = cloud.push(userId, input);
+					if (!cloud.isRevoked(input.deviceId) && cloud.devices.has(input.deviceId)) actsAs = input.deviceId;
+					return r;
+				},
+				batchBegin: async (input: BatchBeginInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.batchBegin(input);
+				},
+				batchPush: async (input: BatchPushInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.batchPush(input);
+				},
+				batchCommit: async (input: BatchCommitInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.batchCommit(userId, input);
+				},
+				batchAbort: async (input: BatchAbortInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.batchAbort(input);
+				},
+				publishSnapshot: async (input: PublishSnapshotInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.publishSnapshot(userId, input);
+				},
+				publishReplica: async (input: PublishReplicaInput) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return cloud.publishReplica(userId, input);
+				},
+				pull: async (input: PullInput) => {
+					offline();
+					// A refused pull still reached the server: counted.
+					if (!cloud.legacy) try { gateRead(input.deviceId); } catch (e) { cloud.calls.pull++; throw e; }
+					return cloud.pull(input);
+				},
+			},
+			// The newest published snapshot's manifest (the server holds no
+			// body); the HTTP transport's job (download, check, join, inflate)
+			// runs here through the same reader. The desktop transport always
+			// asks with `storage: true`; this one does too, and would refuse a
+			// call without it as the real server does.
+			bootstrap: async (input?: BootstrapInput) => {
+				offline();
+				if (!cloud.legacy) gateRead(input?.deviceId);
+				cloud.calls.bootstrap++;
+				const asked: BootstrapInput = { ...(input ?? {}), storage: true };
+				if (!asked.storage) throw new CloudTransportError('update_required', 'update_required');
+				const pub = cloud.published.at(-1);
+				if (!pub) return { snapshotSeq: 0, baseSeq: cloud.baseSeq, snapshot: null };
+				cloud.calls.storageBootstraps++;
+				const body = await readStorageSnapshotBody(pub.manifest, (p) => snapshots.download(p), { maxBytes: 1 << 30 });
+				return { snapshotSeq: pub.seq, baseSeq: cloud.baseSeq, snapshot: inflateSnapshotText(body, { maxBytes: 1 << 30 }) };
+			},
+			replica: async (schema: number) => {
+				offline();
+				return cloud.features.includes('replica_storage') ? cloud.replicaOffer(schema) : null;
+			},
+			account: {
+				registerDevice: async (input: { deviceId: string; name: string; platform: DeviceInfo['platform'] }) => {
+					offline();
+					cloud.calls.register++;
+					// Revocation is final (apps/cloud account/devices.ts), and a
+					// session that acted as a revoked device cannot mint another.
+					if (revokedSession() || cloud.isRevoked(input.deviceId)) throw new CloudTransportError('device_revoked', 'device_revoked');
+					// A re-register keeps the device's place in registration order
+					// (the real upsert never touches created_at): who founds an
+					// empty account is read off that order (client.ts founderOf).
+					const prev = cloud.devices.get(input.deviceId);
+					cloud.devices.set(input.deviceId, { ...input, registeredAt: prev?.registeredAt ?? Date.now(), lastSeenAt: prev?.lastSeenAt ?? null, revokedAt: null });
+					actsAs = input.deviceId;
+					return { ok: true as const };
+				},
+				devices: async () => {
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					return [...cloud.devices.values()];
+				},
+				revokeDevice: async (input: { deviceId: string }) => {
+					offline();
+					if (revokedSession()) throw new CloudTransportError('device_revoked', 'device_revoked');
+					cloud.revoke(input.deviceId);
+					return { ok: true as const };
+				},
+			},
+			spotify: {
+				connect: async (input: SpotifyConnectInput) => { offline(); return cloud.spotifyConnect(input); },
+				adopt: async (input: SpotifyAdoptInput) => { offline(); return cloud.spotifyAdopt(input); },
+				status: async () => { offline(); cloud.spotifyCalls.status++; cloud.spotifyGate(); return cloud.spotifyStatus(); },
+				token: async () => { offline(); return cloud.spotifyToken(); },
+				disconnect: async () => { offline(); return cloud.spotifyDisconnect(); },
+			},
+		};
+		return t;
+	}
+}

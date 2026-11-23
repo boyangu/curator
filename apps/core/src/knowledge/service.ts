@@ -36,7 +36,7 @@ import type {
 	KbExpansion,
 	KbResolver,
 } from './types.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const klog = log.for('kb');
 

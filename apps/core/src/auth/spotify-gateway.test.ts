@@ -12,11 +12,11 @@ import type { SpotifyTokens } from '@curator/spotify';
 // import).
 vi.hoisted(() => { process.env['CURATOR_SPOTIFY_CLIENT_ID'] = '0123456789abcdef0123456789abcdef'; });
 
-import { createDb } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
-import { FakeCloud } from '../test-support/fake-cloud.js';
+import { createDb } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { FakeCloud } from '@curator/sync-core/test-support/fake-cloud';
 import { TwoDesktopRig } from '../test-support/two-desktops.js';
-import { tmpDir, type TmpDir } from '../test-support/tmp.js';
+import { tmpDir, type TmpDir } from '@curator/sync-core/test-support/tmp';
 import { AuthService } from './service.js';
 import { TokenStore } from './store.js';
 

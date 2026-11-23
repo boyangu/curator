@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CatalogObjectSummary, CatalogRef } from '@curator/protocol';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { refsForTrack, writeRefs } from './catalog-refs.js';
 
 let dir: string;

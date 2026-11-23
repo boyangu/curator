@@ -33,7 +33,7 @@ import {
 	type MetricLevel,
 	METRIC_NAMES,
 } from '@curator/shared/schema';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 
 // Map product-name metric → the matching column name on `track`. The columns
 // hold the canonical analyzer values (mirrored from track_analysis by

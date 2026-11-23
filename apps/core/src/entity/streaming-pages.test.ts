@@ -10,7 +10,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CatalogBrowseResult, CatalogClaim, CatalogObjectSummary, CatalogRef, CatalogTracksResult } from '@curator/protocol';
 import type { SpotifyTrack } from '@curator/spotify';
-import { migrate } from '../db/migrate.js';
+import { migrate } from '@curator/sync-core/db/migrate';
 import type { SpotifyMatchClient } from '../feed/spotify-match.js';
 import type { EntityCatalog } from './resolve.js';
 import { createEntityPages } from './service.js';

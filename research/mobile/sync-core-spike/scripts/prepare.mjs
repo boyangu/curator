@@ -1,7 +1,7 @@
 // Builds the spike's inputs from the real library, without touching it:
 //
 //   1. `VACUUM INTO` a copy from a READ-ONLY handle of the live database (the
-//      replay check's way, apps/core/src/sync-log/replay-check.ts);
+//      replay check's way, packages/sync-core/src/sync-log/replay-check.ts);
 //   2. the account snapshot of that copy, with the master's own builder
 //      (snapshot-build.ts) — gzip parts, joined into state.json.gz;
 //   3. an empty library at this build's schema (migrate), the file a new

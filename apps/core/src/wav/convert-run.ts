@@ -22,16 +22,16 @@ import type Database from 'better-sqlite3';
 import { asc, eq, inArray } from 'drizzle-orm';
 import { playlist, playlistTrack, track, rekordboxLink, sourceLink, type NewPlaylist, type NewPlaylistTrack, type TrackArtist, type TrackOverrides } from '@curator/shared/schema';
 import { searchFold, withFormatTag, type ArtistCreditFormat } from '@curator/shared';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 import { audioHash } from '../ingest/audio-hash.js';
 import { normalizePath } from '../local/scanner.js';
 import { effectiveAlbum, effectiveArtistName, effectiveGenre, effectiveLabel, effectiveTitle } from '../sync/curator-view.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import { WAV_MAX_SAMPLE_RATE, estimateWavBytes, planWavOutput, readFlacFormat, type AudioFormat } from './audio-header.js';
 import { runWavJob, WavJobError, type WavConverterSpec, type WavJobTags } from './converter.js';
 import { discardWavCopy, findLiveDerivative, localLinksFor, materializeWavCopy, rebindWavCopy } from './materialize.js';
 import type { WavConvertEvent, WavConvertResult, WavMemberPlan, WavPreview } from './types.js';
-import { replaceRows } from '../library/playlist-order.js';
+import { replaceRows } from '@curator/sync-core/library/playlist-order';
 
 const wlog = log.for('wav-convert');
 

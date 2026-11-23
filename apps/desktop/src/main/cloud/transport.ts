@@ -21,6 +21,7 @@
 // read actually needs, and it says nothing an absent error line does not.
 
 import { randomUUID } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { app, net } from 'electron';
 import { createTRPCUntypedClient, httpLink, TRPCClientError } from '@trpc/client';
 import { CatalogueBlobError, CloudTransportError, inflateSnapshotText, readStorageSnapshotBody, type CloudTransport } from '@curator/core';
@@ -44,6 +45,8 @@ import {
 	type CataloguePutInput,
 	type CataloguePutResult,
 	type DeviceInfo,
+	type PublishReplicaInput,
+	type PublishReplicaResult,
 	type PublishSnapshotInput,
 	type PublishSnapshotResult,
 	type PullInput,
@@ -117,6 +120,7 @@ const PROCS = {
 	batchAbort: { path: 'sync.batchAbort', type: 'mutation' },
 	// 'snapshot_storage': the master names the parts it uploaded.
 	publishSnapshot: { path: 'sync.publishSnapshot', type: 'mutation' },
+	publishReplica: { path: 'sync.publishReplica', type: 'mutation' },
 	registerDevice: { path: 'account.registerDevice', type: 'mutation' },
 	devices: { path: 'account.devices', type: 'query' },
 	revokeDevice: { path: 'account.revokeDevice', type: 'mutation' },
@@ -216,7 +220,7 @@ function mapError(err: unknown): CloudTransportError {
 		if (reason === 'server_outdated') return new CloudTransportError('server', reason, retryMs);
 		if (reason === 'batch_gone') return new CloudTransportError('batch_gone', reason);
 		if (reason === 'batch_committing') return new CloudTransportError('batch_committing', reason);
-		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid') return new CloudTransportError(reason, reason);
+		if (reason === 'not_master' || reason === 'snapshot_ahead' || reason === 'snapshot_part_missing' || reason === 'snapshot_part_invalid' || reason === 'replica_without_snapshot') return new CloudTransportError(reason, reason);
 		if (reason === 'spotify_not_connected' || reason === 'spotify_reconnect_required') return new CloudTransportError(reason, reason);
 		if (reason === 'catalog_disabled' || reason === 'catalog_not_found' || reason === 'catalog_watch_limit' || reason === 'catalog_claim_invalid') return new CloudTransportError(reason, reason);
 		if (status === 401 || reason === 'missing_token' || reason === 'token_expired' || reason === 'invalid_token') return new CloudTransportError('auth', reason ?? 'unauthorized');
@@ -249,11 +253,27 @@ function bodyBytes(body: RequestInit['body']): number {
 	return 0;
 }
 
+// A request body gzipped once the server has said it takes that (its
+// `Accept-Encoding` answer header, apps/cloud http.ts): a push of ops is
+// JSON full of repeated ids, about 5× smaller. Small bodies go as they are.
+// Answers need nothing here: Chromium asks for gzip and inflates it.
+const GZIP_MIN_BODY_BYTES = 4096;
+
+export function maybeGzipBody(init: RequestInit | undefined, serverTakesGzip: boolean): RequestInit | undefined {
+	if (!init || !serverTakesGzip || typeof init.body !== 'string' || Buffer.byteLength(init.body) < GZIP_MIN_BODY_BYTES) return init;
+	const headers = new Headers(init.headers);
+	if (headers.has('content-encoding')) return init;
+	headers.set('content-encoding', 'gzip');
+	return { ...init, headers, body: new Uint8Array(gzipSync(init.body)) };
+}
+
 export function createHttpCloudTransport(baseUrl: string, account: CloudAccount): CloudTransport {
 	// `desktop/<version> <platform>`: lets the server's log tell a release
 	// that misbehaves from one that does not.
 	const clientHeader = `desktop/${app.getVersion()} ${process.platform}`;
 	const wire = new Map<string, Wire>();
+	// Whether the server has said it takes gzipped request bodies.
+	let serverTakesGzip = false;
 	// The `snapshots` bucket ('snapshot_storage'), as the signed-in user.
 	const snapshots = createSnapshotBlobStore(account);
 
@@ -271,13 +291,17 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 					};
 				},
 				// Chromium's stack: system proxy + certificate store. The body is
-				// read here once (tRPC parses it from the copy) to count its bytes.
-				fetch: async (url, init) => {
+				// read here once (tRPC parses it from the copy) to count its bytes:
+				// sent as on the wire, received as inflated (Chromium hands over
+				// the plain body).
+				fetch: async (url, rawInit) => {
 					const href = String(url);
-					const requestId = headerValue(init?.headers as RequestInit['headers'], 'x-request-id');
+					const init = maybeGzipBody(rawInit as RequestInit | undefined, serverTakesGzip);
+					const requestId = headerValue(init?.headers, 'x-request-id');
 					const w = requestId ? wire.get(requestId) : undefined;
-					if (w) w.bytesSent = bodyBytes(init?.body as RequestInit['body']) + Buffer.byteLength(new URL(href).search);
-					const res = await net.fetch(href, init as RequestInit);
+					if (w) w.bytesSent = bodyBytes(init?.body) + Buffer.byteLength(new URL(href).search);
+					const res = await net.fetch(href, init);
+					if (/\bgzip\b/i.test(res.headers.get('accept-encoding') ?? '')) serverTakesGzip = true;
 					const buf = await res.arrayBuffer();
 					if (w) {
 						w.status = res.status;
@@ -364,6 +388,9 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			batchCommit: (input: BatchCommitInput) => call<BatchCommitResult>(PROCS.batchCommit, input),
 			batchAbort: (input: BatchAbortInput) => call<BatchAbortResult>(PROCS.batchAbort, input),
 			publishSnapshot: (input: PublishSnapshotInput) => call<PublishSnapshotResult>(PROCS.publishSnapshot, input),
+			// 'replica_storage': this desktop as the master publishes ready-made
+			// libraries; it never installs one (it has a library of its own).
+			publishReplica: (input: PublishReplicaInput) => call<PublishReplicaResult>(PROCS.publishReplica, input),
 		},
 		snapshots,
 		// The account's base ('snapshot_storage'): the bootstrap names the

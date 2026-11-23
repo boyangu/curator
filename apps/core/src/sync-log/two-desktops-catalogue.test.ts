@@ -19,21 +19,21 @@ import { join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { keysBetween, SCHEMA_VERSION, type StoredOp } from '@curator/protocol';
 import type { SpotifyPlaylist, SpotifyPlaylistTrack } from '@curator/spotify';
-import * as mut from '../library/mutators.js';
+import * as mut from '@curator/sync-core/library/mutators';
 import { normalizePath } from '../local/scanner.js';
 import { SpotifySync } from '../sync/spotify.js';
 import { writeFlac } from '../test-support/catalogue-fakes.js';
-import { memberOrder } from '../test-support/playlist-track.js';
-import { CloudTransportError, readCursor } from './client.js';
-import { heldCount, replayHeldOps } from './held.js';
-import { planIdentityMerges } from './identity.js';
-import { planStreamingDedupe } from './playlist-dedupe.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { INITIAL_PUSH_KEY } from './apply.js';
-import { initialPush } from './initial-push.js';
-import { FIRST_PULL_KEY } from './role.js';
-import { remoteTrackId, streamingPlaylistId } from './stable-ids.js';
-import { syncTrackArtistsByIdRaw } from '../library/artists.js';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
+import { CloudTransportError, readCursor } from '@curator/sync-core/sync-log/client';
+import { heldCount, replayHeldOps } from '@curator/sync-core/sync-log/held';
+import { planIdentityMerges } from '@curator/sync-core/sync-log/identity';
+import { planStreamingDedupe } from '@curator/sync-core/sync-log/playlist-dedupe';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { INITIAL_PUSH_KEY } from '@curator/sync-core/sync-log/apply';
+import { initialPush } from '@curator/sync-core/sync-log/initial-push';
+import { FIRST_PULL_KEY } from '@curator/sync-core/sync-log/role';
+import { remoteTrackId, streamingPlaylistId } from '@curator/sync-core/sync-log/stable-ids';
+import { syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
 import {
 	flacParse,
 	markPreOpLog,

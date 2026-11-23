@@ -1,12 +1,16 @@
-// Two bundles of the same product source:
+// Bundles of the same product source:
 //   dist/desktop.mjs — Node, the real better-sqlite3 (the reference run);
 //   dist/core.js     — one script for QuickJS: no Node, no npm at run time.
 //                      better-sqlite3 and node:* resolve to shim/, which talk
-//                      to the C host (host/host.c).
+//                      to the host (host/host.c);
+//   dist/core.hbc    — the same script for Hermes (host/host-hermes.cpp), as
+//                      Hermes bytecode: dist/core.hermes.js compiled by the
+//                      hermesc of the engine's own release (vendor/hermes).
 // `--why` prints what each node:* / npm import of the phone bundle is pulled in by.
 
 import { build } from 'esbuild';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,8 +28,10 @@ const common = {
 	logLevel: 'warning',
 	metafile: true,
 	// The workspace packages are TypeScript sources resolved through
-	// apps/core's node_modules.
+	// apps/core's node_modules — the spike's own files too (they import
+	// @curator/sync-core, which only workspace members link).
 	absWorkingDir: repo,
+	nodePaths: [join(repo, 'apps/core/node_modules')],
 	tsconfig: join(repo, 'apps/core/tsconfig.json'),
 };
 
@@ -45,10 +51,9 @@ const desktop = await build({
 if ((process.argv[1] ?? '').replaceAll('\\\\', '/').endsWith('/dist/desktop.mjs')) throw new Error('import dist/desktop.mjs, do not run it');` },
 });
 
-const core = await build({
+const phone = {
 	...common,
 	entryPoints: [join(root, 'src/entry.core.ts')],
-	outfile: join(out, 'core.js'),
 	platform: 'neutral',
 	mainFields: ['module', 'main'],
 	conditions: ['import', 'default'],
@@ -59,11 +64,29 @@ const core = await build({
 		'better-sqlite3': shim('better-sqlite3.ts'),
 		'node:crypto': shim('node-crypto.ts'),
 		'node:zlib': shim('node-zlib.ts'),
+		'node:fs': shim('node-fs.ts'),
+		'node:path': shim('node-path.ts'),
+		'node:url': shim('node-url.ts'),
 		'node:fs/promises': shim('node-fs-promises.ts'),
-		'spike-platform': shim('platform.qjs.ts'),
+		'spike-platform': shim('platform.host.ts'),
 	},
 	inject: [shim('globals.ts')],
-});
+};
+const core = await build({ ...phone, outfile: join(out, 'core.js') });
+
+// Hermes V1 compiles everything in the bundle but async generators (the
+// streamed snapshot load's inflater); esbuild lowers those alone, to
+// generators and promises. Block scoping is the compiler's, switched on:
+// without it `let` and `const` are function-scoped, and a closure made in a
+// loop would see the loop's last value.
+await build({ ...phone, outfile: join(out, 'core.hermes.js'), supported: { 'async-generator': false } });
+const hermesc = join(root, 'vendor', 'hermes', 'compiler', 'package', 'hermesc', process.platform === 'win32' ? 'win64-bin/hermesc.exe' : process.platform === 'darwin' ? 'osx-bin/hermesc' : 'linux64-bin/hermesc');
+if (existsSync(hermesc)) {
+	execFileSync(hermesc, ['-emit-binary', '-O', '-Xes6-block-scoping', '-w', '-out', join(out, 'core.hbc'), join(out, 'core.hermes.js')], { stdio: 'inherit' });
+	console.log(`core.hbc: ${(statSync(join(out, 'core.hbc')).size / 1024).toFixed(0)} KB of Hermes bytecode`);
+} else {
+	console.log('core.hbc: not built (no vendor/hermes: node scripts/fetch-vendor.mjs)');
+}
 
 const report = (name, meta) => {
 	const o = Object.values(meta.outputs)[0];

@@ -16,6 +16,7 @@ const USER_TABLES = [
 	'library_op_batch',
 	'library_op_fence',
 	'library_op_staged',
+	'library_replica',
 	'library_snapshot',
 	'request_log',
 	'spotify_grant',

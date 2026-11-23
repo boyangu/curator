@@ -11,8 +11,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
-import { log } from '../log.js';
-import { remintDeviceIdentityAt, type RemintResult } from '../sync-log/remint.js';
+import { log } from '@curator/sync-core/log';
+import { remintDeviceIdentityAt, type RemintResult } from '@curator/sync-core/sync-log/remint';
 import type { PendingRestore } from './types.js';
 
 const alog = log.for('backup-apply');

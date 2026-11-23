@@ -14,11 +14,11 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type { PlayRecordUpsert } from '@curator/shared/schema';
-import { projectAdoptedRecordings } from './claim-bind.js';
-import { PLAY_HEAL_KEY } from './play-heal.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { remoteTrackId } from './stable-ids.js';
-import { TRACK_META_BACKFILL_KEY } from './track-meta.js';
+import { projectAdoptedRecordings } from '@curator/sync-core/sync-log/claim-bind';
+import { PLAY_HEAL_KEY } from '@curator/sync-core/sync-log/play-heal';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
+import { TRACK_META_BACKFILL_KEY } from '@curator/sync-core/sync-log/track-meta';
 import { historyDump, TwoDesktopRig, type Desktop } from '../test-support/two-desktops.js';
 
 let rig: TwoDesktopRig;

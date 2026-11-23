@@ -13,7 +13,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { isWellFormedString } from '@curator/shared';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const mlog = log.for('mir');
 

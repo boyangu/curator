@@ -25,14 +25,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
-import { migrate } from '../db/migrate.js';
-import { createDb } from '../db/client.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb } from '@curator/sync-core/db/client';
 import { RekordboxImporter, type ImportTotals } from './importer.js';
 import type { RekordboxSidecar } from './sidecar.js';
 
 const emission = vi.hoisted(() => ({ on: true }));
-vi.mock('../library/mutators.js', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('../library/mutators.js')>();
+vi.mock('@curator/sync-core/library/mutators', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@curator/sync-core/library/mutators')>();
 	return {
 		...actual,
 		recordPlayAppended: (...args: Parameters<typeof actual.recordPlayAppended>) => {

@@ -31,7 +31,8 @@ import {
 import type { SegmentRecord } from '@curator/shared/schema';
 import { MIN_FULL_REANALYSIS_VERSION } from '../analyzer/queue.js';
 import type { AnalyzeResult, AnalyzerSegment } from '../analyzer/sidecar.js';
-import { stmt } from './stmt.js';
+import { stmt } from '@curator/sync-core/db/stmt';
+import { claimedHashes } from '@curator/sync-core/catalogue/peaks';
 
 type Raw = Database.Database;
 
@@ -204,37 +205,10 @@ export function readLocalTracksByHash(raw: Raw, hashes: readonly string[]): Map<
 	return byHash;
 }
 
-// ── file-less rows (2026-10-21 audit item 3) ────────────────────────────────
-// A device without the file — a fresh second desktop, a streaming-only row —
-// still knows which audio the account analysed for a recording: the
-// recording's `audio_hash` claims (every device that holds the file states
-// one). Exactly one hash names it. Several (a re-encoded or second copy
-// merged into the recording) name it only if the master device
-// (track-meta.ts masterDevice) claimed exactly one of them — its file is the
-// one the account's metadata comes from; otherwise the recording is
-// ambiguous and skipped, the same rule a track with two live files follows.
-
-export type ClaimedHash = { hash: string | null; ambiguous: boolean };
-
-export function claimedHashes(raw: Raw, recordingIds: readonly string[], master: string | null): Map<string, ClaimedHash> {
-	const out = new Map<string, ClaimedHash>();
-	for (let i = 0; i < recordingIds.length; i += IN_CHUNK) {
-		const chunk = recordingIds.slice(i, i + IN_CHUNK);
-		// `+map`: through the recording index (the claims map is ~100k rows).
-		const rows = raw.prepare(`SELECT recording_id AS rec, substr(parent_id, 12) AS hash, json_extract(value, '$.cell.clock.device') AS dev
-			FROM sync_state WHERE recording_id IN (${chunk.map(() => '?').join(',')}) AND +map = 'claims'
-				AND parent_id >= 'audio_hash:' AND parent_id < 'audio_hash;'`).all(...chunk) as Array<{ rec: string; hash: string; dev: string | null }>;
-		const by = new Map<string, Array<{ hash: string; dev: string | null }>>();
-		for (const r of rows) { let l = by.get(r.rec); if (!l) by.set(r.rec, (l = [])); l.push(r); }
-		for (const [rec, list] of by) {
-			const all = new Set(list.map((c) => c.hash));
-			if (all.size === 1) { out.set(rec, { hash: [...all][0]!, ambiguous: false }); continue; }
-			const mine = new Set(list.filter((c) => master !== null && c.dev === master).map((c) => c.hash));
-			out.set(rec, mine.size === 1 ? { hash: [...mine][0]!, ambiguous: false } : { hash: null, ambiguous: true });
-		}
-	}
-	return out;
-}
+// ── file-less rows ──────────────────────────────────────────────────────────
+// Which audio the account analysed for a recording this device holds no file
+// of: its claimed hash (@curator/sync-core catalogue/peaks.ts claimedHashes,
+// shared with the phone, which reads peaks the same way).
 
 const HAS_LIVE_FILE = `EXISTS (SELECT 1 FROM source_link s WHERE s.track_id = t.id AND s.source = 'local' AND s.missing_at IS NULL)`;
 

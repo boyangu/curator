@@ -54,15 +54,11 @@
 // extend without breaking older readers.
 
 import { promises as fsp } from 'node:fs';
+import { CPK_HEADER_SIZE_V1, CPK_HEADER_SIZE_V2, CPK_MAGIC, CPK_NUM_BANDS, CPK_VERSION } from '@curator/sync-core/catalogue/peaks';
 
-export const CPK_MAGIC = Buffer.from('CURPEAKS', 'ascii');
-// Current writer version. v3 carries num_channels + peak/rms; the decoder
-// still reads v1 (mono peak) and v2 (mono/stereo peak).
-export const CPK_VERSION = 3;
-export const CPK_NUM_BANDS = 3;
-// v1 header is 20 bytes; v2/v3 insert num_channels (1 byte) at offset 10.
-export const CPK_HEADER_SIZE_V1 = 20;
-export const CPK_HEADER_SIZE_V2 = 21;
+// The header's constants live with the shared header check (the phone reads
+// peaks too); the codec stays here.
+export { CPK_HEADER_SIZE_V1, CPK_HEADER_SIZE_V2, CPK_MAGIC, CPK_NUM_BANDS, CPK_VERSION };
 
 export interface PeaksHeader {
 	version: number;

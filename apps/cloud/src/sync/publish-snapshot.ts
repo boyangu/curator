@@ -25,12 +25,14 @@
 // them the master's `stateSha256` to compare with their own digest at that
 // seq). The server never folds anything.
 //
-// Retention: the newest KEEP snapshots. The snapshot is the account's base
+// Retention: the newest KEEP snapshots, and the one the newest ready-made
+// replica stands on (publish-replica.ts). The snapshot is the account's base
 // (sql/0009, base.ts): the oldest kept one bounds how far compaction may
 // delete the log, so keeping three means the base trails the head by two
-// publishes. Rows are pruned only here, so the parts they free reach the
-// one device that can delete them: `superseded`, never a path a kept row
-// lists.
+// publishes — or stays at the replica's snapshot, so a device that installs
+// the replica can still pull from its seq. Rows are pruned only by a
+// publish, so the parts they free reach the one device that can delete
+// them: `superseded`, never a path a kept snapshot or replica lists.
 
 import { snapshotPartPath, SYNC_FEATURES, type PublishSnapshotInput, type PublishSnapshotResult, type SnapshotManifest } from '@curator/protocol';
 import { gateDevice, type Caller } from '../account/device-gate.js';
@@ -43,12 +45,13 @@ import { readMaster } from './master.js';
 
 export const SNAPSHOT_KEEP = 3;
 
-// Serialises a user's publishes, so the retention below reads a set no other
-// publish is changing.
+// Serialises a user's publishes, snapshots and replicas alike, so the
+// retention below reads a set no other publish is changing.
 export const SNAPSHOT_LOCK = `select pg_advisory_xact_lock(hashtextextended('library_snapshot:' || (select auth.uid())::text, 0))`;
 
-// Pure: the manifest's own consistency against the caller.
-export function assertManifest(userId: string, m: SnapshotManifest): void {
+// Pure: the manifest's own consistency against the caller (a snapshot's or
+// a replica's: the parts follow the same rule).
+export function assertManifest(userId: string, m: Pick<SnapshotManifest, 'parts' | 'totalBytes'>): void {
 	const paths = new Set<string>();
 	let total = 0;
 	for (const p of m.parts) {
@@ -59,26 +62,43 @@ export function assertManifest(userId: string, m: SnapshotManifest): void {
 	if (total !== m.totalBytes) throw new CloudError('PRECONDITION_FAILED', 'snapshot_part_invalid');
 }
 
-const partPaths = (storage: string | null): string[] => (storage ? (JSON.parse(storage) as SnapshotManifest).parts.map((p) => p.path) : []);
+// Every part is in the caller's prefix with its stated size, read from
+// storage.objects under the caller's RLS (`snapshot_part_missing`).
+export async function assertPartsUploaded(tx: Queryable, parts: ReadonlyArray<{ path: string; bytes: number }>): Promise<void> {
+	const objects = await tx.query<{ name: string; size: unknown }>(
+		`select o.name, (o.metadata ->> 'size')::float8 as size from storage.objects o
+		where o.bucket_id = 'snapshots' and o.name in (select jsonb_array_elements_text($1::text::jsonb))`,
+		[JSON.stringify(parts.map((p) => p.path))],
+	);
+	const sizes = new Map(objects.map((o) => [o.name, o.size === null ? null : num(o.size)]));
+	if (parts.some((p) => sizes.get(p.path) !== p.bytes)) throw new CloudError('PRECONDITION_FAILED', 'snapshot_part_missing');
+}
+
+// The part paths a stored manifest (a snapshot's or a replica's) lists.
+export const partPaths = (storage: string | null): string[] => (storage ? (JSON.parse(storage) as { parts: Array<{ path: string }> }).parts.map((p) => p.path) : []);
 
 // `candidates` minus every part a stored manifest still lists: content
 // addressing lets two snapshots share a part (an unchanged leading stretch
-// of the JSON gzips to the same bytes), and that part must stay.
-async function unreferenced(tx: Queryable, candidates: Iterable<string>): Promise<string[]> {
+// of the JSON gzips to the same bytes), and that part must stay. Replicas'
+// parts live in the same prefix under the same rule.
+export async function unreferenced(tx: Queryable, candidates: Iterable<string>): Promise<string[]> {
 	const freed = new Set(candidates);
 	if (freed.size === 0) return [];
 	const kept = await tx.query<{ storage: string }>(
-		`select storage::text as storage from curator.library_snapshot where user_id = (select auth.uid()) and storage is not null`,
+		`select storage::text as storage from curator.library_snapshot where user_id = (select auth.uid()) and storage is not null
+		union all
+		select storage::text from curator.library_replica where user_id = (select auth.uid())`,
 	);
 	for (const r of kept) for (const p of partPaths(r.storage)) freed.delete(p);
 	return [...freed].sort();
 }
 
-// Deletes what retention drops (every row but the newest `keep`); answers
-// how many rows went and the parts they freed. Only older rows go, so the
-// account's oldest kept seq only ever rises and the base stays at or below
-// it (base.ts).
-async function prune(tx: Queryable, keep: number): Promise<{ pruned: number; superseded: string[] }> {
+// Deletes what retention drops (every row but the newest `keep` and the
+// newest replica's snapshot); answers how many rows went and the parts they
+// freed. Only rows older than the newest `keep` go, and the pinned one only
+// once a newer replica unpins it, so the account's oldest kept seq only ever
+// rises and the base stays at or below it (base.ts).
+export async function pruneSnapshots(tx: Queryable, keep: number): Promise<{ pruned: number; superseded: string[] }> {
 	const dropped = await tx.query<{ storage: string | null }>(
 		`with ranked as (
 			select snapshot_seq, row_number() over (order by snapshot_seq desc) as rn
@@ -88,6 +108,7 @@ async function prune(tx: Queryable, keep: number): Promise<{ pruned: number; sup
 		delete from curator.library_snapshot s
 		using ranked r
 		where s.user_id = (select auth.uid()) and s.snapshot_seq = r.snapshot_seq and r.rn > $1::int
+			and s.snapshot_seq is distinct from (select max(p.snapshot_seq) from curator.library_replica p where p.user_id = (select auth.uid()))
 		returning s.storage::text as storage`,
 		[String(keep)],
 	);
@@ -104,13 +125,7 @@ export async function publishSnapshot(db: Db, audit: AuditEmit, userId: string, 
 		if (input.snapshotSeq > (await headSeq(tx, 'visible'))) throw new CloudError('PRECONDITION_FAILED', 'snapshot_ahead');
 
 		const paths = m.parts.map((p) => p.path);
-		const objects = await tx.query<{ name: string; size: unknown }>(
-			`select o.name, (o.metadata ->> 'size')::float8 as size from storage.objects o
-			where o.bucket_id = 'snapshots' and o.name in (select jsonb_array_elements_text($1::text::jsonb))`,
-			[JSON.stringify(paths)],
-		);
-		const sizes = new Map(objects.map((o) => [o.name, o.size === null ? null : num(o.size)]));
-		if (m.parts.some((p) => sizes.get(p.path) !== p.bytes)) throw new CloudError('PRECONDITION_FAILED', 'snapshot_part_missing');
+		await assertPartsUploaded(tx, m.parts);
 
 		await tx.query(SNAPSHOT_LOCK);
 		const [latest] = await tx.query<{ seq: unknown; same: boolean }>(
@@ -131,7 +146,7 @@ export async function publishSnapshot(db: Db, audit: AuditEmit, userId: string, 
 			values ($1::bigint, $2::text::jsonb, $3, $4)`,
 			[String(input.snapshotSeq), JSON.stringify(m), m.stateSha256, input.deviceId],
 		);
-		const { pruned, superseded } = await prune(tx, keep);
+		const { pruned, superseded } = await pruneSnapshots(tx, keep);
 		return { status: 'stored' as const, latestSeq: input.snapshotSeq, superseded, pruned };
 	});
 	if (result.status === 'stored') {

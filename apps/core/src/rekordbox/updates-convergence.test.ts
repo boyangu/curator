@@ -17,9 +17,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { createDb, type Db } from '../db/client.js';
-import { memberOrder } from '../test-support/playlist-track.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { createDb, type Db } from '@curator/sync-core/db/client';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
 import { RekordboxExporter, type ExportFlags, type RekordboxExportEvent } from './exporter.js';
 import type { RekordboxSidecar, StaleRelation, WriteOp, WriteOpResult } from './sidecar.js';
 

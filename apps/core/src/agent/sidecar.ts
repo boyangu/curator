@@ -6,7 +6,7 @@
 // Protocol contract: @curator/agent-core (protocol.ts), shared by both ends.
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import {
 	AGENT_PROTOCOL,
 	AGENT_SIDECAR_NAME,

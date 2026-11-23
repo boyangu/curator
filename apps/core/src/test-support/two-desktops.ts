@@ -19,20 +19,20 @@ import { basename, join } from 'node:path';
 import type Database from 'better-sqlite3';
 import { it } from 'vitest';
 import { getSourceCapabilities, type StreamingSource } from '@curator/shared';
-import { createDb, type Db } from '../db/client.js';
-import { migrate } from '../db/migrate.js';
+import { createDb, type Db } from '@curator/sync-core/db/client';
+import { migrate } from '@curator/sync-core/db/migrate';
 import { audioHash } from '../ingest/audio-hash.js';
 import type { ParseFn, ParseResult } from '../ingest/types.js';
-import { syncTrackArtistsByIdRaw } from '../library/artists.js';
+import { syncTrackArtistsByIdRaw } from '@curator/sync-core/library/artists';
 import type { ScanProgress } from '../local/scanner.js';
 import { createCoreService, type CoreService, type CoreServiceOptions } from '../service.js';
 import type { StreamingSourceAdapter } from '../sources/adapter.js';
-import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from '../sync-log/apply.js';
-import { readCursor } from '../sync-log/client.js';
-import { canonicalOverrides, compareDumps, dumpLibrary, type LibraryDump, type TableReport } from '../sync-log/dump.js';
-import { recordingIdForTrack } from '../sync-log/recording-id.js';
-import { FakeCloud, type FakeTransport } from './fake-cloud.js';
-import { TmpDir } from './tmp.js';
+import { INITIAL_PUSH_KEY, RECORDS_COMPLETE_KEY } from '@curator/sync-core/sync-log/apply';
+import { readCursor } from '@curator/sync-core/sync-log/client';
+import { canonicalOverrides, compareDumps, dumpLibrary, type LibraryDump, type TableReport } from '@curator/sync-core/sync-log/dump';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { FakeCloud, type FakeTransport } from '@curator/sync-core/test-support/fake-cloud';
+import { TmpDir } from '@curator/sync-core/test-support/tmp';
 
 type Raw = Database.Database;
 
@@ -130,6 +130,9 @@ export type DesktopOpts = {
 	// The master's snapshot publish: cadence knobs, or a builder of its own
 	// (default: the inline builder, as tests and the CLI run it).
 	snapshot?: NonNullable<CoreServiceOptions['cloud']>['snapshot'];
+	// The library put in place at `path` (which does not exist yet) instead
+	// of migrated and seeded: a new device installing a replica.
+	install?: (path: string, transport: FakeTransport) => Promise<void>;
 };
 
 export class Desktop {
@@ -235,15 +238,19 @@ export class TwoDesktopRig {
 		const musicDir = join(dir, 'music');
 		mkdirSync(musicDir, { recursive: true });
 		const path = join(dir, 'curator.db');
-		migrate(path);
-		const { sqlite } = createDb(path);
-		try {
-			seedCatalogue(sqlite, opts.catalogue ?? TRACKS, opts.artists);
-			await opts.seed?.(sqlite, { dir, musicDir });
-		} finally {
-			sqlite.close();
+		const transport = this.cloud.transport(USER);
+		if (opts.install) await opts.install(path, transport);
+		else {
+			migrate(path);
+			const { sqlite } = createDb(path);
+			try {
+				seedCatalogue(sqlite, opts.catalogue ?? TRACKS, opts.artists);
+				await opts.seed?.(sqlite, { dir, musicDir });
+			} finally {
+				sqlite.close();
+			}
 		}
-		const d = new Desktop(this, name, path, dir, musicDir, this.cloud.transport(USER), opts.parseAudio, opts.snapshot);
+		const d = new Desktop(this, name, path, dir, musicDir, transport, opts.parseAudio, opts.snapshot);
 		this.desktops.push(d);
 		return d;
 	}

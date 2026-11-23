@@ -1,6 +1,7 @@
 // The real server code (apps/cloud: migrations, RLS, the tRPC router, the
 // snapshot checks) on an in-process PGlite, listening on this machine, with
-// one account holding the dataset's snapshot as its master published it.
+// one account holding the dataset's snapshot as its master published it,
+// and its ready-made replica when scripts/build-replica.mjs built one.
 // What the driver's `sync` run talks to — from Node directly, from a phone
 // through `adb reverse tcp:<port> tcp:<port>`.
 //
@@ -11,7 +12,7 @@
 //
 // It writes <work>/<name>/server.json (the URL, the user and a token) and
 // answers until `POST /control/exit`. Beside the API:
-//   GET  /storage/<path>   a snapshot part's bytes (the bucket holds only
+//   GET  /storage/<path>   a snapshot or replica part's bytes (the bucket holds only
 //                          the object rows in this harness; the bytes are here)
 //   POST /control/tail     pushes --ops into the account's log as the master
 //   POST /control/exit     stops the server
@@ -19,11 +20,11 @@
 // positions. Nothing real is reached: no Supabase, no network beyond loopback.
 
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, resolve } from 'node:path';
-import { createTestApp, masterOp, uploadBlob } from '../../../../apps/cloud/src/test/harness.js';
-import { MAX_PUSH_BYTES, MAX_PUSH_OPS, snapshotPartPath, type Op, type SnapshotManifest } from '../../../../packages/protocol/src/index.js';
+import { createTestApp, entitle, masterOp, uploadBlob } from '../../../../apps/cloud/src/test/harness.js';
+import { CATALOGUE_UNIT_SCHEMA, catalogueBlobPath, MAX_CATALOGUE_PUT_ITEMS, MAX_PUSH_BYTES, MAX_PUSH_OPS, snapshotPartPath, type CatalogueItem, type Op, type ReplicaManifest, type SnapshotManifest } from '../../../../packages/protocol/src/index.js';
 
 const args = process.argv.slice(2);
 const arg = (name: string, fallback?: string): string | undefined => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : fallback; };
@@ -31,9 +32,17 @@ const port = Number(arg('port', '8799'));
 const dir = join(resolve(arg('work', 'c:/tmp/curator-mobile-spike')!), arg('name', 'main')!);
 const opsFile = arg('ops');
 
-const app = await createTestApp({ catalogue: null });
-const userId = await app.createUser();
-const token = await app.sign(userId, { exp: '24h' });
+// The account's id is fixed (--user, default the dev account) so a replica
+// built ahead by scripts/build-replica.mjs is the account's own, as a master
+// builds it: a device installs it with no rebinding.
+const DEV_USER = '00000000-0000-4000-8000-00000000c0de';
+// --peaks <dir> (scripts/prepare-peaks.mjs): the analysis catalogue on, as
+// production runs it, holding those waveforms; else off.
+const peaksDir = arg('peaks');
+const app = await createTestApp(peaksDir ? {} : { catalogue: null });
+const userId = await app.createUser(arg('user', DEV_USER));
+// Long enough for a phone left installed between dev sessions.
+const token = await app.sign(userId, { exp: '30d' });
 const api = app.client(token);
 
 // The master and its snapshot, as a desktop leaves an account.
@@ -56,6 +65,59 @@ const head = async (): Promise<number> => (await app.pg.query<{ n: number | null
 const snapshotSeq = await head();
 const published = await api.sync.publishSnapshot.mutate({ deviceId: master, snapshotSeq, manifest: { ...given.manifest, parts } });
 if (published.status !== 'stored') throw new Error(`the snapshot was not stored: ${published.status}`);
+
+// The replica, published as the master would (sync.publishReplica), its
+// parts re-filed under this account's prefix by their hashes.
+let replicaSeq: number | null = null;
+if (existsSync(join(dir, 'replica', 'manifest.json'))) {
+	const built = JSON.parse(readFileSync(join(dir, 'replica', 'manifest.json'), 'utf8')) as { snapshotSeq: number; manifest: ReplicaManifest };
+	if (built.snapshotSeq !== snapshotSeq) throw new Error(`the replica was built at seq ${built.snapshotSeq}; this account's snapshot is at ${snapshotSeq} (build-replica.mjs --seq)`);
+	const rparts: ReplicaManifest['parts'] = [];
+	for (const p of built.manifest.parts) {
+		const bytes = readFileSync(join(dir, 'replica', `${p.sha256}.cgz`));
+		const path = snapshotPartPath(userId, p.sha256);
+		await uploadBlob(app.pg, userId, path, bytes.length, 'snapshots');
+		blobs.set(path, bytes);
+		rparts.push({ ...p, path });
+	}
+	const r = await api.sync.publishReplica.mutate({ deviceId: master, snapshotSeq, manifest: { ...built.manifest, parts: rparts } });
+	if (r.status !== 'stored') throw new Error(`the replica was not stored: ${r.status}`);
+	replicaSeq = snapshotSeq;
+}
+
+// The waveforms, as the master's catalogue uploader leaves them: each .cpk in
+// the `catalogue` bucket under the account's prefix by its sha256, then one
+// peaks item per tier naming it. The account is entitled, as a member is.
+let peaksCount = 0;
+if (peaksDir) {
+	await entitle(app.pg, userId);
+	const index = JSON.parse(readFileSync(join(peaksDir, 'index.json'), 'utf8')) as Array<{ hash: string; durationSec: number; tiers: Array<'hi' | 'lo'> }>;
+	const items: CatalogueItem[] = [];
+	for (const e of index) {
+		if (!(e.durationSec > 0)) continue;
+		// The lo tier only: production runs stage D-a, whose policy takes
+		// `peaks:lo` (apps/cloud catalogue/policy.ts); hi comes with D-b.
+		for (const tier of e.tiers.filter((t) => t === 'lo')) {
+			const bytes = readFileSync(join(peaksDir, tier, `${e.hash.replace(':', '_')}.cpk`));
+			const sha256 = createHash('sha256').update(bytes).digest('hex');
+			const path = catalogueBlobPath(userId, 'peaks', sha256);
+			await uploadBlob(app.pg, userId, path, bytes.length, 'catalogue').catch((err: unknown) => {
+				// Content-addressed: two tracks with one waveform share the blob.
+				if (!String(err).includes('duplicate key')) throw err;
+			});
+			blobs.set(path, bytes);
+			items.push({
+				audioHash: e.hash, version: [2, 5, 0], unitSchema: CATALOGUE_UNIT_SCHEMA.peaks, durationSec: e.durationSec, licence: null,
+				unit: 'peaks', variant: tier, data: { blob: { path, sha256, bytes: bytes.length }, cpkVersion: bytes[8]! },
+			});
+		}
+	}
+	for (let i = 0; i < items.length; i += MAX_CATALOGUE_PUT_ITEMS) {
+		const r = await api.catalogue.put.mutate({ deviceId: master, items: items.slice(i, i + MAX_CATALOGUE_PUT_ITEMS) });
+		if (r.rejected.length > 0) throw new Error(`the catalogue refused ${r.rejected.length} waveforms: ${JSON.stringify(r.rejected[0])}`);
+	}
+	peaksCount = index.length;
+}
 
 // The later ops, pushed as the master in calls the server takes.
 async function pushTail(): Promise<{ pushed: number; accepted: number; rejected: number; head: number }> {
@@ -85,9 +147,11 @@ const server = createServer((req, res) => {
 	req.on('end', () => {
 		void (async () => {
 			const url = req.url ?? '/';
-			const send = (status: number, body: Buffer | string, type = 'application/json'): void => {
+			// `encoding`: the API's own Content-Encoding, passed on with its body
+			// (it gzips large answers for a client that asks, as Android's HTTP does).
+			const send = (status: number, body: Buffer | string, type = 'application/json', encoding?: string | null): void => {
 				const buf = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
-				res.writeHead(status, { 'content-type': type, 'content-length': buf.length });
+				res.writeHead(status, { 'content-type': type, 'content-length': buf.length, ...(encoding ? { 'content-encoding': encoding } : {}) });
 				res.end(buf);
 			};
 			try {
@@ -106,7 +170,7 @@ const server = createServer((req, res) => {
 				for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string' && k !== 'content-length' && k !== 'connection') headers.set(k, v);
 				const body = Buffer.concat(chunks);
 				const answer = await app.handler(new Request(`http://127.0.0.1:${port}${url}`, { method: req.method, headers, ...(req.method === 'POST' ? { body } : {}) }));
-				send(answer.status, Buffer.from(await answer.arrayBuffer()), answer.headers.get('content-type') ?? 'application/json');
+				send(answer.status, Buffer.from(await answer.arrayBuffer()), answer.headers.get('content-type') ?? 'application/json', answer.headers.get('content-encoding'));
 			} catch (err) {
 				send(500, JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
 			}
@@ -115,5 +179,5 @@ const server = createServer((req, res) => {
 });
 server.listen(port, '127.0.0.1', () => {
 	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, userId, token, snapshotSeq }, null, 1));
-	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${opsFile ? ', later ops on request' : ''}`);
+	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${replicaSeq !== null ? `, replica at seq ${replicaSeq}` : ''}${opsFile ? ', later ops on request' : ''}${peaksCount ? `, waveforms for ${peaksCount} recordings` : ''}`);
 });

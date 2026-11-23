@@ -37,8 +37,8 @@ import type {
 	FeedEventsResult,
 	FeedRecentResult,
 } from '@curator/protocol';
-import { keyToCamelot } from '../enrich/keys.js';
-import { log } from '../log.js';
+import { keyToCamelot } from '@curator/sync-core/enrich/keys';
+import { log } from '@curator/sync-core/log';
 import type { FeedItemDraft, FeedOrigin, FeedProducer, FeedProducerContext, FeedProducerResult, FeedRefreshKind, FeedTrackRef } from './types.js';
 
 const flog = log.for('feed');

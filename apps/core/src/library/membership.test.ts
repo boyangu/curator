@@ -8,8 +8,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from '../db/migrate.js';
-import { memberOrder } from '../test-support/playlist-track.js';
+import { migrate } from '@curator/sync-core/db/migrate';
+import { memberOrder } from '@curator/sync-core/test-support/playlist-track';
 import { MembershipClassifier } from './membership.js';
 
 let dir: string;

@@ -19,7 +19,7 @@
 import type { CatalogCheckReport, CatalogProvider, CatalogProviderPause, CatalogReadCadenceChoices, CatalogTracker, CatalogTrackingKind, CatalogWorkerDueResult, CatalogWorkerTask, CloudService } from '@curator/protocol';
 import { BandcampTracker, BeatportTracker, DeezerTracker, SpotifyTracker, SpotifyUserPlaylistTracker, TrackerRateLimitedError, type FetchLike, type TrackerAdapter } from '@curator/catalog-readers';
 import { gatedFetch, isSpotifyQuotaBackoff, spotifyBackoffUntil } from '@curator/spotify';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const wlog = log.for('catalog-worker');
 

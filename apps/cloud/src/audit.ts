@@ -74,6 +74,9 @@ export const AUDIT_KINDS = [
 	// 'snapshot_storage' (src/sync/publish-snapshot.ts): the master indexed a
 	// Storage snapshot ({ snapshotSeq, bytes, parts, pruned, superseded }).
 	'snapshot_published',
+	// 'replica_storage' (src/sync/publish-replica.ts): the master indexed a
+	// ready-made library ({ snapshotSeq, schema, bytes, rawBytes, parts, pruned, superseded }).
+	'replica_published',
 	// sync.push / batchPush accepted source ops (library_track set-meta /
 	// set-attrs / set-analysis, album set-meta) from a device that is not the account's
 	// master ({ procedure, master, byKind }). Audit only: the ops are kept.
@@ -145,6 +148,7 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	batch_aborted: 'info',
 	batch_expired: 'warn',
 	snapshot_published: 'info',
+	replica_published: 'info',
 	source_from_non_master: 'info',
 	ops_compacted: 'info',
 	base_without_snapshot: 'warn',

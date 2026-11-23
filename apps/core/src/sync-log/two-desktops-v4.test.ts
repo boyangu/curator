@@ -24,10 +24,10 @@ import { SCHEMA_VERSION, schemaVersionStatus, type StoredOp } from '@curator/pro
 import { SqliteFeedStore } from '../feed/store.js';
 import { syncedItemsFor } from '../feed/sync.js';
 import type { FeedItemDraft } from '../feed/types.js';
-import { syncTrackAlbumsRaw } from '../library/albums.js';
-import { heldCount, holdOps, replayHeldOps } from './held.js';
-import { recordingIdForTrack } from './recording-id.js';
-import { remoteTrackId } from './stable-ids.js';
+import { syncTrackAlbumsRaw } from '@curator/sync-core/library/albums';
+import { heldCount, holdOps, replayHeldOps } from '@curator/sync-core/sync-log/held';
+import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
+import { remoteTrackId } from '@curator/sync-core/sync-log/stable-ids';
 import { markPreOpLog, TwoDesktopRig, tick, type Desktop } from '../test-support/two-desktops.js';
 import { RekordboxExporter } from '../rekordbox/exporter.js';
 import type { WriteOp } from '../rekordbox/sidecar.js';
@@ -375,7 +375,7 @@ describe('playlist details', () => {
 		b.raw.prepare(`UPDATE playlist SET position = 9 WHERE id = 'pl1'`).run();
 		// Pull first, as a write landing between B's drain and its pull would.
 		b.raw.prepare(`DELETE FROM playlist_attrs_dirty`).run();
-		const { applyOps } = await import('./apply.js');
+		const { applyOps } = await import('@curator/sync-core/sync-log/apply');
 		const pending = rig.cloud.log.filter((o) => o.entity === 'playlist' && o.kind === 'set-attrs');
 		applyOps(b.raw, pending.map(({ seq: _s, user_id: _u, received_at: _r, ...op }) => op));
 		expect(b.one(`SELECT position FROM playlist WHERE id = 'pl1'`)).toBe(9);
@@ -447,7 +447,7 @@ describe('remixer role merge (a real-library case, "Night Tide")', () => {
 		// …while the master still shows what it ingested.
 		expect(JSON.parse(a.one<string>(`SELECT artists FROM track WHERE id = 'trk-k'`))).toEqual(credits);
 		// The upgrade's one-time re-derive (migrate.ts → queueRoleMergeRederive).
-		const { queueRoleMergeRederive, ROLE_MERGE_REDERIVE_KEY } = await import('../library/artist-alias.js');
+		const { queueRoleMergeRederive, ROLE_MERGE_REDERIVE_KEY } = await import('@curator/sync-core/library/artist-alias');
 		a.raw.prepare(`DELETE FROM app_setting WHERE key = ?`).run(ROLE_MERGE_REDERIVE_KEY);
 		expect(queueRoleMergeRederive(a.raw)).toBeGreaterThan(0);
 		await rig.settle();

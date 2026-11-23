@@ -11,7 +11,10 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const srcRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..', 'src');
+const coreRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+// packages/sync-core is core's sync client and library writers, moved out so
+// the phone runs them too: the same rule holds there.
+const srcRoots = [join(coreRoot, 'src'), join(coreRoot, '..', '..', 'packages', 'sync-core', 'src')];
 
 const CONSOLE_RE = /\bconsole\.(log|warn|error|info|debug)\(/;
 const EXEMPT = new Set([
@@ -28,7 +31,7 @@ function* walk(dir) {
 }
 
 const failures = [];
-for (const file of walk(srcRoot)) {
+for (const srcRoot of srcRoots) for (const file of walk(srcRoot)) {
 	const rel = relative(srcRoot, file);
 	if (EXEMPT.has(rel)) continue;
 	const text = readFileSync(file, 'utf8');

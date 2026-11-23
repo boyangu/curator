@@ -21,7 +21,7 @@ import type { CatalogClaim } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { FeedItem, FeedTrackRef, SourceLinkDraft } from '../feed/types.js';
 import type { FeedStore } from '../feed/store.js';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 
 const flog = log.for('catalog-facts-up');
 

@@ -8,7 +8,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { DriveClient, SMALL_UPLOAD_MAX, type DriveFile } from '@curator/google-drive';
-import { log } from '../../log.js';
+import { log } from '@curator/sync-core/log';
 import { LIBRARY_ROOT, type BackupTarget, type GetObjectOptions, type ObjectSource, type PutObjectOptions, type RemoteFileInfo, type RemoteObjectInfo } from './types.js';
 
 const tlog = log.for('backup-gdrive');

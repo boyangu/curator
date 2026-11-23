@@ -11,7 +11,7 @@ import {
 	type TrackOverrides,
 } from '@curator/shared/schema';
 import { cueUnitKey, searchFold, splitArtistCredit, type ArtistProtect, type CueUnit, type FieldsSeen, type SyncFieldKey } from '@curator/shared';
-import type { Db } from '../db/client.js';
+import type { Db } from '@curator/sync-core/db/client';
 
 // Translate a pulled FieldsSeen map into a track-table patch: canonical
 // columns + the *_ascii search mirrors, plus (optionally) clearing the

@@ -9,7 +9,7 @@
 // panel states, never errors.
 
 import { randomUUID } from 'node:crypto';
-import { log } from '../log.js';
+import { log } from '@curator/sync-core/log';
 import type { AgentSidecarManager } from './sidecar.js';
 import type { AgentStore, AgentSessionDetail, AgentSessionSummary } from './store.js';
 import type { AgentTool, AgentToolCtx } from './tools.js';
