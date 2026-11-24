@@ -115,7 +115,9 @@ async function main() {
 			CURATOR_SPOTIFY_CLIENT_ID: env.CURATOR_SPOTIFY_CLIENT_ID,
 		};
 		run('pnpm', ['install', '--frozen-lockfile', '--filter', '@curator/mobile...'], { cwd: dir, env: buildEnv, shell: process.platform === 'win32' });
-		run(process.execPath, [join(mobile, 'scripts', 'check.mjs'), `-PcuratorVersion=${version}`], { cwd: mobile, env: buildEnv });
+		// No daemons: one left running from the export holds its files (its JDK
+		// among them) and the export can't be removed afterwards.
+		run(process.execPath, [join(mobile, 'scripts', 'check.mjs'), `-PcuratorVersion=${version}`, '--no-daemon', '-Pkotlin.compiler.execution.strategy=in-process'], { cwd: mobile, env: buildEnv });
 
 		step('verify the APK');
 		const built = join(mobile, 'android', 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk');
