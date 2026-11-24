@@ -29,6 +29,11 @@ export const SQLITE_VERSION = '3.53.1';
 // is GNU tar, which reads `C:` in a path as a remote host.
 const tar = process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
 
+// A zip: Windows' bsdtar reads it, GNU tar (Linux, CI) does not; unzip does.
+const unzip = (file, dir) => process.platform === 'win32'
+	? execFileSync(tar, ['-xf', file, '-C', dir], { stdio: 'inherit' })
+	: execFileSync('unzip', ['-q', '-o', file, '-d', dir], { stdio: 'inherit' });
+
 const sha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 
 // The archive at `file`, from the spike's copy when it matches, else the url.
@@ -60,7 +65,7 @@ if (!existsSync(join(sqliteDir, 'sqlite3.c'))) {
 	const name = 'sqlite-amalgamation-3530100';
 	await pinned(`https://sqlite.org/2026/${name}.zip`, '36ad6e7f38540a3b21a2ac36340833f0a9e426bc1c752751c3ba669466827eae', join(vendor, 'sqlite.zip'), join(spikeVendor, 'sqlite.zip'));
 	rmSync(join(vendor, name), { recursive: true, force: true });
-	execFileSync(tar, ['-xf', join(vendor, 'sqlite.zip'), '-C', vendor], { stdio: 'inherit' });
+	unzip(join(vendor, 'sqlite.zip'), vendor);
 	rmSync(sqliteDir, { recursive: true, force: true });
 	await renameRetried(join(vendor, name), sqliteDir);
 }
@@ -86,7 +91,7 @@ if (process.platform === 'win32' && !existsSync(join(vendor, 'jdk', 'bin', 'java
 	const name = 'jdk-21.0.13.1+2';
 	await pinned('https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk_x64_windows_hotspot_21.0.13.1_2.zip', 'bbebea1469996b276683c9299c227b294f85c847039c82633218186a4ad4fbf2', join(vendor, 'jdk.zip'), join(spikeVendor, 'jdk.zip'));
 	rmSync(join(vendor, name), { recursive: true, force: true });
-	execFileSync(tar, ['-xf', join(vendor, 'jdk.zip'), '-C', vendor], { stdio: 'inherit' });
+	unzip(join(vendor, 'jdk.zip'), vendor);
 	await renameRetried(join(vendor, name), join(vendor, 'jdk'));
 }
 
