@@ -23,6 +23,7 @@ import app.curator.mobile.data.Track
 import app.curator.mobile.ui.chrome.BottomChrome
 import app.curator.mobile.ui.chrome.MiniPlayer
 import app.curator.mobile.ui.home.HomeScreen
+import app.curator.mobile.ui.library.LibraryScreen
 import app.curator.mobile.ui.list.ListActionsPage
 import app.curator.mobile.ui.list.RowFieldsPage
 import app.curator.mobile.ui.list.TrackListScreen
@@ -30,6 +31,7 @@ import app.curator.mobile.ui.nav.Nav
 import app.curator.mobile.ui.nav.Screen
 import app.curator.mobile.ui.nav.StackHost
 import app.curator.mobile.ui.nav.Tab
+import app.curator.mobile.ui.settings.SettingsPage
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
 import app.curator.mobile.ui.track.TrackActionsPage
@@ -65,7 +67,8 @@ fun CuratorUi(model: AppModel) {
 	StackHost(nav) { screen ->
 		when (screen) {
 			is Screen.TabRoot -> when (screen.tab) {
-				Tab.HOME, Tab.LIBRARY -> HomeScreen(model, bottom) { nav.push(Screen.TrackList(it)) }
+				Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
+				Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
 				else -> Placeholder(screen.tab.label, bottom)
 			}
 			is Screen.TrackList -> TrackListScreen(model, screen.source, bottom, back = { nav.pop() }, push = nav::push)
@@ -73,6 +76,7 @@ fun CuratorUi(model: AppModel) {
 			is Screen.RowFields -> RowFieldsPage(model, screen.sample, back = { nav.pop() })
 			is Screen.Track -> TrackScreen(model, screen, back = { nav.pop() }, push = nav::push, replace = nav::replaceTop)
 			is Screen.TrackActions -> TrackActionsPage(model, screen.trackId, back = { nav.pop() })
+			Screen.Settings -> SettingsPage(model, back = { nav.pop() })
 		}
 	}
 }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -41,6 +43,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -49,13 +52,15 @@ import app.curator.mobile.data.PlaylistSummary
 import app.curator.mobile.data.TagSummary
 import app.curator.mobile.data.ViewState
 import app.curator.mobile.model.HomePin
+import app.curator.mobile.model.SearchIndex
 import app.curator.mobile.ui.AppModel
-import app.curator.mobile.ui.common.Chip
 import app.curator.mobile.ui.common.Cover
 import app.curator.mobile.ui.common.Icon
 import app.curator.mobile.ui.common.IconButton
 import app.curator.mobile.ui.common.IconGlyph
 import app.curator.mobile.ui.common.Line
+import app.curator.mobile.ui.common.PullSearchBox
+import app.curator.mobile.ui.common.rememberPullSearch
 import app.curator.mobile.ui.common.SourceDot
 import app.curator.mobile.ui.common.formatWhen
 import app.curator.mobile.ui.nav.ListSource
@@ -66,34 +71,32 @@ import app.curator.mobile.ui.theme.sourceName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-private data class HomeData(val playlists: List<PlaylistSummary>, val folders: List<Folder>, val tags: List<TagSummary>)
 
 @Composable
-fun HomeScreen(model: AppModel, bottom: @Composable () -> Unit, open: (ListSource) -> Unit) {
-	val lib by model.library.collectAsState()
-	val version by model.version.collectAsState()
+fun HomeScreen(model: AppModel, bottom: @Composable () -> Unit, openSettings: () -> Unit, open: (ListSource) -> Unit) {
 	val pins by model.pins.collectAsState()
 	val recent by model.viewState.recent.collectAsState(emptyList())
-	val data by produceState<HomeData?>(null, lib, version) {
-		val l = lib ?: return@produceState
-		value = withContext(Dispatchers.IO) { HomeData(l.playlists(), l.folders(), l.tags()) }
-	}
+	val data by model.lists.collectAsState()
 	var source by rememberSaveable { mutableStateOf<String?>(null) }
 	var editPins by rememberSaveable { mutableStateOf(false) }
-	val open = remember { mutableStateOf(setOf<String>()) }
+	val search = rememberPullSearch()
+	val lines = remember(data) { data?.let { SearchIndex(playlistLines(it.playlists, it.folders)) { l -> l.text } } }
 
-	Column(Modifier.fillMaxSize().background(C.bg)) {
-		LazyColumn(Modifier.weight(1f).windowInsetsPadding(WindowInsets.statusBars)) {
-			item("header") { Header() }
+	Column(Modifier.fillMaxSize().background(C.bg).windowInsetsPadding(WindowInsets.statusBars)) {
+		Header(openSettings)
+		PullSearchBox(search, "Search playlists")
+		LazyColumn(Modifier.weight(1f).nestedScroll(search.connection)) {
 			val d = data
-			if (d == null) {
+			if (d == null || lines == null) {
 				item("loading") { BasicText("Opening the library…", Modifier.padding(16.dp), style = T.secondary) }
 				return@LazyColumn
 			}
 			val byId = d.playlists.associateBy { it.id }
 			val tagsById = d.tags.associateBy { it.id }
+			// While searching, only the playlists that match.
+			val searching = search.query.isNotBlank()
 
-			val recents = recent.mapNotNull { r -> recentCard(r, byId, tagsById) }
+			val recents = if (searching) emptyList() else recent.mapNotNull { r -> recentCard(r, byId, tagsById) }
 			if (recents.isNotEmpty()) {
 				item("recent-h") { SectionLabel("Recent playlists", Modifier.padding(start = 16.dp, top = 6.dp, bottom = 10.dp)) }
 				item("recent") {
@@ -103,19 +106,14 @@ fun HomeScreen(model: AppModel, bottom: @Composable () -> Unit, open: (ListSourc
 				}
 			}
 
-			val pinned = pins.mapNotNull { p -> pinTile(p, byId, tagsById) }
-			item("pins-h") {
+			val pinned = if (searching) emptyList() else pins.mapNotNull { p -> pinTile(p, byId, tagsById) }
+			if (pinned.isNotEmpty()) item("pins-h") {
 				Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 22.dp), verticalAlignment = Alignment.CenterVertically) {
 					SectionLabel("Pinned", Modifier.weight(1f))
-					if (pinned.isNotEmpty()) {
-						Box(Modifier.height(44.dp).clickable(role = Role.Button) { editPins = !editPins }.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
-							BasicText(if (editPins) "Done" else "Edit", style = T.of(12.sp, color = if (editPins) C.accent else C.fg2))
-						}
+					Box(Modifier.height(44.dp).clickable(role = Role.Button) { editPins = !editPins }.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+						BasicText(if (editPins) "Done" else "Edit", style = T.of(12.sp, color = if (editPins) C.accent else C.fg2))
 					}
 				}
-			}
-			if (pinned.isEmpty()) {
-				item("pins-none") { BasicText("Pin a playlist or a tag from its actions.", Modifier.padding(horizontal = 16.dp), style = T.secondary) }
 			}
 			items(pinned.chunked(2), key = { row -> "pins:" + row.joinToString { it.pin.id } }) { row ->
 				Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -136,30 +134,24 @@ fun HomeScreen(model: AppModel, bottom: @Composable () -> Unit, open: (ListSourc
 				}
 			}
 
-			// null is All; Local only when the account has local playlists.
-			val sources: List<String?> = listOf(null, "spotify", "tidal", "rekordbox") + listOfNotNull("local".takeIf { s -> d.playlists.any { it.source == s } })
+			val filters = sourceFilters(d.playlists.map { it.source }.toSet())
+			val filter = source?.takeIf { it in filters }
+			val rows = lines.search(search.query).filter { playlistShows(filter, it.playlist) }
 			item("lists-h") {
-				Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 22.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-					BasicText(
-						buildAnnotatedString {
-							append("Playlists ")
-							withStyle(SpanStyle(fontFamily = Fonts.mono, fontSize = 11.5.sp)) { append(d.playlists.size.toString()) }
-						},
-						Modifier.weight(1f).semantics { heading() },
-						style = T.label,
-					)
-					for (s in sources) Chip(if (s == null) "All" else sourceName(s).removeSuffix(" files"), source == s) { source = s }
-				}
+				FilterPicker(
+					filters, filter,
+					buildAnnotatedString {
+						withStyle(SpanStyle(fontFamily = Fonts.mono, fontSize = 11.5.sp)) { append(rows.size.toString()) }
+						append(if (filter == null) " Playlists" else " ${filterName(filter)} Playlists")
+					},
+					T.label, "Choose which playlists to show",
+					onSelect = { source = it },
+					modifier = Modifier.padding(start = 8.dp, top = 6.dp).semantics { heading() },
+				)
 			}
 			val pinnedLists = pins.filter { it.kind == "playlist" }.map { it.id }.toSet()
-			val rows = if (source != null) d.playlists.filter { it.source == source }.map { HomeRow.List(it, 0) } else tree(d.playlists, d.folders, open.value)
-			items(rows, key = { it.key }) { r ->
-				when (r) {
-					is HomeRow.Dir -> FolderRow(r.folder, r.count, r.depth, r.folder.id in open.value) {
-						open.value = if (r.folder.id in open.value) open.value - r.folder.id else open.value + r.folder.id
-					}
-					is HomeRow.List -> PlaylistRow(r.playlist, r.depth, r.playlist.id in pinnedLists) { open(ListSource.Playlist(r.playlist.id)) }
-				}
+			items(rows, key = { it.playlist.id }) { r ->
+				PlaylistRow(r, r.playlist.id in pinnedLists) { open(ListSource.Playlist(r.playlist.id)) }
 			}
 			item("end") { Spacer(Modifier.height(16.dp)) }
 		}
@@ -168,7 +160,17 @@ fun HomeScreen(model: AppModel, bottom: @Composable () -> Unit, open: (ListSourc
 }
 
 @Composable
-private fun Header() {
+private fun Header(openSettings: () -> Unit) {
+	MainHeader("Curator") {
+		Spacer(Modifier.weight(1f))
+		IconButton(Icon.Plus, "New playlist", tint = C.fg2) { }
+		IconButton(Icon.Settings, "Settings", tint = C.fg2, size = 20.dp, onClick = openSettings)
+	}
+}
+
+/** A main view's header: the mark, the view's [title], then [content] (pickers, actions). */
+@Composable
+fun MainHeader(title: String, content: @Composable RowScope.() -> Unit) {
 	Row(Modifier.fillMaxWidth().height(52.dp).padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 		// The mark: an accent square with three black bars.
 		Box(Modifier.size(22.dp).background(C.accent).semantics { contentDescription = "Curator" }, contentAlignment = Alignment.CenterStart) {
@@ -176,9 +178,8 @@ private fun Header() {
 				for (w in listOf(5, 8, 12)) Box(Modifier.width(w.dp).height(2.dp).background(Color.Black))
 			}
 		}
-		BasicText("Curator", Modifier.weight(1f), style = T.of(14.sp, 700, Color.White))
-		IconButton(Icon.Plus, "New playlist", tint = C.fg2) { }
-		IconButton(Icon.Settings, "Settings", tint = C.fg2, size = 20.dp) { }
+		BasicText(title, Modifier.semantics { heading() }, style = T.of(14.sp, 700, Color.White))
+		content()
 	}
 }
 
@@ -253,73 +254,3 @@ private fun PinTile(t: Tile, editing: Boolean, modifier: Modifier, onOpen: () ->
 	}
 }
 
-private sealed interface HomeRow {
-	val key: String
-	data class Dir(val folder: Folder, val depth: Int, val count: Int) : HomeRow { override val key get() = "f:${folder.id}" }
-	data class List(val playlist: PlaylistSummary, val depth: Int) : HomeRow { override val key get() = "p:${playlist.id}" }
-}
-
-// Folders as expandable rows, their playlists indented beneath when open.
-private fun tree(lists: kotlin.collections.List<PlaylistSummary>, folders: kotlin.collections.List<Folder>, open: Set<String>): kotlin.collections.List<HomeRow> {
-	if (folders.isEmpty()) return lists.map { HomeRow.List(it, 0) }
-	val known = folders.map { it.id }.toSet()
-	val childFolders = folders.groupBy { it.parentId?.takeIf { p -> p in known } }
-	val childLists = lists.groupBy { it.folderId?.takeIf { f -> f in known } }
-	fun count(id: String): Int = (childLists[id]?.size ?: 0) + (childFolders[id] ?: emptyList()).sumOf { count(it.id) }
-	val out = mutableListOf<HomeRow>()
-	fun walk(parent: String?, depth: Int) {
-		for (f in childFolders[parent] ?: emptyList()) {
-			out += HomeRow.Dir(f, depth, count(f.id))
-			if (f.id in open) walk(f.id, depth + 1)
-		}
-		for (p in childLists[parent] ?: emptyList()) out += HomeRow.List(p, depth)
-	}
-	walk(null, 0)
-	return out
-}
-
-@Composable
-private fun FolderRow(f: Folder, count: Int, depth: Int, expanded: Boolean, onToggle: () -> Unit) {
-	Row(
-		Modifier
-			.fillMaxWidth()
-			.height(56.dp)
-			.drawBehind { drawLine(C.lineSoft, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx()) }
-			.clickable(role = Role.Button, onClickLabel = if (expanded) "Collapse" else "Expand", onClick = onToggle)
-			.semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
-			.padding(start = (16 + depth * 16).dp, end = 16.dp),
-		verticalAlignment = Alignment.CenterVertically,
-		horizontalArrangement = Arrangement.spacedBy(12.dp),
-	) {
-		Box(Modifier.size(40.dp).background(C.bg2), contentAlignment = Alignment.Center) { IconGlyph(Icon.Folder, C.fg2, 20.dp, 1.6f) }
-		Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-			Line(f.name, T.of(14.5.sp, color = C.fg))
-			BasicText("Folder · $count", style = T.of(12.5.sp, color = C.fg2))
-		}
-		IconGlyph(if (expanded) Icon.Caret else Icon.Chevron, C.fg3, 16.dp)
-	}
-}
-
-@Composable
-private fun PlaylistRow(p: PlaylistSummary, depth: Int, pinned: Boolean, onClick: () -> Unit) {
-	Row(
-		Modifier
-			.fillMaxWidth()
-			.height(56.dp)
-			.drawBehind { drawLine(C.lineSoft, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx()) }
-			.clickable(role = Role.Button, onClick = onClick)
-			.padding(start = (16 + depth * 16).dp, end = 16.dp),
-		verticalAlignment = Alignment.CenterVertically,
-		horizontalArrangement = Arrangement.spacedBy(12.dp),
-	) {
-		Cover(p.coverUrl, p.id, 40.dp)
-		Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-			Line(p.name, T.of(14.5.sp, color = C.fg))
-			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-				SourceDot(p.source)
-				BasicText("${p.tracks} tracks · ${sourceName(p.source)}", style = T.of(12.5.sp, color = C.fg2), maxLines = 1)
-			}
-		}
-		if (pinned) Box(Modifier.semantics { contentDescription = "Pinned" }) { IconGlyph(Icon.Pin, C.accent, 14.dp, 1.8f) }
-	}
-}

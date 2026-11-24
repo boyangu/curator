@@ -65,15 +65,15 @@ object C {
 fun sourceColor(source: String?): Color = when (source) {
 	"spotify" -> C.spotify
 	"tidal" -> C.tidal
-	"rekordbox" -> C.rekord
+	"rekordbox", "local" -> C.rekord
 	else -> C.local
 }
 
 fun sourceName(source: String?): String = when (source) {
 	"spotify" -> "Spotify"
 	"tidal" -> "Tidal"
-	"rekordbox" -> "Rekordbox"
-	"local" -> "Local files"
+	// The owned library, whichever of the two brought the file or playlist in.
+	"rekordbox", "local" -> "Owned"
 	else -> "Library"
 }
 
@@ -85,12 +85,6 @@ fun keyChipColor(camelot: String?): Color? {
 	val m = camelot?.let { Regex("^(\\d{1,2})([AB])$").find(it.trim().uppercase()) } ?: return null
 	val n = m.groupValues[1].toInt().takeIf { it in 1..12 } ?: return null
 	return if (m.groupValues[2] == "A") oklch(0.86f, 0.09f, (n - 1) * 30f) else oklch(0.80f, 0.17f, (n - 1) * 30f)
-}
-
-/** Camelot order (1A, 1B, 2A, …) for sorting; past the end for none. */
-fun camelotOrder(camelot: String?): Int {
-	val m = camelot?.let { Regex("^(\\d{1,2})([AB])$").find(it.trim().uppercase()) } ?: return Int.MAX_VALUE
-	return m.groupValues[1].toInt() * 2 + if (m.groupValues[2] == "B") 1 else 0
 }
 
 /**

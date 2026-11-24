@@ -18,7 +18,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -40,10 +41,11 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.curator.mobile.data.Library
+import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Track
 import app.curator.mobile.model.HomePin
 import app.curator.mobile.model.ListView
-import app.curator.mobile.model.apply
+import app.curator.mobile.model.StreamingService
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.common.Icon
 import app.curator.mobile.ui.common.IconButton
@@ -60,28 +62,33 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** A list as loaded: its name, what it is, and every track in its own order. */
-data class ListData(val name: String, val kind: String, val source: String?, val tracks: List<Track>, val pin: HomePin)
+/** What a list is, for its header: its name, kind and source. [pin]: null when Home can't pin it (an artist's tracks, the library). */
+data class ListInfo(val name: String, val kind: String, val source: String?, val pin: HomePin?)
 
-/** Loads a list (again when the library changes). One loader for every kind of list (§5). */
+/** A list's header facts: one row read, never its tracks (those come a page at a time: TrackPager). */
 @Composable
-fun rememberList(model: AppModel, source: ListSource): ListData? {
+fun rememberListInfo(model: AppModel, source: ListSource): ListInfo? {
 	val lib by model.library.collectAsState()
 	val version by model.version.collectAsState()
-	val data by produceState<ListData?>(null, lib, version, source) {
+	val info by produceState<ListInfo?>(null, lib, version, source) {
 		val l = lib ?: return@produceState
-		value = withContext(Dispatchers.IO) { load(l, source) }
+		value = withContext(Dispatchers.IO) { info(l, source) }
 	}
-	return data
+	return info
 }
 
-private fun load(l: Library, s: ListSource): ListData? = when (s) {
-	is ListSource.Playlist -> l.playlists().firstOrNull { it.id == s.id }?.let { p ->
-		ListData(p.name, "Playlist", p.source, l.playlistTracks(p.id), HomePin("playlist", p.id))
-	}
-	is ListSource.Tag -> l.tags().firstOrNull { it.id == s.id }?.let { t ->
-		ListData(t.name, "Tag", null, l.tagTracks(t.id), HomePin("tag", t.id))
-	}
+private fun info(l: Library, s: ListSource): ListInfo? = when (s) {
+	is ListSource.Playlist -> l.playlist(s.id)?.let { ListInfo(it.name, "Playlist", it.source, HomePin("playlist", s.id)) }
+	is ListSource.Tag -> l.tagName(s.id)?.let { ListInfo(it, "Tag", null, HomePin("tag", s.id)) }
+	is ListSource.Artist -> l.artistName(s.id)?.let { ListInfo(it, "Artist", null, null) }
+	is ListSource.Library -> ListInfo("Library", "Library", null, null)
+}
+
+/** The view a list is shown with: null for the moment it takes to read, so a list never opens on the default view first. */
+@Composable
+fun rememberView(model: AppModel, source: ListSource): ListView? {
+	val view by remember(source.key) { model.viewState.listView(source.key) }.collectAsState(null)
+	return view
 }
 
 @Composable
@@ -92,14 +99,11 @@ fun TrackListScreen(
 	back: () -> Unit,
 	push: (Screen) -> Unit,
 ) {
-	val data = rememberList(model, source)
-	val view by model.viewState.listView(source.key).collectAsState(ListView())
+	val info = rememberListInfo(model, source)
+	val view = rememberView(model, source)
+	val pager = rememberPager(model, view?.let { ListQuery(source.scope(), it) })
 	val rows by model.rows.collectAsState()
 	val pins by model.pins.collectAsState()
-	val metrics by model.metrics.collectAsState()
-	val player by model.player.state.collectAsState()
-	val scope = androidx.compose.runtime.rememberCoroutineScope()
-	val shown = remember(data, view) { data?.let { view.apply(it.tracks) } ?: emptyList() }
 	val level = rows.density
 
 	// Opened lately (Home's Recent), on this device only.
@@ -107,6 +111,8 @@ fun TrackListScreen(
 		when (source) {
 			is ListSource.Playlist -> model.viewState.opened("playlist", source.id)
 			is ListSource.Tag -> model.viewState.opened("tag", source.id)
+			// Recent holds what Home can open from its own lists.
+			is ListSource.Artist, is ListSource.Library -> {}
 		}
 	}
 
@@ -118,8 +124,7 @@ fun TrackListScreen(
 			DensityButton(level) { model.setRows(rows.copy(density = if (level == 3) 1 else level + 1)) }
 			IconButton(Icon.Menu, "List actions", tint = C.fg) { push(Screen.ListActions(source)) }
 		}
-		if (data == null) {
-			BasicText("Opening…", Modifier.padding(16.dp), style = T.secondary)
+		if (info == null || view == null || pager == null) {
 			Spacer(Modifier.weight(1f))
 			bottom()
 			return@Column
@@ -130,12 +135,14 @@ fun TrackListScreen(
 			Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 				Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
 					Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-						BasicText(data.name, Modifier.weight(1f, fill = false), style = T.screenTitle, maxLines = 1)
-						if (data.pin in pins) Box(Modifier.semantics { contentDescription = "Pinned" }) { IconGlyph(Icon.Pin, C.accent, 14.dp, 1.6f) }
+						BasicText(info.name, Modifier.weight(1f, fill = false), style = T.screenTitle, maxLines = 1)
+						if (info.pin != null && info.pin in pins) Box(Modifier.semantics { contentDescription = "Pinned" }) { IconGlyph(Icon.Pin, C.accent, 14.dp, 1.6f) }
 					}
-					val secs = data.tracks.sumOf { (it.durationSec ?: 0).toLong() }
+					val totals = pager.totals
 					BasicText(
-						listOfNotNull(data.kind, "${data.tracks.size} tracks", formatDuration(secs), data.source?.let { sourceName(it) }).joinToString(" · "),
+						listOfNotNull(
+							info.kind, totals?.let { "${it.count} tracks" }, totals?.let { formatDuration(it.seconds) }, info.source?.let { sourceName(it) },
+						).joinToString(" · "),
 						style = T.of(12.5.sp, color = C.fg2), maxLines = 1,
 					)
 				}
@@ -144,50 +151,78 @@ fun TrackListScreen(
 						.size(44.dp)
 						.clip(CircleShape)
 						.background(C.accent)
-						.clickable(role = Role.Button, onClickLabel = "Play") { shown.firstOrNull()?.let { scope.launch { playFrom(model, it); model.player.play() } } }
+						.clickable(role = Role.Button, onClickLabel = "Play") { pager.track(0)?.let { model.open(it, start = true) } }
 						.semantics { contentDescription = "Play" },
 					contentAlignment = Alignment.Center,
 				) { IconGlyph(Icon.Play, Color.Black, 18.dp) }
 			}
-			StateChips(view, shown.size, data.tracks.size) { push(Screen.ListActions(source)) }
+			StateChips(view, pager) { push(Screen.ListActions(source)) }
 		}
 
-		LazyColumn(Modifier.weight(1f).drawBehind { drawLine(C.lineSoft, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx()) }) {
-			if (shown.isEmpty()) {
-				item("empty") {
-					BasicText(
-						if (data.tracks.isEmpty()) "No tracks here yet." else "No tracks match these filters.",
-						Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 32.dp),
-						style = T.of(14.sp, color = C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center),
-					)
-				}
-			}
-			itemsIndexed(shown, key = { _, t -> t.id }) { i, t ->
-				TrackRow(t, level, rows.level(level), metrics, playing = player.track?.trackId == t.id && player.playing) {
-					scope.launch { playFrom(model, t) }
-					push(Screen.Track(t.id, source, i, shown.size))
-				}
-			}
-		}
+		// Another view starts the list at its top.
+		key(pager.query.key) { TrackRows(model, source, pager, "", "No tracks match these filters.", Modifier.weight(1f), push) }
 		bottom()
 	}
 }
 
-/** Loads a track into the player (Track opens on it). */
-suspend fun playFrom(model: AppModel, t: Track) {
+/**
+ * A list's rows, read a page at a time from [pager]: a row whose page is on
+ * its way holds its place, empty, for the moment it takes. A tap plays the
+ * track and opens it. [empty] when the list holds nothing, [noMatch] when
+ * the view or the [search] leaves nothing.
+ */
+@Composable
+internal fun TrackRows(model: AppModel, source: ListSource, pager: TrackPager, search: String, noMatch: String, modifier: Modifier, push: (Screen) -> Unit) {
+	val rows by model.rows.collectAsState()
+	val metrics by model.metrics.collectAsState()
+	val player by model.player.state.collectAsState()
+	val main by model.streaming.collectAsState()
+	val level = rows.density
+	val cfg = rows.level(level)
+	LazyColumn(modifier.drawBehind { drawLine(C.lineSoft, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx()) }) {
+		if (pager.started && pager.size == 0) {
+			item("empty") {
+				BasicText(
+					if (pager.totals?.count == 0) "No tracks here yet." else noMatch,
+					Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 32.dp),
+					style = T.of(14.sp, color = C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center),
+				)
+			}
+		}
+		items(pager.size, key = { pager.keys[it] }, contentType = { 0 }) { i ->
+			val t = pager.track(i)
+			if (t == null) TrackRowPlaceholder(level)
+			else TrackRow(
+				t, level, cfg, metrics,
+				playing = player.track?.trackId == t.id && player.playing,
+				missingOn = if (t.foundOn(main)) null else StreamingService.forTrack(t.source, main),
+			) {
+				model.open(t, start = true)
+				push(Screen.Track(t.id, source, i, pager.size, search))
+			}
+		}
+	}
+}
+
+/** Loads a track into the player (Track opens on it); [start] plays it too (a tap on its row). */
+suspend fun playFrom(model: AppModel, t: Track, start: Boolean = false) {
 	val lib = model.library.value ?: return
-	val providerId = if (t.source == "spotify") withContext(Dispatchers.IO) { lib.spotifyId(t.id) } else null
+	// A local file plays as the track its recording claims on the service picked in Settings.
+	val service = StreamingService.forTrack(t.source, model.streaming.value)
+	val streamId = withContext(Dispatchers.IO) { lib.streamId(t.id, service.id) }
 	model.player.load(
 		app.curator.mobile.player.PlayerTrack(
 			trackId = t.id, title = t.title, artist = t.artist, coverUrl = t.coverUrl,
-			durationSec = (t.durationSec ?: 0).toDouble(), source = t.source, providerId = providerId,
+			durationSec = (t.durationSec ?: 0).toDouble(), source = t.source, service = service, streamId = streamId,
 		),
 	)
+	// The row of the track already playing carries on rather than restarting.
+	if (start && !model.player.state.value.playing) model.player.play()
 }
 
-/** One row: the active sort, each active filter (accent border), "<shown> of <total>". Opens Actions. */
+/** One row: the active sort, each active filter (accent border), "<shown> of <total>" once both are counted. Opens Actions. */
 @Composable
-private fun StateChips(view: ListView, shown: Int, total: Int, onClick: () -> Unit) {
+internal fun StateChips(view: ListView, pager: TrackPager, onClick: () -> Unit) {
 	Row(
 		Modifier.fillMaxWidth().clickable(role = Role.Button, onClickLabel = "Sort and filters", onClick = onClick),
 		horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -198,7 +233,8 @@ private fun StateChips(view: ListView, shown: Int, total: Int, onClick: () -> Un
 		for (t in view.tags.sorted()) StateChip(t, active = true)
 		if (view.bpm != app.curator.mobile.model.BpmBucket.ANY) StateChip("${view.bpm.label} BPM", active = true)
 		if (view.ownedOnly) StateChip("Owned", active = true)
-		BasicText("$shown of $total", Modifier.padding(horizontal = 8.dp), style = T.of(12.5.sp, color = C.fg1), maxLines = 1)
+		val total = pager.totals?.count
+		if (pager.complete && total != null) BasicText("${pager.size} of $total", Modifier.padding(horizontal = 8.dp), style = T.of(12.5.sp, color = C.fg1), maxLines = 1)
 	}
 }
 
@@ -212,7 +248,7 @@ private fun StateChip(text: String, active: Boolean) {
 
 /** Cycles 1 → 2 → 3 → 1 rows; its icon shows the level as line pairs. */
 @Composable
-private fun DensityButton(level: Int, onClick: () -> Unit) {
+internal fun DensityButton(level: Int, onClick: () -> Unit) {
 	Box(
 		Modifier
 			.size(44.dp)

@@ -2,6 +2,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
 	<uses-permission android:name="android.permission.INTERNET" />
+	<!-- The app installs its own updates (update/Updater.kt); the user grants
+	     it once, as "Install unknown apps". -->
+	<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+	<!-- What lets Android 12+ install the app's own update without a
+	     confirmation (PackageInstaller's USER_ACTION_NOT_REQUIRED); granted at
+	     install, no prompt. -->
+	<uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+
+	<!-- TIDAL plays through its installed app (player/TidalRemote.kt): seeing
+	     it installed and opening a track in it. -->
+	<queries>
+		<package android:name="com.aspiro.tidal" />
+	</queries>
 
 	<!-- networkSecurityConfig: cleartext only to the local test server
 	     (adb reverse onto 127.0.0.1); everything else is TLS. -->
@@ -27,5 +40,21 @@
 				<category android:name="android.intent.category.LAUNCHER" />
 			</intent-filter>
 		</activity>
+
+		<!-- Notification access, granted by the user: how the player sees
+		     TIDAL's media session. It reads no notifications. -->
+		<service
+			android:name=".player.MediaAccessService"
+			android:label="Curator"
+			android:exported="true"
+			android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+			<intent-filter>
+				<action android:name="android.service.notification.NotificationListenerService" />
+			</intent-filter>
+		</service>
+
+		<!-- An update's install outcome, from the installer through our own
+		     PendingIntent only. -->
+		<receiver android:name=".update.InstallResult" android:exported="false" />
 	</application>
 </manifest>

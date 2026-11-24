@@ -8,6 +8,8 @@
 // The server is the sync-core spike's (research/mobile/sync-core-spike/scripts/
 // serve-cloud.ts, started from apps/cloud): local testing only, for now.
 // --fresh clears the app's data first, so it joins as a new device.
+// --apk <file> installs that APK instead of the debug build (a release, which
+// then updates itself; a phone holds one signing key's install at a time).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -34,8 +36,8 @@ if (!serverDir || !existsSync(join(serverDir, 'server.json'))) throw new Error('
 const server = JSON.parse(readFileSync(join(serverDir, 'server.json'), 'utf8'));
 const port = new URL(server.apiUrl).port || '80';
 
-const apk = join(root, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
-if (!existsSync(apk)) throw new Error('no debug APK: run `pnpm --filter @curator/mobile build`');
+const apk = arg('apk') ?? join(root, 'android', 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
+if (!existsSync(apk)) throw new Error(arg('apk') ? `no APK at ${apk}` : 'no debug APK: run `pnpm --filter @curator/mobile build`');
 
 adb('reverse', `tcp:${port}`, `tcp:${port}`);
 adb('install', '-r', apk);

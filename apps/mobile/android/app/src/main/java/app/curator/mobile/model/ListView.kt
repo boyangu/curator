@@ -1,7 +1,5 @@
 package app.curator.mobile.model
 
-import app.curator.mobile.data.Track
-import app.curator.mobile.ui.theme.camelotOrder
 import kotlinx.serialization.Serializable
 
 /**
@@ -35,48 +33,7 @@ enum class Sort(val label: String, val chip: String) {
 	TITLE("Title", "Title"),
 }
 
-/** Placeholder buckets from the design; a range slider may replace them. */
+/** Placeholder buckets from the design; a range slider may replace them. Read in SQL (ListQuery). */
 enum class BpmBucket(val label: String) {
 	ANY("Any"), LOW("<120"), MID("120–124"), HIGH(">124");
-
-	fun matches(bpm: Double?): Boolean = when (this) {
-		ANY -> true
-		LOW -> bpm != null && bpm < 120
-		MID -> bpm != null && bpm >= 120 && bpm <= 124
-		HIGH -> bpm != null && bpm > 124
-	}
-}
-
-/**
- * The list as shown: filtered, then sorted. Secondary order is always the
- * key (Camelot: 1A, 1B, 2A…), and the direction applies to both, as the
- * design's list does. A track with no value for the sort goes last either way.
- */
-fun ListView.apply(tracks: List<Track>): List<Track> {
-	val kept = tracks.filter { t ->
-		(!ownedOnly || t.owned) && bpm.matches(t.bpm) && (tags.isEmpty() || t.tags.any { it in tags })
-	}
-	val primary: Comparator<Track> = when (sort) {
-		Sort.CUSTOM -> compareBy(nullsLast()) { it.orderKey }
-		Sort.ENERGY -> compareBy(nullsLast()) { it.power }
-		Sort.BPM -> compareBy(nullsLast()) { it.bpm }
-		Sort.KEY -> compareBy { camelotOrder(it.key) }
-		Sort.ADDED -> compareBy(nullsLast()) { it.addedAt }
-		Sort.TITLE -> compareBy(nullsLast()) { it.title.lowercase() }
-	}
-	val missing: (Track) -> Boolean = when (sort) {
-		Sort.CUSTOM -> { t -> t.orderKey == null }
-		Sort.ENERGY -> { t -> t.power == null }
-		Sort.BPM -> { t -> t.bpm == null }
-		Sort.KEY -> { t -> camelotOrder(t.key) == Int.MAX_VALUE }
-		Sort.ADDED -> { t -> t.addedAt == null }
-		Sort.TITLE -> { _ -> false }
-	}
-	val byKey = compareBy<Track> { camelotOrder(it.key) }
-	val (have, lack) = kept.partition { !missing(it) }
-	val ordered = have.sortedWith { a, b ->
-		val c = primary.compare(a, b).takeIf { it != 0 } ?: byKey.compare(a, b)
-		c * dir
-	}
-	return ordered + lack
 }

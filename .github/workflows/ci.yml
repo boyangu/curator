@@ -38,8 +38,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       # Runs every package that defines a test script (matcher, core,
-      # desktop). The suites are pure-JS — no native rebuild needed.
-      - run: pnpm -r test
+      # desktop). The suites are pure-JS — no native rebuild needed. The
+      # mobile app's are Gradle's: the mobile job runs them.
+      - run: pnpm -r --filter '!@curator/mobile' test
 
   # Actions has no job-level `paths`, so this job computes the filter and
   # `cloud` runs only when its inputs changed.
@@ -50,6 +51,7 @@ jobs:
       pull-requests: read
     outputs:
       cloud: ${{ steps.filter.outputs.cloud }}
+      mobile: ${{ steps.filter.outputs.mobile }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
@@ -65,6 +67,11 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
               - '.github/actions/cloud-check/**'
+            mobile:
+              - 'apps/mobile/**'
+              - 'packages/**'
+              - 'pnpm-lock.yaml'
+              - '.github/workflows/ci.yml'
 
   # The cloud API on its own: install only it and its workspace deps, then
   # typecheck (incl. the boundary rule), test and bundle
@@ -79,6 +86,51 @@ jobs:
           persist-credentials: false
       # The same steps gate every release (scripts/release-cloud.mjs).
       - uses: ./.github/actions/cloud-check
+
+  # The Android app: the gate scripts/release-mobile.mjs runs on the commit
+  # it ships (apps/mobile/scripts/check.mjs: typecheck, the pinned toolchain
+  # inputs, the Hermes bundle, the Kotlin unit tests and the release build,
+  # which compiles the native side). Unsigned here: no key and no vendor
+  # config reach GitHub; releases are signed on the maintainer's machine.
+  mobile:
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+      # The JDK fetch-vendor.mjs pins on Windows; Gradle's caches keyed on
+      # the build files and the wrapper.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+          cache-dependency-path: |
+            apps/mobile/android/**/*.gradle.kts
+            apps/mobile/android/gradle/libs.versions.toml
+            apps/mobile/android/gradle/wrapper/gradle-wrapper.properties
+      # The runner's SDK, with the NDK and CMake the build names
+      # (app/build.gradle.kts ndkVersion, externalNativeBuild).
+      - run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125" "cmake;3.22.1" > /dev/null
+      # fetch-vendor.mjs's inputs, each pinned by SHA-256: the cache only
+      # saves the downloads, and turns over when the pins change.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            apps/mobile/vendor
+            apps/mobile/android/app/src/main/res/font
+          key: mobile-vendor-${{ runner.os }}-${{ hashFiles('apps/mobile/scripts/fetch-vendor.mjs') }}
+      - run: pnpm install --frozen-lockfile --filter @curator/mobile...
+      - run: pnpm --filter @curator/mobile check
 
   rust-audio:
     runs-on: ubuntu-latest

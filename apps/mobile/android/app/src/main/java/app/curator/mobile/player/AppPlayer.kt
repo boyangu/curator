@@ -1,20 +1,10 @@
 package app.curator.mobile.player
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
-import android.util.Log
-import app.curator.mobile.BuildConfig
-import com.spotify.android.appremote.api.ConnectionParams
-import com.spotify.android.appremote.api.Connector
-import com.spotify.android.appremote.api.SpotifyAppRemote
-import com.spotify.android.appremote.api.error.CouldNotFindSpotifyApp
-import com.spotify.android.appremote.api.error.NotLoggedInException
-import com.spotify.android.appremote.api.error.UserNotAuthorizedException
-import com.spotify.protocol.types.PlayerState as SpotifyState
-import com.spotify.sdk.android.auth.AuthorizationClient
-import com.spotify.sdk.android.auth.AuthorizationRequest
-import com.spotify.sdk.android.auth.AuthorizationResponse
+import app.curator.mobile.model.StreamingService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,80 +15,94 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.lang.ref.WeakReference
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
- * The app's player. A Spotify track plays through the installed Spotify app
- * (App Remote: Spotify does the audio and its own notification; we drive it
- * and follow its state). Anything else loads and cues but does not play yet:
- * Tidal and the library's own files come later.
+ * The app's player. A streaming track plays from its own service, a local
+ * file from the service picked in Settings, as the track its recording
+ * claims there. Each service plays through its installed app, which a
+ * [Backend] drives and follows: [SpotifyRemote], [TidalRemote]. A track with
+ * nowhere to play loads and cues but does not play.
  *
- * App Remote reports the position only when the state changes (play, pause,
- * seek); between those the position here runs on the clock, so the playhead
- * moves smoothly.
+ * The services report the position only when their state changes (play,
+ * pause, seek); between those the position here runs on the clock, so the
+ * playhead moves smoothly.
  */
-class AppPlayer : Player {
+class AppPlayer(context: Context) : Player {
 	private val _state = MutableStateFlow(PlayerState())
 	override val state: StateFlow<PlayerState> = _state
 
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-	private var remote: SpotifyAppRemote? = null
-	private var connecting = false
-	private var afterConnect: (() -> Unit)? = null
-	private var activity = WeakReference<Activity>(null)
-	private var launchAuth: ((Intent) -> Unit)? = null
-	// The consent was asked in this run: a second "not authorized" is a refusal, not a first time.
-	private var askedConsent = false
+	private var activityRef = WeakReference<Activity>(null)
 	private var ticker: Job? = null
-	// The last position Spotify reported, and when (elapsed realtime ms).
+	// The last position the service reported, and when (elapsed realtime ms).
 	private var anchorSec = 0.0
 	private var anchorAt = 0L
 
-	/**
-	 * The screen in front, and how it opens Spotify's consent screen. App
-	 * Remote's own consent (showAuthView) is started by the Spotify app from
-	 * the background, which Android 14+ blocks (seen on the Xperia, 2026-11-23:
-	 * BAL_BLOCK); asked from our activity through the auth library, it shows.
-	 */
-	fun attach(a: Activity?, authorize: ((Intent) -> Unit)?) {
-		activity = WeakReference(a)
-		launchAuth = authorize
-	}
+	private val host = object : BackendHost {
+		override val current get() = _state.value.track
+		override val activity get() = activityRef.get()
 
-	/** The consent screen's answer (MainActivity's result callback). */
-	fun onAuthorized(resultCode: Int, data: Intent?) {
-		val r = AuthorizationClient.getResponse(resultCode, data)
-		when (r.type) {
-			AuthorizationResponse.Type.TOKEN -> { val p = pending ?: return; pending = null; withRemote(p) }
-			AuthorizationResponse.Type.ERROR -> { pending = null; fail("Spotify said no: ${r.error}") }
-			else -> { pending = null; fail("Spotify wasn't connected") }
+		override fun onState(playing: Boolean, positionSec: Double, atMs: Long, streamSec: Double?) {
+			val t = _state.value.track ?: return
+			anchorSec = positionSec
+			anchorAt = atMs
+			val now = positionSec + if (playing) (SystemClock.elapsedRealtime() - atMs) / 1000.0 else 0.0
+			_state.value = _state.value.copy(
+				playing = playing, positionSec = if (t.durationSec > 0) now.coerceAtMost(t.durationSec) else now,
+				unavailable = null, note = noteFor(t, streamSec),
+			)
+			if (playing) startTicker() else stopTicker()
+		}
+
+		override fun onDisplaced() {
+			if (_state.value.playing) { stopTicker(); _state.value = _state.value.copy(playing = false) }
+		}
+
+		override fun onFail(reason: String) {
+			stopTicker()
+			_state.value = _state.value.copy(playing = false, unavailable = reason)
 		}
 	}
 
-	// What to do once connected, while the consent screen is up.
-	private var pending: ((SpotifyAppRemote) -> Unit)? = null
+	private val spotify = SpotifyRemote(host)
+	private val tidal = TidalRemote(context.applicationContext, host)
+
+	private fun backend(s: StreamingService): Backend = when (s) {
+		StreamingService.SPOTIFY -> spotify
+		StreamingService.TIDAL -> tidal
+	}
+
+	/** The screen in front, and how it opens Spotify's consent screen (null when it goes). */
+	fun attach(a: Activity?, authorize: ((Intent) -> Unit)?) {
+		activityRef = WeakReference(a)
+		spotify.attach(authorize)
+		if (a != null) tidal.onResume()
+	}
+
+	/** Spotify's consent screen's answer (MainActivity's result callback). */
+	fun onAuthorized(resultCode: Int, data: Intent?) = spotify.onAuthorized(resultCode, data)
 
 	override fun load(track: PlayerTrack) {
-		if (_state.value.track?.trackId == track.trackId) return
+		// The same track again keeps its place, unless Settings moved where it plays from.
+		val now = _state.value
+		if (now.track?.trackId == track.trackId && now.track.service == track.service) return
+		// The other service's app would play on under this one.
+		if (now.playing && now.track != null && now.track.service != track.service) backend(now.track.service).pause()
 		stopTicker()
-		_state.value = PlayerState(track = track, unavailable = reasonFor(track))
+		_state.value = PlayerState(track = track, unavailable = reasonFor(track), note = noteFor(track, null))
 	}
 
 	override fun play() {
 		val t = _state.value.track ?: return
 		val reason = reasonFor(t)
 		if (reason != null) { _state.value = _state.value.copy(playing = false, unavailable = reason); return }
-		withRemote { r ->
-			val uri = "spotify:track:${t.providerId}"
-			val from = _state.value.positionSec
-			r.playerApi.playerState.setResultCallback { s ->
-				if (s.track?.uri == uri && s.isPaused) r.playerApi.resume()
-				else r.playerApi.play(uri).setResultCallback { if (from > 1.0) r.playerApi.seekTo((from * 1000).toLong()) }
-			}
-		}
+		backend(t.service).play(t, _state.value.positionSec)
 	}
 
 	override fun pause() {
-		remote?.playerApi?.pause()
+		_state.value.track?.let { backend(it.service).pause() }
 		stopTicker()
 		_state.value = _state.value.copy(playing = false)
 	}
@@ -110,81 +114,28 @@ class AppPlayer : Player {
 		anchorSec = at
 		anchorAt = SystemClock.elapsedRealtime()
 		_state.value = s.copy(positionSec = at)
-		// Only the track Spotify is playing for us moves there; otherwise this is the cue point.
-		if (s.playing) remote?.playerApi?.seekTo((at * 1000).toLong())
+		// Only the track the service is playing for us moves there; otherwise this is the cue point.
+		if (s.playing && s.track != null) backend(s.track.service).seek(at)
 	}
 
-	private fun reasonFor(t: PlayerTrack): String? = when {
-		t.source != "spotify" -> "Not playable on this phone yet"
-		t.providerId == null -> "No Spotify id for this track"
-		BuildConfig.SPOTIFY_CLIENT_ID.isEmpty() -> "Spotify isn't configured in this build"
-		else -> null
-	}
-
-	// Runs [then] with a connected App Remote, connecting first if needed.
-	private fun withRemote(then: (SpotifyAppRemote) -> Unit) {
-		remote?.takeIf { it.isConnected }?.let { then(it); return }
-		afterConnect = { remote?.let(then) }
-		if (connecting) return
-		connecting = true
-		val params = ConnectionParams.Builder(BuildConfig.SPOTIFY_CLIENT_ID)
-			.setRedirectUri(BuildConfig.SPOTIFY_REDIRECT_URI)
-			.showAuthView(false)
-			.build()
-		val context = activity.get() ?: return run { connecting = false; fail("Open Curator to connect Spotify") }
-		SpotifyAppRemote.connect(context, params, object : Connector.ConnectionListener {
-			override fun onConnected(r: SpotifyAppRemote) {
-				connecting = false
-				remote = r
-				r.playerApi.subscribeToPlayerState().setEventCallback { follow(it) }
-				afterConnect?.invoke()
-				afterConnect = null
-			}
-
-			override fun onFailure(err: Throwable) {
-				connecting = false
-				val then = afterConnect
-				afterConnect = null
-				Log.w("curator-player", "Spotify did not connect", err)
-				// First time on this phone: ask for the consent, then connect again.
-				if (err is UserNotAuthorizedException && !askedConsent && then != null) {
-					val ask = launchAuth ?: return fail("Open Curator to connect Spotify")
-					askedConsent = true
-					pending = { then() }
-					val request = AuthorizationRequest.Builder(BuildConfig.SPOTIFY_CLIENT_ID, AuthorizationResponse.Type.TOKEN, BuildConfig.SPOTIFY_REDIRECT_URI)
-						.setScopes(arrayOf("app-remote-control"))
-						.build()
-					ask(AuthorizationClient.createLoginActivityIntent(activity.get() ?: return fail("Open Curator to connect Spotify"), request))
-					return
-				}
-				fail(
-					when (err) {
-						is CouldNotFindSpotifyApp -> "Install Spotify to play this track"
-						is NotLoggedInException -> "Sign in to Spotify to play this track"
-						is UserNotAuthorizedException -> "This Spotify account isn't allowed for Curator yet"
-						else -> "Spotify didn't connect: ${err.message ?: err.javaClass.simpleName}"
-					},
-				)
-			}
-		})
-	}
-
-	private fun fail(reason: String) {
-		_state.value = _state.value.copy(playing = false, unavailable = reason)
-	}
-
-	// Spotify's state, for the track it plays for us: playing or not, where.
-	private fun follow(s: SpotifyState) {
-		val ours = _state.value.track ?: return
-		if (s.track?.uri != "spotify:track:${ours.providerId}") {
-			// Something else plays in Spotify now (changed there): ours stopped.
-			if (_state.value.playing) { stopTicker(); _state.value = _state.value.copy(playing = false) }
-			return
+	private fun reasonFor(t: PlayerTrack): String? {
+		val name = t.service.label
+		return when {
+			t.streamId == null -> if (t.source == t.service.id) "No $name id for this track" else "Not on $name, so not playable on this phone"
+			else -> backend(t.service).unavailable()
 		}
-		anchorSec = s.playbackPosition / 1000.0
-		anchorAt = SystemClock.elapsedRealtime()
-		_state.value = _state.value.copy(playing = !s.isPaused, positionSec = anchorSec, unavailable = null)
-		if (s.isPaused) stopTicker() else startTicker()
+	}
+
+	// A track the library has elsewhere says where it plays from. The cues,
+	// grid and waveform are the file's analysis: when the stream's version
+	// runs a different length (an edit, another master) they may not line up.
+	private fun noteFor(t: PlayerTrack, streamSec: Double?): String? {
+		if (t.source == t.service.id || t.streamId == null) return null
+		val via = "Plays from ${t.service.label}"
+		val diff = if (streamSec != null && t.durationSec > 0) streamSec - t.durationSec else 0.0
+		if (abs(diff) < 2.0) return via
+		val d = abs(diff).roundToInt()
+		return "$via, whose version is ${d / 60}:${(d % 60).toString().padStart(2, '0')} ${if (diff > 0) "longer" else "shorter"}: cues may not line up"
 	}
 
 	private fun startTicker() {

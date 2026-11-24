@@ -1,10 +1,11 @@
 package app.curator.mobile.player
 
+import app.curator.mobile.model.StreamingService
 import kotlinx.coroutines.flow.StateFlow
 
 /**
  * What the Track view and the mini player drive. One interface over the
- * backends a track can play through (Spotify App Remote now; Tidal and the
+ * backends a track can play through (the Spotify and TIDAL apps now; the
  * library's own files later), so the views never know which one it is.
  *
  * Position is the player's, in seconds; while paused it is a cue point the
@@ -26,10 +27,12 @@ data class PlayerTrack(
 	val artist: String,
 	val coverUrl: String?,
 	val durationSec: Double,
-	/** Where it plays from: 'spotify', 'tidal', 'local'. */
+	/** Where the library has it: 'spotify', 'tidal', 'local'. */
 	val source: String?,
-	/** The provider's own id, when it has one (a Spotify track id). */
-	val providerId: String?,
+	/** The service it plays through: its own for a streaming track, the one picked in Settings for a file. */
+	val service: StreamingService,
+	/** Its id on [service]: the recording's best claim there. */
+	val streamId: String?,
 )
 
 data class PlayerState(
@@ -38,4 +41,6 @@ data class PlayerState(
 	val positionSec: Double = 0.0,
 	/** Why the current track cannot play here, or null when it can. */
 	val unavailable: String? = null,
+	/** Where it plays from when that isn't where the library has it ("Plays from Spotify"). */
+	val note: String? = null,
 )

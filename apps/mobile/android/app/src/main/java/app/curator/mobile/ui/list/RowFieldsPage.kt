@@ -1,5 +1,6 @@
 package app.curator.mobile.ui.list
 
+import app.curator.mobile.data.ListQuery
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -72,7 +73,8 @@ fun RowFieldsPage(model: AppModel, sampleFrom: ListSource?, back: () -> Unit) {
 	val rows by model.rows.collectAsState()
 	val metrics by model.metrics.collectAsState()
 	// A track from the list behind, one that fills most fields if it can.
-	val tracks = sampleFrom?.let { rememberList(model, it) }?.tracks ?: emptyList()
+	val view = sampleFrom?.let { rememberView(model, it) }
+	val tracks = rememberPager(model, if (sampleFrom == null || view == null) null else ListQuery(sampleFrom.scope(), view))?.firstPage ?: emptyList()
 	val sample = tracks.firstOrNull { it.version != null && it.tags.isNotEmpty() } ?: tracks.firstOrNull() ?: SAMPLE
 	var level by rememberSaveable { mutableIntStateOf(rows.density) }
 	var line by rememberSaveable { mutableIntStateOf(0) }

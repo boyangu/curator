@@ -1,5 +1,8 @@
 package app.curator.mobile.ui.common
 
+import android.view.Gravity
+import android.view.View
+import android.widget.PopupMenu
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,6 +19,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -31,6 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
 import app.curator.mobile.ui.theme.keyChipColor
@@ -123,31 +128,26 @@ fun SwitchRow(label: String, on: Boolean, modifier: Modifier = Modifier, leading
 	}
 }
 
-/** A chip: square-ish (radius 4), accent border and dim fill when selected. */
+/**
+ * The platform's own popup menu, a radio group of [options] with [selected]
+ * checked, opened under [content] by the `open` it is handed. PopupMenu wants
+ * a View to hang from, so an empty one sits behind the content at its size.
+ */
 @Composable
-fun Chip(
-	label: String,
-	selected: Boolean,
-	modifier: Modifier = Modifier,
-	height: Dp = 28.dp,
-	radius: Dp = 4.dp,
-	mono: Boolean = false,
-	onClick: () -> Unit,
-) {
-	val shape = RoundedCornerShape(radius)
-	Box(
-		modifier
-			.height(height)
-			.clip(shape)
-			.background(if (selected) C.accentDim else Color.Transparent)
-			.border(1.dp, if (selected) C.accent else C.line, shape)
-			.clickable(role = Role.Button, onClick = onClick)
-			.semantics { toggleableState = if (selected) ToggleableState.On else ToggleableState.Off }
-			.padding(horizontal = 8.dp),
-		contentAlignment = Alignment.Center,
-	) {
-		val color = if (selected) C.fg else C.fg1
-		BasicText(label, style = if (mono) T.mono(12.5.sp, color) else T.of(12.sp, color = color), maxLines = 1)
+fun PopupMenuAnchor(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier, content: @Composable (open: () -> Unit) -> Unit) {
+	val anchor = remember { arrayOfNulls<View>(1) }
+	Box(modifier) {
+		AndroidView({ View(it).also { v -> anchor[0] = v } }, Modifier.matchParentSize())
+		content {
+			val a = anchor[0] ?: return@content
+			PopupMenu(a.context, a, Gravity.START).apply {
+				options.forEachIndexed { i, label -> menu.add(0, i, i, label) }
+				menu.setGroupCheckable(0, true, true)
+				menu.findItem(selected)?.isChecked = true
+				setOnMenuItemClickListener { onSelect(it.itemId); true }
+				show()
+			}
+		}
 	}
 }
 

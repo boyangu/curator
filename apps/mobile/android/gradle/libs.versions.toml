@@ -13,6 +13,7 @@ serialization = "1.9.0"
 hermes = "260318099.0.8"
 fbjni = "0.7.0"
 junit = "4.13.2"
+sqliteJdbc = "3.49.1.0"
 gson = "2.11.0"
 spotifyAuth = "2.1.0"
 
@@ -31,6 +32,8 @@ serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-jso
 hermes-android = { module = "com.facebook.hermes:hermes-android", version.ref = "hermes" }
 fbjni = { module = "com.facebook.fbjni:fbjni", version.ref = "fbjni" }
 junit = { module = "junit:junit", version.ref = "junit" }
+# The list queries run against a real SQLite in unit tests (ListQueryTest).
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 spotify-auth = { module = "com.spotify.android:auth", version.ref = "spotifyAuth" }
 

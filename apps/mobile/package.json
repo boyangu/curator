@@ -8,6 +8,7 @@
     "bundle": "node scripts/bundle.mjs",
     "build": "node scripts/bundle.mjs && node scripts/gradle.mjs assembleDebug",
     "test": "node scripts/gradle.mjs testDebugUnitTest",
+    "check": "node scripts/check.mjs",
     "typecheck": "tsc --noEmit",
     "device": "node scripts/run.mjs"
   },

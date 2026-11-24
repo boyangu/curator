@@ -9,6 +9,7 @@
     "dev": "pnpm --filter @curator/desktop dev",
     "desktop:profile": "node apps/desktop/scripts/run-profile.mjs",
     "release:cloud": "node scripts/release-cloud.mjs",
+    "release:mobile": "node scripts/release-mobile.mjs",
     "cloud:rotate-db-password": "node scripts/rotate-cloud-db-password.mjs",
     "cloud:db-apply": "node scripts/cloud-db-apply.mjs",
     "cloud:catalog-push": "node scripts/cloud-catalog-push.mjs",

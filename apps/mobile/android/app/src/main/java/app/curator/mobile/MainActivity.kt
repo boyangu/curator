@@ -30,18 +30,20 @@ class MainActivity : ComponentActivity() {
 		setActive(true)
 		// Spotify's consent screen opens over the screen in front.
 		(application as CuratorApp).model.player.attach(this) { spotifyConsent.launch(it) }
+		(application as CuratorApp).model.updater.onForeground(this)
 	}
 
 	override fun onStop() {
 		super.onStop()
 		setActive(false)
 		(application as CuratorApp).model.player.attach(null, null)
+		(application as CuratorApp).model.updater.onBackground()
 	}
 
 	private fun setActive(active: Boolean) {
 		val app = application as CuratorApp
 		app.scope.launch {
-			if (app.db.value != null) runCatching { app.core.call("setActive", buildJsonObject { put("active", JsonPrimitive(active)) }) }
+			if (app.core.phase.value == "ready") runCatching { app.core.call("setActive", buildJsonObject { put("active", JsonPrimitive(active)) }) }
 		}
 	}
 }

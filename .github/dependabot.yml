@@ -30,6 +30,19 @@ updates:
     schedule:
       interval: weekly
 
+  # The Android app's Gradle plugins and libraries (its version catalog).
+  - package-ecosystem: gradle
+    directory: /apps/mobile/android
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Hermes moves with its JSI sources and hermesc, which fetch-vendor.mjs
+      # pins at the same version: bumped by hand, all three together.
+      - dependency-name: com.facebook.hermes:hermes-android
+
   # The Dockerfile's digest-pinned base image (node:22-slim@sha256:...).
   - package-ecosystem: docker
     directory: /

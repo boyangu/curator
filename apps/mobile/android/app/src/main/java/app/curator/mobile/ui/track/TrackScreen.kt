@@ -53,12 +53,22 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.onLongClick
+import app.curator.mobile.data.ArtistRef
+import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.TrackAnalysis
-import app.curator.mobile.model.ListView
-import app.curator.mobile.model.apply
 import app.curator.mobile.ui.AppModel
+import app.curator.mobile.ui.common.ContextMenu
 import app.curator.mobile.ui.common.Cover
+import app.curator.mobile.ui.common.CoverFill
+import app.curator.mobile.ui.common.MenuItem
 import app.curator.mobile.ui.common.Icon
 import app.curator.mobile.ui.common.IconButton
 import app.curator.mobile.ui.common.IconGlyph
@@ -70,7 +80,11 @@ import app.curator.mobile.ui.common.formatBpm
 import app.curator.mobile.ui.common.formatTime
 import app.curator.mobile.ui.list.Metrics
 import app.curator.mobile.ui.list.playFrom
-import app.curator.mobile.ui.list.rememberList
+import app.curator.mobile.ui.list.rememberListInfo
+import app.curator.mobile.ui.list.rememberPager
+import app.curator.mobile.ui.list.rememberView
+import app.curator.mobile.ui.list.scope
+import app.curator.mobile.ui.nav.ListSource
 import app.curator.mobile.ui.nav.LocalPageGestures
 import app.curator.mobile.ui.nav.Screen
 import app.curator.mobile.ui.nav.swipeToOpen
@@ -95,9 +109,15 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 		val l = lib ?: return@produceState
 		value = withContext(Dispatchers.IO) { l.track(screen.trackId)?.let { it to l.analysis(it.id) } }
 	}
+	val artists by produceState(emptyList<ArtistRef>(), lib, version, screen.trackId) {
+		value = lib?.let { l -> withContext(Dispatchers.IO) { l.trackArtists(screen.trackId) } } ?: emptyList()
+	}
 	val peaks = rememberPeaks(model, screen.trackId)
-	val listName = screen.from?.let { rememberList(model, it) }
-	val view by (screen.from?.let { model.viewState.listView(it.key) } ?: kotlinx.coroutines.flow.flowOf(ListView())).collectAsState(ListView())
+	val from = screen.from
+	val listName = from?.let { rememberListInfo(model, it) }
+	// The list it was opened from, as shown there (view and search): the same pager, so Next is the row below.
+	val view = from?.let { rememberView(model, it) }
+	val pager = rememberPager(model, if (from == null || view == null) null else ListQuery(from.scope(), view, screen.search))
 	val rotatedOnce by model.viewState.rotatedOnce.collectAsState(true)
 
 	// The player follows the open track (rotating keeps it: same screen, same state).
@@ -119,13 +139,21 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 	val jump: (Int) -> Unit = { n -> seek(jumpBeats(analysis.beats, track.bpm, position, n)) }
 	val cuePoint = analysis.cues.firstOrNull()?.positionSec ?: 0.0
 	val playPause = { if (player.playing && ours) model.player.pause() else model.player.play() }
-	val next: (() -> Unit)? = listName?.let { data ->
-		val shown = view.apply(data.tracks)
-		val i = shown.indexOfFirst { it.id == track.id }
-		shown.getOrNull(i + 1)?.let { n -> { scope.launch { playFrom(model, n) }; replace(Screen.Track(n.id, screen.from, i + 1, shown.size)) } }
+	// The row it was opened from (a track twice in a playlist is two rows), else where it is now.
+	val at = pager?.let { p -> remember(p.ids, track.id) { if (p.ids.getOrNull(screen.index) == track.id) screen.index else p.ids.indexOf(track.id) } } ?: -1
+	val next: (() -> Unit)? = pager?.ids?.getOrNull(at + 1)?.let { nextId ->
+		{
+			// Next keeps playing when this one was.
+			val keepPlaying = player.playing && ours
+			scope.launch {
+				val n = withContext(Dispatchers.IO) { lib?.track(nextId) } ?: return@launch
+				model.open(n, start = keepPlaying)
+				replace(Screen.Track(n.id, from, at + 1, pager.size, screen.search))
+			}
+		}
 	}
 	val transport = Transport(
-		playing = player.playing && ours, unavailable = player.unavailable.takeIf { ours },
+		playing = player.playing && ours, caption = (player.unavailable ?: player.note).takeIf { ours },
 		onPlay = playPause, onCue = { seek(cuePoint) }, onJump = jump, onNext = next,
 	)
 	val gestures = LocalPageGestures.current
@@ -137,8 +165,9 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 			onCycleZoom = { zoom = ZOOMS.firstOrNull { it > zoom + 0.01f } ?: ZOOMS.first() },
 			onScrub = { scrub = it }, onSeek = seek)
 	} else {
-		Portrait(track, analysis, peaks, metrics, position, duration, transport,
+		Portrait(track, artists, analysis, peaks, metrics, position, duration, transport,
 			from = listName?.name, index = screen.index, count = screen.count,
+			openArtist = { push(Screen.TrackList(ListSource.Artist(it.id))) },
 			showHint = !rotatedOnce, back = back, openActions = open,
 			onScrub = { scrub = it }, onSeek = seek,
 			modifier = Modifier.swipeToOpen(gestures) { Screen.TrackActions(track.id) })
@@ -147,7 +176,8 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 
 private class Transport(
 	val playing: Boolean,
-	val unavailable: String?,
+	/** Under the transport: why it can't play, else where it plays from. */
+	val caption: String?,
 	val onPlay: () -> Unit,
 	val onCue: () -> Unit,
 	val onJump: (Int) -> Unit,
@@ -157,8 +187,8 @@ private class Transport(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Portrait(
-	t: Track, a: TrackAnalysis, peaks: Peaks?, metrics: Metrics, position: Double, duration: Double, tr: Transport,
-	from: String?, index: Int, count: Int, showHint: Boolean,
+	t: Track, artists: List<ArtistRef>, a: TrackAnalysis, peaks: Peaks?, metrics: Metrics, position: Double, duration: Double, tr: Transport,
+	from: String?, index: Int, count: Int, openArtist: (ArtistRef) -> Unit, showHint: Boolean,
 	back: () -> Unit, openActions: () -> Unit, onScrub: (Double) -> Unit, onSeek: (Double) -> Unit, modifier: Modifier,
 ) {
 	Column(modifier.fillMaxSize().background(C.bg).windowInsetsPadding(WindowInsets.statusBars)) {
@@ -177,58 +207,96 @@ private fun Portrait(
 			IconButton(Icon.Menu, "Track actions", tint = C.fg, onClick = openActions)
 		}
 		Column(
-			Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 6.dp).windowInsetsPadding(WindowInsets.navigationBars),
+			Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp).windowInsetsPadding(WindowInsets.navigationBars),
 			verticalArrangement = Arrangement.spacedBy(18.dp),
 		) {
-			Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-				Cover(t.coverUrl, t.id, 116.dp)
+			// The cover big and centred, as wide as the screen less 48dp a side.
+			CoverFill(t.coverUrl, t.id, Modifier.fillMaxWidth().padding(horizontal = 48.dp))
+			Column(Modifier.padding(start = 24.dp, end = 24.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+				BasicText(t.title, Modifier.semantics { heading() }, style = T.trackTitle)
+				Artists(artists, t.artist, openArtist)
+				listOfNotNull(t.version, t.label).joinToString(" · ").takeIf { it.isNotEmpty() }?.let { BasicText(it, style = T.of(13.sp, color = C.fg2)) }
+				listOfNotNull(t.genre, t.released?.take(10)).joinToString(" · ").takeIf { it.isNotEmpty() }?.let { BasicText(it, style = T.of(13.sp, color = C.fg2)) }
+			}
+			Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+				Facts(t)
 				Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-					BasicText(t.title, Modifier.semantics { heading() }, style = T.trackTitle)
-					if (t.artist.isNotEmpty()) BasicText(t.artist, style = T.of(15.sp, color = C.fg1))
-					listOfNotNull(t.version, t.label).joinToString(" · ").takeIf { it.isNotEmpty() }?.let { BasicText(it, style = T.of(13.sp, color = C.fg2)) }
-					listOfNotNull(t.genre, t.released?.take(10)).joinToString(" · ").takeIf { it.isNotEmpty() }?.let { BasicText(it, style = T.of(13.sp, color = C.fg2)) }
+					BasicText(formatTime(position), Modifier.align(Alignment.End).semantics { contentDescription = "Elapsed ${formatTime(position)}" }, style = T.mono(12.sp, C.fg2))
+					OverviewMap(peaks, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onSeek = onSeek)
+					PhraseLane(a.phrases, duration, Modifier.fillMaxWidth().height(5.dp))
 				}
-			}
-			Facts(t)
-			Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-				OverviewMap(peaks, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onSeek = onSeek)
-				PhraseLane(a.phrases, duration, Modifier.fillMaxWidth().height(5.dp))
-				Row {
-					BasicText(formatTime(position), Modifier.weight(1f), style = T.mono(12.sp, C.fg2))
-					BasicText("-" + formatTime(duration - position), style = T.mono(12.sp, C.fg2))
+				Row(Modifier.fillMaxWidth().padding(top = 0.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+					Boxed("-16", "Back 16 beats", 52.dp, 48.dp, mono = true) { tr.onJump(-16) }
+					Boxed("Cue", "Cue", 52.dp, 48.dp) { tr.onCue() }
+					Box(
+						Modifier.size(64.dp).clip(CircleShape).background(C.fg)
+							.clickable(role = Role.Button, onClickLabel = if (tr.playing) "Pause" else "Play", onClick = tr.onPlay)
+							.semantics { contentDescription = if (tr.playing) "Pause" else "Play" },
+						contentAlignment = Alignment.Center,
+					) { IconGlyph(if (tr.playing) Icon.Pause else Icon.Play, Color.Black, 24.dp) }
+					BoxedIcon(Icon.Next, "Next track", 52.dp, 48.dp, enabled = tr.onNext != null) { tr.onNext?.invoke() }
+					Boxed("+16", "Forward 16 beats", 52.dp, 48.dp, mono = true) { tr.onJump(16) }
 				}
-			}
-			Row(Modifier.fillMaxWidth().padding(top = 0.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-				Boxed("-16", "Back 16 beats", 52.dp, 48.dp, mono = true) { tr.onJump(-16) }
-				Boxed("Cue", "Cue", 52.dp, 48.dp) { tr.onCue() }
-				Box(
-					Modifier.size(64.dp).clip(CircleShape).background(C.fg)
-						.clickable(role = Role.Button, onClickLabel = if (tr.playing) "Pause" else "Play", onClick = tr.onPlay)
-						.semantics { contentDescription = if (tr.playing) "Pause" else "Play" },
-					contentAlignment = Alignment.Center,
-				) { IconGlyph(if (tr.playing) Icon.Pause else Icon.Play, Color.Black, 24.dp) }
-				BoxedIcon(Icon.Next, "Next track", 52.dp, 48.dp, enabled = tr.onNext != null) { tr.onNext?.invoke() }
-				Boxed("+16", "Forward 16 beats", 52.dp, 48.dp, mono = true) { tr.onJump(16) }
-			}
-			tr.unavailable?.let { BasicText(it, Modifier.fillMaxWidth(), style = T.of(12.5.sp, color = C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center)) }
-			if (showHint) {
-				Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-					IconGlyph(Icon.Rotate, C.fg2, 16.dp, 1.6f)
-					Spacer(Modifier.width(8.dp))
-					BasicText("Turn sideways for the big waveform", style = T.of(12.5.sp, color = C.fg2))
+				tr.caption?.let { BasicText(it, Modifier.fillMaxWidth(), style = T.of(12.5.sp, color = C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center)) }
+				if (showHint) {
+					Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+						IconGlyph(Icon.Rotate, C.fg2, 16.dp, 1.6f)
+						Spacer(Modifier.width(8.dp))
+						BasicText("Turn sideways for the big waveform", style = T.of(12.5.sp, color = C.fg2))
+					}
 				}
-			}
-			Sound(t, metrics)
-			FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp), itemVerticalAlignment = Alignment.CenterVertically) {
-				for (tag in t.tags) TagPill(tag, height = 26.dp)
-				Spacer(Modifier.weight(1f))
-				Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.height(26.dp)) {
-					SourceDot(t.source)
-					BasicText("Playing from ${sourceName(t.source)}", style = T.of(12.sp, color = C.fg2))
+				Sound(t, metrics)
+				FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp), itemVerticalAlignment = Alignment.CenterVertically) {
+					for (tag in t.tags) TagPill(tag, height = 26.dp)
+					Spacer(Modifier.weight(1f))
+					Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.height(26.dp)) {
+						SourceDot(t.source)
+						// Where the library has it; where it plays from is the transport's caption.
+						BasicText(sourceName(t.source), style = T.of(12.sp, color = C.fg2))
+					}
 				}
+				Spacer(Modifier.height(12.dp))
 			}
-			Spacer(Modifier.height(12.dp))
 		}
+	}
+}
+
+// The credited artists, each its own target: a long press opens its menu.
+// None linked (a row the artist index hasn't reached): the credit as text.
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun Artists(artists: List<ArtistRef>, credit: String, open: (ArtistRef) -> Unit) {
+	val style = T.of(15.sp, color = C.fg1)
+	if (artists.isEmpty()) {
+		if (credit.isNotEmpty()) BasicText(credit, style = style)
+		return
+	}
+	FlowRow {
+		artists.forEachIndexed { i, a ->
+			ArtistName(a, style, open)
+			if (i < artists.lastIndex) BasicText(", ", Modifier.padding(vertical = 4.dp), style = style)
+		}
+	}
+}
+
+@Composable
+private fun ArtistName(a: ArtistRef, style: androidx.compose.ui.text.TextStyle, open: (ArtistRef) -> Unit) {
+	var menu by remember { mutableStateOf(false) }
+	var height by remember { mutableIntStateOf(0) }
+	val haptics = LocalHapticFeedback.current
+	Box {
+		BasicText(
+			a.name,
+			Modifier
+				.onSizeChanged { height = it.height }
+				.pointerInput(a.id) {
+					detectTapGestures(onLongPress = { haptics.performHapticFeedback(HapticFeedbackType.LongPress); menu = true })
+				}
+				.semantics { onLongClick("Artist options") { menu = true; true } }
+				.padding(vertical = 4.dp),
+			style = style,
+		)
+		if (menu) ContextMenu(a.name, listOf(MenuItem("Navigate to artist") { open(a) }), height) { menu = false }
 	}
 }
 

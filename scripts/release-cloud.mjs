@@ -21,54 +21,17 @@
 // The token is handed to flyctl through its own environment only; it is never
 // printed or written anywhere.
 
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { loadDotEnv, releaseKit, repoRoot } from './release-common.mjs';
 
-const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TAG_RE = /^cloud-v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 const APP_RE = /^[a-z0-9][a-z0-9-]{1,62}$/;
 const HEALTH_TIMEOUT_MS = 180_000;
 
-function fail(msg) {
-	console.error(`release-cloud: ${msg}`);
-	process.exit(1);
-}
-
-function step(msg) {
-	console.log(`\n== ${msg}`);
-}
-
-// A minimal .env reader: KEY=value per line, `#` comments, optional quotes,
-// whitespace around `=` tolerated. The shell wins over the file.
-function loadDotEnv(path) {
-	const out = {};
-	if (!existsSync(path)) return out;
-	for (const raw of readFileSync(path, 'utf8').split(/\r?\n/)) {
-		const line = raw.trim();
-		if (!line || line.startsWith('#')) continue;
-		const eq = line.indexOf('=');
-		if (eq < 1) continue;
-		const key = line.slice(0, eq).trim();
-		let value = line.slice(eq + 1).trim();
-		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
-		out[key] = value;
-	}
-	return out;
-}
-
-function run(cmd, args, opts = {}) {
-	const r = spawnSync(cmd, args, { cwd: opts.cwd ?? repoRoot, env: opts.env ?? process.env, stdio: opts.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', encoding: 'utf8', shell: opts.shell ?? false });
-	if (r.error) fail(`${cmd} could not start: ${r.error.message}`);
-	if (r.status !== 0 && !opts.allowFail) fail(`${cmd} ${args.join(' ')} exited ${r.status}${opts.capture ? `\n${r.stderr}` : ''}`);
-	return r;
-}
-
-function git(args, opts = {}) {
-	return run('git', args, { capture: true, ...opts }).stdout.trim();
-}
+const { fail, step, run, verifyTag, exportCommit } = releaseKit('release-cloud');
 
 function findFlyctl() {
 	const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['flyctl'], { encoding: 'utf8' });
@@ -99,22 +62,6 @@ async function waitForCommit(app, sha) {
 	fail(`${url} did not report ${sha} within ${HEALTH_TIMEOUT_MS / 1000} s (last: ${last})`);
 }
 
-async function exportCommit(sha, dir) {
-	// git archive | tar -x: the tracked tree of exactly that commit, nothing else.
-	await new Promise((resolve, reject) => {
-		const archive = spawn('git', ['archive', '--format=tar', sha], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'inherit'] });
-		const untar = spawn('tar', ['-xf', '-', '-C', dir], { stdio: ['pipe', 'inherit', 'inherit'] });
-		archive.stdout.pipe(untar.stdin);
-		let pending = 2;
-		const done = (name) => (code) => {
-			if (code !== 0) reject(new Error(`${name} exited ${code}`));
-			else if (--pending === 0) resolve();
-		};
-		archive.on('error', reject).on('close', done('git archive'));
-		untar.on('error', reject).on('close', done('tar'));
-	});
-}
-
 async function main() {
 	const tag = process.argv[2];
 	if (!tag || !TAG_RE.test(tag)) fail('usage: pnpm release:cloud cloud-vX.Y.Z (the tag must already be pushed to origin)');
@@ -127,17 +74,7 @@ async function main() {
 	const flyctl = findFlyctl();
 
 	step(`verify ${tag}`);
-	// The tag as origin has it is what ships: a local tag that was never
-	// pushed, or moved, does not count.
-	const remote = git(['ls-remote', '--tags', 'origin', `refs/tags/${tag}`, `refs/tags/${tag}^{}`]);
-	if (!remote) fail(`${tag} is not on origin; push it first (git push origin ${tag})`);
-	const lines = remote.split('\n').map((l) => l.split('\t'));
-	const peeled = lines.find(([, ref]) => ref.endsWith('^{}')) ?? lines[0];
-	const sha = peeled[0];
-	git(['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-	if (run('git', ['cat-file', '-e', `${sha}^{commit}`], { capture: true, allowFail: true }).status !== 0) git(['fetch', '--quiet', 'origin', sha]);
-	if (run('git', ['merge-base', '--is-ancestor', sha, 'origin/main'], { capture: true, allowFail: true }).status !== 0) fail(`${tag} (${sha}) is not on origin/main`);
-	console.log(`${tag} -> ${sha}, on origin/main`);
+	const sha = verifyTag(tag);
 
 	const flyEnv = { ...process.env, FLY_API_TOKEN: token };
 	// JSON, not the table: the table's box-drawing borders and colours make

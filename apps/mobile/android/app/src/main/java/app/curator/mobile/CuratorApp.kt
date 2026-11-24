@@ -36,6 +36,9 @@ class CuratorApp : Application() {
 
 	val dbPath: String get() = File(filesDir, "library.db").absolutePath
 
+	// Set once the core has said the library is ready on this device (its install is done).
+	private val installedMark: File get() = File(filesDir, "library.installed")
+
 	override fun onCreate() {
 		super.onCreate()
 		core = CoreRuntime(this)
@@ -44,6 +47,11 @@ class CuratorApp : Application() {
 			_problem.value = "No dev server configured: run the app with scripts/run.mjs"
 			return
 		}
+		// A library this device installed before opens for the views at once:
+		// the core's start (its migrate, 0.7 s) goes on beside them, and a WAL
+		// reader sees the last committed state meanwhile. The core's `applied`
+		// events bring the views up to date after.
+		if (installedMark.exists()) scope.launch(Dispatchers.IO) { runCatching { openViews() } }
 		scope.launch {
 			try {
 				val t0 = android.os.SystemClock.elapsedRealtime()
@@ -57,11 +65,19 @@ class CuratorApp : Application() {
 					put("appVersion", JsonPrimitive(packageManager.getPackageInfo(packageName, 0).versionName ?: "0"))
 				})
 				core.phase.first { it == "ready" }
-				_db.value = NativeDb.open(dbPath)
-				android.util.Log.i("curator-core", "library open after ${android.os.SystemClock.elapsedRealtime() - t0} ms: $started")
+				openViews()
+				installedMark.createNewFile()
+				android.util.Log.i("curator-core", "library ready after ${android.os.SystemClock.elapsedRealtime() - t0} ms: $started")
 			} catch (e: Exception) {
 				_problem.value = e.message ?: e.javaClass.simpleName
 			}
 		}
+	}
+
+	// The views' read connection, once (the early open and the core's ready may both ask).
+	private fun openViews() {
+		if (_db.value != null) return
+		val db = NativeDb.open(dbPath)
+		if (!_db.compareAndSet(null, db)) db.close()
 	}
 }

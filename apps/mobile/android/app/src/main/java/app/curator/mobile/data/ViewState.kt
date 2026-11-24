@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import app.curator.mobile.model.ListView
+import app.curator.mobile.model.StreamingService
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
@@ -15,13 +16,19 @@ private val Context.viewStore by preferencesDataStore("view-state")
 
 /**
  * This device's view state: which lists were opened lately (Home's Recent),
- * each list's sort and filters, whether the Track view has been turned
- * sideways yet. Per device by design (§3, §5): nothing here rides an op.
+ * each list's sort and filters, Library's pickers, whether the Track view has been turned
+ * sideways yet, the streaming service the library's files play from. Per
+ * device by design (§3, §5): nothing here rides an op. The streaming service
+ * too, as the desktop keeps its primary one (app_setting primary_streaming,
+ * not an account setting): what a device can play through is its own.
+ * Whether it updates itself too: each phone's choice.
  */
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
 	private val recentKey = stringPreferencesKey("recent")
 	private val rotatedKey = booleanPreferencesKey("rotated-once")
+	private val streamingKey = stringPreferencesKey("streaming")
+	private val autoUpdateKey = booleanPreferencesKey("auto-update")
 	private fun listKey(list: String) = stringPreferencesKey("list:$list")
 
 	@Serializable
@@ -51,6 +58,26 @@ class ViewState(private val context: Context) {
 
 	suspend fun rotated() {
 		context.viewStore.edit { it[rotatedKey] = true }
+	}
+
+	/** A remembered choice of a picker (Library's Tracks/Playlists and source): "" when none was made yet. */
+	fun pick(name: String): Flow<String> = context.viewStore.data.map { it[stringPreferencesKey("pick:$name")] ?: "" }
+
+	suspend fun setPick(name: String, value: String) {
+		context.viewStore.edit { it[stringPreferencesKey("pick:$name")] = value }
+	}
+
+	val streaming: Flow<StreamingService> = context.viewStore.data.map { StreamingService.of(it[streamingKey]) ?: StreamingService.DEFAULT }
+
+	suspend fun setStreaming(s: StreamingService) {
+		context.viewStore.edit { it[streamingKey] = s.id }
+	}
+
+	/** Install new releases without asking (Updater); on unless turned off. */
+	val autoUpdate: Flow<Boolean> = context.viewStore.data.map { it[autoUpdateKey] ?: true }
+
+	suspend fun setAutoUpdate(on: Boolean) {
+		context.viewStore.edit { it[autoUpdateKey] = on }
 	}
 
 	companion object {

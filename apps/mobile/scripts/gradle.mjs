@@ -18,6 +18,11 @@ else if (!env.JAVA_HOME) throw new Error('no JDK: run `node scripts/fetch-vendor
 const sdk = env.ANDROID_HOME ?? env.ANDROID_SDK_ROOT ?? (process.platform === 'win32' ? join(env.LOCALAPPDATA ?? '', 'Android', 'Sdk') : join(env.HOME ?? '', 'Android', 'Sdk'));
 if (!existsSync(join(android, 'local.properties'))) writeFileSync(join(android, 'local.properties'), `sdk.dir=${sdk.replace(/\\/g, '/')}\n`);
 
-const gradlew = join(android, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew');
-const r = spawnSync(gradlew, ['--console=plain', ...process.argv.slice(2)], { cwd: android, env, stdio: 'inherit', shell: process.platform === 'win32' });
+// Through sh elsewhere: the wrapper is in git without its executable bit
+// (committed from Windows), so a Linux checkout can't run it directly.
+const win = process.platform === 'win32';
+const args = ['--console=plain', ...process.argv.slice(2)];
+const r = win
+	? spawnSync(join(android, 'gradlew.bat'), args, { cwd: android, env, stdio: 'inherit', shell: true })
+	: spawnSync('sh', [join(android, 'gradlew'), ...args], { cwd: android, env, stdio: 'inherit' });
 process.exit(r.status ?? 1);

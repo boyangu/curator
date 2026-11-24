@@ -12,12 +12,40 @@ plugins {
 // below (prefab).
 val vendorDir = rootDir.resolve("../vendor").canonicalFile
 
-// The Spotify app the desktop uses (its client id, from the repo's .env as the
-// desktop build reads it; never in git). Empty: Spotify playback reports
-// itself unconfigured. The redirect URI is registered on that app with this
-// package and its signing SHA-1 (Android packages, in Spotify's dashboard).
-val spotifyClientId: String = rootDir.resolve("../../../.env").takeIf { it.exists() }?.readLines()
-	?.firstOrNull { it.startsWith("CURATOR_SPOTIFY_CLIENT_ID=") }?.substringAfter("=")?.trim()?.trim('"') ?: ""
+// Configuration as the desktop build reads it: the environment (what
+// scripts/release-mobile.mjs passes), else the repo's git-ignored .env.
+// Never in git.
+val dotEnv: Map<String, String> = rootDir.resolve("../../../.env").takeIf { it.exists() }?.readLines().orEmpty()
+	.map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") && "=" in it }
+	.associate { it.substringBefore("=").trim() to it.substringAfter("=").trim().trim('"', '\'') }
+fun config(name: String): String = System.getenv(name)?.takeIf { it.isNotBlank() } ?: dotEnv[name] ?: ""
+
+// The Spotify app the desktop uses. Empty: Spotify playback reports itself
+// unconfigured. The redirect URI is registered on that app with this package
+// and each signing key's SHA-1 (Android packages, in Spotify's dashboard).
+val spotifyClientId = config("CURATOR_SPOTIFY_CLIENT_ID")
+
+// Where released builds look for their updates: the release list of the
+// GitHub repo ("owner/name") whose mobile-v* releases carry them
+// (scripts/release-mobile.mjs). CURATOR_MOBILE_UPDATE_FEED names another list
+// of the same shape instead (a local test feed through adb reverse); a
+// release never sets it. Empty: the updater reports itself unconfigured.
+val updateRepo = config("CURATOR_MOBILE_UPDATE_REPO")
+val updateFeed = config("CURATOR_MOBILE_UPDATE_FEED").ifEmpty { if (updateRepo.isEmpty()) "" else "https://api.github.com/repos/$updateRepo/releases?per_page=30" }
+
+// The release's version, from its tag (mobile-v1.2.3 → -PcuratorVersion=1.2.3);
+// a build without one is a development build. The code orders releases for
+// Android and the updater: 1.2.3 → 1_002_003.
+val curatorVersion = (findProperty("curatorVersion") as String?)?.takeIf { it.isNotBlank() }
+val versionParts = curatorVersion?.let { v ->
+	requireNotNull(Regex("""^(\d+)\.(\d+)\.(\d+)$""").find(v)) { "curatorVersion must be X.Y.Z, got $v" }.groupValues.drop(1).map { it.toInt() }
+}
+
+// The release key (scripts/release-mobile.mjs checks the APK was signed with
+// it): a PKCS12 keystore kept off GitHub, its path and password in the
+// environment or .env. Without it a release build is signed with the debug
+// key, for local runs.
+val releaseKeystore = config("CURATOR_MOBILE_KEYSTORE").takeIf { it.isNotEmpty() }?.let { file(it) }
 
 android {
 	namespace = "app.curator.mobile"
@@ -28,11 +56,12 @@ android {
 		applicationId = "app.curator.mobile"
 		minSdk = 29
 		targetSdk = 35
-		versionCode = 1
-		versionName = "0.1.0"
+		versionCode = versionParts?.let { (major, minor, patch) -> major * 1_000_000 + minor * 1_000 + patch } ?: 1
+		versionName = curatorVersion ?: "0.0.0-dev"
 		ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
 		buildConfigField("String", "SPOTIFY_CLIENT_ID", "\"$spotifyClientId\"")
 		buildConfigField("String", "SPOTIFY_REDIRECT_URI", "\"curator-mobile://spotify-callback\"")
+		buildConfigField("String", "UPDATE_FEED", "\"$updateFeed\"")
 		// The auth library's redirect activity answers that URI.
 		manifestPlaceholders["redirectSchemeName"] = "curator-mobile"
 		manifestPlaceholders["redirectHostName"] = "spotify-callback"
@@ -44,9 +73,23 @@ android {
 		}
 	}
 
+	signingConfigs {
+		if (releaseKeystore != null) create("release") {
+			storeFile = releaseKeystore
+			storeType = "PKCS12"
+			// One password: a PKCS12 store's key has the store's.
+			storePassword = config("CURATOR_MOBILE_KEYSTORE_PASSWORD")
+			keyAlias = config("CURATOR_MOBILE_KEY_ALIAS").ifEmpty { "curator" }
+			keyPassword = config("CURATOR_MOBILE_KEYSTORE_PASSWORD")
+		}
+	}
+
 	buildTypes {
 		release {
 			isMinifyEnabled = false
+			// The release build starts in 0.5 s where the debuggable one takes 3,
+			// so local runs use it too, with the debug key.
+			signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
 		}
 	}
 
@@ -103,4 +146,5 @@ dependencies {
 	// The one-time consent, asked from our activity (see player/AppPlayer.kt).
 	implementation(libs.spotify.auth)
 	testImplementation(libs.junit)
+	testImplementation(libs.sqlite.jdbc)
 }

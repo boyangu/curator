@@ -6,6 +6,8 @@ import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
@@ -78,10 +80,21 @@ object Covers {
 
 @Composable
 fun Cover(url: String?, seed: String, size: Dp, modifier: Modifier = Modifier) {
+	CoverImage(url, seed, size, modifier.size(size))
+}
+
+/** Square cover art as wide as its space (the Track view's big cover). */
+@Composable
+fun CoverFill(url: String?, seed: String, modifier: Modifier = Modifier) {
+	BoxWithConstraints(modifier.aspectRatio(1f)) { CoverImage(url, seed, maxWidth, Modifier.fillMaxSize()) }
+}
+
+@Composable
+private fun CoverImage(url: String?, seed: String, shownAt: Dp, modifier: Modifier) {
 	val context = LocalContext.current
-	val px = with(LocalDensity.current) { size.roundToPx() }
+	val px = with(LocalDensity.current) { shownAt.roundToPx() }
 	val image by produceState<ImageBitmap?>(null, url, px) { value = url?.let { Covers.load(context, it, px) } }
-	Box(modifier.size(size).background(oklch(0.36f, 0.06f, (seed.hashCode() and 0x7fffffff) % 360f))) {
+	Box(modifier.background(oklch(0.36f, 0.06f, (seed.hashCode() and 0x7fffffff) % 360f))) {
 		image?.let { Image(it, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
 	}
 }

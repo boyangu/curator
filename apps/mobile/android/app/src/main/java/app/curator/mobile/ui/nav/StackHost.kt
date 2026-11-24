@@ -14,6 +14,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -72,22 +73,22 @@ fun Modifier.swipeToOpen(gestures: PageGestures?, page: () -> Screen): Modifier 
 	awaitEachGesture {
 		val down = awaitFirstDown(requireUnconsumed = false)
 		if (down.position.x < edge || down.position.x > size.width - edge) return@awaitEachGesture
-		pageSwipe(down.id, leftward = true, onStart = { gestures.begin(page()) }, onDrag = gestures.drag, onEnd = gestures.end)
+		pageSwipe(down.id, accepts = { it < 0 }, onStart = { gestures.begin(page()) }, onDrag = gestures.drag, onEnd = gestures.end)
 	}
 }
 
 /**
- * Follows one pointer until it lifts: past the touch slop horizontally in the
- * given direction it is a page swipe (its moves are taken from then on, so
- * the row under the finger does not also get a tap); vertically first, or a
- * move a child already took, it is someone else's (a list's scroll, the
- * waveform's scrub) and is let go. [onEnd] runs even if the gesture is
- * cancelled, so a page never stays half open.
+ * Follows one pointer until it lifts: past the touch slop horizontally, in a
+ * direction [accepts] takes (given the first move's dx), it is a page swipe
+ * (its moves are taken from then on, so the row under the finger does not
+ * also get a tap); vertically first, or a move a child already took, it is
+ * someone else's (a list's scroll, the waveform's scrub) and is let go.
+ * [onEnd] runs even if the gesture is cancelled, so a page never stays half open.
  */
 private suspend fun AwaitPointerEventScope.pageSwipe(
 	id: PointerId,
-	leftward: Boolean,
-	onStart: () -> Unit,
+	accepts: (Float) -> Boolean,
+	onStart: (Float) -> Unit,
 	onDrag: (Float) -> Unit,
 	onEnd: (Float) -> Unit,
 ) {
@@ -108,7 +109,11 @@ private suspend fun AwaitPointerEventScope.pageSwipe(
 			tracker.addPosition(ch.uptimeMillis, ch.position)
 			if (!swiping) {
 				if (abs(dy) > slop && abs(dy) > abs(dx)) break
-				if ((if (leftward) -dx else dx) > slop && abs(dx) > abs(dy)) { swiping = true; onStart() } else continue
+				if (abs(dx) > slop && abs(dx) > abs(dy)) {
+					if (!accepts(dx)) break
+					swiping = true
+					onStart(dx)
+				} else continue
 			}
 			ch.consume()
 			onDrag(dx)
@@ -194,7 +199,7 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 				val down = awaitFirstDown(requireUnconsumed = false)
 				if (down.position.x < edge) return@awaitEachGesture
 				pageSwipe(
-					down.id, leftward = false,
+					down.id, accepts = { it > 0 },
 					onStart = {
 						dragging = "close"
 						over = nav.top
@@ -205,23 +210,68 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 			}
 		}
 
+		// Swipe sideways on a main view's root: the view beside it (Home, Feed,
+		// Library, Explore) follows the finger in, as a pager would. Only at a
+		// root: a pushed screen's swipe left is its Actions page.
+		val tx = remember { Animatable(0f) }
+		var beside by remember { mutableStateOf<Tab?>(null) }
+		var besideDir by remember { mutableIntStateOf(0) }
+		val tabSwipe = Modifier.pointerInput(top.id, nav.tab) {
+			if (nav.stack.size > 1 || nav.tab !in Tab.swipeable) return@pointerInput
+			val edge = EDGE.toPx()
+			fun dirOf(dx: Float) = if (dx < 0) 1 else -1
+			awaitEachGesture {
+				val down = awaitFirstDown(requireUnconsumed = false)
+				if (down.position.x < edge || down.position.x > size.width - edge) return@awaitEachGesture
+				pageSwipe(
+					down.id,
+					accepts = { dx -> nav.beside(dirOf(dx)) != null },
+					onStart = { dx -> besideDir = dirOf(dx); beside = nav.beside(besideDir) },
+					onDrag = { dx -> scope.launch { tx.snapTo(if (besideDir > 0) dx.coerceIn(-width, 0f) else dx.coerceIn(0f, width)) } },
+					onEnd = { velocity ->
+						scope.launch {
+							val t = beside ?: return@launch
+							val flung = if (besideDir > 0) velocity < -800f else velocity > 800f
+							if (abs(tx.value) > width * 0.33f || flung) {
+								tx.animateTo(-besideDir * width, tween(180))
+								// One frame: the view beside becomes the tab's top in place (same key, same composition).
+								beside = null
+								nav.select(t)
+							} else {
+								tx.animateTo(0f, tween(180))
+								beside = null
+							}
+							tx.snapTo(0f)
+						}
+					},
+				)
+			}
+		}
+
 		BackHandler(enabled = stack.size > 1) { nav.pop() }
 
 		CompositionLocalProvider(LocalPageGestures provides gestures) {
 			val o = over
 			val u = under
-			val visible = if (o == null || u == null) listOf(top) else listOf(u, o)
+			val b = beside?.let { nav.topOf(it) }
+			val visible = if (b != null) listOf(top, b) else if (o == null || u == null) listOf(top) else listOf(u, o)
 			// One keyed loop, one chain of modifiers for every entry: an entry
 			// keeps its composition and its gesture detectors (a swipe in
 			// progress) as it goes from settled to beneath to sliding; only the
 			// values inside the chain change.
 			for (e in visible) key(e.id) {
-				val sliding = e === o
-				val beneath = e === u && o != null
+				val sliding = e === o && b == null
+				val beneath = e === u && o != null && b == null
 				Box(
 					Modifier
 						.fillMaxSize()
-						.graphicsLayer { translationX = if (sliding) x.value else 0f }
+						.graphicsLayer {
+							translationX = when {
+								b == null -> if (sliding) x.value else 0f
+								e === b -> tx.value + besideDir * width
+								else -> tx.value
+							}
+						}
 						.drawBehind {
 							// The one shadow the design allows: a page sliding over (-8px 0 24px rgba(0,0,0,.5)).
 							if (!sliding) return@drawBehind
@@ -232,7 +282,7 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 							)
 						}
 						.background(C.bg)
-						.then(if (e === top) closeSwipe else Modifier)
+						.then(if (e === top) closeSwipe.then(tabSwipe) else Modifier)
 						// Beneath: seen but not reachable (TalkBack skips it).
 						.then(if (beneath) Modifier.clearAndSetSemantics {} else Modifier),
 				) { holder.SaveableStateProvider(e.id) { content(e.screen) } }

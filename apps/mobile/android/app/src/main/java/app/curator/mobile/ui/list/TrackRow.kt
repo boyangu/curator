@@ -17,6 +17,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -31,6 +32,7 @@ import androidx.compose.ui.unit.sp
 import app.curator.mobile.data.Track
 import app.curator.mobile.model.LevelConfig
 import app.curator.mobile.model.RowField
+import app.curator.mobile.model.StreamingService
 import app.curator.mobile.ui.common.Cover
 import app.curator.mobile.ui.common.KeyChip
 import app.curator.mobile.ui.common.TagPill
@@ -71,12 +73,33 @@ private sealed interface Seg {
 	data class Pill(val name: String) : Seg
 }
 
+// A row whose track isn't on the service it plays through.
+private const val MISSING_ALPHA = 0.38f
+
 // Heights, art and line gap by detail level (§6).
 private val HEIGHT = mapOf(1 to 48, 2 to 60, 3 to 76)
 private val ART = mapOf(1 to 32, 2 to 44, 3 to 60)
 
+/** A row whose page is still on its way: the row's height and divider, its art's place, so nothing moves when it fills. */
 @Composable
-fun TrackRow(track: Track, level: Int, cfg: LevelConfig, metrics: Metrics, playing: Boolean, onClick: () -> Unit) {
+fun TrackRowPlaceholder(level: Int) {
+	Row(
+		Modifier
+			.fillMaxWidth()
+			.height(HEIGHT.getValue(level).dp)
+			.drawBehind { drawLine(C.lineSoft, Offset(0f, size.height), Offset(size.width, size.height), 1.dp.toPx()) }
+			.padding(horizontal = 16.dp),
+		verticalAlignment = Alignment.CenterVertically,
+	) { Box(Modifier.size(ART.getValue(level).dp).background(C.bg1)) }
+}
+
+/**
+ * [missingOn]: the service the track plays through when that service doesn't
+ * have it (a file whose recording has no id on the one picked in Settings).
+ * The row greys out but still opens: its cues, grid and waveform are there.
+ */
+@Composable
+fun TrackRow(track: Track, level: Int, cfg: LevelConfig, metrics: Metrics, playing: Boolean, missingOn: StreamingService?, onClick: () -> Unit) {
 	val lines = cfg.lines
 	Row(
 		Modifier
@@ -85,7 +108,9 @@ fun TrackRow(track: Track, level: Int, cfg: LevelConfig, metrics: Metrics, playi
 			.background(if (playing) C.bg1 else C.bg)
 			.drawBehind { drawLine(C.lineSoft, Offset(0f, size.height), Offset(size.width, size.height), 1.dp.toPx()) }
 			.clickable(role = Role.Button, onClick = onClick)
-			.semantics(mergeDescendants = true) { contentDescription = describe(track, playing) }
+			.semantics(mergeDescendants = true) { contentDescription = describe(track, playing, missingOn) }
+			// After the divider and background, so only the content dims.
+			.alpha(if (missingOn != null) MISSING_ALPHA else 1f)
 			.padding(horizontal = 16.dp),
 		verticalAlignment = Alignment.CenterVertically,
 		horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -170,8 +195,9 @@ private fun segments(fields: List<RowField>, line: Int, right: Boolean, t: Track
 	return out
 }
 
-private fun describe(t: Track, playing: Boolean): String = buildString {
+private fun describe(t: Track, playing: Boolean, missingOn: StreamingService?): String = buildString {
 	if (playing) append("Now playing. ")
+	missingOn?.let { append("Not on ${it.label}. ") }
 	append(t.title)
 	t.version?.let { append(", $it") }
 	if (t.artist.isNotEmpty()) append(", by ${t.artist}")
