@@ -61,6 +61,8 @@ const MAX_DETAIL_LINES = 15;
 const DEFAULT_LIST_LIMIT = 50;
 // A reorder names every row; past this a playlist is not a hand-ordered list.
 const MAX_REORDER_ROWS = 2000;
+// Row removal only looks rows up, so it reaches the biggest playlists too.
+const MAX_ROW_LOOKUP = 20_000;
 
 type Args = Record<string, unknown>;
 const asArgs = (a: unknown): Args => (a && typeof a === 'object' ? (a as Args) : {});
@@ -163,6 +165,8 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 					playlist: { id: pl.id, name: pl.name, source: pl.source, trackCount: pl.trackCount ?? 0 },
 					tracks: tracks.map((t) => ({
 						id: t.id,
+						// The "#" column, 1-based — how remove_playlist_rows names a row.
+						...(t.playlistPosition != null ? { position: t.playlistPosition + 1 } : {}),
 						// A followed playlist keeps tracks the user deleted (the app
 						// shows them with a "deleted" chip); they're not in the library.
 						...(t.deletedAt ? { deleted: true } : {}),
@@ -276,6 +280,84 @@ export function buildMcpWriteTools(ports: McpWritePorts): McpWriteToolRegistry {
 				if (!approved) throw deny();
 				const res = await svc().removeTracksFromPlaylist(playlistId, trackIds);
 				return { ok: true, removed: res.removed, upstream: res.upstream };
+			},
+		},
+		{
+			name: 'remove_playlist_rows',
+			annotations: STREAMING_REMOVE,
+			description: 'Remove single rows of a playlist — e.g. the extra copies of a duplicated track — leaving every other row, including other copies of the same track, where it is (remove_tracks_from_playlist takes every copy). Each row is named by its 1-based `position` (from get_playlist_tracks) AND its track id, and the call is refused if they no longer match. DESTRUCTIVE — always requires the user to approve an in-app confirmation; on a spotify/tidal playlist it changes the user\'s live account (a kept copy of a track that was in twice is re-inserted in place, so its "date added" there resets) and is refused up front when the provider has drifted from the last sync.',
+			parameters: {
+				type: 'object',
+				properties: {
+					playlistId: { type: 'string' },
+					rows: {
+						type: 'array',
+						items: {
+							type: 'object',
+							properties: { position: { type: 'number' }, trackId: { type: 'string' } },
+							required: ['position', 'trackId'],
+						},
+					},
+				},
+				required: ['playlistId', 'rows'],
+			},
+			async execute(rawArgs) {
+				const a = asArgs(rawArgs);
+				const playlistId = str(a['playlistId']);
+				if (!playlistId) throw new Error('playlistId is required');
+				const wanted = (Array.isArray(a['rows']) ? a['rows'] : []).map((r) => asArgs(r));
+				if (wanted.length === 0) throw new Error('rows is required');
+				const pl = await requirePlaylist(playlistId);
+				const rows = await svc().getTracks({ playlistId }, { column: 'index', dir: 'asc' }, MAX_ROW_LOOKUP + 1);
+				if (rows.length > MAX_ROW_LOOKUP) throw new Error(`a playlist over ${MAX_ROW_LOOKUP} tracks is not edited row by row here`);
+				const at = new Map(rows.map((t) => [(t.playlistPosition ?? -2) + 1, t]));
+				const picked = wanted.map((r) => {
+					const position = typeof r['position'] === 'number' ? r['position'] : NaN;
+					const t = at.get(position);
+					if (!t || t.id !== r['trackId']) throw new Error(`row #${position} is not track ${String(r['trackId'])} — use get_playlist_tracks`);
+					return t;
+				});
+				const approved = await ports.confirm({
+					kind: 'destructive-write',
+					title: `Remove ${picked.length} row(s) from ${pl.source} playlist "${pl.name}" (other copies stay)`,
+					detailLines: detailLines(picked).map((line, i) => (i < picked.length ? `#${picked[i]!.playlistPosition! + 1}  ${line}` : line)),
+				});
+				if (!approved) throw deny();
+				const res = await svc().removePlaylistRows(playlistId, picked.map((t) => t.playlistPosition!));
+				if (!STREAMING_SOURCES.has(pl.source)) ports.notify(`Claude removed ${res.removed} rows from "${pl.name}"`);
+				return { ok: true, removed: res.removed, upstream: res.upstream, ...(res.detail ? { detail: res.detail } : {}) };
+			},
+		},
+		{
+			name: 'delete_playlists',
+			annotations: STREAMING_REMOVE,
+			description: 'Delete Tidal playlists FROM THE USER\'S LIVE TIDAL ACCOUNT (for every listener — not undoable), then from Curator. Only playlists Tidal says the user owns are deleted; followed playlists, Favorite Tracks and non-Tidal playlists are skipped and listed with the reason. One in-app confirmation covers the whole batch.',
+			parameters: {
+				type: 'object',
+				properties: {
+					playlistIds: { type: 'array', items: { type: 'string' }, description: 'Curator playlist ids (from list_playlists).' },
+				},
+				required: ['playlistIds'],
+			},
+			async execute(rawArgs) {
+				const a = asArgs(rawArgs);
+				const playlistIds = strArray(a['playlistIds']);
+				if (playlistIds.length === 0) throw new Error('playlistIds is required');
+				const all = new Map((await svc().getPlaylists()).map((p) => [p.id, p]));
+				const unknown = playlistIds.filter((id) => !all.has(id));
+				if (unknown.length > 0) throw new Error(`unknown playlistIds: ${unknown.slice(0, 5).join(', ')}`);
+				const names = playlistIds.map((id) => all.get(id)!.name);
+				const approved = await ports.confirm({
+					kind: 'destructive-write',
+					title: `Delete up to ${playlistIds.length} playlists from your Tidal account (only ones you own; this can't be undone)`,
+					detailLines: [
+						...names.slice(0, MAX_DETAIL_LINES),
+						...(names.length > MAX_DETAIL_LINES ? [`… and ${names.length - MAX_DETAIL_LINES} more`] : []),
+					],
+				});
+				if (!approved) throw deny();
+				const res = await svc().deleteStreamingPlaylists(playlistIds);
+				return { ok: res.failed.length === 0, ...res };
 			},
 		},
 		{

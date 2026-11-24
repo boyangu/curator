@@ -295,14 +295,14 @@ export type ClaimLinkRead = { source: ClaimLinkSource; sourceTrackId: string };
 // the first of a provider is its primary.
 export function claimLinksOf(raw: Raw, trackIds: readonly string[]): Map<string, ClaimLinkRead[]> {
 	const out = new Map<string, ClaimLinkRead[]>();
-	for (let i = 0; i < trackIds.length; i += 500) {
-		const chunk = trackIds.slice(i, i + 500);
-		for (const r of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link WHERE track_id IN (${marks(chunk.length)}) ORDER BY track_id, source, rank, source_track_id`)
-			.all(...chunk) as Array<{ t: string; s: ClaimLinkSource; v: string }>) {
-			let list = out.get(r.t);
-			if (!list) out.set(r.t, (list = []));
-			list.push({ source: r.s, sourceTrackId: r.v });
-		}
+	if (trackIds.length === 0) return out;
+	// One json_each parameter for the whole set, not 500-id IN-list chunks:
+	// the track list decorates a whole source root (~40k ids) through here.
+	for (const r of raw.prepare(`SELECT track_id AS t, source AS s, source_track_id AS v FROM claim_link WHERE track_id IN (SELECT value FROM json_each(?)) ORDER BY track_id, source, rank, source_track_id`)
+		.all(JSON.stringify(trackIds)) as Array<{ t: string; s: ClaimLinkSource; v: string }>) {
+		let list = out.get(r.t);
+		if (!list) out.set(r.t, (list = []));
+		list.push({ source: r.s, sourceTrackId: r.v });
 	}
 	return out;
 }

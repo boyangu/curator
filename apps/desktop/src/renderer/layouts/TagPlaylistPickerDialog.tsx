@@ -2,7 +2,7 @@
 // replaces the separate Tag and Playlist pickers. One surface answers "where
 // does this selection belong?" across three columns:
 //
-//   Tags (accent) · Local · Rekordbox (orange) · Streaming · Spotify (green)
+//   Tags (accent) · Owned (orange) · Streaming · Spotify (green)
 //
 // A single search box filters every column by name + folder path; a docked
 // "Associated" pane on the right lists everything currently applied (grouped
@@ -670,7 +670,7 @@ export function mountOrganizeDialog(host: HTMLElement, props: OrganizeDialogProp
 						>
 							<span
 								class="organize__cover-art"
-								style={{ 'background-image': `url(curator-cover://${encodeURIComponent(id)})` }}
+								style={{ 'background-image': `url(curator-cover://${encodeURIComponent(id)}?s=thumb)` }}
 							/>
 							<Show when={i() === shown - 1 && extra > 0}>
 								<span class="organize__cover-more">+{extra}</span>

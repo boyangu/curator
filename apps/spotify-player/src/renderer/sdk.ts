@@ -18,6 +18,7 @@ type SpotifyPlayer = {
 	setVolume(volume: number): Promise<void>;
 	getCurrentState(): Promise<SpotifyState | null>;
 	activateElement(): Promise<void>;
+	disconnect(): void;
 };
 type SpotifyState = {
 	paused: boolean;
@@ -76,61 +77,123 @@ function getToken(): Promise<string | null> {
 let player: SpotifyPlayer | null = null;
 let deviceId: string | null = null;
 let ready: Promise<void> | null = null;
+let sdkLoaded = false;
 let activated = false;
 
-async function ensureSpotify(): Promise<void> {
+const SDK_SRC = 'https://sdk.scdn.co/spotify-player.js';
+// The outer script loads the SDK's own iframe (sdk.scdn.co/embedded) before
+// it fires onSpotifyWebPlaybackSDKReady; if that inner load dies there is no
+// error event at all, so a timeout is the only way out of the wait.
+const SDK_LOAD_TIMEOUT_MS = 20_000;
+const DEVICE_WAIT_MS = 8000;
+
+function loadSdk(): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		// A failed earlier attempt (offline at boot, captive portal) leaves a
+		// dead <script> and maybe a half-loaded SDK iframe behind. Drop both so
+		// this attempt re-requests the URLs instead of reusing the corpse.
+		for (const el of document.querySelectorAll(`script[src="${SDK_SRC}"], iframe[src^="https://sdk.scdn.co/"]`)) el.remove();
+		const s = document.createElement('script');
+		const fail = (msg: string): void => {
+			clearTimeout(timer);
+			s.remove();
+			reject(new Error(msg));
+		};
+		const timer = setTimeout(() => fail('Timed out loading Spotify Web Playback SDK'), SDK_LOAD_TIMEOUT_MS);
+		window.onSpotifyWebPlaybackSDKReady = () => { clearTimeout(timer); resolve(); };
+		s.src = SDK_SRC;
+		s.async = true;
+		s.onerror = () => fail('Failed to load Spotify Web Playback SDK');
+		document.head.appendChild(s);
+	});
+}
+
+// connect() resolves before "ready" fires — wait briefly for the device id.
+function waitForDevice(): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const start = Date.now();
+		const tick = (): void => {
+			if (deviceId) return resolve();
+			if (Date.now() - start > DEVICE_WAIT_MS) return resolve();
+			setTimeout(tick, 100);
+		};
+		tick();
+	});
+}
+
+// Memoizes success only. A rejected attempt clears `ready` so the next
+// ensure/play retries from scratch — memoizing the rejection meant one failed
+// SDK load while the network was down broke Spotify until the app restarted
+// (2026-11-24).
+function ensureSpotify(): Promise<void> {
 	if (ready) return ready;
-	ready = (async () => {
-		if (!window.Spotify) {
-			await new Promise<void>((resolve, reject) => {
-				const s = document.createElement('script');
-				s.src = 'https://sdk.scdn.co/spotify-player.js';
-				s.async = true;
-				s.onerror = () => reject(new Error('Failed to load Spotify Web Playback SDK'));
-				document.head.appendChild(s);
-				window.onSpotifyWebPlaybackSDKReady = () => resolve();
-			});
-		}
-		const p = new window.Spotify!.Player({
-			name: 'Curator',
-			getOAuthToken: (cb) => {
-				getToken().then((t) => { if (t) cb(t); }).catch(() => { /* SDK surfaces auth_error */ });
-			},
-		});
-		p.addListener('ready', (data: unknown) => {
-			deviceId = (data as { device_id: string }).device_id;
-			spx.emit({ event: 'ready', deviceId });
-		});
-		p.addListener('not_ready', () => { deviceId = null; });
-		p.addListener('initialization_error', (e: unknown) => log('init error', e));
-		p.addListener('authentication_error', (e: unknown) => {
-			log('auth error', e);
-			spx.emit({ event: 'auth_error', message: errMessage(e) });
-		});
-		p.addListener('account_error', (e: unknown) => {
-			log('account error (Premium required?)', e);
-			spx.emit({ event: 'auth_error', message: errMessage(e) });
-		});
-		p.addListener('playback_error', (e: unknown) => log('playback error', e));
-		p.addListener('player_state_changed', (st: unknown) => {
-			if (st) handleStateChange(st as SpotifyState);
-		});
-		const ok = await p.connect();
-		if (!ok) throw new Error('Spotify SDK connect() returned false');
-		// connect() resolves before "ready" fires — wait briefly for the device id.
-		await new Promise<void>((resolve) => {
-			const start = Date.now();
-			const tick = (): void => {
-				if (deviceId) return resolve();
-				if (Date.now() - start > 8000) return resolve();
-				setTimeout(tick, 100);
-			};
-			tick();
-		});
-		player = p;
-	})();
+	ready = connectPlayer().catch((err: unknown) => {
+		ready = null;
+		throw err;
+	});
 	return ready;
 }
+
+async function connectPlayer(): Promise<void> {
+	if (!sdkLoaded) {
+		await loadSdk();
+		sdkLoaded = true;
+	}
+	const p = new window.Spotify!.Player({
+		name: 'Curator',
+		getOAuthToken: (cb) => {
+			getToken().then((t) => { if (t) cb(t); }).catch(() => { /* SDK surfaces auth_error */ });
+		},
+	});
+	p.addListener('ready', (data: unknown) => {
+		deviceId = (data as { device_id: string }).device_id;
+		spx.emit({ event: 'ready', deviceId });
+	});
+	p.addListener('not_ready', () => { deviceId = null; });
+	p.addListener('initialization_error', (e: unknown) => log('init error', e));
+	p.addListener('authentication_error', (e: unknown) => {
+		log('auth error', e);
+		spx.emit({ event: 'auth_error', message: errMessage(e) });
+	});
+	p.addListener('account_error', (e: unknown) => {
+		log('account error (Premium required?)', e);
+		spx.emit({ event: 'auth_error', message: errMessage(e) });
+	});
+	p.addListener('playback_error', (e: unknown) => log('playback error', e));
+	p.addListener('player_state_changed', (st: unknown) => {
+		if (st) handleStateChange(st as SpotifyState);
+	});
+	const ok = await p.connect();
+	if (!ok) {
+		// Drop this instance so the retry's fresh Player doesn't race it.
+		p.disconnect();
+		throw new Error('Spotify SDK connect() returned false');
+	}
+	await waitForDevice();
+	player = p;
+}
+
+// The SDK fires not_ready when its connection drops (network loss) and is
+// supposed to re-register and fire ready on its own once it's back — but when
+// it doesn't, deviceId stays null (or names a device Spotify has forgotten)
+// and every play fails. Re-registering the same Player is the cheap recovery.
+let reconnecting: Promise<void> | null = null;
+function reconnectDevice(): Promise<void> {
+	if (!player) return Promise.resolve();
+	const p = player;
+	reconnecting ??= (async () => {
+		deviceId = null;
+		p.disconnect();
+		if (await p.connect()) await waitForDevice();
+	})().finally(() => { reconnecting = null; });
+	return reconnecting;
+}
+
+// Back online after a failed boot-time load: warm up again so the first play
+// doesn't eat the SDK load + connect latency.
+window.addEventListener('online', () => {
+	if (!player) ensureSpotify().catch((e: unknown) => log('reconnect after online failed', e));
+});
 
 // ── state → events ──────────────────────────────────────────────────────────
 // Natural-end detection mirrors the original renderer logic: Spotify reports
@@ -209,9 +272,18 @@ async function trackPlayable(sourceTrackId: string, token: string): Promise<bool
 	}
 }
 
+async function startPlayback(sourceTrackId: string, tok: string): Promise<Response> {
+	if (!deviceId) await reconnectDevice();
+	if (!deviceId) throw rpcError('internal', 'Spotify device not ready');
+	return fetch(`https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
+		method: 'PUT',
+		headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+		body: JSON.stringify({ uris: [`spotify:track:${sourceTrackId}`] }),
+	});
+}
+
 async function play(sourceTrackId: string): Promise<void> {
 	await ensureSpotify();
-	if (!deviceId) throw rpcError('internal', 'Spotify device not ready');
 	startPolling();
 	// Prime EME once. With autoplay-policy disabled this is largely belt-and-
 	// suspenders, but it forces the CDM session up before the first license
@@ -221,11 +293,13 @@ async function play(sourceTrackId: string): Promise<void> {
 	}
 	const tok = await getToken();
 	if (!tok) throw rpcError('auth', 'No Spotify token (reconnect required)');
-	const resp = await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
-		method: 'PUT',
-		headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ uris: [`spotify:track:${sourceTrackId}`] }),
-	});
+	let resp = await startPlayback(sourceTrackId, tok);
+	// 404 = Spotify no longer knows our device id — the session lapsed while
+	// the network was down. Re-register once and retry.
+	if (resp.status === 404) {
+		await reconnectDevice();
+		resp = await startPlayback(sourceTrackId, tok);
+	}
 	if (!resp.ok && resp.status !== 204) {
 		const text = await resp.text().catch(() => '');
 		// 403 "Restriction violated" is ambiguous: region-locked track vs.

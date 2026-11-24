@@ -1403,6 +1403,11 @@ const ALTER_MIGRATIONS: string[] = [
 	)`,
 	`CREATE INDEX IF NOT EXISTS production_judgment_a_idx ON production_judgment(a_track_id)`,
 	`CREATE INDEX IF NOT EXISTS production_judgment_b_idx ON production_judgment(b_track_id)`,
+	// The library in its own order, newest added first: the phone's Library
+	// reads its first screen from this (apps/mobile ListQuery, INDEXED BY),
+	// 0.1 ms where sorting every track row takes 15-100 (38k tracks). Exactly
+	// the expression and the predicate that query uses, or SQLite won't take it.
+	`CREATE INDEX IF NOT EXISTS track_added_order_idx ON track(coalesce(added_at, created_at)) WHERE deleted_at IS NULL`,
 ];
 
 // System tags seeded on every migrate. `INSERT OR IGNORE` keeps it idempotent.

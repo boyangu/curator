@@ -15,4 +15,5 @@ export * from './version.js';
 export * from './merge.js';
 export * from './overrides.js';
 export * from './reorder-moves.js';
+export * from './row-removal.js';
 export * from './production-flags.js';

@@ -1020,7 +1020,7 @@ async function renderTracks(): Promise<void> {
 		if (jitTracks.length > 0) {
 			const ids = jitTracks.map((t) => t.id);
 			tagsStore.ensureTracksLoaded(ids).then(() => {
-				for (const t of jitTracks) mainTrackList?.patchOne(t);
+				mainTrackList?.repaintVisibleRows();
 				if (mainFilterText.trim() && collectTagNames(parseQuery(mainFilterText)).length > 0) {
 					applyFilterToMainList();
 				}
@@ -1109,22 +1109,19 @@ async function renderTracks(): Promise<void> {
 	// evaluate now that the data set has been swapped.
 	updateReorderableState();
 
-	// Fire-and-forget batch load of tag memberships for the visible page.
-	// The 'tags' column renders empty until this resolves, then bumps the
-	// resolver via patchOne on each row that now has tags. We don't await
-	// — the table is already on screen by this point; the chip cells just
-	// pop in once the IPC returns (~5-20ms over a page of ~50-200 tracks).
+	// Fire-and-forget batch load of tag memberships for the list. The
+	// 'tags' column renders empty until this resolves; chips resolve when a
+	// row is built, so rebuilding the mounted window is all the repaint
+	// needed — rows built later read the loaded cache. Never patchOne per
+	// track here: each call scans the whole list, so a loop over a 39k
+	// source root froze the renderer for ~13 s. (A `#tag` filter typed
+	// before this batch settles is handled inside applyFilterToMainList,
+	// which gates tag evaluation on tagsStore.areTracksSettled and
+	// re-applies itself.)
 	if (tracks.length > 0) {
 		const ids = tracks.map((t) => t.id);
 		tagsStore.ensureTracksLoaded(ids).then(() => {
-			// Only re-paint rows whose ids are still the current ones —
-			// renderTracks may have been called again in the meantime
-			// (sort change, filter switch). patchOne is a no-op for
-			// rows that aren't currently mounted. (A `#tag` filter typed
-			// before this batch settles is handled inside
-			// applyFilterToMainList, which gates tag evaluation on
-			// tagsStore.areTracksSettled and re-applies itself.)
-			for (const t of tracks) mainTrackList?.patchOne(t);
+			mainTrackList?.repaintVisibleRows();
 		}).catch((err) => {
 			tagsLog.error('batch fetch failed', err);
 		});
@@ -3088,9 +3085,9 @@ async function addLibraryFolderFlow(): Promise<void> {
 function showRekordboxTabMenu(evt: MouseEvent): void {
 	const settings = loadRekordboxSettings();
 	const items: ContextMenuItem[] = [
-		{ kind: 'header', label: 'Rekordbox' },
+		{ kind: 'header', label: 'Owned' },
 		{
-			kind: 'item', id: 'read-incremental', label: 'Read library (incremental)',
+			kind: 'item', id: 'read-incremental', label: 'Read Rekordbox library (incremental)',
 			iconHtml: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3.4-7"/><path d="M21 4v5h-5"/></svg>',
 		},
 		{
@@ -3937,7 +3934,7 @@ function ensureRegionMounted(r: 'discover' | 'sync' | 'downloads', opts: { refre
 // viewmodel/navHistory.ts; this is the orchestration (fetches, scroll,
 // region mounts) the shell comment reserves for callers.
 
-const SOURCE_LABELS: Record<SourceTab, string> = { spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Rekordbox' };
+const SOURCE_LABELS: Record<SourceTab, string> = { spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Owned' };
 const SIDEBAR_STEP_COALESCE_MS = 800;
 
 // Title text for a tracks scope — the filter-bar title and the history
@@ -4159,9 +4156,9 @@ async function applyTracksLocation(loc: Extract<NavLocation, { kind: 'tracks' }>
 		persistUiState();
 		return true;
 	}
-	// A source switch re-reads auth / playlists / counts (the tab-click
-	// contract); within a source only the list changes.
-	if (sourceChanged) await refreshAll(); else await renderTracks();
+	// A source switch repaints the tab's chrome from the library cache
+	// (showSource); within a source only the list changes.
+	if (sourceChanged) await showSource(); else await renderTracks();
 	if (seq !== navApplySeq) return true;
 	if (restore) applyTracksRestore(restore);
 	else if (moved) restoreCurrentAnchor();
@@ -4366,7 +4363,7 @@ async function renderEntityTracks(ent: EntityScope, renderSeq: number): Promise<
 	const ids = rows.map((t) => t.id).filter(isLibraryTrackId);
 	if (ids.length > 0) {
 		tagsStore.ensureTracksLoaded(ids).then(() => {
-			for (const t of rows) if (!isCatalogRow(t)) mainTrackList?.patchOne(t);
+			mainTrackList?.repaintVisibleRows();
 		}).catch((err) => { tagsLog.error('batch fetch failed', err); });
 	}
 }
@@ -4456,7 +4453,7 @@ async function applyEntityLocation(loc: Extract<NavLocation, { kind: 'entity' }>
 	}
 	mainTrackList?.setSort({ column: state.sortColumn, dir: state.sortDir });
 	syncMatchColumn();
-	if (sourceChanged) await refreshAll(); else await renderTracks();
+	if (sourceChanged) await showSource(); else await renderTracks();
 	if (seq !== navApplySeq) return true;
 	if (restore) applyTracksRestore(restore);
 	return true;
@@ -5049,6 +5046,21 @@ async function refreshAll(): Promise<void> {
 	if (sourceNeedsRekordboxTree(shell.activeSource())) void ensureRekordboxTree();
 }
 
+// A source-tab switch. What the tab paints beyond its list — the empty
+// state, the top-right actions, the rekordbox tree — reads the library cache
+// refreshAll keeps warm; auth, playlists and counts move through events that
+// call refreshAll themselves (sign-in, sync, scan, import, cloud apply).
+// Re-reading them on every click cost ~170 ms of sync DB work on main
+// (source + tag counts, the tag counts twice), queued ahead of the list.
+async function showSource(): Promise<void> {
+	const auth = library.auth();
+	if (!auth) { await refreshAll(); return; } // boot's refreshAll hasn't landed
+	const src = shell.activeSource();
+	renderEmptyState(auth, library.allPlaylists().some((p) => p.source === src));
+	await Promise.all([renderTopRight(auth), renderTracks()]);
+	if (sourceNeedsRekordboxTree(src)) void ensureRekordboxTree();
+}
+
 // Lightweight refresh of playlist metadata for the Sync view during an active
 // sync. Doesn't touch the rest of the UI to avoid flicker.
 async function refreshPlaylistsForSyncView(): Promise<void> {
@@ -5209,7 +5221,7 @@ async function loadArtists(): Promise<void> {
 function artistScopeForTab(src: SourceTab): ArtistScope {
 	return { sources: src === 'rekordbox' ? ['rekordbox', 'local'] : [src] };
 }
-const TAB_LABEL: Record<SourceTab, string> = { spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Rekordbox' };
+const TAB_LABEL: Record<SourceTab, string> = { spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Owned' };
 
 // The library artist the pane is about — what the Artists folder marks as
 // selected: the artist whose page is open, or the one an `artistid={id}`

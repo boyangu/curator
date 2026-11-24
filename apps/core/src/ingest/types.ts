@@ -30,3 +30,16 @@ export interface ParseResult {
 // In Electron the desktop main process injects a utility-process-backed
 // implementation; in tests / headless CLI we fall back to parseInline.
 export type ParseFn = (path: string) => Promise<ParseResult>;
+
+// A file's embedded album art, bytes as stored in the tag. Uint8Array (not
+// Buffer) so it crosses structured-clone boundaries as-is.
+export interface CoverArt {
+	data: Uint8Array;
+	format: string;
+}
+
+// Embedded-art reader, injected the same way as ParseFn: the desktop main
+// process hands in the utility-process pool, because reading the art means a
+// full music-metadata parse — the cover protocol must not run that on the
+// main loop. null = the file has no picture.
+export type CoverFn = (path: string) => Promise<CoverArt | null>;

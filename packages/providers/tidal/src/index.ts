@@ -379,7 +379,7 @@ export class TidalApiClient {
 		private readonly countryCode: string
 	) {}
 
-	private async request<T = unknown>(path: string, params: Record<string, string> = {}): Promise<T> {
+	private async request<T = unknown>(path: string, params: Record<string, string> = {}, method: 'GET' | 'DELETE' = 'GET'): Promise<T> {
 		const url = new URL(path, this.apiBase.endsWith('/') ? this.apiBase : this.apiBase + '/');
 		// JSON:API requires countryCode for most endpoints — apply it once here.
 		if (!('countryCode' in params)) params['countryCode'] = this.countryCode;
@@ -391,6 +391,7 @@ export class TidalApiClient {
 			await waitForSlot();
 			const token = await this.tokenProvider();
 			const res = await fetch(url, {
+				method,
 				headers: {
 					Authorization: `Bearer ${token}`,
 					Accept: 'application/vnd.api+json',
@@ -405,8 +406,35 @@ export class TidalApiClient {
 				const body = await res.text().catch(() => '');
 				throw new Error(`Tidal API ${res.status} ${url.pathname}: ${body}`);
 			}
+			if (res.status === 204) return undefined as T;
 			return res.json() as Promise<T>;
 		}
+	}
+
+	// The playlists this user owns — the user's collection also holds the
+	// ones they only follow. Ids only; the owner filter is the authority on
+	// what a delete may touch.
+	async listOwnedPlaylistIds(userId: string): Promise<Set<string>> {
+		const out = new Set<string>();
+		let cursor: string | undefined;
+		for (let i = 0; i < 50; i++) { // safety cap
+			const params: Record<string, string> = { 'filter[owners.id]': userId };
+			if (cursor) params['page[cursor]'] = cursor;
+			const doc = await this.request<JsonApiDoc<JsonApiResource[]>>('playlists', params);
+			for (const r of doc.data ?? []) if (r.type === 'playlists') out.add(r.id);
+			const next = doc.links?.next;
+			if (!next) break;
+			const c = new URL(next, this.apiBase).searchParams.get('page[cursor]');
+			if (!c) break;
+			cursor = c;
+		}
+		return out;
+	}
+
+	// Deletes the playlist for everyone (needs playlists.write). Tidal only
+	// lets the owner do it.
+	async deletePlaylist(playlistId: string): Promise<void> {
+		await this.request(`playlists/${encodeURIComponent(playlistId)}`, {}, 'DELETE');
 	}
 
 	// Resolve the logged-in user. The OpenAPI spec exposes /users/me.

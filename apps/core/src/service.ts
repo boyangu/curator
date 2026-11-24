@@ -44,8 +44,8 @@ import {
 import { LibraryScanner, isCloudSyncPath, normalizePath, type ScanProgress, type ScanProgressFn } from './local/scanner.js';
 import { log, setCoreLogger } from '@curator/sync-core/log';
 import type { Logger } from '@curator/shared/log';
-import { parseInline } from './ingest/parser.js';
-import type { ParseFn } from './ingest/types.js';
+import { parseInline, readCoverInline } from './ingest/parser.js';
+import type { CoverFn, ParseFn } from './ingest/types.js';
 import { createArtistPages } from './library/artist-pages.js';
 import { createEntityPages } from './entity/service.js';
 import { createEntityWork, type EntityWork } from './entity/work.js';
@@ -63,7 +63,7 @@ import { createAlbumEnricher } from './library/album-enrich.js';
 import { SpotifyAdapter } from './sources/spotify-adapter.js';
 import { SourceSyncScheduler } from './sources/scheduler.js';
 import type { StreamingSourceAdapter, RemoteWritePolicy } from './sources/adapter.js';
-import { makeRemoteWriteGate, guardRemoteWrites } from './sources/adapter.js';
+import { makeRemoteWriteGate, guardRemoteWrites, RemoteWriteDeniedError } from './sources/adapter.js';
 import * as plays from './plays/plays.js';
 import type { PlayHistoryRow, PlaySessionSummary, SessionPlayRow, TopPlayedRow } from './plays/plays.js';
 import { AuthService, type AuthStatus } from './auth/service.js';
@@ -242,7 +242,7 @@ import type { AgentResultSet, ResultRefPorts } from './agent/result-set.js';
 import { createWorkspaceManager } from './agent/workspace/manager.js';
 import { createInlineWorkspaceHost, type WorkspaceHost } from './agent/workspace/host.js';
 import type { WorkspaceDbPaths } from './agent/workspace/engine.js';
-import { TidalSync } from './sync/tidal.js';
+import { TidalSync, FAVORITES_SENTINEL_ID as TIDAL_FAVORITES_SOURCE_ID } from './sync/tidal.js';
 import { TidalHybrid } from './sync/tidal-hybrid.js';
 import { TidalApiClient } from '@curator/tidal';
 import { config } from './config.js';
@@ -271,7 +271,7 @@ export type TrackPlaylistEntry = {
 };
 import { CancelToken } from './sync/cancellation.js';
 import { sortColumn as sharedSortColumn, indexSortColumn } from './sync/sort.js';
-import { applyOverrides, computePositionalMoves, nameFold, normalizeIsrc } from '@curator/library-logic';
+import { applyOverrides, computePositionalMoves, nameFold, normalizeIsrc, planRowRemoval, type RowRemovalPlan } from '@curator/library-logic';
 
 // A provider's own track id, as the upstream API takes it: Spotify's 22-char
 // base62 id, Tidal's numeric id. Anything else on a streaming playlist row
@@ -402,6 +402,10 @@ export interface CoreServiceOptions {
 	// in-process parseInline — fine for tests and headless CLI usage, where
 	// no renderer is competing for the loop.
 	parseAudio?: ParseFn;
+	// Embedded-art reader for extractLocalCover (the curator-cover protocol).
+	// Same injection as parseAudio and for the same reason — it's a full
+	// music-metadata parse. Falls back to the in-process readCoverInline.
+	readCover?: CoverFn;
 	// Send a file to the OS trash. Electron main wires `shell.trashItem`;
 	// tests/CLI can pass a stub or omit (in which case deleteTracks will
 	// skip the trash step and report it via the errors[] surface). Kept
@@ -612,6 +616,24 @@ export interface CoreService {
 	// delete. Default false: ordinary picker-driven removes keep
 	// respecting the user's per-source auto-write preference.
 	removeTracksFromPlaylist(playlistId: string, trackIds: string[], opts?: { forceUpstream?: boolean }): Promise<{ removed: number; upstream: UpstreamPushOutcome }>;
+	// Remove single rows, named by position (playlist_track.position), and
+	// leave every other row in place — including other copies of the same
+	// track, which removeTracksFromPlaylist would take too. On a streaming
+	// playlist the provider is checked first and every refusal (not owner,
+	// write sync off, the provider's order differs from the last sync) is
+	// thrown before anything changes: a removal kept only here would come
+	// back with the next read-sync.
+	removePlaylistRows(playlistId: string, positions: number[]): Promise<{ removed: number; upstream: UpstreamPushOutcome; detail?: string }>;
+	// Delete Tidal playlists from the user's Tidal account, then from
+	// Curator. Only playlists the provider says the user owns are deleted;
+	// the rest (followed playlists, Favorite Tracks, other sources) come back
+	// in `skipped` with the reason, untouched. Sequential, and a failed
+	// delete is reported per playlist rather than aborting the batch.
+	deleteStreamingPlaylists(playlistIds: string[]): Promise<{
+		deleted: Array<{ id: string; name: string }>;
+		skipped: Array<{ id: string; name: string; reason: string }>;
+		failed: Array<{ id: string; name: string; error: string }>;
+	}>;
 	// For each playlistId, return the track ids in it whose local file
 	// pointer is dead — i.e. there is a source_link with source='local'
 	// whose filePath no longer exists on disk. Tracks without any local
@@ -2264,6 +2286,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	// the caller's thread via parseInline — fine for tests + CLI but bad
 	// for Electron, where it would block the event loop.
 	const parseAudio: ParseFn = opts.parseAudio ?? parseInline;
+	const readCover: CoverFn = opts.readCover ?? readCoverInline;
 	const libraryScanner = new LibraryScanner(db, parseAudio);
 	// NOTE: startAll() is NOT called here. The desktop main process triggers
 	// it via startLibraryWatching() after the renderer has loaded its UI —
@@ -3252,21 +3275,10 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				.get();
 			if (!row?.filePath) return null;
 
-			// Lazy-import music-metadata so the (modest) startup cost of
-			// loading parser plugins is paid only when a cover request lands
-			// for a local file with no remote URL. Cached by Node's module
-			// system after the first call.
+			// Off the main loop when the host injected the utility pool
+			// (readCover) — this is a full music-metadata parse.
 			try {
-				const { parseFile } = await import('music-metadata');
-				const meta = await parseFile(row.filePath, { duration: false });
-				const pic = meta.common.picture?.[0];
-				if (!pic?.data || pic.data.length === 0) return null;
-				// `pic.data` is a Uint8Array (newer music-metadata versions
-				// dropped the Buffer alias). Coerce to Uint8Array so the IPC
-				// surface is structured-clone friendly even when the caller
-				// runs in a renderer.
-				const data = pic.data instanceof Uint8Array ? pic.data : new Uint8Array(pic.data as ArrayLike<number>);
-				return { data, format: pic.format || 'image/jpeg' };
+				return await readCover(row.filePath);
 			} catch (err) {
 				log.for('cover').warn('embedded-art extract failed', { trackId }, err);
 				return null;
@@ -4148,6 +4160,144 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (removed > 0) membership.recomputeForTracks(trackIds);
 
 			return { removed, upstream };
+		},
+
+		async removePlaylistRows(playlistId, positions) {
+			const pl = db.select().from(playlist).where(eq(playlist.id, playlistId)).get();
+			if (!pl) throw new Error(`Playlist ${playlistId} not found`);
+			if (pl.isSmart) throw new Error('Cannot remove from a smart playlist');
+			const rows = db
+				.select({ id: playlistTrack.id, position: playlistTrack.position, trackId: playlistTrack.trackId, sourceTrackId: playlistTrack.sourceTrackId })
+				.from(playlistTrack)
+				.where(eq(playlistTrack.playlistId, playlistId))
+				.orderBy(asc(playlistTrack.position))
+				.all();
+			const byPosition = new Map(rows.map((r, k) => [r.position, k]));
+			const drop = [...new Set(positions)].map((p) => {
+				const k = byPosition.get(p);
+				if (k === undefined) throw new Error(`"${pl.name}" has no row at position ${p}`);
+				return k;
+			});
+			if (drop.length === 0) return { removed: 0, upstream: 'none' };
+
+			const streaming = pl.source === 'spotify' || pl.source === 'tidal';
+			const src = pl.source as StreamingSource;
+			const adapter = streaming ? sourceAdapters[src] : undefined;
+			let plan: RowRemovalPlan | null = null;
+			if (streaming) {
+				if (pl.sourceId === LIKED_SONGS_SENTINEL_ID) throw new Error('Liked Songs is not a playlist the provider lets us write to');
+				if (!adapter?.fetchPlaylistItemIds || !adapter.insertTracks || !adapter.capabilities.canRemoveTracks) throw new Error(`single rows can't be removed from a ${src} playlist`);
+				if (!canModifyUpstream(pl)) throw new Error(`"${pl.name}" belongs to another ${src} user`);
+				if (!sourceSyncSettings[src].writeSyncAuto) throw new Error(`write sync to ${src} is off, so the removal would not reach it`);
+				// Local row k is the k-th addressable item on the provider. Any
+				// disagreement means one side changed since the last sync, and
+				// indices computed now could land on the wrong rows.
+				const remote = await adapter.fetchPlaylistItemIds(pl.sourceId);
+				const remoteIndex = remote.flatMap((id, i) => (id == null ? [] : [i]));
+				const aligned = remoteIndex.length === rows.length && rows.every((r, k) => r.sourceTrackId === remote[remoteIndex[k]!]);
+				if (!aligned) throw new Error(`"${pl.name}" on ${src} differs from the last sync — sync it, then try again`);
+				plan = planRowRemoval(remote, drop.map((k) => remoteIndex[k]!));
+			}
+
+			const removeRows = () => mut.removeMemberRows(db, playlistId, drop.map((k) => rows[k]!.id));
+			const { result: removed, opIds: pendingOps } = streaming
+				? mut.withUpstreamPending(db, src, removeRows)
+				: { result: removeRows(), opIds: [] as string[] };
+			if (removed > 0) {
+				db.update(playlist)
+					.set({ trackCount: rows.length - removed, updatedAt: new Date() })
+					.where(eq(playlist.id, playlistId))
+					.run();
+				membership.recomputeForTracks([...new Set(drop.map((k) => rows[k]!.trackId))]);
+			}
+			if (!plan || !adapter || removed === 0) return { removed, upstream: 'none' };
+
+			// Removes first (they take every copy of each URI), then the
+			// survivors back in ascending index. A failed insert stops the
+			// rest — later indices assume the earlier ones landed — and the
+			// detail names what the provider is now missing.
+			const ctx = { source: src, playlistSourceId: pl.sourceId, rows: removed, reinserts: plan.reinserts.length };
+			let snapshotId: string | null = null;
+			try {
+				snapshotId = (await adapter.removeTracks(pl.sourceId, plan.removeUris)).snapshotId;
+			} catch (err) {
+				const detail = `the removal didn't reach ${src}; the next sync will bring the rows back`;
+				log.for('remove-rows').warn('upstream remove failed', ctx, err);
+				mut.ackUpstream(db, pendingOps, src, 'failed', err instanceof Error ? err.message : String(err));
+				return { removed, upstream: 'failed', detail };
+			}
+			for (let i = 0; i < plan.reinserts.length; i++) {
+				const { uri, index } = plan.reinserts[i]!;
+				try {
+					// Checked present before the plan was made.
+					snapshotId = (await adapter.insertTracks!(pl.sourceId, [uri], index)).snapshotId ?? snapshotId;
+				} catch (err) {
+					const missing = plan.reinserts.slice(i).map((r) => `${r.uri} at #${r.index + 1}`).join(', ');
+					const detail = `${src} lost the copies that should have stayed: ${missing}`;
+					log.for('remove-rows').error('upstream re-insert failed', err, { ...ctx, missing });
+					mut.ackUpstream(db, pendingOps, src, 'failed', detail);
+					return { removed, upstream: 'failed', detail };
+				}
+			}
+			if (snapshotId) {
+				db.update(playlist)
+					.set({ syncCursor: snapshotId, lastSyncedAt: new Date() })
+					.where(eq(playlist.id, playlistId))
+					.run();
+			}
+			log.for('remove-rows').info('pushed upstream', ctx);
+			mut.ackUpstream(db, pendingOps, src, 'pushed');
+			return { removed, upstream: 'pushed' };
+		},
+
+		async deleteStreamingPlaylists(playlistIds) {
+			const deleted: Array<{ id: string; name: string }> = [];
+			const skipped: Array<{ id: string; name: string; reason: string }> = [];
+			const failed: Array<{ id: string; name: string; error: string }> = [];
+			const targets: Array<typeof playlist.$inferSelect> = [];
+			for (const id of new Set(playlistIds)) {
+				const pl = db.select().from(playlist).where(eq(playlist.id, id)).get();
+				if (!pl) skipped.push({ id, name: '?', reason: 'not found' });
+				else if (pl.source !== 'tidal') skipped.push({ id, name: pl.name, reason: `${pl.source} playlists are not deleted here` });
+				else if (pl.sourceId === TIDAL_FAVORITES_SOURCE_ID) skipped.push({ id, name: pl.name, reason: 'Favorite Tracks is the collection, not a playlist' });
+				else targets.push(pl);
+			}
+			if (targets.length === 0) return { deleted, skipped, failed };
+
+			const token = await auth.getTidalAccessToken();
+			if (!token) throw new Error('Tidal not connected');
+			const client = new TidalApiClient(config.tidal.apiBase, async () => token, auth.getTidalCountryCode() ?? 'US');
+			// Ownership comes from the provider, not the row: Tidal sync stores
+			// no owner (its collection read doesn't carry one).
+			const me = auth.getStatus().tidal.id ?? (await client.getMe()).id;
+			const owned = await client.listOwnedPlaylistIds(me);
+			for (const pl of targets) {
+				if (!owned.has(pl.sourceId)) {
+					skipped.push({ id: pl.id, name: pl.name, reason: 'not owned by you on Tidal (followed)' });
+					continue;
+				}
+				try {
+					remoteWriteGate({ source: 'tidal', op: 'deletePlaylist', remoteId: pl.sourceId, name: pl.name });
+					await client.deletePlaylist(pl.sourceId);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					const refused = /Tidal API (401|403)\b/.exec(msg);
+					const error = refused
+						? `Tidal refused the delete (${refused[1]}) — reconnect Tidal in Settings to grant playlist write access`
+						: msg;
+					log.for('delete-playlists').warn('tidal delete failed', { playlistSourceId: pl.sourceId }, err);
+					failed.push({ id: pl.id, name: pl.name, error });
+					// The same refusal would repeat for every playlist.
+					if (/reconnect Tidal/.test(error) || err instanceof RemoteWriteDeniedError) break;
+					continue;
+				}
+				const members = db.select({ trackId: playlistTrack.trackId }).from(playlistTrack).where(eq(playlistTrack.playlistId, pl.id)).all();
+				mut.deletePlaylist(db, pl.id);
+				membership.recomputeForTracks([...new Set(members.map((m) => m.trackId))]);
+				log.for('delete-playlists').info('tidal playlist deleted', { playlistSourceId: pl.sourceId, tracks: members.length });
+				deleted.push({ id: pl.id, name: pl.name });
+			}
+			return { deleted, skipped, failed };
 		},
 
 		async findTracksWithDeletedFiles(playlistIds) {
@@ -7135,55 +7285,68 @@ function getTracksImpl(
 // visible tracklist row (e.g. commitRating's patchOne) would blank the SRC
 // pips. This is the single home for that hydration; getTracksImpl and the
 // write methods that return Track[] both delegate here.
+// decorateTracks scans whole tables instead of looking ids up once the list
+// covers this share of the library. A scan costs about the same at any list
+// size (it reads every link row); by-id lookups grow with the list. Measured
+// on a 39k-track library: scan ~370–445 ms flat, by-id ~17 ms per 1k ids —
+// even at ~23k (≈60%); the whole Spotify root is 682 ms by id, 445 ms scanned.
+const DECORATE_SCAN_SHARE = 0.6;
+
 function decorateTracks(db: Db, cutoffStore: CutoffStore, tracks: Track[]): Track[] {
-	// Batched source-link lookup — single query per chunk for all tracks,
-	// grouped client-side. Avoids one-per-row IPC over many tracks while
-	// keeping the join out of the caller's paginated query (which would
-	// multiply rows and break per-row sort/limit). Chunked at 500: SQLite caps
-	// bound params (SQLITE_MAX_VARIABLE_NUMBER = 32766) — same chunk size as
-	// every other batched IN site in this file.
+	// Batched lookups — one statement per decoration for the whole list,
+	// grouped client-side. Keeps the joins out of the caller's paginated query
+	// (which would multiply rows and break per-row sort/limit). Two shapes,
+	// picked by how much of the library the list covers: a small list looks
+	// its ids up through the track_id indexes (one json_each parameter, no
+	// 500-id IN-list chunks); a list that is a large share of the library — a
+	// source root — reads each table once in a sequential scan and keeps its
+	// own rows (DECORATE_SCAN_SHARE). The old 500-id chunked form spent
+	// ~690 ms of sync time on main decorating the Spotify root, more than the
+	// list query itself.
 	if (tracks.length) {
 		const ids = tracks.map((t) => t.id);
+		const raw = rawOf(db);
+		const idsJson = JSON.stringify(ids);
+		const libraryRows = raw.prepare('SELECT count(*) FROM track').pluck().get() as number;
+		const scan = ids.length >= libraryRows * DECORATE_SCAN_SHARE;
+		const idSet = scan ? new Set(ids) : null;
+		// `byId` carries a `track_id IN (SELECT value FROM json_each(?))`
+		// condition; `scanAll` is the same statement without it. Every row's
+		// first column is the track id, aliased `t`.
+		const rowsFor = <R extends { t: string }>(byId: string, scanAll: string): R[] => idSet
+			? (raw.prepare(scanAll).all() as R[]).filter((r) => idSet.has(r.t))
+			: raw.prepare(byId).all(idsJson) as R[];
+		const IN_IDS = 'IN (SELECT value FROM json_each(?))';
+		// De-duplicates in JS: per-track lists are a handful of entries, and a
+		// SQL DISTINCT over the whole join builds a temp B-tree of string
+		// pairs — 4× the cost of the playlist-name scan itself.
+		const push = (m: Map<string, string[]>, k: string, v: string): void => {
+			const arr = m.get(k);
+			if (!arr) m.set(k, [v]);
+			else if (!arr.includes(v)) arr.push(v);
+		};
 		const bySrc = new Map<string, string[]>();
-		for (let i = 0; i < ids.length; i += 500) {
-			// A missing_at local link gets no pip — the same rule as
-			// sourceMembership, so `source:local` means the same thing in SQL
-			// and in the renderer's in-memory matchTrack.
-			const linkRows = db
-				.selectDistinct({ trackId: sourceLink.trackId, source: sourceLink.source })
-				.from(sourceLink)
-				.where(and(
-					inArray(sourceLink.trackId, ids.slice(i, i + 500)),
-					or(ne(sourceLink.source, 'local'), isNull(sourceLink.missingAt)),
-				))
-				.all();
-			for (const r of linkRows) {
-				const arr = bySrc.get(r.trackId) ?? [];
-				arr.push(r.source);
-				bySrc.set(r.trackId, arr);
-			}
-		}
+		// A missing_at local link gets no pip — the same rule as
+		// sourceMembership, so `source:local` means the same thing in SQL
+		// and in the renderer's in-memory matchTrack.
+		const LIVE_LINK = `(source <> 'local' OR missing_at IS NULL)`;
+		for (const r of rowsFor<{ t: string; s: string }>(
+			`SELECT track_id AS t, source AS s FROM source_link WHERE track_id ${IN_IDS} AND ${LIVE_LINK}`,
+			`SELECT track_id AS t, source AS s FROM source_link WHERE ${LIVE_LINK}`,
+		)) push(bySrc, r.t, r.s);
 		// Rekordbox membership isn't a source_link (provenance lives in
 		// rekordbox_link) — union it into the same array so the renderer's
 		// in-memory matchTrack can evaluate `source:rekordbox` exactly like
 		// the SQL `hasSource: 'rekordbox'` predicate (sourceMembership). The
 		// SRC-pip renderer whitelists which sources get pips.
-		for (let i = 0; i < ids.length; i += 500) {
-			const rbRows = db
-				.select({ trackId: rekordboxLink.trackId })
-				.from(rekordboxLink)
-				.where(inArray(rekordboxLink.trackId, ids.slice(i, i + 500)))
-				.all();
-			for (const r of rbRows) {
-				const arr = bySrc.get(r.trackId) ?? [];
-				arr.push('rekordbox');
-				bySrc.set(r.trackId, arr);
-			}
-		}
+		for (const r of rowsFor<{ t: string }>(
+			`SELECT track_id AS t FROM rekordbox_link WHERE track_id ${IN_IDS}`,
+			'SELECT track_id AS t FROM rekordbox_link',
+		)) push(bySrc, r.t, 'rekordbox');
 		for (const t of tracks) t.sources = bySrc.get(t.id) ?? [];
 		// Claim-derived provider ids (sync-log/claim-links.ts): a separate
-		// field, never `sources` — see Track.claimSources. Same chunked shape.
-		const derived = claimLinksOf(rawOf(db), ids);
+		// field, never `sources` — see Track.claimSources.
+		const derived = claimLinksOf(raw, ids);
 		for (const t of tracks) {
 			const d = derived.get(t.id);
 			// One entry per provider (a row may know several ids of one), and
@@ -7195,40 +7358,23 @@ function decorateTracks(db: Db, cutoffStore: CutoffStore, tracks: Track[]): Trac
 		// Same shape, for playlist-name memberships. Powers the in-memory
 		// matchTrack pass for `#name` tokens (filterbox path): without this
 		// the renderer would have to either re-issue SQL on every keystroke
-		// or carry a global playlist-membership cache. Batched DISTINCT join
-		// is cheap — one query per chunk, naturally limited by page size.
+		// or carry a global playlist-membership cache.
 		const byTrack = new Map<string, string[]>();
-		for (let i = 0; i < ids.length; i += 500) {
-			const plRows = db
-				.selectDistinct({ trackId: playlistTrack.trackId, nameAscii: playlist.nameAscii })
-				.from(playlistTrack)
-				.innerJoin(playlist, eq(playlist.id, playlistTrack.playlistId))
-				.where(inArray(playlistTrack.trackId, ids.slice(i, i + 500)))
-				.all();
-			for (const r of plRows) {
-				if (!r.nameAscii) continue;
-				const arr = byTrack.get(r.trackId) ?? [];
-				arr.push(r.nameAscii);
-				byTrack.set(r.trackId, arr);
-			}
+		const PLAYLIST_NAMES = 'SELECT pt.track_id AS t, p.name_ascii AS n FROM playlist_track pt JOIN playlist p ON p.id = pt.playlist_id';
+		for (const r of rowsFor<{ t: string; n: string | null }>(`${PLAYLIST_NAMES} WHERE pt.track_id ${IN_IDS}`, PLAYLIST_NAMES)) {
+			if (r.n) push(byTrack, r.t, r.n);
 		}
 		for (const t of tracks) t.playlistNamesAscii = byTrack.get(t.id) ?? [];
 
 		// Curator artist ids, position-aligned with the effective artists
-		// array (the seam derives both from the same list). Same chunked
-		// shape as the pips above — one query per 500 rows, never per row.
+		// array (the seam derives both from the same list). Same one-statement
+		// shape as the pips above, never per row.
 		const artistIdsByTrack = new Map<string, Array<{ position: number; artistId: string }>>();
-		for (let i = 0; i < ids.length; i += 500) {
-			const rows = db
-				.select({ trackId: trackArtist.trackId, artistId: trackArtist.artistId, position: trackArtist.position })
-				.from(trackArtist)
-				.where(inArray(trackArtist.trackId, ids.slice(i, i + 500)))
-				.all();
-			for (const r of rows) {
-				const arr = artistIdsByTrack.get(r.trackId) ?? [];
-				arr.push({ position: r.position, artistId: r.artistId });
-				artistIdsByTrack.set(r.trackId, arr);
-			}
+		const TRACK_ARTISTS = 'SELECT track_id AS t, artist_id AS a, position AS p FROM track_artist';
+		for (const r of rowsFor<{ t: string; a: string; p: number }>(`${TRACK_ARTISTS} WHERE track_id ${IN_IDS}`, TRACK_ARTISTS)) {
+			const arr = artistIdsByTrack.get(r.t);
+			const e = { position: r.p, artistId: r.a };
+			if (arr) arr.push(e); else artistIdsByTrack.set(r.t, [e]);
 		}
 		for (const t of tracks) {
 			const arr = artistIdsByTrack.get(t.id);

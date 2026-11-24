@@ -26,7 +26,7 @@ export interface OrganizeItem {
 
 export const COL_TITLE: Record<ColKey, string> = {
 	tag: 'Tags',
-	local: 'Local · Rekordbox',
+	local: 'Owned',
 	stream: 'Streaming · Spotify',
 };
 
@@ -57,13 +57,13 @@ export function pathString(it: OrganizeItem): string {
 }
 
 const SOURCE_LABEL: Record<OrganizeSource, string> = {
-	spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Rekordbox', local: 'Curator',
+	spotify: 'Spotify', tidal: 'Tidal', rekordbox: 'Owned', local: 'Curator',
 };
 
 // Hover text for a chip/pill — the chip itself shows only the name, so the
 // tooltip carries the source + folder path that disambiguate same-named
-// playlists across Spotify / Tidal / Rekordbox. "Tidal playlist: Warm
-// hypnotic electronica", "Rekordbox playlist: Sets / SetX / Opening".
+// playlists across Spotify / Tidal / Owned. "Tidal playlist: Warm
+// hypnotic electronica", "Owned playlist: Sets / SetX / Opening".
 export function describeItem(it: OrganizeItem): string {
 	if (it.kind === 'tag') return `Tag: ${it.name}`;
 	const path = pathString(it);

@@ -197,10 +197,10 @@ export function AppShell() {
 								<section>
 									<h4>Omnibar only</h4>
 									<dl>
-										<dt><code>s/</code> &nbsp; <code>t/</code> &nbsp; <code>r/</code></dt>
-										<dd>scope to Spotify / Tidal / Rekordbox (collection + local files)</dd>
+										<dt><code>s/</code> &nbsp; <code>t/</code> &nbsp; <code>o/</code></dt>
+										<dd>scope to Spotify / Tidal / Owned (rekordbox collection + local files)</dd>
 										<dt><code>zen/uplifting/</code></dt>
-										<dd>narrow to a Rekordbox folder subtree</dd>
+										<dd>narrow to an Owned playlist folder subtree</dd>
 									</dl>
 								</section>
 							</div>

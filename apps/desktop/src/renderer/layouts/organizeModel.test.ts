@@ -43,7 +43,7 @@ describe('pathString', () => {
 
 describe('describeItem', () => {
 	it('names the source and prefixes the folder path for playlists', () => {
-		expect(describeItem(item({ kind: 'playlist', source: 'rekordbox', name: 'Opening', folderPath: ['Sets', 'SetX'] }))).toBe('Rekordbox playlist: Sets / SetX / Opening');
+		expect(describeItem(item({ kind: 'playlist', source: 'rekordbox', name: 'Opening', folderPath: ['Sets', 'SetX'] }))).toBe('Owned playlist: Sets / SetX / Opening');
 		expect(describeItem(item({ kind: 'playlist', source: 'tidal', name: 'Warm hypnotic electronica', folderPath: [] }))).toBe('Tidal playlist: Warm hypnotic electronica');
 		expect(describeItem(item({ kind: 'playlist', source: 'spotify', name: 'Night' }))).toBe('Spotify playlist: Night');
 		expect(describeItem(item({ kind: 'playlist', source: 'local', name: 'Picks' }))).toBe('Curator playlist: Picks');

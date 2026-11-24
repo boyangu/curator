@@ -68,6 +68,12 @@ export interface StreamingSourceAdapter {
 	// as above — adapter unrolls pages internally. Order matches the
 	// remote's playlist order so we can mirror playlist_track.position.
 	fetchPlaylistTracks(remoteId: string): Promise<RemoteTrackRef[]>;
+	// The playlist's track ids in the provider's own index space: an item
+	// with no addressable id (a local file, a track pulled from the
+	// catalogue) is a null that still holds its index. fetchPlaylistTracks
+	// drops those, so positional writes must count against this instead.
+	// Optional: providers without positional writes omit it.
+	fetchPlaylistItemIds?(remoteId: string): Promise<Array<string | null>>;
 
 	// ── Write ─────────────────────────────────────────────────────────
 	// Every write throws if the corresponding capability is false; the
@@ -80,6 +86,9 @@ export interface StreamingSourceAdapter {
 	renamePlaylist(remoteId: string, name: string): Promise<void>;
 	addTracks(remoteId: string, remoteTrackIds: string[]): Promise<{ snapshotId: string | null }>;
 	removeTracks(remoteId: string, remoteTrackIds: string[]): Promise<{ snapshotId: string | null }>;
+	// Insert at a zero-based index of the current order instead of
+	// appending. Optional, like reorderTracks — callers feature-detect it.
+	insertTracks?(remoteId: string, remoteTrackIds: string[], position: number): Promise<{ snapshotId: string | null }>;
 	// Full replacement — sends the entire new ordering. Spotify's
 	// PUT /playlists/{id}/tracks supports this in chunks of 100; the
 	// adapter is responsible for chunking. CAUTION: a full replace
@@ -171,6 +180,9 @@ export function guardRemoteWrites(adapter: StreamingSourceAdapter, gate: RemoteW
 		capabilities: adapter.capabilities,
 		listRemotePlaylists: () => adapter.listRemotePlaylists(),
 		fetchPlaylistTracks: (remoteId) => adapter.fetchPlaylistTracks(remoteId),
+		...(adapter.fetchPlaylistItemIds ? {
+			fetchPlaylistItemIds: (remoteId: string) => adapter.fetchPlaylistItemIds!(remoteId),
+		} : {}),
 		createPlaylist: (name, opts) => {
 			gate({ source, op: 'createPlaylist', name });
 			return adapter.createPlaylist(name, opts);
@@ -191,6 +203,12 @@ export function guardRemoteWrites(adapter: StreamingSourceAdapter, gate: RemoteW
 			gate({ source, op: 'removeTracks', remoteId, count: ids.length });
 			return adapter.removeTracks(remoteId, ids);
 		},
+		...(adapter.insertTracks ? {
+			insertTracks: (remoteId: string, ids: string[], position: number) => {
+				gate({ source, op: 'addTracks', remoteId, count: ids.length });
+				return adapter.insertTracks!(remoteId, ids, position);
+			},
+		} : {}),
 		replaceTracks: (remoteId, ids) => {
 			gate({ source, op: 'replaceTracks', remoteId, count: ids.length });
 			return adapter.replaceTracks(remoteId, ids);

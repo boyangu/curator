@@ -2,9 +2,11 @@
 // process. Each entry in the pool is one `app.utilityProcess.fork()` running
 // the worker script at ./worker.ts (bundled to ingest-worker.cjs).
 //
-// The pool is owned by the desktop main process and exposes a single
-// `parse(path)` Promise API. Calls land on a free worker if there is one;
-// otherwise they queue in a FIFO and run as workers become idle.
+// The pool is owned by the desktop main process and exposes two Promise APIs
+// over the same workers: `parse(path)` (the scanner's metadata read) and
+// `cover(path)` (embedded art for the curator-cover protocol). Calls land on a
+// free worker if there is one; otherwise they queue in a FIFO and run as
+// workers become idle.
 //
 // Worker crashes are handled defensively: the in-flight promise rejects, the
 // dead entry is removed, and a fresh utility process is forked after a small
@@ -16,18 +18,25 @@
 
 import { cpus } from 'node:os';
 import { utilityProcess, type UtilityProcess } from 'electron';
-import type { ParseFn, ParseResult } from '@curator/core/ingest';
+import type { CoverArt, CoverFn, ParseFn, ParseResult } from '@curator/core/ingest';
 import { mainLog } from '../log.js';
 
 const slog = mainLog.for('ingest');
 
-interface InflightRequest {
-	id: number;
-	// Path being parsed — kept so a worker death can be attributed to the
+type JobKind = 'parse' | 'cover';
+
+interface Job {
+	kind: JobKind;
+	// Path being read — kept so a worker death can be attributed to the
 	// file that killed it (see crashCounts / dead-letter below).
 	path: string;
-	resolve: (r: ParseResult) => void;
+	// ParseResult for 'parse', CoverArt | null for 'cover'.
+	resolve: (r: unknown) => void;
 	reject: (e: Error) => void;
+}
+
+interface InflightRequest extends Job {
+	id: number;
 }
 
 interface WorkerEntry {
@@ -40,7 +49,7 @@ interface WorkerEntry {
 interface WorkerResponse {
 	id: number;
 	ok: boolean;
-	result?: ParseResult;
+	result?: ParseResult | CoverArt | null;
 	message?: string;
 }
 
@@ -72,7 +81,7 @@ export class IngestPool {
 	private workers: WorkerEntry[] = [];
 	private idle: WorkerEntry[] = [];
 	// FIFO of jobs waiting for a free worker.
-	private waiting: Array<{ path: string; resolve: (r: ParseResult) => void; reject: (e: Error) => void }> = [];
+	private waiting: Job[] = [];
 	private nextId = 1;
 	private shuttingDown = false;
 	// Worker-death attribution. crashCounts only grows on crashes (not on
@@ -88,8 +97,13 @@ export class IngestPool {
 
 	// Exposed as ParseFn so consumers can pass `pool.parse` straight into
 	// createCoreService without a wrapper.
-	parse: ParseFn = (path: string): Promise<ParseResult> => {
-		return new Promise<ParseResult>((resolve, reject) => {
+	parse: ParseFn = (path: string): Promise<ParseResult> => this.submit<ParseResult>('parse', path);
+
+	// Same shape for embedded art, passed into createCoreService as readCover.
+	cover: CoverFn = (path: string): Promise<CoverArt | null> => this.submit<CoverArt | null>('cover', path);
+
+	private submit<T>(kind: JobKind, path: string): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
 			if (this.shuttingDown) {
 				reject(new Error('ingest pool shutting down'));
 				return;
@@ -98,11 +112,12 @@ export class IngestPool {
 				reject(new Error(`file repeatedly crashed the ingest worker (${MAX_CRASHES_PER_PATH}×) — skipped: ${path}`));
 				return;
 			}
+			const job: Job = { kind, path, resolve: resolve as (r: unknown) => void, reject };
 			const worker = this.idle.pop();
-			if (worker) this.dispatch(worker, path, resolve, reject);
-			else this.waiting.push({ path, resolve, reject });
+			if (worker) this.dispatch(worker, job);
+			else this.waiting.push(job);
 		});
-	};
+	}
 
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true;
@@ -153,15 +168,10 @@ export class IngestPool {
 		this.idle.push(entry);
 	}
 
-	private dispatch(
-		entry: WorkerEntry,
-		path: string,
-		resolve: (r: ParseResult) => void,
-		reject: (e: Error) => void,
-	): void {
+	private dispatch(entry: WorkerEntry, job: Job): void {
 		const id = this.nextId++;
-		entry.inflight = { id, path, resolve, reject };
-		entry.proc.postMessage({ type: 'parse', id, path });
+		entry.inflight = { ...job, id };
+		entry.proc.postMessage({ type: job.kind, id, path: job.path });
 	}
 
 	private onMessage(entry: WorkerEntry, data: WorkerResponse): void {
@@ -171,13 +181,16 @@ export class IngestPool {
 		if (!inflight || data.id !== inflight.id) return;
 		entry.inflight = null;
 
-		if (data.ok && data.result) inflight.resolve(data.result);
+		// A cover job legitimately answers null (no embedded picture); a parse
+		// job always carries a result when ok.
+		const answered = data.ok && (inflight.kind === 'cover' ? data.result !== undefined : data.result != null);
+		if (answered) inflight.resolve(data.result);
 		else inflight.reject(new Error(data.message ?? 'ingest worker returned no result'));
 
 		// Worker is free — hand it the next waiting job (if any), otherwise
 		// return it to the idle pool.
 		const next = this.waiting.shift();
-		if (next) this.dispatch(entry, next.path, next.resolve, next.reject);
+		if (next) this.dispatch(entry, next);
 		else this.idle.push(entry);
 	}
 
@@ -215,7 +228,7 @@ export class IngestPool {
 			if (!next) return;
 			const idx = this.idle.indexOf(replacement);
 			if (idx >= 0) this.idle.splice(idx, 1);
-			this.dispatch(replacement, next.path, next.resolve, next.reject);
+			this.dispatch(replacement, next);
 		}, RESPAWN_DELAY_MS);
 	}
 }

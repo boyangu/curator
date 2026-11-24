@@ -60,7 +60,7 @@ const SOURCE_TABS: SourceTabDef[] = [
 			<path d="M7 18a4 4 0 0 1-.4-7.96A6 6 0 0 1 18.5 11a3.5 3.5 0 0 1-.5 7H7Z"/>
 		</svg>
 	) },
-	{ id: 'rekordbox',  label: 'Rekordbox', contextual: true, sourceCapable: true, iconSvg: () => (
+	{ id: 'rekordbox',  label: 'Owned', contextual: true, sourceCapable: true, iconSvg: () => (
 		<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
 			<circle cx="12" cy="12" r="9"/>
 			<circle cx="12" cy="12" r="3"/>

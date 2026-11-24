@@ -1064,11 +1064,27 @@ export class SpotifyClient {
 		return { snapshot_id: snapshot };
 	}
 
+	// Insert tracks at `position` (zero-based, in the playlist's current
+	// order), as one block in the given order. Used to put back the copy
+	// that should survive after a remove took out every occurrence of its
+	// URI (see planRowRemoval).
+	// (Add takes no snapshot_id, unlike remove and reorder.)
+	async insertPlaylistTracks(playlistId: string, trackIds: string[], position: number): Promise<{ snapshot_id: string }> {
+		if (trackIds.length === 0) return { snapshot_id: '' };
+		let snapshot = '';
+		let at = position;
+		for (const chunk of chunkArray(trackIds, 100)) {
+			const res = await this.playlistItemsWrite<{ snapshot_id: string }>('POST', playlistId, { uris: chunk.map(toTrackUri), position: at });
+			if (res?.snapshot_id) snapshot = res.snapshot_id;
+			at += chunk.length;
+		}
+		return { snapshot_id: snapshot };
+	}
+
 	// Remove every occurrence of each given track id. Same 100-per-request
 	// cap as add. NB: this removes ALL occurrences of the URI in the
-	// playlist — for duplicate-aware deletes (remove one instance, leave
-	// the other), you'd pass `positions` per URI, which we don't need yet
-	// because curator's reorder path uses replace, not remove.
+	// playlist — to drop one copy and keep another, remove the URI and put
+	// the survivor back with insertPlaylistTracks (planRowRemoval).
 	async removePlaylistTracks(playlistId: string, trackIds: string[]): Promise<{ snapshot_id: string }> {
 		if (trackIds.length === 0) return { snapshot_id: '' };
 		let snapshot = '';

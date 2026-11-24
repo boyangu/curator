@@ -304,6 +304,9 @@ export const track = sqliteTable(
 		// few-to-many minority on a source-holding desktop and the count,
 		// sweep and filter read only them.
 		remoteOnlyIdx: index('track_remote_only_idx').on(t.remoteOnly),
+		// The library newest added first, live rows only: the phone's Library
+		// reads its first screen through it (migrate.ts has the why).
+		addedOrderIdx: index('track_added_order_idx').on(sql`coalesce(added_at, created_at)`).where(sql`deleted_at IS NULL`),
 	})
 );
 

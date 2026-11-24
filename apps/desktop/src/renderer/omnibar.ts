@@ -3,7 +3,7 @@
 // playlists across the user's library.
 //
 // Scope is set either by a prefix at the head of the query (`s/foo`, `l/foo`,
-// `r/foo`, `t/foo`) or by the pill row above the input. Tab cycles enabled
+// `o/foo` for Owned, `t/foo`) or by the pill row above the input. Tab cycles enabled
 // pills; typing a prefix updates the active pill and strips the prefix from
 // the searchable term.
 //
@@ -108,7 +108,7 @@ const PILL_DEFS: { src: OmnibarSource; label: string; prefix: string | null }[] 
 	{ src: 'all',       label: 'All',       prefix: null },
 	{ src: 'spotify',   label: 'Spotify',   prefix: 's/' },
 	{ src: 'tidal',     label: 'Tidal',     prefix: 't/' },
-	{ src: 'rekordbox', label: 'Rekordbox', prefix: 'r/' },
+	{ src: 'rekordbox', label: 'Owned',     prefix: 'o/' },
 	{ src: 'world',     label: 'World',     prefix: 'w/' },
 ];
 
@@ -438,7 +438,7 @@ function updateScopeChip(): void {
 // Splits raw input into a prefix + remaining searchable term, but does NOT
 // touch `scope`. Used by both prefix-detection and scope-sync paths.
 function parseInputRaw(raw: string): { prefix: string | null; term: string } {
-	const m = raw.match(/^([sltrw])\/(.*)$/i);
+	const m = raw.match(/^([sltow])\/(.*)$/i);
 	if (m && m[1] !== undefined) return { prefix: m[1].toLowerCase(), term: m[2] ?? '' };
 	return { prefix: null, term: raw };
 }
@@ -451,7 +451,7 @@ function applyPrefixFromInput(): void {
 	if (!inputEl) return;
 	const { prefix } = parseInputRaw(inputEl.value);
 	if (!prefix) return;
-	const map: Record<string, OmnibarSource> = { s: 'spotify', t: 'tidal', r: 'rekordbox', w: 'world' };
+	const map: Record<string, OmnibarSource> = { s: 'spotify', t: 'tidal', o: 'rekordbox', w: 'world' };
 	const next = map[prefix];
 	if (next && next !== scope && deps.isSourceEnabled(next as Exclude<OmnibarSource, 'all'>)) {
 		scope = next;
@@ -1039,7 +1039,7 @@ function render(): void {
 			rows.push(`
 				<div class="omnibar__row${active}" data-result-idx="${idx}" data-kind="track" role="option" aria-selected="${idx === activeIdx}">
 					<div class="omnibar__row-kind" title="Track">♪</div>
-					<div class="omnibar__row-art" style="background-image: url(curator-cover://${encodeURIComponent(t.id)});"></div>
+					<div class="omnibar__row-art" style="background-image: url(curator-cover://${encodeURIComponent(t.id)}?s=thumb);"></div>
 					<div class="omnibar__row-main">
 						<div class="omnibar__row-title">${highlight(t.title, q)}</div>
 						<div class="omnibar__row-sub">${highlight(artistText || '—', q)}${t.albumTitle ? ' · ' + highlight(t.albumTitle, q) : ''}</div>

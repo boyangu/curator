@@ -70,8 +70,10 @@ export const config = {
 		// Must match exactly what's registered on the developer.tidal.com app.
 		redirectUri: env.CURATOR_TIDAL_REDIRECT_URI ?? 'http://127.0.0.1:51737/auth/spotify/callback',
 		// Third-party scopes Tidal exposes (per OpenAPI spec). Together these
-		// cover: user profile, the user's playlists, their saved collection.
-		scopes: ['user.read', 'playlists.read', 'collection.read'].join(' '),
+		// cover: user profile, the user's playlists, their saved collection,
+		// and deleting playlists the user owns (playlists.write — a session
+		// granted before it was added must reconnect to get it).
+		scopes: ['user.read', 'playlists.read', 'playlists.write', 'collection.read'].join(' '),
 		// OAuth endpoints. Verified against @tidal-music/auth source + the
 		// official OpenAPI spec — token endpoint is reused for refresh.
 		authorizeUrl: 'https://login.tidal.com/authorize',

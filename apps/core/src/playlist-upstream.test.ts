@@ -263,3 +263,70 @@ describe('reorder upstream refuses rows without a provider id', () => {
 		expect(acks.some((a) => a.status === 'failed' && /no spotify id on this computer/.test(a.error ?? ''))).toBe(true);
 	});
 });
+
+describe('removePlaylistRows drops single rows and leaves the other copies', () => {
+	// p1 on the provider: [sp1, (local file), sp2, sp1]; Curator mirrors the
+	// three addressable rows at positions 0..2.
+	beforeEach(() => {
+		seedPlaylist('p1');
+		seedTrack('t1', ['sp1']);
+		seedTrack('t2', ['sp2']);
+		seedRow('p1', 't1', 0, 'sp1');
+		seedRow('p1', 't2', 1, 'sp2');
+		seedRow('p1', 't1', 2, 'sp1');
+		fake.fetchPlaylistItemIds = vi.fn(async () => remoteItems);
+		fake.insertTracks = vi.fn(async () => ({ snapshotId: null }));
+		// The guard wraps an adapter's optional methods when the service is
+		// built, so this service is built after they exist.
+		svc = tmp.track(createCoreService(dbPath, { peaksDir: join(dir, 'peaks'), sourceAdapters: { spotify: fake } }));
+	});
+	let remoteItems: Array<string | null> = ['sp1', null, 'sp2', 'sp1'];
+	afterEach(() => { remoteItems = ['sp1', null, 'sp2', 'sp1']; });
+
+	it('refuses before any change while write sync is off', async () => {
+		await expect(svc.removePlaylistRows('p1', [2])).rejects.toThrow(/write sync to spotify is off/);
+		expect(rows('p1')).toHaveLength(3);
+	});
+
+	it('refuses before any change when the provider differs from the last sync', async () => {
+		await svc.setSourceSyncSettings('spotify', { readSyncAuto: false, readIntervalMin: 5, writeSyncAuto: true });
+		remoteItems = ['sp1', 'sp1', 'sp2'];
+		await expect(svc.removePlaylistRows('p1', [2])).rejects.toThrow(/differs from the last sync/);
+		expect(rows('p1')).toHaveLength(3);
+	});
+
+	it('removes just the named row; the push stays behind the default-deny gate', async () => {
+		await svc.setSourceSyncSettings('spotify', { readSyncAuto: false, readIntervalMin: 5, writeSyncAuto: true });
+		const res = await svc.removePlaylistRows('p1', [2]);
+		expect(rows('p1')).toEqual([{ track_id: 't1', position: 0 }, { track_id: 't2', position: 1 }]);
+		// No RemoteWritePolicy in tests — the remove is denied, reported, never sent.
+		expect(res).toMatchObject({ removed: 1, upstream: 'failed' });
+		expect(fake.insertTracks).not.toHaveBeenCalled();
+	});
+
+	it('refuses an unknown position', async () => {
+		await expect(svc.removePlaylistRows('p1', [9])).rejects.toThrow(/no row at position 9/);
+	});
+});
+
+describe('deleteStreamingPlaylists', () => {
+	it('skips what is not a Tidal playlist, and Favorite Tracks, before touching Tidal', async () => {
+		seedPlaylist('p1');
+		sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES ('fav', 'tidal', 'favorite-tracks', 'Favorite Tracks')`).run();
+		const res = await svc.deleteStreamingPlaylists(['p1', 'fav', 'ghost']);
+		expect(res.deleted).toEqual([]);
+		expect(res.failed).toEqual([]);
+		expect(res.skipped.map((s) => [s.id, s.reason])).toEqual([
+			['p1', 'spotify playlists are not deleted here'],
+			['fav', 'Favorite Tracks is the collection, not a playlist'],
+			['ghost', 'not found'],
+		]);
+		expect(sqlite.prepare(`SELECT count(*) AS n FROM playlist`).get()).toEqual({ n: 2 });
+	});
+
+	it('needs a Tidal session before anything else', async () => {
+		sqlite.prepare(`INSERT INTO playlist (id, source, source_id, name) VALUES ('t1', 'tidal', 'remote-t1', 'Mine')`).run();
+		await expect(svc.deleteStreamingPlaylists(['t1'])).rejects.toThrow(/Tidal not connected/);
+		expect(sqlite.prepare(`SELECT count(*) AS n FROM playlist WHERE id = 't1'`).get()).toEqual({ n: 1 });
+	});
+});

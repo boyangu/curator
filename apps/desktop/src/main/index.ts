@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, net, powerMonitor, protocol, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, net, powerMonitor, protocol, shell } from 'electron';
 // `components` is castlabs/electron-releases' Widevine CDM loader. The fork
 // adds it to the Electron API; upstream Electron also exposes it on recent
 // versions but castlabs is the one that ships a signed VMP keyset usable by
@@ -572,37 +572,90 @@ async function handlePeaksRequest(request: Request, svc: CoreService): Promise<R
 	}
 }
 
+// Row-sized art for list cells (`curator-cover://<id>?s=thumb`). A cell draws
+// ~44 px, but the full art is 640 px from Spotify and up to 1400 px / 2 MB
+// embedded in local files — read through main and decoded per row as rows
+// scroll in. A thumb is Spotify's own 300 px variant of the same image (a URL
+// rewrite: no decode here), or for embedded art a one-time resize cached
+// beside the full copy.
+const COVER_THUMB_PX = 128;
+// Spotify CDN size prefixes for one image hash: 640 px → 300 px.
+const SPOTIFY_COVER_640 = 'ab67616d0000b273';
+const SPOTIFY_COVER_300 = 'ab67616d00001e02';
+function remoteCoverThumbUrl(remote: string): string | null {
+	try {
+		const u = new URL(remote);
+		if (u.hostname !== 'i.scdn.co' || !u.pathname.includes(SPOTIFY_COVER_640)) return null;
+		u.pathname = u.pathname.replace(SPOTIFY_COVER_640, SPOTIFY_COVER_300);
+		return u.toString();
+	} catch {
+		return null;
+	}
+}
+
+// Tracks found to have no art, by when. Chromium doesn't cache the 404, so a
+// row re-created by scrolling repeated every lookup — and for a local file a
+// full tag parse — each time it came back into view. Retried after a while:
+// a sync or a re-tag can give the track art.
+const COVER_MISS_TTL_MS = 10 * 60_000;
+const coverMisses = new Map<string, number>();
+
+async function readIfExists(path: string): Promise<Buffer | null> {
+	try {
+		return await fsp.readFile(path);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+		throw err;
+	}
+}
+
+// The disk-cached copy of a remote image, fetched on first use. A number is
+// the upstream's failing HTTP status.
+async function fetchCoverCached(remote: string, filePath: string): Promise<Buffer | number> {
+	const hit = await readIfExists(filePath);
+	if (hit) return hit;
+	const res = await net.fetch(remote);
+	if (!res.ok) return res.status;
+	const buf = Buffer.from(await res.arrayBuffer());
+	await fsp.writeFile(filePath, buf);
+	return buf;
+}
+
+function coverResponse(data: Buffer | Uint8Array, contentType: string): Response {
+	return new Response(data as unknown as BodyInit, {
+		headers: { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=31536000, immutable' },
+	});
+}
+
 async function handleCoverRequest(request: Request, svc: CoreService): Promise<Response> {
 	try {
 		const url = new URL(request.url);
 		// `url.hostname` holds the trackId for curator-cover://<trackId>
 		const trackId = decodeURIComponent(url.hostname);
 		if (!trackId) return new Response('missing track id', { status: 400 });
+		const thumb = url.searchParams.get('s') === 'thumb';
+
+		const missedAt = coverMisses.get(trackId);
+		if (missedAt != null && Date.now() - missedAt < COVER_MISS_TTL_MS) return new Response('no cover for track', { status: 404 });
 
 		// Fast path A — remote URL from Spotify/Tidal payload, cached by URL hash.
 		const remote = await svc.getTrackCoverUrl(trackId);
 		if (remote) {
-			const hash = createHash('sha1').update(remote).digest('hex');
-			const remoteExt = (() => {
-				try { return extname(new URL(remote).pathname).toLowerCase(); } catch { return ''; }
-			})();
-			const ext = MIME_BY_EXT[remoteExt] ? remoteExt : '.jpg';
-			const filePath = join(getCoversDir(), `${hash}${ext}`);
-
-			if (!existsSync(filePath)) {
-				const res = await net.fetch(remote);
-				if (!res.ok) return new Response(`upstream ${res.status}`, { status: res.status });
-				const buf = Buffer.from(await res.arrayBuffer());
-				await fsp.writeFile(filePath, buf);
-			}
-
-			const data = await fsp.readFile(filePath);
-			return new Response(data as unknown as BodyInit, {
-				headers: {
-					'Content-Type': MIME_BY_EXT[ext] ?? 'image/jpeg',
-					'Cache-Control': 'public, max-age=31536000, immutable',
-				},
-			});
+			const urlExt = (u: string): string => {
+				try { return extname(new URL(u).pathname).toLowerCase(); } catch { return ''; }
+			};
+			const cached = async (u: string): Promise<{ data: Buffer; ext: string } | number> => {
+				const ext = MIME_BY_EXT[urlExt(u)] ? urlExt(u) : '.jpg';
+				const hash = createHash('sha1').update(u).digest('hex');
+				const r = await fetchCoverCached(u, join(getCoversDir(), `${hash}${ext}`));
+				return typeof r === 'number' ? r : { data: r, ext };
+			};
+			const small = thumb ? remoteCoverThumbUrl(remote) : null;
+			// A thumb variant the CDN refuses falls back to the full image.
+			let got = small ? await cached(small) : null;
+			if (got == null || typeof got === 'number') got = await cached(remote);
+			if (typeof got === 'number') return new Response(`upstream ${got}`, { status: got });
+			return coverResponse(got.data, MIME_BY_EXT[got.ext] ?? 'image/jpeg');
 		}
 
 		// Fast path B — embedded album art from a local audio file. Cached on
@@ -612,30 +665,34 @@ async function handleCoverRequest(request: Request, svc: CoreService): Promise<R
 		// (re-ingest of the same file path keeps the same track id via the
 		// scanner's ISRC/title resolver); manual user re-tag-of-cover is a
 		// future concern.
+		const thumbCache = join(getCoversDir(), `t_${trackId}_s.jpg`);
+		if (thumb) {
+			const hit = await readIfExists(thumbCache);
+			if (hit) return coverResponse(hit, 'image/jpeg');
+		}
 		const localCache = join(getCoversDir(), `t_${trackId}.bin`);
-		if (existsSync(localCache)) {
-			const data = await fsp.readFile(localCache);
-			return new Response(data as unknown as BodyInit, {
-				headers: {
-					'Content-Type': 'image/jpeg', // music-metadata pictures usually JPEG; PNG ok too — browsers detect from bytes
-					'Cache-Control': 'public, max-age=31536000, immutable',
-				},
-			});
+		let full: Buffer | null = await readIfExists(localCache);
+		let format = 'image/jpeg'; // music-metadata pictures usually JPEG; PNG ok too — browsers detect from bytes
+		if (!full) {
+			// The tag parse runs in the ingest pool, not here (readCover).
+			const embedded = await svc.extractLocalCover(trackId);
+			if (!embedded) {
+				coverMisses.set(trackId, Date.now());
+				return new Response('no cover for track', { status: 404 });
+			}
+			full = Buffer.from(embedded.data);
+			format = embedded.format || format;
+			await fsp.writeFile(localCache, full);
 		}
-
-		const embedded = await svc.extractLocalCover(trackId);
-		if (embedded) {
-			const buf = Buffer.from(embedded.data);
-			await fsp.writeFile(localCache, buf);
-			return new Response(buf as unknown as BodyInit, {
-				headers: {
-					'Content-Type': embedded.format || 'image/jpeg',
-					'Cache-Control': 'public, max-age=31536000, immutable',
-				},
-			});
-		}
-
-		return new Response('no cover for track', { status: 404 });
+		if (!thumb) return coverResponse(full, format);
+		// One-time resize, then served from disk. The decode is synchronous
+		// on main, which is why it's done once per track and kept.
+		const img = nativeImage.createFromBuffer(full);
+		if (img.isEmpty()) return coverResponse(full, format);
+		const fitted = img.getSize().width > COVER_THUMB_PX ? img.resize({ width: COVER_THUMB_PX, quality: 'good' }) : img;
+		const jpeg = fitted.toJPEG(85);
+		await fsp.writeFile(thumbCache, jpeg);
+		return coverResponse(jpeg, 'image/jpeg');
 	} catch (err) {
 		mainLog.for('curator-cover').error('failed', err);
 		return new Response('error', { status: 500 });
@@ -1285,6 +1342,8 @@ app.whenReady().then(async () => {
 		// SQL must never block the main loop (better-sqlite3 has no interrupt).
 		workspaceHost: (paths) => new UtilityWorkspaceHost(join(__dirname, 'workspace-worker.cjs'), paths),
 		parseAudio: ingestPool.parse,
+		// Embedded cover art for curator-cover:// — a full parse, so off main too.
+		readCover: ingestPool.cover,
 		// `cargo run` fallback (dev, no prebuilt binary) needs `--` before the
 		// binary's own argument.
 		wavConverter: audioBinary

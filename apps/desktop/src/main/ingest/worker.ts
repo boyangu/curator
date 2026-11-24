@@ -1,7 +1,8 @@
 // Utility process entry. Runs in a Node sub-process spawned by the main
 // process via `app.utilityProcess.fork`. No Electron APIs are touched here —
-// this is plain Node. The sole job: parse one audio file's metadata when the
-// parent asks, and post the result back.
+// this is plain Node. Its job: read one audio file when the parent asks —
+// its metadata ('parse') or its embedded album art ('cover') — and post the
+// result back.
 //
 // One utility process == one worker slot in the IngestPool (apps/desktop/src/
 // main/ingest/pool.ts). The pool sizes the number of these processes; each
@@ -10,8 +11,8 @@
 // Communication is via process.parentPort (Electron's structured-clone
 // channel — no JSON parsing on either side):
 //
-//   parent → worker:  { type: 'parse', id: <n>, path: <abs path> }
-//   worker → parent:  { id: <n>, ok: true,  result: ParseResult }
+//   parent → worker:  { type: 'parse' | 'cover', id: <n>, path: <abs path> }
+//   worker → parent:  { id: <n>, ok: true,  result: ParseResult | CoverArt | null }
 //                  |  { id: <n>, ok: false, message: string }
 //
 // `id` correlates request ↔ response; the pool's dispatcher uses it to
@@ -23,16 +24,16 @@
 // import from `@curator/core/ingest` (the sub-path export) rather than the
 // package root so rollup only pulls the metadata-parsing module — not the
 // whole service + drizzle + sqlite surface — into this worker's bundle.
-import { parseInline, type ParseResult } from '@curator/core/ingest';
+import { parseInline, readCoverInline, type CoverArt, type ParseResult } from '@curator/core/ingest';
 
-interface ParseRequest {
-	type: 'parse';
+interface WorkerRequest {
+	type: 'parse' | 'cover';
 	id: number;
 	path: string;
 }
 
 type WorkerResponse =
-	| { id: number; ok: true; result: ParseResult }
+	| { id: number; ok: true; result: ParseResult | CoverArt | null }
 	| { id: number; ok: false; message: string };
 
 if (!process.parentPort) {
@@ -43,12 +44,12 @@ if (!process.parentPort) {
 }
 
 process.parentPort.on('message', async (evt) => {
-	const req = evt.data as ParseRequest | undefined;
-	if (!req || req.type !== 'parse') return;
+	const req = evt.data as WorkerRequest | undefined;
+	if (!req || (req.type !== 'parse' && req.type !== 'cover')) return;
 
 	let response: WorkerResponse;
 	try {
-		const result = await parseInline(req.path);
+		const result = req.type === 'cover' ? await readCoverInline(req.path) : await parseInline(req.path);
 		response = { id: req.id, ok: true, result };
 	} catch (err) {
 		response = {

@@ -87,7 +87,7 @@ function syncCursorFor(pl: TidalPlaylist): string | null {
 
 // "Favorite Tracks" — Tidal's Liked Songs. Synthetic playlist with a stable
 // sourceId, same pattern as Spotify's 'liked-songs' sentinel.
-const FAVORITES_SENTINEL_ID = 'favorite-tracks';
+export const FAVORITES_SENTINEL_ID = 'favorite-tracks';
 const FAVORITES_URL = 'https://listen.tidal.com/collection/tracks';
 
 function favoritesSynthPlaylist(meta: { lastModifiedAt: string | null; numberOfItems: number | null } | null): TidalPlaylist {

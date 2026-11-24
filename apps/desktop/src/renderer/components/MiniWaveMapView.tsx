@@ -21,7 +21,7 @@
 // MiniWaveMapViews against different tracks would just pass different
 // trackId-bound accessors here.
 
-import { For, Show, createEffect, createSignal, untrack } from 'solid-js';
+import { For, Show, createEffect, untrack } from 'solid-js';
 import type { Accessor } from 'solid-js';
 import { render } from 'solid-js/web';
 import type { PeaksTier, CueData } from '../stores/analysisStore.js';
@@ -72,7 +72,7 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 
 	// Played-position fill — % of track. Driven by the positionSec
 	// accessor (likely `() => player.getState().position` on the
-	// reactive proxy), with the CSS transition smoothing playback.
+	// reactive proxy). No CSS transition: a click must land at once.
 	const fillPct = (): number => {
 		const dur = props.duration();
 		if (!dur) return 0;
@@ -176,10 +176,6 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 	let dragX0 = 0;
 	let dragStarted = false;
 	let dragWasPlaying = false;
-	// Toggled on for the duration of a drag so the played-fill CSS
-	// transition (`width 120ms linear`) gets suppressed — without that
-	// override the visual playhead lags ~120 ms behind the cursor.
-	const [isScrubbing, setIsScrubbing] = createSignal(false);
 
 	function ratioToSec(clientX: number): number {
 		if (!hostRef) return 0;
@@ -205,7 +201,6 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 		dragX0 = evt.clientX;
 		dragStarted = false;
 		dragWasPlaying = untrack(() => props.isPlaying());
-		setIsScrubbing(true);
 
 		try { hostRef.setPointerCapture(evt.pointerId); }
 		catch { /* unsupported — moves outside the wavemap will stop, that's fine */ }
@@ -235,7 +230,6 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 		const pointerId = dragPointerId;
 		dragPointerId = null;
 		dragStarted = false;
-		setIsScrubbing(false);
 		if (hostRef) {
 			try { hostRef.releasePointerCapture(pointerId); } catch { /* */ }
 		}
@@ -250,7 +244,6 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 		if (dragPointerId !== evt.pointerId) return;
 		dragPointerId = null;
 		dragStarted = false;
-		setIsScrubbing(false);
 		if (hostRef) {
 			try { hostRef.releasePointerCapture(evt.pointerId); } catch { /* */ }
 		}
@@ -262,7 +255,6 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 		<div
 			ref={hostRef}
 			class="wavemap sunken"
-			classList={{ 'is-scrubbing': isScrubbing() }}
 			onPointerDown={handlePointerDown}
 			onPointerMove={handlePointerMove}
 			onPointerUp={handlePointerUp}

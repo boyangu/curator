@@ -950,7 +950,7 @@ async function renderSettingsUI(): Promise<void> {
 				${sourceRow('spotify',    'Spotify')}
 				${sourceRow('tidal',      'Tidal')}
 				${sourceRow('soundcloud', 'Soundcloud')}
-				${sourceRow('rekordbox',  'Rekordbox')}
+				${sourceRow('rekordbox',  'Owned')}
 			</div>
 		</div>
 		<div class="settings-ui__section">

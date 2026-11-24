@@ -2,9 +2,16 @@
 //
 // The `.now-playing-eq` bars (the playing-track index cell + the now-playing
 // chip) are CSS-keyframe fakes by default. While something plays, this drives
-// them from real audio: it sets --np-eq-1..N + an `eq-live` class on <html>,
-// and the CSS bars read the vars (see style.css). Only one track plays at a
-// time, so every eq instance reads the same vars and stays in sync.
+// them from real audio: it sets an `eq-live` class on <html> and writes
+// --np-eq-1..N onto each `.now-playing-eq` element, and the CSS bars read the
+// vars (see style.css). Only one track plays at a time, so every eq instance
+// gets the same values and stays in sync.
+//
+// The vars go on the eq elements, NOT on <html>: custom properties inherit,
+// so a per-frame write on the root restyles the whole document — measured
+// 8–35 ms a frame at 4k–18k elements with the app's stylesheet, most of the
+// frame budget whenever anything played (scroll jank). Writing them on the
+// eq elements restyles only those few subtrees (~1–3 ms at the same sizes).
 //
 // Two signal sources, by backend:
 //   - local files: the audio engine's own output peaks (player state peakL/R,
@@ -31,6 +38,7 @@ const EMA = 0.5;  // per-frame smoothing toward the new level
 const SILENCE = 0.02;
 const SILENT_MS = 2000;
 const levels = new Array<number>(BANDS).fill(0);
+const heights = new Array<string>(BANDS).fill('');
 let silentSince: number | null = null;
 
 // Local backend: one loudness level for the whole mix, spread over the bars
@@ -64,8 +72,12 @@ function tick(now: number): void {
 	}
 	for (let b = 0; b < BANDS; b++) {
 		levels[b]! += (bands[b]! - levels[b]!) * EMA;
-		const h = FLOOR + levels[b]! * (100 - FLOOR);
-		root.style.setProperty(`--np-eq-${b + 1}`, `${h.toFixed(1)}%`);
+		heights[b] = `${(FLOOR + levels[b]! * (100 - FLOOR)).toFixed(1)}%`;
+	}
+	// Queried per frame: rows mount and unmount as the list scrolls, and a
+	// fresh row picks the values up on the next frame.
+	for (const el of document.querySelectorAll<HTMLElement>('.now-playing-eq')) {
+		for (let b = 0; b < BANDS; b++) el.style.setProperty(`--np-eq-${b + 1}`, heights[b]!);
 	}
 	root.classList.add('eq-live');
 }

@@ -72,6 +72,12 @@ export class SpotifyAdapter implements StreamingSourceAdapter {
 		return out;
 	}
 
+	async fetchPlaylistItemIds(remoteId: string): Promise<Array<string | null>> {
+		const c = await this.client();
+		const items = await c.getPlaylistTracks(remoteId);
+		return items.map((it) => (it.is_local || !it.track?.id ? null : it.track.id));
+	}
+
 	async createPlaylist(name: string, opts: { description?: string; isPublic?: boolean } = {}): Promise<RemotePlaylistRef> {
 		this.assertCap('canCreatePlaylist', 'createPlaylist');
 		const c = await this.client();
@@ -111,6 +117,14 @@ export class SpotifyAdapter implements StreamingSourceAdapter {
 		if (remoteTrackIds.length === 0) return { snapshotId: null };
 		const c = await this.client();
 		const res = await c.removePlaylistTracks(remoteId, remoteTrackIds);
+		return { snapshotId: res.snapshot_id || null };
+	}
+
+	async insertTracks(remoteId: string, remoteTrackIds: string[], position: number): Promise<{ snapshotId: string | null }> {
+		this.assertCap('canAddTracks', 'insertTracks');
+		if (remoteTrackIds.length === 0) return { snapshotId: null };
+		const c = await this.client();
+		const res = await c.insertPlaylistTracks(remoteId, remoteTrackIds, position);
 		return { snapshotId: res.snapshot_id || null };
 	}
 

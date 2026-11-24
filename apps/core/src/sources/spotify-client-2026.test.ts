@@ -147,6 +147,14 @@ describe('writes', () => {
 		]);
 	});
 
+	it('an insert names its position', async () => {
+		fakeSpotify((u, init) => (init?.method === 'POST' && u.pathname.endsWith('/items') ? { status: 201, body: { snapshot_id: 'snap3' } } : null));
+		const { c } = await client();
+		const res = await c.insertPlaylistTracks('pl1', ['t1'], 7);
+		expect(res.snapshot_id).toBe('snap3');
+		expect(calls.map((x) => x.body)).toEqual([{ uris: ['spotify:track:t1'], position: 7 }]);
+	});
+
 	it('a write is sent once when its first form answers', async () => {
 		fakeSpotify((u, init) => (init?.method === 'POST' && u.pathname.endsWith('/items') ? { status: 201, body: { snapshot_id: 'snap' } } : null));
 		const { c } = await client();

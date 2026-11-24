@@ -33,6 +33,8 @@ function makeFakeSvc() {
 			({ playlist: { id: 'new-sp', name, source: 'spotify' }, added: trackIds.length, skipped: 0 })),
 		addTracksToPlaylist: vi.fn(async (_id: string, trackIds: string[]) => ({ added: trackIds.length, skipped: 0, noUpstreamTrackIds: [] as string[], upstream: 'none' as const })),
 		removeTracksFromPlaylist: vi.fn(async (_id: string, trackIds: string[]) => ({ removed: trackIds.length, upstream: 'none' as const })),
+		deleteStreamingPlaylists: vi.fn(async (ids: string[]) => ({ deleted: ids.map((id) => ({ id, name: id })), skipped: [], failed: [] })),
+		removePlaylistRows: vi.fn(async (_id: string, positions: number[]) => ({ removed: positions.length, upstream: 'pushed' as const })),
 		renamePlaylist: vi.fn(async () => ({ pushedToSource: true })),
 		getTags: vi.fn(async () => [{ id: 'tag1', name: 'Peak Time' }]),
 		createTag: vi.fn(async (name: string) => ({ id: `tag-${name}`, name })),
@@ -68,7 +70,7 @@ describe('MCP write tools', () => {
 	it('exposes specs for every tool', () => {
 		expect(tools.specs().map((s) => s.name)).toEqual([
 			'list_playlists', 'get_playlist_tracks', 'create_playlist', 'add_tracks_to_playlist',
-			'remove_tracks_from_playlist', 'rename_playlist', 'reorder_playlist_tracks', 'tag_tracks', 'set_rating',
+			'remove_tracks_from_playlist', 'remove_playlist_rows', 'delete_playlists', 'rename_playlist', 'reorder_playlist_tracks', 'tag_tracks', 'set_rating',
 			'set_track_source_links', 'update_track_fields', 'set_play_session_kind',
 		]);
 	});
@@ -135,6 +137,37 @@ describe('MCP write tools', () => {
 		await tools.execute('remove_tracks_from_playlist', { playlistId: 'pl-local', trackIds: ['t1'] });
 		expect(confirms).toHaveLength(1);
 		expect(confirms[0]!.kind).toBe('destructive-write');
+	});
+
+	it('remove_playlist_rows names rows by 1-based position + track id and passes the stored positions', async () => {
+		// The fake playlist is t1@0, t2@5, t1@7 — drop the second t1 only.
+		const res = await tools.execute('remove_playlist_rows', { playlistId: 'pl-sp', rows: [{ position: 8, trackId: 't1' }] }) as { removed: number };
+		expect(confirms).toHaveLength(1);
+		expect(confirms[0]!.kind).toBe('destructive-write');
+		expect(confirms[0]!.detailLines[0]).toMatch(/^#8 /);
+		expect(svc.removePlaylistRows).toHaveBeenCalledWith('pl-sp', [7]);
+		expect(res.removed).toBe(1);
+	});
+
+	it('remove_playlist_rows refuses a position that no longer holds that track, before the modal', async () => {
+		await expect(tools.execute('remove_playlist_rows', { playlistId: 'pl-sp', rows: [{ position: 6, trackId: 't1' }] }))
+			.rejects.toThrow(/#6 is not track t1/);
+		expect(confirms).toHaveLength(0);
+		expect(svc.removePlaylistRows).not.toHaveBeenCalled();
+	});
+
+	it('delete_playlists: one destructive confirm for the batch; deny deletes nothing; unknown ids refused first', async () => {
+		await expect(tools.execute('delete_playlists', { playlistIds: ['ghost'] })).rejects.toThrow(/unknown playlistIds/);
+		expect(confirms).toHaveLength(0);
+		confirmAnswer = false;
+		await expect(tools.execute('delete_playlists', { playlistIds: ['pl-sp', 'pl-local'] })).rejects.toThrow('declined');
+		expect(svc.deleteStreamingPlaylists).not.toHaveBeenCalled();
+		confirmAnswer = true;
+		const res = await tools.execute('delete_playlists', { playlistIds: ['pl-sp', 'pl-local'] }) as { ok: boolean };
+		expect(confirms.map((c) => c.kind)).toEqual(['destructive-write', 'destructive-write']);
+		expect(confirms[1]!.detailLines).toEqual(['Melodic', 'Crate']);
+		expect(svc.deleteStreamingPlaylists).toHaveBeenCalledWith(['pl-sp', 'pl-local']);
+		expect(res.ok).toBe(true);
 	});
 
 	it('rename gates only for streaming sources', async () => {

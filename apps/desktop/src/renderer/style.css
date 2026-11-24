@@ -506,9 +506,11 @@ body.resizing * { user-select: none !important; }
 	0%, 100% { height: 25%; }
 	50%      { height: 100%; }
 }
-/* LIVE: eq-driver.ts sets `eq-live` + --np-eq-* on <html> from the real
-   loopback FFT; bars take their heights from those vars instead of the keyframe
-   loop (per-bar fallback 25% until the first frame lands). */
+/* LIVE: eq-driver.ts sets `eq-live` on <html> and --np-eq-* on each
+   .now-playing-eq (never on <html>: an inherited var written per frame restyles
+   the whole page) from the real audio level; bars take their heights from those
+   vars instead of the keyframe loop (per-bar fallback 25% until the first frame
+   lands). */
 .eq-live .now-playing-eq i { animation: none; }
 .eq-live .now-playing-eq i:nth-child(1) { height: var(--np-eq-1, 25%); }
 .eq-live .now-playing-eq i:nth-child(2) { height: var(--np-eq-2, 25%); }
@@ -2612,13 +2614,10 @@ body[data-player-mode="big"] .player-deck > .player-controls-row { flex: 0 0 aut
 	pointer-events: none;
 }
 .wavemap > .wave-inner > svg.t-waveform { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-.wavemap .t-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: rgba(0, 0, 0, 0.55); pointer-events: none; transition: width 120ms linear; z-index: 1; }
-/* While the user is dragging on the mini-wavemap, suppress the playhead
-   transition so the fill snaps with the cursor instead of lagging by
-   ~120 ms. The toggle is owned by MiniWaveMapView's pointer-event
-   handlers; on pointerup the transition restores and play-driven
-   updates smooth again. */
-.wavemap.is-scrubbing .t-fill { transition: none; }
+/* No width transition: on a whole-track map one 50 ms position tick moves the
+   fill by a fraction of a pixel, so a transition smooths nothing and only
+   animates jumps — a click read as the fill "running" to the spot. */
+.wavemap .t-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: rgba(0, 0, 0, 0.55); pointer-events: none; z-index: 1; }
 .wavemap .t-cue-tick {
 	position: absolute;
 	top: 0;

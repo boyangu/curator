@@ -460,7 +460,9 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 		? coverGradient(i)
 		: catalogRow
 			? (t.coverUrl ? `url(&quot;${escapeHtml(cssUrl(t.coverUrl))}&quot;), ${coverGradient(i)}` : coverGradient(i))
-			: `url(curator-cover://${encodeURIComponent(t.id)}), ${coverGradient(i)}`;
+			// `s=thumb`: a cell-sized copy (main/index.ts handleCoverRequest),
+			// not the 640–1400 px original decoded per row as rows scroll in.
+			: `url(curator-cover://${encodeURIComponent(t.id)}?s=thumb), ${coverGradient(i)}`;
 	const isNowPlaying = getNowPlayingTrackId() === t.id;
 	// `#` cell prefers the canonical playlist position over the visible-array
 	// index. Stable across sort + client-side filter — the track's identity
@@ -1914,6 +1916,23 @@ export function mountTrackList(
 		}
 	}
 
+	// id → position, per array. patchOne runs once per row in callers' loops
+	// (a rating over a whole selection), and a findIndex per call made those
+	// loops quadratic — 39k rows froze the renderer for seconds. Keyed on the
+	// array itself: update() swaps in new arrays, and the only in-place writes
+	// (patchOne's own, the caller's) replace a row with the same id, so an
+	// index never goes stale. First occurrence wins, like findIndex.
+	const idIndex = new WeakMap<Track[], Map<string, number>>();
+	function indexIn(arr: Track[], id: string): number {
+		let m = idIndex.get(arr);
+		if (!m) {
+			m = new Map();
+			for (let i = 0; i < arr.length; i++) if (!m.has(arr[i]!.id)) m.set(arr[i]!.id, i);
+			idIndex.set(arr, m);
+		}
+		return m.get(id) ?? -1;
+	}
+
 	const handle: TrackListHandle = {
 		el: root,
 		update(next) {
@@ -1981,7 +2000,7 @@ export function mountTrackList(
 			if (selectionChanged) notifySelection();
 		},
 		patchOne(t) {
-			const ai = allTracks.findIndex((x) => x.id === t.id);
+			const ai = indexIn(allTracks, t.id);
 			if (ai < 0) return;
 			// A patch that moves the track to another group changes the
 			// geometry — go through update().
@@ -1993,7 +2012,7 @@ export function mountTrackList(
 			}
 			// Mirror the in-memory lists so subsequent re-renders see the patch.
 			allTracks[ai] = t;
-			const vi = tracks.findIndex((x) => x.id === t.id);
+			const vi = indexIn(tracks, t.id);
 			if (vi >= 0 && tracks !== allTracks) tracks[vi] = t;
 			if (display) {
 				const row = display.rows[display.trackRow[vi] ?? -1];

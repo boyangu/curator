@@ -505,6 +505,36 @@ export function prewarmAudio(): void {
 	/* No-op — Rust sidecar is spawned at main-process startup. */
 }
 
+// ─── Seek fence ────────────────────────────────────────────────────────
+// A seek or a wavemap click moves state.position at once (optimistic), but
+// the backend keeps streaming position ticks that were already queued behind
+// the request — 20 a second while playing, and a backlog of them when main
+// was busy as the click landed. Applied as they arrive, they drag the
+// playhead back to where it was until the backend's answer gets through, so
+// the progress "runs to the click" late. The fence drops those ticks until
+// one lands near the target (both backends echo the new position as soon as
+// they take the seek), or a grace period after the request settles if no
+// such tick comes (a failed seek, an SDK that reports late).
+const SEEK_FENCE_TOLERANCE_SEC = 0.25;
+const SEEK_FENCE_GRACE_MS = 1000;
+let seekFence: { target: number; until: number } | null = null;
+function fenceSeek(target: number, request: Promise<unknown>): void {
+	const fence = { target, until: Infinity };
+	seekFence = fence;
+	const settle = (): void => { fence.until = performance.now() + SEEK_FENCE_GRACE_MS; };
+	request.then(settle, settle);
+}
+// True when a backend position tick predates the pending seek.
+function fencedOff(position: number): boolean {
+	const f = seekFence;
+	if (!f) return false;
+	if (Math.abs(position - f.target) < SEEK_FENCE_TOLERANCE_SEC || performance.now() > f.until) {
+		seekFence = null;
+		return false;
+	}
+	return true;
+}
+
 // Wire the sidecar's push events into the player state once at module load.
 // state_changed → mutate state.position / state.playing reactively.
 // ended → advance the queue (same as the previous onended handler).
@@ -515,6 +545,9 @@ window.api.onAudioEvent((evt) => {
 		// reporting position on a track that's no longer "playing" from
 		// the renderer's POV; the activeBackend gate filters those out.
 		if (activeBackend !== 'local') return;
+		// Its `playing` is as stale as its position (a click pauses into
+		// scrub mode; an older tick still says playing).
+		if (fencedOff(evt.position)) return;
 		state.position = evt.position;
 		state.playing = evt.playing;
 		// Push raw per-channel peaks into the store. The VU meter
@@ -576,9 +609,11 @@ window.api.onSpotifyEvent((evt) => {
 				coverUrl: evt.track.coverUrl,
 			};
 		}
-		state.position = evt.position;
 		state.duration = evt.duration;
-		state.playing = evt.playing;
+		if (!fencedOff(evt.position)) {
+			state.position = evt.position;
+			state.playing = evt.playing;
+		}
 		// Once the sidecar reports playing, audio is actually out — clear the
 		// loading indicator playSpotify set before the RPC.
 		if (evt.playing && state.loading) state.loading = false;
@@ -638,6 +673,7 @@ async function playLocal(track: Track, filePath: string): Promise<void> {
 		hasLocal: true,
 	};
 	state.position = 0;
+	seekFence = null; // a seek on the previous track must not hold off this one's ticks
 	state.duration = track.duration ?? 0;
 	state.playing = false;
 	state.loading = true;
@@ -719,7 +755,7 @@ function seekLocal(seconds: number): void {
 	// immediately; the sidecar's state_changed event will reconfirm.
 	state.position = target;
 	emit();
-	void window.api['audio:rpc']('seek', { seconds: target });
+	fenceSeek(target, window.api['audio:rpc']('seek', { seconds: target }));
 
 	// Instrumentation — log click → RPC-dispatched time. With the sidecar,
 	// the ui→engine number is now JS click → renderer process boundary.
@@ -795,6 +831,7 @@ async function startCatalogSpotify(track: Track, stid: string): Promise<void> {
 		coverUrl: track.coverUrl ?? null,
 	};
 	state.position = 0;
+	seekFence = null; // a seek on the previous track must not hold off this one's ticks
 	state.duration = track.duration ?? 0;
 	state.playing = false;
 	emit();
@@ -894,6 +931,7 @@ export async function play(track: Track, list?: Track[]): Promise<void> {
 			coverUrl: null,
 		};
 		state.position = 0;
+		seekFence = null; // a seek on the previous track must not hold off this one's ticks
 		state.duration = track.duration ?? 0;
 		state.playing = false;
 		emit();
@@ -984,7 +1022,7 @@ export async function seekBy(deltaSec: number): Promise<void> {
 		return;
 	}
 	if (state.current.source === 'spotify') {
-		void window.api['spotify:rpc']('seek', { seconds: next });
+		fenceSeek(next, window.api['spotify:rpc']('seek', { seconds: next }));
 	}
 	state.position = next;
 	emit();
@@ -1012,24 +1050,26 @@ export function scrubStart(targetSec?: number): { wasPlaying: boolean } {
 		// Local: tell the sidecar to enter scrub mode. The engine clears
 		// `playing` internally; emit a state event so listeners (UI) see
 		// the pause. When targetSec is set, also snap engine cursor.
-		void window.api['audio:rpc']('scrub_begin', targetSec != null ? { seconds: targetSec } : {});
+		const begin = window.api['audio:rpc']('scrub_begin', targetSec != null ? { seconds: targetSec } : {});
 		state.playing = false;
 		// Optimistic position update for the snap case so the UI jumps
 		// without waiting for the engine's StateChanged round-trip.
 		if (targetSec != null) {
 			const dur = state.duration || 0;
 			state.position = Math.max(0, Math.min(dur, targetSec));
+			fenceSeek(state.position, begin);
 		}
 		emit();
 		return { wasPlaying };
 	}
 	if (state.current.source === 'spotify') {
 		// SDK pause. Silent scrub for the drag's duration.
-		void window.api['spotify:rpc']('pause');
+		const pause = window.api['spotify:rpc']('pause');
 		state.playing = false;
 		if (targetSec != null) {
 			const dur = state.duration || 0;
 			state.position = Math.max(0, Math.min(dur, targetSec));
+			fenceSeek(state.position, pause);
 		}
 		emit();
 		return { wasPlaying };
@@ -1057,21 +1097,25 @@ export async function scrubEnd(finalSec: number, resumePlaying: boolean): Promis
 	const dur = state.duration || 0;
 	const clamped = Math.max(0, Math.min(dur, finalSec));
 	if (state.current.source === 'local') {
-		void window.api['audio:rpc']('scrub_end', {
+		fenceSeek(clamped, window.api['audio:rpc']('scrub_end', {
 			final_seconds: clamped,
 			resume_playing: resumePlaying,
-		});
+		}));
 		state.position = clamped;
 		state.playing = resumePlaying;
 		emit();
 		return;
 	}
 	if (state.current.source === 'spotify') {
-		await window.api['spotify:rpc']('seek', { seconds: clamped });
+		// Position first: the fill lands at the release point now, not after
+		// the SDK round-trips.
+		state.position = clamped;
+		const seek = window.api['spotify:rpc']('seek', { seconds: clamped });
+		fenceSeek(clamped, seek);
+		await seek;
 		if (resumePlaying) {
 			await window.api['spotify:rpc']('resume');
 		}
-		state.position = clamped;
 		state.playing = resumePlaying;
 		emit();
 	}

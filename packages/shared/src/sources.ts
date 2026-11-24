@@ -109,7 +109,8 @@ const TIDAL_CAPS: SourceCapabilities = {
 	canWriteSync:       false,
 	canReorder:         false,
 	canCreatePlaylist:  false,
-	canDeletePlaylist:  false,
+	// Owned playlists only, through CoreService.deleteStreamingPlaylists.
+	canDeletePlaylist:  true,
 	canAddTracks:       false,
 	canRemoveTracks:    false,
 	canRename:          false,

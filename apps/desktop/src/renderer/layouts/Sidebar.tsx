@@ -740,7 +740,7 @@ export function Sidebar(props: SidebarProps) {
 						{snap().artistsExpanded ? '▾' : '▸'}
 					</span>
 					<span class="pl-name">Artists</span>
-					<span class="pl-count" title="Counts are this tab's tracks">{snap().activeSource === 'rekordbox' ? 'Rekordbox' : snap().activeSource === 'tidal' ? 'Tidal' : 'Spotify'}</span>
+					<span class="pl-count" title="Counts are this tab's tracks">{snap().activeSource === 'rekordbox' ? 'Owned' : snap().activeSource === 'tidal' ? 'Tidal' : 'Spotify'}</span>
 				</button>
 				<Show when={snap().artistsExpanded}>
 					<input
@@ -786,8 +786,8 @@ export function Sidebar(props: SidebarProps) {
 								when={snap().rekordboxLoading}
 								fallback={
 									<div class="pl-empty-hint">
-										No Rekordbox library imported yet.<br/>
-										Open Settings → Rekordbox to read your library.
+										Nothing owned imported yet.<br/>
+										Open Settings → Rekordbox to read your rekordbox library.
 									</div>
 								}
 							>

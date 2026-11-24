@@ -18,11 +18,14 @@ vi.mock('./spectrum.js', () => ({ readBands: () => h.bands, followOutputDeviceCh
 
 const classes = new Set<string>();
 const vars = new Map<string, string>();
+const rootVars = new Map<string, string>();
+const eqEl = { style: { setProperty: (k: string, v: string) => vars.set(k, v) } };
 (globalThis as unknown as { document: unknown }).document = {
 	documentElement: {
 		classList: { add: (c: string) => classes.add(c), remove: (c: string) => classes.delete(c) },
-		style: { setProperty: (k: string, v: string) => vars.set(k, v) },
+		style: { setProperty: (k: string, v: string) => rootVars.set(k, v) },
 	},
+	querySelectorAll: (sel: string) => (sel === '.now-playing-eq' ? [eqEl] : []),
 };
 
 const { startEqDriver } = await import('./eq-driver.js');
@@ -31,7 +34,7 @@ startEqDriver();
 function play(): void { h.subscriber!(h.state); }
 
 describe('now-playing eq driver', () => {
-	beforeEach(() => { classes.clear(); vars.clear(); h.state.playing = true; });
+	beforeEach(() => { classes.clear(); vars.clear(); rootVars.clear(); h.state.playing = true; });
 
 	it('streaming: silence for 2 s falls back to the CSS animation, signal brings live bars back', () => {
 		h.state.current = { source: 'spotify' };
@@ -56,5 +59,8 @@ describe('now-playing eq driver', () => {
 		const heights = [1, 2, 3, 4].map((b) => parseFloat(vars.get(`--np-eq-${b}`)!));
 		expect(Math.min(...heights)).toBeGreaterThan(40);
 		expect(new Set(heights).size).toBeGreaterThan(1); // not four identical columns
+		// Written on the eq elements only — an inherited var on <html> restyles
+		// the whole document every frame.
+		expect(rootVars.size).toBe(0);
 	});
 });
