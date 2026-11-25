@@ -41,6 +41,7 @@ enum class Icon(val path: String, val filled: Boolean = false) {
 	Heart("M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z"),
 	HeartFill("M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20z", filled = true),
 	Share("M12 3.5v11M8 7.5l4-4 4 4M5.5 11.5v8h13v-8"),
+	Filter("M4 5h16l-6.2 7.4V18.8l-3.6-1.8v-4.6z"),
 	Refresh("M19 12a7 7 0 1 1-2.1-5M19 4v4h-4"),
 	Following("M4 7h10M18 7h2M4 17h4M12 17h8M16 5a2 2 0 1 0 0 4 2 2 0 1 0 0-4M10 15a2 2 0 1 0 0 4 2 2 0 1 0 0-4"),
 }
