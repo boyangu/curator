@@ -6,6 +6,7 @@ import android.os.HandlerThread
 import android.util.Log
 import androidx.annotation.Keep
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -56,6 +57,10 @@ class CoreRuntime(private val context: Context) {
 	/** The library changed (a pull applied rows, or a local write): views reload. */
 	val applied: SharedFlow<Applied> = _applied
 
+	private val _feed = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+	/** feed.db changed: the feed reloads. */
+	val feed: SharedFlow<Unit> = _feed
+
 	private val runner = Runnable { runLoop() }
 
 	init {
@@ -105,6 +110,7 @@ class CoreRuntime(private val context: Context) {
 				pending = e["pending"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
 				error = (e["error"] as? JsonPrimitive)?.contentOrNull,
 			)
+			"feed" -> _feed.tryEmit(Unit)
 			"applied" -> _applied.tryEmit(Applied(tracks = e["tracks"]?.jsonPrimitive?.int ?: 0, playlists = e["playlists"]?.jsonPrimitive?.int ?: 0))
 		}
 	}

@@ -8,7 +8,7 @@
 // closer than `minGapMs`, whoever asks; the callers' own pacing still
 // applies on top.
 
-import type { Enricher, EnricherOutput, EnrichmentTarget } from './contract.js';
+import type { Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 
 export function inLane(enricher: Enricher, minGapMs: number): Enricher {
 	let tail: Promise<unknown> = Promise.resolve();

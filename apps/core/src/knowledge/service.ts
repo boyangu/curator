@@ -12,8 +12,8 @@
 
 import { SpotifyClient, type SpotifyTrack } from '@curator/spotify';
 import { artistNames, searchFold, splitArtistCredit } from '@curator/shared';
-import type { EnrichmentResult } from '../enrich/contract.js';
-import type { FeedAuthPort } from '../feed/types.js';
+import type { EnrichmentResult } from '@curator/sync-core/enrich/contract';
+import type { FeedAuthPort } from '@curator/sync-core/feed/types';
 import { KbExpansionQueue } from './expansion.js';
 import { resolveDraft } from './identity.js';
 import { ResearcherKbResolver } from './resolvers/researcher.js';

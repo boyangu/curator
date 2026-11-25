@@ -14,7 +14,7 @@
 
 import type { AnalyzeOptions } from '../../analyzer/sidecar.js';
 import type { AnalysisJobEvent } from '../../analyzer/queue.js';
-import type { Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
+import type { Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 
 // The slice of AnalysisQueue this enricher depends on. Declared as a port (not
 // the concrete class) so the enricher is decoupled from the queue's internals

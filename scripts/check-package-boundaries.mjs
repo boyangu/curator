@@ -61,7 +61,8 @@ const RULES = {
 		allowExact: ['@curator/shared/artist-credit'],
 	},
 	// The device sync client and the library writers it cycles with (op
-	// builders, mutators, migrate), shared by the desktop and the phone. It is
+	// builders, mutators, migrate), and the Discover feed's store, cloud
+	// producer and decisions, shared by the desktop and the phone. It is
 	// SQLite-bound and Node-shaped on purpose: the phone runs it in an embedded
 	// engine whose bundle aliases better-sqlite3 and node:* to host shims
 	// (apps/mobile/js/shim), so the source stays the desktop's, unchanged.

@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CatalogClaim } from '@curator/protocol';
-import type { FeedItem } from '../feed/types.js';
+import type { FeedItem } from '@curator/sync-core/feed/types';
 import { claimsFor, createFactsUp, factsKey } from './facts-up.js';
 
 afterEach(() => {

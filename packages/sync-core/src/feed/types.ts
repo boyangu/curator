@@ -583,6 +583,6 @@ export interface FeedProducerContext {
 // DJ metadata fields (bpm/key/genre/label) live on FeedItemPayload (track
 // items) and FeedTrackRef (album tracks). The enrichment contract — the patch
 // shape, the per-track query, the Enricher interface — is now shared with the
-// library and future discover via apps/core/src/enrich/. Re-exported here so
+// library and future discover via enrich/. Re-exported here so
 // feed consumers keep one import surface.
 export type { DjMetadataPatch, EnrichmentResult, SourceLinkDraft } from '../enrich/contract.js';

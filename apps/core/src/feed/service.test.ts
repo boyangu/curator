@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { createFeedService, type LibraryPort } from './service.js';
-import { SqliteFeedStore } from './store.js';
-import type { FeedItemDraft } from './types.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
+import type { FeedItemDraft } from '@curator/sync-core/feed/types';
 
 let tokenAsked = 0;
 const auth = { getSpotifyAccessToken: async () => { tokenAsked++; return 'tok'; } };

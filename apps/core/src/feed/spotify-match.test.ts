@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SpotifyAlbum, SpotifySimplifiedTrack, SpotifyTrack } from '@curator/spotify';
 import { albumDraft, matchSpotify, needsMatch, pairTracks, titleKey, type SpotifyMatchClient } from './spotify-match.js';
-import type { FeedItem, FeedItemDraft, FeedTrackRef } from './types.js';
+import type { FeedItem, FeedItemDraft, FeedTrackRef } from '@curator/sync-core/feed/types';
 
 const NOW = 1_800_000_000_000;
 

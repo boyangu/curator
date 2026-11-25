@@ -30,7 +30,7 @@ import type {
 } from './types.js';
 import { recordingKeysFor } from './recording.js';
 import { mergeFeedPayload } from './merge.js';
-import { keyToCamelot } from '@curator/sync-core/enrich/keys';
+import { keyToCamelot } from '../enrich/keys.js';
 import { itemArtists } from './lenses.js';
 
 // Ranking lift per EXTRA source (beyond the first) that surfaced an item —
@@ -508,6 +508,10 @@ export class SqliteFeedStore implements FeedStore {
 			this.db.exec(`ALTER TABLE feed_item_origin ADD COLUMN seen_at INTEGER`);
 		} catch { /* column exists */ }
 		this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feed_item_covered ON feed_item (covered_by)`);
+		// What the live feed shows, for a reader that is not this class: the
+		// phone's views read feed.db from Kotlin. Recreated on every open, so it
+		// is always this build's predicate and carries no schema version.
+		this.db.exec(`DROP VIEW IF EXISTS feed_visible; CREATE VIEW feed_visible AS SELECT * FROM feed_item WHERE ${VISIBLE_WHERE}`);
 		// v6 → v7: feed_item_origin (the named source set behind the card's
 		// "+N sources" badge). One-shot backfill from each row's primary
 		// origin_json — the only origin whose NAME survived pre-v7 (dedupe-hit

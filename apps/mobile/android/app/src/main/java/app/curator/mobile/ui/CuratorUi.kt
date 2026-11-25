@@ -22,6 +22,8 @@ import androidx.compose.ui.unit.dp
 import app.curator.mobile.data.Track
 import app.curator.mobile.ui.chrome.BottomChrome
 import app.curator.mobile.ui.chrome.MiniPlayer
+import app.curator.mobile.ui.feed.FeedModel
+import app.curator.mobile.ui.feed.FeedScreen
 import app.curator.mobile.ui.home.HomeScreen
 import app.curator.mobile.ui.library.LibraryScreen
 import app.curator.mobile.ui.list.ListActionsPage
@@ -68,6 +70,7 @@ fun CuratorUi(model: AppModel) {
 		when (screen) {
 			is Screen.TabRoot -> when (screen.tab) {
 				Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
+				Tab.FEED -> FeedScreen(model, bottom)
 				Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
 				else -> Placeholder(screen.tab.label, bottom)
 			}
@@ -90,16 +93,22 @@ private fun Bottom(model: AppModel, nav: Nav) {
 	val id = player.track?.trackId
 	val facts by produceState<Pair<Track, Boolean>?>(null, id, lib, version) {
 		val l = lib ?: return@produceState
+		// The track before this one is not what the mini player now plays.
+		if (value?.first?.id != id) value = null
 		value = id?.let { withContext(Dispatchers.IO) { l.track(it)?.let { t -> t to l.hasTag(it, "interested") } } }
 	}
 	BottomChrome(
 		miniPlayer = {
-			facts?.let { (t, interested) ->
+			val known = facts
+			if (known != null) {
+				val (t, interested) = known
 				MiniPlayer(
 					model.player, t.bpm, t.key, interested,
 					onInterested = { model.setTag(t.id, "interested", !interested) },
 					onOpen = { nav.push(Screen.Track(t.id, null, 0, 1)) },
 				)
+			} else if (id != null && FeedModel.isFeedTrack(id)) {
+				MiniPlayer(model.player, null, null, interested = false, onInterested = null, onOpen = null)
 			}
 		},
 		tab = nav.tab,

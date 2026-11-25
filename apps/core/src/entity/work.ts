@@ -53,7 +53,7 @@ import { searchFold, type EntityHeader, type EntityRef, type EntityRowPatch, typ
 import { nameClaims } from '../catalog-client/facts-up.js';
 import { isDistributor } from '../catalog-client/library-claims.js';
 import type { CatalogClient } from '../catalog-client/service.js';
-import type { Enricher } from '../enrich/contract.js';
+import type { Enricher } from '@curator/sync-core/enrich/contract';
 import { enrichOne } from '../enrich/runner.js';
 import { findSpotifyAlbum, pairTracks, type SpotifyMatchClient } from '../feed/spotify-match.js';
 import { log } from '@curator/sync-core/log';

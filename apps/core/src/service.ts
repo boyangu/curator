@@ -171,11 +171,11 @@ export interface PlaylistUpstreamDrift {
 	}>;
 }
 import { keyToCamelot } from '@curator/sync-core/enrich/keys';
-import { SqliteFeedStore } from './feed/store.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
 import { createFeedService } from './feed/service.js';
-import { FEED_LENSES_SETTING, normalizeLenses, parseRule, serializeLenses, withLens, withoutLens, type FeedLens } from './feed/lenses.js';
+import { FEED_LENSES_SETTING, normalizeLenses, parseRule, serializeLenses, withLens, withoutLens, type FeedLens } from '@curator/sync-core/feed/lenses';
 import { libraryArtistKeys, setPlayCounts } from './library/artist-signals.js';
-import type { CatalogFeedPort } from './feed/cloud-producer.js';
+import type { CatalogFeedPort } from '@curator/sync-core/feed/cloud-producer';
 import { syncSpotifyFollows, type FollowsSyncState } from './catalog-client/follows-sync.js';
 import { refsForTrack, type TrackCatalogRefs } from './catalog-client/catalog-refs.js';
 import {
@@ -198,9 +198,9 @@ import {
 	type FollowCandidate,
 	type FollowCandidateKind,
 } from './catalog-client/library-candidates.js';
-import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedDecisionPort, feedBackfillPending, feedPendingCount, syncedItemsFor } from './feed/sync.js';
-import type { LibraryMembershipLookup } from './feed/pipeline.js';
-import type { FeedAction, FeedActionResult, FeedItem, FeedItemActivity, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, EnrichmentResult } from './feed/types.js';
+import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedDecisionPort, feedBackfillPending, feedPendingCount, syncedItemsFor } from '@curator/sync-core/feed/sync';
+import type { LibraryMembershipLookup } from '@curator/sync-core/feed/filters';
+import type { FeedAction, FeedActionResult, FeedItem, FeedItemActivity, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, EnrichmentResult } from '@curator/sync-core/feed/types';
 import { createCatalogWorker, type CatalogWorker, type CatalogWorkerStatus } from './catalog-worker/service.js';
 import { checkedTrackers, readCadence, readReadSources, writeReadCadence, writeReadSources, type CatalogReadCadence, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 import { createFactsUp } from './catalog-client/facts-up.js';
@@ -212,9 +212,9 @@ const WORKER_EVENTS_POLL_DELAY_MS = 30_000;
 
 // A build with no cloud transport has no worker to report on.
 const NO_CATALOG_WORKER: CatalogWorkerStatus = { reason: 'server_off', active: false, providers: [], trackers: [], weekEndsAt: null, lastAskedAt: null, lastReportAt: null, polled: 0, events: 0, inHand: 0, paused: [], lastError: null, check: null };
-import { resolveFeedMembership } from './feed/types.js';
+import { resolveFeedMembership } from '@curator/sync-core/feed/types';
 import { LibrarySink } from './enrich/sinks/library-sink.js';
-import type { FeedFilter } from './feed/store.js';
+import type { FeedFilter } from '@curator/sync-core/feed/store';
 import { SqliteKnowledgeStore } from './knowledge/store.js';
 import { createKnowledgeService } from './knowledge/service.js';
 import { AgentResearchPort } from './knowledge/agent-research.js';

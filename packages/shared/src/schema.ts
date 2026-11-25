@@ -1768,7 +1768,7 @@ export const playlistAttrsSeen = sqliteTable(
 // Feed decisions pulled for feed.db (protocol v4 feed_item /
 // feed_suppression): feed.db is another database, so the projection queues
 // the record keys here in its own transaction and the feed side applies
-// them (apps/core/src/feed/sync.ts). `map` is the records map.
+// them (sync-core feed/sync.ts). `map` is the records map.
 export const feedSyncPending = sqliteTable(
 	'feed_sync_pending',
 	{ map: text('map').notNull(), key: text('key').notNull() },

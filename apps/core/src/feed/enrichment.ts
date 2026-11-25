@@ -9,10 +9,10 @@
 // before items reach the bus). It stays POST-bus and async so a deep backfill
 // can't block the feed from populating behind Beatport's 1.5s/track pace.
 
-import type { DjMetadataPatch, Enricher, EnrichmentResult, SourceLinkDraft, TrackQuery } from '../enrich/contract.js';
+import type { DjMetadataPatch, Enricher, EnrichmentResult, SourceLinkDraft, TrackQuery } from '@curator/sync-core/enrich/contract';
 import { enrichOne } from '../enrich/runner.js';
-import type { EnrichStatus, FeedEnrichReport, FeedItem, FeedItemActivity, FeedItemPayload, FeedTrackRef } from './types.js';
-import type { FeedStore } from './store.js';
+import type { EnrichStatus, FeedEnrichReport, FeedItem, FeedItemActivity, FeedItemPayload, FeedTrackRef } from '@curator/sync-core/feed/types';
+import type { FeedStore } from '@curator/sync-core/feed/store';
 import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');

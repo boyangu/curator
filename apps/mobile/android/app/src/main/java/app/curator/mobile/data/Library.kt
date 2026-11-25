@@ -28,6 +28,7 @@ import kotlinx.serialization.json.contentOrNull
  * desktop (Owned), else the streaming service it came from.
  */
 class Library(private val db: NativeDb) {
+	internal fun query(q: Sql): Rows = db.query(q.text, *q.args)
 
 	private val trackColumns = """
 		t.id, t.recording_id,

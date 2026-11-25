@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { buildAgentTools, type AgentTool, type AgentToolCtx } from './tools.js';
-import { parseRule, withLens, withoutLens, type FeedLens } from '../feed/lenses.js';
+import { parseRule, withLens, withoutLens, type FeedLens } from '@curator/sync-core/feed/lenses';
 import type { CoreService } from '../service.js';
 
 function setup(): { tools: Map<string, AgentTool>; lenses: () => FeedLens[] } {

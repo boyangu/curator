@@ -77,6 +77,8 @@ fun TabBar(active: Tab, onSelect: (Tab) -> Unit) {
 /**
  * What is loaded: art, title, artist and where it plays from, BPM and key,
  * Interested, play/pause; a 2dp accent line for the position. Opens Track.
+ * A track the library does not hold (from the feed) has no Track view and no
+ * Interested here: both null.
  */
 @Composable
 fun MiniPlayer(
@@ -84,8 +86,8 @@ fun MiniPlayer(
 	bpm: Double?,
 	key: String?,
 	interested: Boolean,
-	onInterested: () -> Unit,
-	onOpen: () -> Unit,
+	onInterested: (() -> Unit)?,
+	onOpen: (() -> Unit)?,
 ) {
 	val state by player.state.collectAsState()
 	val t = state.track ?: return
@@ -107,7 +109,7 @@ fun MiniPlayer(
 		Column(
 			Modifier
 				.weight(1f)
-				.clickable(role = Role.Button, onClickLabel = "Open the track", onClick = onOpen),
+				.then(if (onOpen == null) Modifier else Modifier.clickable(role = Role.Button, onClickLabel = "Open the track", onClick = onOpen)),
 			verticalArrangement = Arrangement.spacedBy(3.dp),
 		) {
 			Line(t.title, T.of(14.sp, color = C.fg))
@@ -119,7 +121,7 @@ fun MiniPlayer(
 		}
 		if (bpm != null) BasicText(formatBpm(bpm), style = T.mono(12.sp, C.fg1))
 		KeyChip(key)
-		IconButton(Icon.Pin, if (interested) "Remove from Interested" else "Mark interested", tint = if (interested) C.accent else C.fg2, size = 20.dp, onClick = onInterested)
+		if (onInterested != null) IconButton(Icon.Pin, if (interested) "Remove from Interested" else "Mark interested", tint = if (interested) C.accent else C.fg2, size = 20.dp, onClick = onInterested)
 		IconButton(
 			if (state.playing) Icon.Pause else Icon.Play,
 			if (state.playing) "Pause" else "Play",

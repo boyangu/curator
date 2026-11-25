@@ -11,9 +11,10 @@
 // startLibraryWatching() (sync better-sqlite3 work before first paint produces
 // a blank window).
 
-import type { FeedItemDraft, FeedProducer, FeedProducerContext, FeedProducerResult, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRefreshStep } from './types.js';
-import type { FeedStore } from './store.js';
-import type { FeedStage, FeedStageContext } from './pipeline.js';
+import type { FeedProducer, FeedProducerContext, FeedProducerResult, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRefreshStep } from '@curator/sync-core/feed/types';
+import type { FeedStore } from '@curator/sync-core/feed/store';
+import type { FeedStage } from '@curator/sync-core/feed/filters';
+import { runProducerPass } from '@curator/sync-core/feed/pass';
 import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');
@@ -62,7 +63,7 @@ export class FeedScheduler {
 		// enrichment queue without coupling the scheduler to it.
 		private readonly onPassComplete?: () => void,
 		// Ordered enrich/filter stages run over each producer's drafts before
-		// upsert (see pipeline.ts). Empty by default — tests/CLI run raw.
+		// upsert (sync-core feed/filters.ts). Empty by default — tests/CLI run raw.
 		private readonly stages: FeedStage[] = [],
 	) {}
 
@@ -209,19 +210,19 @@ export class FeedScheduler {
 			step.state = 'running';
 			this.emitStatus();
 			try {
-				const cursor = await this.store.getCursor(p.id);
-				const { drafts, nextCursor, skipped, note } = await fetch(p, cursor, { report, manual, ...(scope ? { scope } : {}) });
-				if (drafts.length > 0) report(`Checking ${drafts.length} found`);
-				const survivors = await this.pipe(drafts, { producerId: p.id, mode, signal: this.aborter.signal, report });
-				const { inserted } = await this.store.upsertItems(survivors);
-				await this.store.setCursor(p.id, nextCursor);
+				const { inserted, skipped, note } = await runProducerPass(this.store, p, this.stages, {
+					mode,
+					fetch,
+					ctx: { report, manual, ...(scope ? { scope } : {}) },
+					signal: this.aborter.signal,
+				});
 				if (mode === 'backfill' || inserted > 0) flog.info(`${mode} inserted items`, { producerId: p.id, ...logData, inserted });
 				step.state = skipped ? 'skipped' : 'done';
 				// A finished step keeps what it did beyond reading (its note), not
 				// its last progress line.
 				step.detail = skipped ?? note ?? null;
 				step.inserted = inserted;
-				results.push({ producerId: p.id, name: p.displayName, inserted, error: null, skipped: skipped ?? null, note: note ?? null });
+				results.push({ producerId: p.id, name: p.displayName, inserted, error: null, skipped, note });
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				flog.warn(`${mode} failed`, { producerId: p.id }, err);
@@ -257,24 +258,5 @@ export class FeedScheduler {
 		} catch (err) {
 			flog.warn('prune failed', undefined, err);
 		}
-	}
-
-	// Thread a producer's drafts through the ordered stages before upsert.
-	// A whole-stage failure is caught and the batch continues with that
-	// stage's input — a filter that can't query just doesn't filter
-	// (dedupe_key UNIQUE backstops dedup), an enricher that throws leaves the
-	// payload as-is. Short-circuits once a filter empties the batch so the
-	// expensive network stages don't run on nothing.
-	private async pipe(drafts: FeedItemDraft[], ctx: FeedStageContext): Promise<FeedItemDraft[]> {
-		let cur = drafts;
-		for (const stage of this.stages) {
-			if (cur.length === 0) break;
-			try {
-				cur = await stage.run(cur, ctx);
-			} catch (err) {
-				flog.warn('stage failed', { stageId: stage.id, producerId: ctx.producerId }, err);
-			}
-		}
-		return cur;
 	}
 }

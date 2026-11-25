@@ -4,8 +4,8 @@
 
 import { describe, expect, it } from 'vitest';
 import { createFeedService, type CatalogFollowsPort, type LibraryPort } from './service.js';
-import { SqliteFeedStore } from './store.js';
-import type { FeedItemDraft } from './types.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
+import type { FeedItemDraft } from '@curator/sync-core/feed/types';
 
 function album(id: string, origin: string, credited: string[]): FeedItemDraft {
 	return {

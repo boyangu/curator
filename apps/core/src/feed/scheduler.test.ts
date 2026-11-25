@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { FeedScheduler } from './scheduler.js';
-import type { FeedProducer, FeedRefreshStatus } from './types.js';
-import type { FeedStore } from './store.js';
+import type { FeedProducer, FeedRefreshStatus } from '@curator/sync-core/feed/types';
+import type { FeedStore } from '@curator/sync-core/feed/store';
 
 // Minimal store — the scheduler's poll path only touches these four methods.
 const STORE = {

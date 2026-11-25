@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from '@curator/sync-core/db/migrate';
-import { SqliteFeedStore } from '../feed/store.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
 import { SqliteKnowledgeStore } from '../knowledge/store.js';
 import type { CoreService } from '../service.js';
 import { buildAgentTools, type AgentTool, type AgentToolCtx } from './tools.js';

@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CatalogClaim, CatalogPageRelease, CatalogPageTrack, CatalogTracker, CatalogTracksResult } from '@curator/protocol';
 import type { TrackerPoll, TrackerTarget } from '@curator/catalog-readers';
 import type { EntityHeader, EntityRef, EntityWorkEvent } from '@curator/shared';
-import type { Enricher } from '../enrich/contract.js';
+import type { Enricher } from '@curator/sync-core/enrich/contract';
 import type { SpotifyMatchClient } from '../feed/spotify-match.js';
 import type { StreamingCatalog } from './streaming.js';
 import { createEntityWork, type EntityReaders, type EntityWorkDeps } from './work.js';

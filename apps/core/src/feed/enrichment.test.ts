@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { FeedEnrichmentQueue } from './enrichment.js';
-import type { EnrichStatus, FeedItem, FeedItemPayload } from './types.js';
-import type { FeedStore } from './store.js';
-import type { DjMetadataPatch, Enricher, EnricherOutput, EnrichmentTarget } from '../enrich/contract.js';
+import type { EnrichStatus, FeedItem, FeedItemPayload } from '@curator/sync-core/feed/types';
+import type { FeedStore } from '@curator/sync-core/feed/store';
+import type { DjMetadataPatch, Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 
 // A complete Beatport-style patch — all core fields, so a single enricher
 // short-circuits the chain exactly as the real one does.

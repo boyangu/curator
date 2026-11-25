@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { AnalysisEnricher, type AnalysisJobs } from './analysis.js';
 import type { AnalysisJobEvent } from '../../analyzer/queue.js';
-import type { EnrichmentTarget } from '../contract.js';
+import type { EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 
 // Fake queue: records enqueue/cancel calls and lets the test drive terminal
 // events. No DB, no sidecar — exercises the adapter in isolation.

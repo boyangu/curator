@@ -5,7 +5,7 @@
 // by the ISRC-aware scorer inside BeatportClient.lookup.
 
 import { BeatportClient, type FetchLike as BeatportFetch } from '@curator/beatport';
-import type { Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
+import type { Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 
 export class BeatportEnricher implements Enricher {

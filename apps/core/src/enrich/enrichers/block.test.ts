@@ -3,7 +3,7 @@ import { ProviderBlockedError, ProviderUnavailableError } from '@curator/matcher
 import type { FetchLike } from '@curator/beatport';
 import { BeatportEnricher } from './beatport.js';
 import { enrichOne } from '../runner.js';
-import type { DjMetadataPatch, Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
+import type { DjMetadataPatch, Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 
 const target: EnrichmentTarget = {
 	query: { title: 'Foundation', artists: ['Joey White'], durationSec: 375 },

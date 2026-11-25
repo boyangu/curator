@@ -12,7 +12,7 @@
 // batch at ~350ms — both are properties of the caller, passed through here so
 // the delay lands between the actual lookups rather than around them.
 
-import type { DjMetadataPatch, Enricher, EnricherOutcome, EnrichmentResult, EnrichmentTarget } from './contract.js';
+import type { DjMetadataPatch, Enricher, EnricherOutcome, EnrichmentResult, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 import { log } from '@curator/sync-core/log';
 
 const elog = log.for('enrich');

@@ -19,7 +19,7 @@ import { asciify } from '@curator/shared';
 import { normalizeIsrc } from '@curator/library-logic';
 import type { Db } from '@curator/sync-core/db/client';
 import { addClaims } from '@curator/sync-core/library/mutators';
-import type { DjMetadataPatch, EnrichmentResult } from '../contract.js';
+import type { DjMetadataPatch, EnrichmentResult } from '@curator/sync-core/enrich/contract';
 
 export class LibrarySink {
 	constructor(private readonly db: Db) {}

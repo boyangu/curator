@@ -11,24 +11,16 @@
 
 import { SpotifyClient, type SpotifyTrack } from '@curator/spotify';
 import type { FetchLike as BeatportFetch } from '@curator/beatport';
-import type { FeedFilter, FeedStore } from './store.js';
+import type { FeedFilter, FeedStore } from '@curator/sync-core/feed/store';
 import { FeedScheduler } from './scheduler.js';
 import { FeedEnrichmentQueue } from './enrichment.js';
-import type { Enricher } from '../enrich/contract.js';
+import type { Enricher } from '@curator/sync-core/enrich/contract';
 import { BeatportEnricher } from '../enrich/enrichers/beatport.js';
 import { TraxsourceEnricher } from '../enrich/enrichers/traxsource.js';
 import { SpotifyPlaylistDeltaProducer, SpotifyNewReleasesProducer } from './spotify-producers.js';
 import { makeRemoteWriteGate, type RemoteWriteGate } from '../sources/adapter.js';
-import {
-	AlbumExpanderStage,
-	ArtistDismissFilter,
-	FeedDedupFilter,
-	LibraryFilter,
-	resolveAlbumTracks,
-	fillAlbumTrackIsrcs,
-	type FeedStage,
-	type LibraryMembershipLookup,
-} from './pipeline.js';
+import { AlbumExpanderStage, resolveAlbumTracks, fillAlbumTrackIsrcs } from './pipeline.js';
+import { ArtistDismissFilter, FeedDedupFilter, LibraryFilter, type FeedStage, type LibraryMembershipLookup } from '@curator/sync-core/feed/filters';
 import type {
 	EnrichmentResult,
 	FeedAction,
@@ -46,13 +38,13 @@ import type {
 	FeedDecisionPort,
 	FeedRole,
 	FeedTrackRef,
-} from './types.js';
-import { resolveFeedMembership } from './types.js';
-import { spotifyIdOf, trackSpotifyIdOf } from './handles.js';
+} from '@curator/sync-core/feed/types';
+import { resolveFeedMembership } from '@curator/sync-core/feed/types';
+import { spotifyIdOf, trackSpotifyIdOf } from '@curator/sync-core/feed/handles';
 import { log } from '@curator/sync-core/log';
-import { CLOUD_FEED_PRODUCER_ID, CloudFeedProducer, type CatalogFeedPort } from './cloud-producer.js';
+import { CLOUD_FEED_PRODUCER_ID, CloudFeedProducer, type CatalogFeedPort } from '@curator/sync-core/feed/cloud-producer';
 import { matchSpotify, needsMatch } from './spotify-match.js';
-import { hasArtistLens, itemArtists, passesArtistLenses, sqlFilterOf, type ArtistSignals, type FeedLens } from './lenses.js';
+import { hasArtistLens, itemArtists, passesArtistLenses, sqlFilterOf, type ArtistSignals, type FeedLens } from '@curator/sync-core/feed/lenses';
 
 const flog = log.for('feed');
 

@@ -4,21 +4,24 @@
 // Kotlin (core/CoreRuntime.kt) owns the one thread this runs on. It calls
 // `__dispatch(name, argJson, callId)`; each call answers once through
 // `emit({ type: 'result', id, ok, value | error })`. Between calls the core
-// emits `phase`, `status` and `applied` events, which the app's repositories
-// turn into refreshes. HTTP goes out through Kotlin and comes back through
+// emits `phase`, `status`, `applied` and `feed` events, which the app's
+// repositories turn into refreshes. HTTP goes out through Kotlin and comes back through
 // `__httpDone`.
 //
 // Every edit here is a library write the desktop makes the same way, so it
-// becomes the same op (D4): a rating, an Interested / Basket tag, a setting.
-// None reaches Spotify, Tidal or rekordbox from the phone; a desktop pushes
+// becomes the same op (D4): a rating, an Interested / Basket tag, a setting,
+// a feed card archived or taken into the library. None reaches Spotify, Tidal or rekordbox from the phone; a desktop pushes
 // those upstream on its own terms.
 
 import './shim/globals.js';
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { fetchPeaks } from '@curator/sync-core/catalogue/peaks';
 import { createDb, type Db } from '@curator/sync-core/db/client';
 import { getDeviceId } from '@curator/sync-core/sync-log/device';
 import { migrate } from '@curator/sync-core/db/migrate';
+import { createDeviceFeed, queueKnownSuppressions, type DeviceFeed, type FeedArtistRef, type FeedInterestedInput } from '@curator/sync-core/feed/device-feed';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
+import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, feedBackfillPending, feedPendingCount, syncedItemsFor } from '@curator/sync-core/feed/sync';
 import { setRating, setSetting, tagTracks, untagTracks } from '@curator/sync-core/library/mutators';
 import { createSyncClient, type SyncClient } from '@curator/sync-core/sync-log/client';
 import { createFetchCloudTransport } from '@curator/sync-core/sync-log/fetch-transport';
@@ -28,6 +31,10 @@ import type Database from 'better-sqlite3';
 
 type StartConfig = {
 	dbPath: string;
+	// The Discover feed's own database (the views read it too) and where its
+	// watch list is kept between runs.
+	feedDbPath: string;
+	feedWatchesPath: string;
 	// Where fetched waveform peaks are cached, one <track id>.cpk each
 	// (the Track view reads them there: ui/track/PeaksLoader.kt).
 	peaksDir: string;
@@ -96,7 +103,7 @@ function* inflateText(body: Uint8Array): Iterable<string> {
 
 // ── the library ──────────────────────────────────────────────────────────────
 
-let library: { db: Db; raw: Database.Database; client: SyncClient; transport: ReturnType<typeof createFetchCloudTransport>; cfg: StartConfig } | null = null;
+let library: { db: Db; raw: Database.Database; client: SyncClient; transport: ReturnType<typeof createFetchCloudTransport>; feed: DeviceFeed; cfg: StartConfig } | null = null;
 
 function transportFor(cfg: StartConfig) {
 	const auth = { authorization: `Bearer ${cfg.token}` };
@@ -143,17 +150,51 @@ async function start(cfg: StartConfig): Promise<Record<string, unknown>> {
 	migrate(cfg.dbPath);
 	console.debug(`migrate at open: ${Math.round(performance.now() - tm)} ms`);
 	const { db, sqlite } = createDb(cfg.dbPath);
+	// A library just installed was projected elsewhere, and a new feed.db has
+	// applied nothing: either way its mutes are not in here yet.
+	const behind = installed !== null || !existsSync(cfg.feedDbPath);
+	const feedStore = new SqliteFeedStore(cfg.feedDbPath);
+	feedStore.setDecisionSource((keys) => syncedItemsFor(sqlite, keys));
+	if (behind) queueKnownSuppressions(sqlite);
 	const client = createSyncClient({
 		db: sqlite,
 		transport,
 		device: { name: cfg.deviceName, platform: 'android' },
+		// The account's feed decisions, onto this phone's feed.db.
+		feed: {
+			pending: () => feedPendingCount(sqlite),
+			applyPending: async () => {
+				const r = await applyPendingFeedDecisionsAsync(sqlite, feedStore);
+				// Mutes change what shows without changing an item's row.
+				if (r.keys > 0) emit({ type: 'feed' });
+				return r;
+			},
+			backfillPending: () => feedBackfillPending(sqlite),
+			backfill: (o) => backfillFeedDecisionsAsync(sqlite, feedStore, o),
+		},
 		onApplied: (a) => emit({ type: 'applied', tracks: a.tracks.length, playlists: a.playlists.length, entities: a.entities.map((e) => e.entity) }),
 	});
+	const feed = createDeviceFeed({
+		db, raw: sqlite, store: feedStore,
+		feed: transport.feed!,
+		catalog: transport.catalog!,
+		available: () => transport.session() !== null && (client.serverFeatures()?.includes('global_catalog') ?? false),
+		deviceId: () => client.deviceId(),
+		cache: {
+			read: () => (existsSync(cfg.feedWatchesPath) ? readFileSync(cfg.feedWatchesPath, 'utf8') : null),
+			write: (text) => {
+				writeFileSync(`${cfg.feedWatchesPath}.part`, text);
+				renameSync(`${cfg.feedWatchesPath}.part`, cfg.feedWatchesPath);
+			},
+		},
+		onChanged: () => emit({ type: 'feed' }),
+	});
 	client.subscribe(() => {
+		feed.onStatus();
 		const s = client.status();
 		emit({ type: 'status', lastSeq: s.lastSeq, pending: s.pending, error: s.lastError, bootstrap: s.bootstrap ?? null });
 	});
-	library = { db, raw: sqlite, client, transport, cfg };
+	library = { db, raw: sqlite, client, transport, feed, cfg };
 	client.start();
 	emit({ type: 'phase', phase: 'ready' });
 	return { installed };
@@ -205,7 +246,20 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 		return got.tier;
 	},
 	syncNow: () => lib().client.syncNow(),
-	setActive: (a) => { lib().client.setActive(!!a['active']); },
+	setActive: (a) => { lib().client.setActive(!!a['active']); lib().feed.setActive(!!a['active']); },
+
+	// ── the feed ──
+	feedRefresh: () => lib().feed.refresh(),
+	feedArchive: async (a) => { await lib().feed.archive(a['itemId'] as string); lib().client.wake('local'); },
+	feedMuteArtist: async (a) => { await lib().feed.muteArtist(a['itemId'] as string, a['artistKey'] as string); lib().client.wake('local'); },
+	feedPlayed: async (a) => { await lib().feed.played(a['itemId'] as string, (a['sourceTrackId'] as string | null) ?? null); lib().client.wake('local'); },
+	// Answers the library track's id, or why there is none.
+	feedInterested: async (a) => {
+		const r = await lib().feed.interested(a as unknown as FeedInterestedInput);
+		if (r.ok) wrote();
+		return r;
+	},
+	feedArtists: (a) => lib().feed.artistPictures(a['refs'] as FeedArtistRef[]),
 };
 
 g['__dispatch'] = (name: string, argJson: string, id: number): void => {

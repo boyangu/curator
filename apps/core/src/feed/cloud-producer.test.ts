@@ -1,9 +1,9 @@
 import type { CatalogCheckReport, CatalogEvent, CatalogEventCardV1, CatalogEventCardV2, FeedEventsResult } from '@curator/protocol';
 import { describe, expect, it } from 'vitest';
-import { CloudFeedProducer, eventToDraft, type CatalogFeedPort } from './cloud-producer.js';
+import { CloudFeedProducer, eventToDraft, type CatalogFeedPort } from '@curator/sync-core/feed/cloud-producer';
 import { FeedScheduler } from './scheduler.js';
-import { SqliteFeedStore } from './store.js';
-import type { FeedItemDraft } from './types.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
+import type { FeedItemDraft } from '@curator/sync-core/feed/types';
 
 const NOW = Date.UTC(2026, 9, 23);
 

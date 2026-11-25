@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Enricher } from './contract.js';
+import type { Enricher } from '@curator/sync-core/enrich/contract';
 import { inLane } from './lane.js';
 
 const target = (title: string) => ({ query: { title, artists: ['A'] } });

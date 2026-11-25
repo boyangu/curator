@@ -11,6 +11,7 @@ import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.TracklistRows
 import app.curator.mobile.player.AppPlayer
 import app.curator.mobile.update.Updater
+import app.curator.mobile.ui.feed.FeedModel
 import app.curator.mobile.ui.list.Metrics
 import app.curator.mobile.ui.list.TrackPager
 import app.curator.mobile.ui.list.playFrom
@@ -83,6 +84,9 @@ class AppModel(val app: CuratorApp) {
 	private val listsFile = File(app.filesDir, "lists.json")
 	private val json = Json { ignoreUnknownKeys = true }
 
+	/** The Feed tab's list: lives with the process, so a visit elsewhere keeps its place. */
+	val feed: FeedModel by lazy { FeedModel(this) }
+
 	private val _metrics = MutableStateFlow(Metrics.EMPTY)
 	/** The library's power / brightness / density distributions (rows and meters show percentiles). */
 	val metrics: StateFlow<Metrics> = _metrics
@@ -137,9 +141,12 @@ class AppModel(val app: CuratorApp) {
 		_metrics.value = Metrics(lib.metricValues("power"), lib.metricValues("brightness"), lib.metricValues("density"))
 	}
 
+	/** One call into the core with its answer; throws what it throws. */
+	suspend fun ask(name: String, vararg args: Pair<String, JsonElement>): JsonElement? = app.core.call(name, buildJsonObject { for ((k, v) in args) put(k, v) })
+
 	private fun call(name: String, vararg args: Pair<String, JsonElement>, then: () -> Unit = {}) {
 		app.scope.launch {
-			runCatching { app.core.call(name, buildJsonObject { for ((k, v) in args) put(k, v) }) }
+			runCatching { ask(name, *args) }
 				.onFailure { android.util.Log.w("curator-ui", "$name failed", it) }
 			then()
 		}

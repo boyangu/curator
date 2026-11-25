@@ -12,7 +12,7 @@
 
 import { SpotifyClient, spotifyBackoffUntil } from '@curator/spotify';
 import type { SpotifyAlbum, SpotifyPlaylist, SpotifyTrack } from '@curator/spotify';
-import type { FeedAuthPort, FeedItemDraft, FeedProducer, FeedProducerContext, FeedProducerResult } from './types.js';
+import type { FeedAuthPort, FeedItemDraft, FeedProducer, FeedProducerContext, FeedProducerResult } from '@curator/sync-core/feed/types';
 import { log } from '@curator/sync-core/log';
 
 const flog = log.for('feed');

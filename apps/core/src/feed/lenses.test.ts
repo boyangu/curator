@@ -18,10 +18,10 @@ import {
 	type ArtistSignals,
 	type FeedLens,
 	type FeedLensRule,
-} from './lenses.js';
-import { SqliteFeedStore } from './store.js';
+} from '@curator/sync-core/feed/lenses';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
 import { createFeedService, type LibraryPort } from './service.js';
-import type { FeedItemDraft } from './types.js';
+import type { FeedItemDraft } from '@curator/sync-core/feed/types';
 
 let n = 0;
 const lens = (rule: FeedLensRule): FeedLens => ({ id: `l${++n}`, label: 'x', rule, by: 'user', createdAt: 0 });

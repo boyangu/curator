@@ -27,13 +27,13 @@ import app.curator.mobile.ui.theme.T
 class MenuItem(val label: String, val onClick: () -> Unit)
 
 /**
- * A long-press menu: a panel just under what was pressed ([belowPx]: its
+ * A long-press (or a button's) menu: a panel just under what was pressed ([belowPx]: its
  * height), a quiet title, then 48dp items. A tap outside or back dismisses it
  * (a focusable popup); an item dismisses it, then acts.
  */
 @Composable
-fun ContextMenu(title: String?, items: List<MenuItem>, belowPx: Int, onDismiss: () -> Unit) {
-	Popup(offset = IntOffset(0, belowPx), onDismissRequest = onDismiss, properties = PopupProperties(focusable = true)) {
+fun ContextMenu(title: String?, items: List<MenuItem>, belowPx: Int, alignment: Alignment = Alignment.TopStart, onDismiss: () -> Unit) {
+	Popup(alignment = alignment, offset = IntOffset(0, belowPx), onDismissRequest = onDismiss, properties = PopupProperties(focusable = true)) {
 		Column(Modifier.widthIn(min = 220.dp).width(IntrinsicSize.Max).background(C.bg2).border(1.dp, C.line).padding(vertical = 4.dp)) {
 			title?.let { Line(it, T.label, Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp)) }
 			for (item in items) {

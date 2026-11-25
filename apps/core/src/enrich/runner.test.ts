@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { enrichOne } from './runner.js';
-import type { Enricher, EnricherOutput, EnrichmentTarget, DjMetadataPatch } from './contract.js';
+import type { Enricher, EnricherOutput, EnrichmentTarget, DjMetadataPatch } from '@curator/sync-core/enrich/contract';
 
 // A metadata enricher that records whether it ran and returns a fixed patch
 // (or null to mean "no match"). Mirrors how Beatport/Traxsource plug in.

@@ -6,7 +6,7 @@
 // matching leans on the title + artist + duration rule.
 
 import { TraxsourceClient, type FetchLike as TraxsourceFetch } from '@curator/traxsource';
-import type { Enricher, EnricherOutput, EnrichmentTarget } from '../contract.js';
+import type { Enricher, EnricherOutput, EnrichmentTarget } from '@curator/sync-core/enrich/contract';
 import { keyToCamelot } from '@curator/sync-core/enrich/keys';
 
 export class TraxsourceEnricher implements Enricher {

@@ -6,7 +6,7 @@
 // through `adb reverse tcp:<port> tcp:<port>`.
 //
 //   cd apps/cloud && npx tsx ../../research/mobile/sync-core-spike/scripts/serve-cloud.ts
-//       [--port 8799] [--name main] [--work c:/tmp/curator-mobile-spike] [--ops <ops.json>]
+//       [--port 8799] [--name main] [--work c:/tmp/curator-mobile-spike] [--ops <ops.json>] [--feed <feed.json>]
 //
 // (Run from apps/cloud so tsx and the server's dependencies resolve there.)
 //
@@ -15,6 +15,8 @@
 //   GET  /storage/<path>   a snapshot or replica part's bytes (the bucket holds only
 //                          the object rows in this harness; the bytes are here)
 //   POST /control/tail     pushes --ops into the account's log as the master
+//   POST /control/feed     raises the next of --feed's `later` events
+//   GET  /control/ops      the log's newest ops, as JSON (what a device pushed)
 //   POST /control/exit     stops the server
 // One account per process, so a fresh process gives every run the same log
 // positions. Nothing real is reached: no Supabase, no network beyond loopback.
@@ -141,6 +143,42 @@ async function pushTail(): Promise<{ pushed: number; accepted: number; rejected:
 	return { pushed: ops.length, accepted, rejected, head: await head() };
 }
 
+// The Global Catalog's events for the account (--feed, scripts/make-feed.mjs):
+// { watches: [{ id, kind, name, providerId, imageUrl? }], events, later },
+// an event being { kind, subjectId, subjects, ago (ms), card }. Written as the
+// catalogue's own rows, settled: what the trackers would have raised.
+type FeedEvent = { kind: string; subjectId: string; subjects: string[]; ago: number; card: { title: string; kind: string; addedAt?: number; releaseDate?: string | null } };
+const feed = arg('feed') ? (JSON.parse(readFileSync(resolve(arg('feed')!), 'utf8')) as { watches: Array<{ id: string; kind: string; name: string; providerId: string; imageUrl?: string | null }>; events: FeedEvent[]; later: FeedEvent[] }) : null;
+async function catalogObject(id: string, kind: string, name: string, attrs: Record<string, unknown> = {}): Promise<void> {
+	await app.pg.query(`insert into curator.catalog_object (id, kind, name, name_fold, attrs, discovered_via) values ($1, $2, $3, lower($3), $4::jsonb, 'tracker') on conflict (id) do nothing`, [id, kind, name, JSON.stringify(attrs)]);
+}
+async function raise(e: FeedEvent): Promise<void> {
+	const at = Date.now() - e.ago;
+	await catalogObject(e.subjectId, e.card.kind === 'track' ? 'recording' : 'release', e.card.title);
+	for (const s of e.subjects) await catalogObject(s, 'artist', 'Feed test');
+	const card = { ...e.card, ...(e.card.kind === 'track' ? { addedAt: at } : { releaseDate: new Date(at).toISOString().slice(0, 10) }) };
+	const r = await app.pg.query<{ seq: string }>(
+		`insert into curator.catalog_event (kind, subject_id, dedupe_key, release_at, first_seen_at, recordings_new, confidence, card)
+		values ($1, $2, $3, to_timestamp($4::float8 / 1000), now() - interval '5 minutes', 1, 1, $5::jsonb) returning seq`,
+		[e.kind, e.subjectId, `feed-test:${e.subjectId}`, at, JSON.stringify(card)],
+	);
+	for (const s of new Set(e.subjects)) await app.pg.query(`insert into curator.catalog_event_subject (seq, object_id) values ($1, $2)`, [r.rows[0]!.seq, s]);
+}
+if (feed) {
+	for (const w of feed.watches) {
+		await catalogObject(w.id, w.kind, w.name, w.imageUrl ? { image: w.imageUrl, imageUrl: w.imageUrl, coverUrl: w.imageUrl } : {});
+		await app.pg.query(`insert into curator.catalog_source_object (object_id, provider, kind, provider_id, url) values ($1, 'spotify', $2, $3, null) on conflict do nothing`, [w.id, w.kind, w.providerId]);
+		await app.pg.query(`insert into curator.catalog_watch (user_id, object_id, source) values ($1, $2, 'manual') on conflict do nothing`, [userId, w.id]);
+	}
+	// Oldest first, as a stream raises them.
+	for (const e of [...feed.events].sort((a, b) => b.ago - a.ago)) await raise(e);
+}
+async function raiseLater(): Promise<{ raised: string | null; left: number }> {
+	const e = feed?.later.shift();
+	if (e) await raise(e);
+	return { raised: e?.card.title ?? null, left: feed?.later.length ?? 0 };
+}
+
 const server = createServer((req, res) => {
 	const chunks: Buffer[] = [];
 	req.on('data', (c: Buffer) => chunks.push(c));
@@ -161,6 +199,11 @@ const server = createServer((req, res) => {
 					return blob ? send(200, blob, 'application/octet-stream') : send(404, '{"error":"not_found"}');
 				}
 				if (url === '/control/tail' && req.method === 'POST') return send(200, JSON.stringify(await pushTail()));
+				if (url === '/control/feed' && req.method === 'POST') return send(200, JSON.stringify(await raiseLater()));
+				if (url === '/control/ops') {
+					const r = await app.pg.query(`select seq::float8 as seq, device_id, entity, entity_id, kind, payload from curator.library_op where user_id = $1 order by seq desc limit 40`, [userId]);
+					return send(200, JSON.stringify(r.rows));
+				}
 				if (url === '/control/exit' && req.method === 'POST') {
 					send(200, '{"ok":true}');
 					setTimeout(() => process.exit(0), 100);
@@ -179,5 +222,5 @@ const server = createServer((req, res) => {
 });
 server.listen(port, '127.0.0.1', () => {
 	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, userId, token, snapshotSeq }, null, 1));
-	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${replicaSeq !== null ? `, replica at seq ${replicaSeq}` : ''}${opsFile ? ', later ops on request' : ''}${peaksCount ? `, waveforms for ${peaksCount} recordings` : ''}`);
+	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${replicaSeq !== null ? `, replica at seq ${replicaSeq}` : ''}${opsFile ? ', later ops on request' : ''}${peaksCount ? `, waveforms for ${peaksCount} recordings` : ''}${feed ? `, ${feed.events.length} feed events` : ''}`);
 });

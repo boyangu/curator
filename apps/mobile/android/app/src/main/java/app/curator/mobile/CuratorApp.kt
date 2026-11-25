@@ -31,10 +31,15 @@ class CuratorApp : Application() {
 	private val _db = MutableStateFlow<NativeDb?>(null)
 	val db: StateFlow<NativeDb?> = _db
 
+	private val _feedDb = MutableStateFlow<NativeDb?>(null)
+	/** The feed's own file, which the core makes (js/entry.ts). */
+	val feedDb: StateFlow<NativeDb?> = _feedDb
+
 	private val _problem = MutableStateFlow<String?>(null)
 	val problem: StateFlow<String?> = _problem
 
 	val dbPath: String get() = File(filesDir, "library.db").absolutePath
+	private val feedFile: File get() = File(filesDir, "feed.db")
 
 	// Set once the core has said the library is ready on this device (its install is done).
 	private val installedMark: File get() = File(filesDir, "library.installed")
@@ -57,6 +62,8 @@ class CuratorApp : Application() {
 				val t0 = android.os.SystemClock.elapsedRealtime()
 				val started = core.call("start", buildJsonObject {
 					put("dbPath", JsonPrimitive(dbPath))
+					put("feedDbPath", JsonPrimitive(feedFile.absolutePath))
+					put("feedWatchesPath", JsonPrimitive(File(filesDir, "feed-watches.json").absolutePath))
 					put("peaksDir", JsonPrimitive(File(filesDir, "peaks").absolutePath))
 					put("apiUrl", JsonPrimitive(server.apiUrl))
 					put("userId", JsonPrimitive(server.userId))
@@ -66,6 +73,7 @@ class CuratorApp : Application() {
 				})
 				core.phase.first { it == "ready" }
 				openViews()
+				openFeed()
 				installedMark.createNewFile()
 				android.util.Log.i("curator-core", "library ready after ${android.os.SystemClock.elapsedRealtime() - t0} ms: $started")
 			} catch (e: Exception) {
@@ -79,5 +87,13 @@ class CuratorApp : Application() {
 		if (_db.value != null) return
 		val db = NativeDb.open(dbPath)
 		if (!_db.compareAndSet(null, db)) db.close()
+	}
+
+	// The feed's, once the core has opened the file: a feed.db an older build
+	// left may lack what this build's views read (feed_visible).
+	private fun openFeed() {
+		if (_feedDb.value != null) return
+		val db = NativeDb.open(feedFile.absolutePath)
+		if (!_feedDb.compareAndSet(null, db)) db.close()
 	}
 }

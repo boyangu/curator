@@ -19,8 +19,8 @@
 import { createHash } from 'node:crypto';
 import type { CatalogClaim } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
-import type { FeedItem, FeedTrackRef, SourceLinkDraft } from '../feed/types.js';
-import type { FeedStore } from '../feed/store.js';
+import type { FeedItem, FeedTrackRef, SourceLinkDraft } from '@curator/sync-core/feed/types';
+import type { FeedStore } from '@curator/sync-core/feed/store';
 import { log } from '@curator/sync-core/log';
 
 const flog = log.for('catalog-facts-up');

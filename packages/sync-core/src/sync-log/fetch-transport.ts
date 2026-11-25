@@ -22,9 +22,9 @@
 //
 // Covered: sync and account, which is what a device needs to hold the
 // library, and the analysis catalogue's procedures (a phone reads waveform
-// peaks through `catalogue.lookup`; catalogue/peaks.ts). The Spotify
-// gateway, the Global Catalog and the feed are optional members of
-// CloudTransport and are not here yet.
+// peaks through `catalogue.lookup`; catalogue/peaks.ts), the Global Catalog
+// and its event stream (feed/device-feed.ts). The Spotify gateway is an
+// optional member of CloudTransport and is not here yet.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -40,6 +40,40 @@ import {
 	type BootstrapInput,
 	type BootstrapResult,
 	type CallErrorReason,
+	type CatalogBrowseInput,
+	type CatalogBrowseResult,
+	type CatalogConnectAnswerInput,
+	type CatalogConnectAnswerResult,
+	type CatalogConnectQueueInput,
+	type CatalogConnectQueueResult,
+	type CatalogConnectSearchInput,
+	type CatalogConnectSearchResult,
+	type CatalogEnrichInput,
+	type CatalogEnrichResult,
+	type CatalogGetInput,
+	type CatalogImportInput,
+	type CatalogImportResult,
+	type CatalogIngestInput,
+	type CatalogIngestResult,
+	type CatalogListWatchesInput,
+	type CatalogMuteInput,
+	type CatalogObjectDetail,
+	type CatalogRefreshInput,
+	type CatalogRefreshResult,
+	type CatalogResolveInput,
+	type CatalogResolveResult,
+	type CatalogSearchInput,
+	type CatalogSearchResult,
+	type CatalogTracksInput,
+	type CatalogTracksResult,
+	type CatalogUnwatchInput,
+	type CatalogWatch,
+	type CatalogWatchInput,
+	type CatalogWatchResult,
+	type CatalogWorkerDueInput,
+	type CatalogWorkerDueResult,
+	type CatalogWorkerReportInput,
+	type CatalogWorkerReportResult,
 	type CatalogueInventoryInput,
 	type CatalogueInventoryResult,
 	type CatalogueLookupInput,
@@ -47,6 +81,10 @@ import {
 	type CataloguePutInput,
 	type CataloguePutResult,
 	type DeviceInfo,
+	type FeedEventsInput,
+	type FeedEventsResult,
+	type FeedRecentInput,
+	type FeedRecentResult,
 	type PublishReplicaInput,
 	type PublishReplicaResult,
 	type PublishSnapshotInput,
@@ -203,6 +241,32 @@ export function createFetchCloudTransport(deps: FetchTransportDeps): CloudTransp
 			lookup: (input: CatalogueLookupInput) => call<CatalogueLookupResult>('mutation', 'catalogue.lookup', input),
 			put: (input: CataloguePutInput) => call<CataloguePutResult>('mutation', 'catalogue.put', input),
 			inventory: (input: CatalogueInventoryInput) => call<CatalogueInventoryResult>('query', 'catalogue.inventory', input),
+		},
+		// 'global_catalog' and the features after it: used only once the server
+		// lists them.
+		catalog: {
+			ingest: (input: CatalogIngestInput) => call<CatalogIngestResult>('mutation', 'catalog.ingest', input),
+			resolve: (input: CatalogResolveInput) => call<CatalogResolveResult>('mutation', 'catalog.resolve', input),
+			search: (input: CatalogSearchInput) => call<CatalogSearchResult>('mutation', 'catalog.search', input),
+			get: (input: CatalogGetInput) => call<CatalogObjectDetail>('query', 'catalog.get', input),
+			browse: (input: CatalogBrowseInput) => call<CatalogBrowseResult>('query', 'catalog.browse', input),
+			watch: (input: CatalogWatchInput) => call<CatalogWatchResult>('mutation', 'catalog.watch', input),
+			unwatch: (input: CatalogUnwatchInput) => call<{ ok: true }>('mutation', 'catalog.unwatch', input),
+			mute: (input: CatalogMuteInput) => call<{ ok: true }>('mutation', 'catalog.mute', input),
+			listWatches: (input: CatalogListWatchesInput) => call<CatalogWatch[]>('query', 'catalog.listWatches', input),
+			import: (input: CatalogImportInput) => call<CatalogImportResult>('mutation', 'catalog.import', input),
+			refreshNow: (input: CatalogRefreshInput) => call<CatalogRefreshResult>('mutation', 'catalog.refreshNow', input),
+			enrich: (input: CatalogEnrichInput) => call<CatalogEnrichResult>('mutation', 'catalog.enrich', input),
+			workerDue: (input: CatalogWorkerDueInput) => call<CatalogWorkerDueResult>('mutation', 'catalog.workerDue', input),
+			workerReport: (input: CatalogWorkerReportInput) => call<CatalogWorkerReportResult>('mutation', 'catalog.workerReport', input),
+			connectQueue: (input: CatalogConnectQueueInput) => call<CatalogConnectQueueResult>('mutation', 'catalog.connectQueue', input),
+			connectAnswer: (input: CatalogConnectAnswerInput) => call<CatalogConnectAnswerResult>('mutation', 'catalog.connectAnswer', input),
+			connectSearch: (input: CatalogConnectSearchInput) => call<CatalogConnectSearchResult>('mutation', 'catalog.connectSearch', input),
+			tracks: (input: CatalogTracksInput) => call<CatalogTracksResult>('query', 'catalog.tracks', input),
+		},
+		feed: {
+			events: (input: FeedEventsInput) => call<FeedEventsResult>('query', 'feed.events', input),
+			recent: (input: FeedRecentInput) => call<FeedRecentResult>('query', 'feed.recent', input),
 		},
 		account: {
 			registerDevice: (input: RegisterDeviceInput) => call<{ ok: true }>('mutation', 'account.registerDevice', input),

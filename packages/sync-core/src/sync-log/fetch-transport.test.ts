@@ -53,6 +53,18 @@ describe('plain-HTTP transport', () => {
 		expect(new Set(sent.map((r) => r.headers['x-request-id'])).size).toBe(3);
 	});
 
+	it('asks the catalogue and its event stream as the router declares each procedure', async () => {
+		const { transport, sent } = rig(() => ok({ events: [], nextSeq: 0 }));
+		const id = '00000000-0000-4000-8000-000000000001';
+		await transport.feed!.events({ deviceId: 'd1', afterSeq: 4 });
+		await transport.feed!.recent({ deviceId: 'd1', days: 30 });
+		await transport.catalog!.listWatches({ deviceId: 'd1' });
+		await transport.catalog!.get({ deviceId: 'd1', id });
+		await transport.catalog!.resolve({ deviceId: 'd1', refs: [{ provider: 'spotify', kind: 'artist', providerId: 'a1' }] });
+		expect(sent.map((r) => `${r.method} ${r.url.replace('https://api.test/trpc/', '').split('?')[0]}`))
+			.toEqual(['GET feed.events', 'GET feed.recent', 'GET catalog.listWatches', 'GET catalog.get', 'POST catalog.resolve']);
+	});
+
 	it('turns the server\'s refusals into the kinds the client branches on', async () => {
 		const cases: Array<[HttpResponse, string]> = [
 			[refused(403, 'device_revoked'), 'device_revoked'],

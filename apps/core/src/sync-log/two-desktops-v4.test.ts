@@ -14,6 +14,8 @@
 //     Traxsource claims, provider album metadata, artist spellings;
 //   - the Discover feed: decisions by stable key both ways, a follower runs
 //     no producer;
+//   - a feed track promoted on a device with no providers (the phone): a
+//     remote row on the master, nothing pushed upstream or into rekordbox;
 //   - a v3 client holds v4 ops aside and applies them once it reads them;
 //   - the remixer role merge: the replay divergence of a real-library recording.
 
@@ -21,9 +23,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { SCHEMA_VERSION, schemaVersionStatus, type StoredOp } from '@curator/protocol';
-import { SqliteFeedStore } from '../feed/store.js';
-import { syncedItemsFor } from '../feed/sync.js';
-import type { FeedItemDraft } from '../feed/types.js';
+import { SqliteFeedStore } from '@curator/sync-core/feed/store';
+import { createFeedDecisionPort, syncedItemsFor } from '@curator/sync-core/feed/sync';
+import type { FeedItemDraft } from '@curator/sync-core/feed/types';
+import { promoteExternalTrack } from '@curator/sync-core/library/external-track';
+import { pendingUpstreamOps, untagTracks } from '@curator/sync-core/library/mutators';
 import { syncTrackAlbumsRaw } from '@curator/sync-core/library/albums';
 import { heldCount, holdOps, replayHeldOps } from '@curator/sync-core/sync-log/held';
 import { recordingIdForTrack } from '@curator/sync-core/sync-log/recording-id';
@@ -513,6 +517,48 @@ describe('Discover feed decisions', () => {
 			expect([feedState(d, 'isrc:GB0000000001'), feedState(d, 'spotify:track:sp2')]).toEqual(['archived', 'dismissed']);
 			const dId = await d.deviceId();
 			expect(rig.cloud.log.filter((o) => o.device_id === dId && (o.entity === 'feed_item' || o.entity === 'feed_suppression'))).toEqual([]);
+		} finally {
+			for (const s of stores) s.close();
+		}
+	});
+});
+
+// ── a feed track promoted where there is no provider ────────────────────────
+
+describe('Interested on a device with no providers', () => {
+	it('reaches the master as a remote row in the backlog, tagged, and pushes nothing upstream or into rekordbox', async () => {
+		const a = await rig.desktop('a', { catalogue: ['trk-0'] });
+		const b = await rig.desktop('b', { catalogue: [] });
+		await rig.settle();
+		const stores = [a, b].map((d) => new SqliteFeedStore(join(d.dir, 'feed.db')));
+		try {
+			for (const s of stores) await s.upsertItems([draft('catalog:recording:r1', 'sp9', 'Lailonie')]);
+			const r = promoteExternalTrack(b.db, {
+				spotifyTrackId: 'sp9', isrc: 'GBAAA2600001', title: 'Lailonie', artists: ['Marsh'], albumTitle: null, releaseDate: '2026-10-23', label: 'Anjunadeep',
+				genre: null, coverUrl: 'https://img.test/c.jpg', durationSec: 384, trackNumber: null, bpm: 123, keyCamelot: '9A',
+			});
+			if (!r.ok) throw new Error(r.reason);
+			createFeedDecisionPort(b.raw).itemState('catalog:recording:r1', 'promoted', r.trackId);
+			await rig.settle();
+			const onA = a.all<Record<string, unknown>>(`SELECT * FROM track WHERE recording_id = ?`, r.recordingId);
+			expect(onA).toHaveLength(1);
+			expect(onA[0]).toMatchObject({ remote_only: 1, remote_source: 'spotify', state: 'backlog', title: 'Lailonie', isrc: 'GBAAA2600001', bpm: 123, key_camelot: '9A', deleted_at: null });
+			const id = onA[0]!['id'] as string;
+			expect(a.one(`SELECT tag_id FROM track_tag WHERE track_id = ?`, id)).toBe('interested');
+			expect(a.one(`SELECT source_track_id FROM claim_link WHERE track_id = ? AND source = 'spotify'`, id)).toBe('sp9');
+			expect(feedState(a, 'catalog:recording:r1')).toBe('promoted');
+			// The master describes nothing of it back, and neither device owes a
+			// streaming service or rekordbox anything (the rig's afterEach holds
+			// that no adapter was called).
+			const aId = await a.deviceId();
+			expect(rig.cloud.log.filter((o) => o.device_id === aId && o.entity_id === r.recordingId)).toEqual([]);
+			expect([pendingUpstreamOps(a.raw).size, pendingUpstreamOps(b.raw).size]).toEqual([0, 0]);
+			expect(rbTrackOp(a, id)).toBeUndefined();
+			// Taking Interested off deletes nothing anywhere.
+			untagTracks(b.db, [r.trackId], 'interested', { bump: true });
+			await rig.settle();
+			expect(a.one(`SELECT count(*) FROM track_tag WHERE track_id = ?`, id)).toBe(0);
+			expect(a.one(`SELECT count(*) FROM track WHERE id = ? AND deleted_at IS NULL`, id)).toBe(1);
 		} finally {
 			for (const s of stores) s.close();
 		}
