@@ -364,8 +364,8 @@ data class Track(
 ) {
 	val owned: Boolean get() = source == "local"
 
-	/** Whether the service it plays through, with [main] picked in Settings, has it ([StreamingService.forTrack]). */
-	fun foundOn(main: StreamingService): Boolean = StreamingService.forTrack(source, main).id in streams
+	/** Whether the service it plays through, with [main] picked in Settings, has it and plays here ([StreamingService.forTrack]). */
+	fun foundOn(main: StreamingService): Boolean = StreamingService.forTrack(source, main).let { it.playable && it.id in streams }
 }
 
 /** A list's size and length (seconds) before its view. */

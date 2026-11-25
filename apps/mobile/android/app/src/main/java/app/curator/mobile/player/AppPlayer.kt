@@ -1,7 +1,6 @@
 package app.curator.mobile.player
 
 import android.app.Activity
-import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import app.curator.mobile.model.StreamingService
@@ -22,14 +21,15 @@ import kotlin.math.roundToInt
  * The app's player. A streaming track plays from its own service, a local
  * file from the service picked in Settings, as the track its recording
  * claims there. Each service plays through its installed app, which a
- * [Backend] drives and follows: [SpotifyRemote], [TidalRemote]. A track with
- * nowhere to play loads and cues but does not play.
+ * [Backend] drives and follows: [SpotifyRemote]; Tidal has none yet
+ * (StreamingService.playable). A track with nowhere to play loads and cues
+ * but does not play.
  *
  * The services report the position only when their state changes (play,
  * pause, seek); between those the position here runs on the clock, so the
  * playhead moves smoothly.
  */
-class AppPlayer(context: Context) : Player {
+class AppPlayer : Player {
 	private val _state = MutableStateFlow(PlayerState())
 	override val state: StateFlow<PlayerState> = _state
 
@@ -67,18 +67,16 @@ class AppPlayer(context: Context) : Player {
 	}
 
 	private val spotify = SpotifyRemote(host)
-	private val tidal = TidalRemote(context.applicationContext, host)
 
-	private fun backend(s: StreamingService): Backend = when (s) {
+	private fun backend(s: StreamingService): Backend? = when (s) {
 		StreamingService.SPOTIFY -> spotify
-		StreamingService.TIDAL -> tidal
+		StreamingService.TIDAL -> null
 	}
 
 	/** The screen in front, and how it opens Spotify's consent screen (null when it goes). */
 	fun attach(a: Activity?, authorize: ((Intent) -> Unit)?) {
 		activityRef = WeakReference(a)
 		spotify.attach(authorize)
-		if (a != null) tidal.onResume()
 	}
 
 	/** Spotify's consent screen's answer (MainActivity's result callback). */
@@ -89,7 +87,7 @@ class AppPlayer(context: Context) : Player {
 		val now = _state.value
 		if (now.track?.trackId == track.trackId && now.track.service == track.service) return
 		// The other service's app would play on under this one.
-		if (now.playing && now.track != null && now.track.service != track.service) backend(now.track.service).pause()
+		if (now.playing && now.track != null && now.track.service != track.service) backend(now.track.service)?.pause()
 		stopTicker()
 		_state.value = PlayerState(track = track, unavailable = reasonFor(track), note = noteFor(track, null))
 	}
@@ -98,11 +96,11 @@ class AppPlayer(context: Context) : Player {
 		val t = _state.value.track ?: return
 		val reason = reasonFor(t)
 		if (reason != null) { _state.value = _state.value.copy(playing = false, unavailable = reason); return }
-		backend(t.service).play(t, _state.value.positionSec)
+		backend(t.service)?.play(t, _state.value.positionSec)
 	}
 
 	override fun pause() {
-		_state.value.track?.let { backend(it.service).pause() }
+		_state.value.track?.let { backend(it.service)?.pause() }
 		stopTicker()
 		_state.value = _state.value.copy(playing = false)
 	}
@@ -115,14 +113,15 @@ class AppPlayer(context: Context) : Player {
 		anchorAt = SystemClock.elapsedRealtime()
 		_state.value = s.copy(positionSec = at)
 		// Only the track the service is playing for us moves there; otherwise this is the cue point.
-		if (s.playing && s.track != null) backend(s.track.service).seek(at)
+		if (s.playing && s.track != null) backend(s.track.service)?.seek(at)
 	}
 
 	private fun reasonFor(t: PlayerTrack): String? {
 		val name = t.service.label
 		return when {
+			!t.service.playable -> "$name playback is coming soon"
 			t.streamId == null -> if (t.source == t.service.id) "No $name id for this track" else "Not on $name, so not playable on this phone"
-			else -> backend(t.service).unavailable()
+			else -> backend(t.service)?.unavailable()
 		}
 	}
 
@@ -130,7 +129,7 @@ class AppPlayer(context: Context) : Player {
 	// grid and waveform are the file's analysis: when the stream's version
 	// runs a different length (an edit, another master) they may not line up.
 	private fun noteFor(t: PlayerTrack, streamSec: Double?): String? {
-		if (t.source == t.service.id || t.streamId == null) return null
+		if (t.source == t.service.id || t.streamId == null || !t.service.playable) return null
 		val via = "Plays from ${t.service.label}"
 		val diff = if (streamSec != null && t.durationSec > 0) streamSec - t.durationSec else 0.0
 		if (abs(diff) < 2.0) return via

@@ -36,10 +36,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -168,28 +173,48 @@ private fun ServiceRow(s: StreamingService, on: Boolean, coverage: StreamingCove
 	val owned = coverage?.owned ?: 0
 	val has = coverage?.by?.get(s.id) ?: 0
 	val share = if (owned > 0) has.toFloat() / owned else 0f
-	Row(
-		Modifier
-			.fillMaxWidth()
-			.heightIn(min = 72.dp)
-			.selectable(selected = on, role = Role.RadioButton, onClick = onPick)
-			.padding(horizontal = 16.dp, vertical = 10.dp),
-		verticalAlignment = Alignment.CenterVertically,
-		horizontalArrangement = Arrangement.spacedBy(14.dp),
-	) {
-		Radio(on)
-		Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-			Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-				SourceDot(s.id)
-				BasicText(s.label, style = T.of(15.sp, color = C.fg))
+	// A service this phone can't play through yet shows, dimmed and unpickable, under a watermark.
+	Box(Modifier.fillMaxWidth()) {
+		Row(
+			Modifier
+				.fillMaxWidth()
+				.heightIn(min = 72.dp)
+				.then(
+					if (s.playable) Modifier.selectable(selected = on, role = Role.RadioButton, onClick = onPick)
+					else Modifier.semantics(mergeDescendants = true) { stateDescription = "Coming soon"; disabled() },
+				)
+				.alpha(if (s.playable) 1f else 0.3f)
+				.padding(horizontal = 16.dp, vertical = 10.dp),
+			verticalAlignment = Alignment.CenterVertically,
+			horizontalArrangement = Arrangement.spacedBy(14.dp),
+		) {
+			Radio(on)
+			Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+				Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+					SourceDot(s.id)
+					BasicText(s.label, style = T.of(15.sp, color = C.fg))
+				}
+				BasicText(
+					if (coverage == null) "Counting your files…" else "%,d of %,d of your files".format(has, owned),
+					style = T.mono(12.5.sp, C.fg2),
+				)
+				CoverageBar(share)
 			}
-			BasicText(
-				if (coverage == null) "Counting your files…" else "%,d of %,d of your files".format(has, owned),
-				style = T.mono(12.5.sp, C.fg2),
-			)
-			CoverageBar(share)
+			if (coverage != null && owned > 0) BasicText("${(share * 100).toInt()}%", style = T.mono(13.sp, if (on) C.fg else C.fg1))
 		}
-		if (coverage != null && owned > 0) BasicText("${(share * 100).toInt()}%", style = T.mono(13.sp, if (on) C.fg else C.fg1))
+		if (!s.playable) ComingSoon(Modifier.matchParentSize())
+	}
+}
+
+/** The watermark across a row that isn't available yet; its row carries the words for TalkBack. */
+@Composable
+private fun ComingSoon(modifier: Modifier) {
+	Box(modifier.clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+		BasicText(
+			"COMING SOON",
+			Modifier.rotate(-6f),
+			style = T.of(20.sp, 600, C.fg.copy(alpha = 0.6f)).copy(letterSpacing = 6.sp),
+		)
 	}
 }
 

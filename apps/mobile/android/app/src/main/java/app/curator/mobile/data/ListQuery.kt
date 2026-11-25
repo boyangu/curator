@@ -47,7 +47,7 @@ private const val HAYSTACK =
  *
  * The view's semantics, as the design states them: missing values go last in
  * both directions; ties break on the key (Camelot), in the sort's direction;
- * a tag filter matches any of its tags.
+ * a tag filter matches a track carrying every one of its tags.
  */
 class ListQuery(val scope: ListScope, val view: ListView, val search: String = "") {
 	private val words = searchWords(search)
@@ -129,8 +129,10 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 			BpmBucket.HIGH -> conds += "$bpm > 124"
 		}
 		if (view.tags.isNotEmpty()) {
-			conds += "t.id IN (SELECT f.track_id FROM track_tag f JOIN tag g ON g.id = f.tag_id WHERE g.name IN (${view.tags.joinToString(",") { "?" }}))"
+			// Every tag: the tracks holding any of them, kept when they hold all (by name: two tags may share one).
+			conds += "t.id IN (SELECT f.track_id FROM track_tag f JOIN tag g ON g.id = f.tag_id WHERE g.name IN (${view.tags.joinToString(",") { "?" }}) GROUP BY f.track_id HAVING count(DISTINCT g.name) = ?)"
 			args.addAll(view.tags.sorted())
+			args += view.tags.size
 		}
 		for (w in words) {
 			conds += "$HAYSTACK LIKE ? ESCAPE '\\'"

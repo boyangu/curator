@@ -95,7 +95,8 @@ fun TrackRowPlaceholder(level: Int) {
 
 /**
  * [missingOn]: the service the track plays through when that service doesn't
- * have it (a file whose recording has no id on the one picked in Settings).
+ * have it (a file whose recording has no id on the one picked in Settings),
+ * or can't play on this phone yet (a Tidal track).
  * The row greys out but still opens: its cues, grid and waveform are there.
  */
 @Composable
@@ -197,7 +198,7 @@ private fun segments(fields: List<RowField>, line: Int, right: Boolean, t: Track
 
 private fun describe(t: Track, playing: Boolean, missingOn: StreamingService?): String = buildString {
 	if (playing) append("Now playing. ")
-	missingOn?.let { append("Not on ${it.label}. ") }
+	missingOn?.let { append(if (it.playable) "Not on ${it.label}. " else "${it.label} playback coming soon. ") }
 	append(t.title)
 	t.version?.let { append(", $it") }
 	if (t.artist.isNotEmpty()) append(", by ${t.artist}")

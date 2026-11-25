@@ -67,7 +67,7 @@ class ViewState(private val context: Context) {
 		context.viewStore.edit { it[stringPreferencesKey("pick:$name")] = value }
 	}
 
-	val streaming: Flow<StreamingService> = context.viewStore.data.map { StreamingService.of(it[streamingKey]) ?: StreamingService.DEFAULT }
+	val streaming: Flow<StreamingService> = context.viewStore.data.map { StreamingService.picked(it[streamingKey]) }
 
 	suspend fun setStreaming(s: StreamingService) {
 		context.viewStore.edit { it[streamingKey] = s.id }

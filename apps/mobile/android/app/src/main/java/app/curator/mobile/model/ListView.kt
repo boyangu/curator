@@ -11,7 +11,7 @@ data class ListView(
 	val sort: Sort = Sort.CUSTOM,
 	/** 1 ascending, -1 descending. */
 	val dir: Int = 1,
-	/** A track matches when it carries any of these tags. */
+	/** A track matches when it carries every one of these tags. */
 	val tags: Set<String> = emptySet(),
 	val bpm: BpmBucket = BpmBucket.ANY,
 	val ownedOnly: Boolean = false,

@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 
 /**
  * What the Track view and the mini player drive. One interface over the
- * backends a track can play through (the Spotify and TIDAL apps now; the
+ * backends a track can play through (the Spotify app now; Tidal and the
  * library's own files later), so the views never know which one it is.
  *
  * Position is the player's, in seconds; while paused it is a cue point the

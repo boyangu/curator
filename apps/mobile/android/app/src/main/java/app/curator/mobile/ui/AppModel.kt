@@ -41,7 +41,7 @@ import kotlinx.serialization.json.buildJsonObject
  */
 class AppModel(val app: CuratorApp) {
 	val viewState = ViewState(app)
-	val player = AppPlayer(app)
+	val player = AppPlayer()
 
 	private val _library = MutableStateFlow<Library?>(null)
 	val library: StateFlow<Library?> = _library

@@ -82,8 +82,10 @@ class ListQueryTest {
 		assertEquals(listOf("c", "b", "a", "d"), ids(ListView(sort = Sort.BPM)))
 	}
 
-	@Test fun `tag filter matches any selected tag, bpm buckets, owned only`() {
-		assertEquals(listOf("a", "b"), ids(ListView(tags = setOf("p2", "build"))))
+	@Test fun `tag filter matches every selected tag, bpm buckets, owned only`() {
+		assertEquals(listOf("b"), ids(ListView(tags = setOf("build"))))
+		assertEquals(listOf("b"), ids(ListView(tags = setOf("p3", "build"))))
+		assertEquals(emptyList<String>(), ids(ListView(tags = setOf("p2", "build"))))
 		assertEquals(listOf("a"), ids(ListView(bpm = BpmBucket.LOW)))
 		assertEquals(listOf("b"), ids(ListView(bpm = BpmBucket.MID)))
 		assertEquals(listOf("c"), ids(ListView(bpm = BpmBucket.HIGH)))

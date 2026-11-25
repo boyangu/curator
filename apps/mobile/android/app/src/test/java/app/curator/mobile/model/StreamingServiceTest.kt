@@ -23,14 +23,22 @@ class StreamingServiceTest {
 	)
 
 	@Test
-	fun `a track is found when the service it plays through has it`() {
-		val file = track("local", "spotify")
+	fun `a track is found when the service it plays through has it and plays here`() {
+		val file = track("local", "spotify", "tidal")
 		assertTrue(file.foundOn(StreamingService.SPOTIFY))
-		assertFalse(file.foundOn(StreamingService.TIDAL))
+		assertFalse(track("local", "tidal").foundOn(StreamingService.SPOTIFY))
 		// A streaming track is looked for on its own service, whichever is picked.
-		val tidal = track("tidal", "tidal")
-		assertTrue(tidal.foundOn(StreamingService.SPOTIFY))
-		assertFalse(track("spotify", "tidal").foundOn(StreamingService.TIDAL))
+		assertTrue(track("spotify", "spotify").foundOn(StreamingService.TIDAL))
 		assertFalse(track("local").foundOn(StreamingService.SPOTIFY))
+		// Tidal doesn't play on the phone yet: its tracks are never found.
+		assertFalse(track("tidal", "tidal").foundOn(StreamingService.SPOTIFY))
+		assertFalse(file.foundOn(StreamingService.TIDAL))
+	}
+
+	@Test
+	fun `a stored pick that can't play falls back to Spotify`() {
+		assertEquals(StreamingService.SPOTIFY, StreamingService.picked("tidal"))
+		assertEquals(StreamingService.SPOTIFY, StreamingService.picked(null))
+		assertEquals(StreamingService.SPOTIFY, StreamingService.picked("spotify"))
 	}
 }
