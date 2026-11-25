@@ -176,13 +176,13 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 		Landscape(track, analysis, peaks, skin, model::setSkin, position, duration, zoom, transport, back, open,
 			onZoom = { factor -> zoom = (zoom * factor).coerceIn(2f, 64f) },
 			onCycleZoom = { zoom = ZOOMS.firstOrNull { it > zoom + 0.01f } ?: ZOOMS.first() },
-			onScrub = { scrub = it }, onSeek = seek)
+			onScrub = { scrub = it }, onCallOff = { scrub = null }, onSeek = seek)
 	} else {
 		Portrait(track, artists, analysis, peaks, skin, metrics, position, duration, transport,
 			from = listName?.name, index = screen.index, count = screen.count,
 			openArtist = { push(Screen.TrackList(ListSource.Artist(it.id))) },
 			showHint = !rotatedOnce, back = back, openActions = open,
-			onScrub = { scrub = it }, onSeek = seek,
+			onScrub = { scrub = it }, onCallOff = { scrub = null }, onSeek = seek,
 			modifier = Modifier.swipeToOpen(gestures) { Screen.TrackActions(track.id) })
 	}
 }
@@ -243,7 +243,7 @@ private class Transport(
 private fun Portrait(
 	t: Track, artists: List<ArtistRef>, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, metrics: Metrics, position: () -> Double, duration: Double, tr: Transport,
 	from: String?, index: Int, count: Int, openArtist: (ArtistRef) -> Unit, showHint: Boolean,
-	back: () -> Unit, openActions: () -> Unit, onScrub: (Double) -> Unit, onSeek: (Double) -> Unit, modifier: Modifier,
+	back: () -> Unit, openActions: () -> Unit, onScrub: (Double) -> Unit, onCallOff: () -> Unit, onSeek: (Double) -> Unit, modifier: Modifier,
 ) {
 	Column(modifier.fillMaxSize().background(C.bg).windowInsetsPadding(WindowInsets.statusBars)) {
 		Row(Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -276,7 +276,7 @@ private fun Portrait(
 				Facts(t)
 				Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
 					Ticking({ formatTime(position()) }) { BasicText(it, Modifier.align(Alignment.End).semantics { contentDescription = "Elapsed $it" }, style = T.mono(12.sp, C.fg2)) }
-					OverviewMap(peaks, skin, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onSeek = onSeek)
+					OverviewMap(peaks, skin, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek)
 					PhraseLane(a.phrases, skin, duration, Modifier.fillMaxWidth().height(5.dp))
 				}
 				Row(Modifier.fillMaxWidth().padding(top = 0.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -429,7 +429,7 @@ private fun Landscape(
 	t: Track, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, onSkin: (WaveSkin) -> Unit,
 	position: () -> Double, duration: Double, zoom: Float, tr: Transport,
 	back: () -> Unit, openActions: () -> Unit, onZoom: (Float) -> Unit, onCycleZoom: () -> Unit,
-	onScrub: (Double) -> Unit, onSeek: (Double) -> Unit,
+	onScrub: (Double) -> Unit, onCallOff: () -> Unit, onSeek: (Double) -> Unit,
 ) {
 	val span = windowSec(a.beats, t.bpm, zoom)
 	Column(Modifier.fillMaxSize().background(C.bg).windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 8.dp)) {
@@ -450,7 +450,7 @@ private fun Landscape(
 		androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth().height(192.dp)) {
 			BigWave(peaks, skin, position, duration, a.beats, a.downbeats, span, a.cues, a.phrases,
 				Modifier.fillMaxSize().semantics { contentDescription = "Waveform, ${zoom.toInt()} bars around the playhead. Drag to scrub" },
-				onScrub = onScrub, onSeek = onSeek, onZoom = onZoom)
+				onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek, onZoom = onZoom)
 			// Just right of the centre playhead, over the bar numbers' row.
 			Ticking({ readout(a.beats, a.downbeats, a.phrases, position()) ?: "" }) {
 				if (it.isNotEmpty()) BasicText(it, Modifier.padding(start = maxWidth / 2 + 6.dp, top = 4.dp).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 4.dp, vertical = 1.dp), style = T.mono(11.sp, C.fg))
@@ -460,7 +460,7 @@ private fun Landscape(
 			peaks, skin, duration, position, a.cues,
 			Modifier.fillMaxWidth().height(42.dp).padding(top = 0.dp).semantics { contentDescription = "Track overview. The box is the window above" },
 			windowSec = span, badge = androidx.compose.ui.geometry.Size(13f, 12f),
-			onScrub = onScrub, onSeek = onSeek,
+			onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek,
 		)
 		Row(Modifier.fillMaxWidth().weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
 			Ticking({ formatTime(position()) }) { BasicText(it, Modifier.width(64.dp), style = T.mono(13.sp, C.fg)) }

@@ -7,11 +7,11 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -27,8 +27,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextMeasurer
@@ -40,13 +40,14 @@ import androidx.compose.ui.unit.sp
 import app.curator.mobile.data.Cue
 import app.curator.mobile.data.Phrase
 import app.curator.mobile.model.Bands
+import app.curator.mobile.model.Finger
 import app.curator.mobile.model.Peaks
 import app.curator.mobile.model.WaveSkin
+import app.curator.mobile.model.WaveTouch
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.CuePalette
 import app.curator.mobile.ui.theme.T
 import app.curator.mobile.ui.theme.oklch
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
@@ -85,6 +86,49 @@ private fun DrawScope.cueBadge(measurer: TextMeasurer, cue: Cue, x: Float, y: Fl
 	drawText(label, topLeft = Offset(x + (w - label.size.width) / 2, y + (h - label.size.height) / 2))
 }
 
+private fun secAt(x: Float, width: Int, durationSec: Double) = (x / width * durationSec).coerceIn(0.0, durationSec)
+
+/**
+ * The touches on a wave, told apart by [WaveTouch]: a scrub from [onBegin] to
+ * [onEnd] (at its last x) or [onCallOff], a pinch to [onSpread].
+ */
+private fun Modifier.waveTouch(
+	key: Any?,
+	yields: Boolean,
+	onBegin: () -> Unit = {},
+	onScrub: PointerInputScope.(x: Float, dx: Float) -> Unit,
+	onEnd: PointerInputScope.(x: Float) -> Unit,
+	onCallOff: () -> Unit,
+	onSpread: (Float) -> Unit = {},
+): Modifier = pointerInput(key) {
+	val input = this
+	awaitEachGesture {
+		val touch = WaveTouch(viewConfiguration.touchSlop, yields)
+		val down = awaitFirstDown()
+		touch.on(listOf(Finger(down.id.value, down.position.x, down.position.y)))
+		var x = down.position.x
+		try {
+			do {
+				val ev = awaitPointerEvent()
+				val pressed = ev.changes.filter { it.pressed }
+				val act = touch.on(pressed.map { Finger(it.id.value, it.position.x, it.position.y) }, taken = pressed.any { it.isConsumed })
+				when (act) {
+					is WaveTouch.Act.Begin -> { x = pressed[0].position.x; onBegin() }
+					is WaveTouch.Act.Scrub -> { x = act.x; input.onScrub(act.x, act.dx) }
+					is WaveTouch.Act.Spread -> onSpread(act.factor)
+					is WaveTouch.Act.End -> input.onEnd(x)
+					is WaveTouch.Act.CallOff -> onCallOff()
+					is WaveTouch.Act.Idle -> {}
+				}
+				// Taken: no tap, page swipe or scroll is made of it as well.
+				if (act !is WaveTouch.Act.Idle || act.ours) ev.changes.forEach { it.consume() }
+			} while (pressed.isNotEmpty())
+		} finally {
+			if (touch.cancel() is WaveTouch.Act.CallOff) onCallOff()
+		}
+	}
+}
+
 /**
  * The whole track: played part dimmed, white 2dp playhead, cue letters on the
  * top edge, the phrase lane under it. Tap or drag seeks (a drag scrubs and
@@ -103,11 +147,13 @@ fun OverviewMap(
 	windowSec: Double? = null,
 	badge: Size = Size(14f, 13f),
 	onScrub: (Double) -> Unit,
+	onCallOff: () -> Unit,
 	onSeek: (Double) -> Unit,
 ) {
 	val measurer = rememberTextMeasurer()
 	val seek by rememberUpdatedState(onSeek)
 	val scrub by rememberUpdatedState(onScrub)
+	val callOff by rememberUpdatedState(onCallOff)
 	val dur = durationSec.takeIf { it > 0 } ?: peaks?.seconds ?: 0.0
 	var box by remember { mutableStateOf(IntSize.Zero) }
 	val inset = with(LocalDensity.current) { 4.dp.roundToPx() }
@@ -118,20 +164,12 @@ fun OverviewMap(
 				.fillMaxSize()
 				.onSizeChanged { box = it }
 				.pointerInput(dur) { detectTapGestures { o -> if (dur > 0) seek((o.x / size.width) * dur) } }
-				.pointerInput(dur) {
-					awaitEachGesture {
-						val down = awaitFirstDown()
-						var at = (down.position.x / size.width) * dur
-						var moved = false
-						horizontalDrag(down.id) { ch ->
-							ch.consume()
-							moved = true
-							at = ((ch.position.x / size.width) * dur).coerceIn(0.0, dur)
-							scrub(at)
-						}
-						if (moved && dur > 0) seek(at)
-					}
-				},
+				.waveTouch(
+					dur, yields = true,
+					onScrub = { x, _ -> if (dur > 0) scrub(secAt(x, size.width, dur)) },
+					onEnd = { x -> if (dur > 0) seek(secAt(x, size.width, dur)) },
+					onCallOff = { callOff() },
+				),
 		) {
 			if (map != null) drawImage(map, topLeft = Offset(0f, inset.toFloat())) else noWave(0f, size.height)
 			if (dur <= 0) return@Canvas
@@ -216,7 +254,8 @@ fun jumpBeats(beats: FloatArray, bpm: Double?, t: Double, n: Int): Double {
  * across, the grid's beats in line-soft and bars in fg-4 with their numbers,
  * cue lines full height with their letter at the bottom, the phrase lane on
  * the bottom edge. A horizontal drag scrubs ([onScrub] as it moves, [onSeek]
- * on release: streaming sources only seek then); pinch zooms.
+ * on release: streaming sources only seek then); two fingers zoom and leave
+ * playback alone ([onCallOff]: a scrub their first one began is none).
  *
  * [position] is read while drawing, so a frame of playback draws and nothing
  * recomposes. Everything sits at a whole pixel of the wave and the window moves
@@ -235,6 +274,7 @@ fun BigWave(
 	phrases: List<Phrase>,
 	modifier: Modifier,
 	onScrub: (Double) -> Unit,
+	onCallOff: () -> Unit,
 	onSeek: (Double) -> Unit,
 	onZoom: (Float) -> Unit,
 ) {
@@ -243,46 +283,30 @@ fun BigWave(
 	val tiles = rememberWaveTiles()
 	val pos by rememberUpdatedState(position)
 	val scrub by rememberUpdatedState(onScrub)
+	val callOff by rememberUpdatedState(onCallOff)
 	val seek by rememberUpdatedState(onSeek)
 	val zoom by rememberUpdatedState(onZoom)
 	val spanNow by rememberUpdatedState(span)
+	val lengthNow by rememberUpdatedState(durationSec)
+	val drag = remember { mutableDoubleStateOf(0.0) }
 	Box(modifier.background(C.bg1).border(1.dp, C.lineSoft)) {
 		Canvas(
 			Modifier
 				.fillMaxSize()
 				// Phrases, cue badges and the grid reach past the window's edges.
 				.clipToBounds()
-				.pointerInput(Unit) {
-					awaitEachGesture {
-						val down = awaitFirstDown()
-						down.consume()
-						var at = pos()
-						var moved = false
-						var pinch: Float? = null
-						while (true) {
-							val ev = awaitPointerEvent()
-							val pressed = ev.changes.filter { it.pressed }
-							if (pressed.isEmpty()) break
-							if (pressed.size >= 2) {
-								val d = abs(pressed[0].position.x - pressed[1].position.x)
-								val prev = pinch
-								if (prev != null && d > 0) zoom(prev / d)
-								pinch = d
-								ev.changes.forEach { it.consume() }
-								continue
-							}
-							val ch = pressed[0]
-							val dx = ch.positionChange().x
-							if (dx != 0f) {
-								moved = true
-								at = (at - dx / size.width * spanNow).coerceIn(0.0, durationSec.coerceAtLeast(0.0))
-								scrub(at)
-								ch.consume()
-							}
-						}
-						if (moved && pinch == null) seek(at)
-					}
-				},
+				.waveTouch(
+					Unit, yields = false,
+					// From where it is now, not where it was at the touch.
+					onBegin = { drag.doubleValue = pos() },
+					onScrub = { _, dx ->
+						drag.doubleValue = (drag.doubleValue - dx / size.width * spanNow).coerceIn(0.0, lengthNow.coerceAtLeast(0.0))
+						scrub(drag.doubleValue)
+					},
+					onEnd = { seek(drag.doubleValue) },
+					onCallOff = { callOff() },
+					onSpread = { zoom(1 / it) },
+				),
 		) {
 			val pxPerSec = size.width / span
 			val playhead = (size.width / 2).roundToInt()
