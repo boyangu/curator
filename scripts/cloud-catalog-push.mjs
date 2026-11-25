@@ -4,8 +4,12 @@
 //
 //   pnpm cloud:catalog-push --from <copy of ~/.curator-local-cloud/pgdata>
 //   pnpm cloud:catalog-push --from <pgdata> --to-pglite <empty dir>   # rehearsal into a fresh PGlite
+//   pnpm cloud:catalog-push --from <pgdata> --to-postgres <ENV_NAME>  # rehearsal into the Postgres that variable names
 //
-// Take the source from a copy made while the local server is stopped (PGlite
+// The whole load is one transaction: whatever stops it, the target is as it
+// was, seeds and trigger included, and running it again starts over.
+//
+// Take the source from a copy (its schema is brought up to this checkout) made while the local server is stopped (PGlite
 // is single-process; a copy of a running folder may not open). The target's
 // catalogue tables must be empty: this is the first fill, not a sync, and it
 // refuses anything else. Rows move as CSV through COPY on both sides, table by
@@ -17,14 +21,16 @@
 // spotify_grant, request_log, audit_event: the cloud's own, and the local shim's
 // copies are test data), catalog_worker (its device row is the local shim's; the
 // desktop re-registers on first contact), and schema_migration (the target ran
-// its own). catalog_watch rows whose user is unknown to the target's auth.users
-// are dropped with a warning; the watch counter trigger stays off during the
-// load because watch_count arrives with the objects.
+// its own). Rows of a user the target's auth.users does not know (catalog_watch,
+// catalog_connect_vote, admin_user) are dropped with a warning; the watch
+// counter trigger stays off during the load because watch_count arrives with
+// the objects.
 //
 // The owner connection comes from CURATOR_DB_OWNER_URL in the git-ignored root
-// .env (never argv), like scripts/cloud-db-apply.mjs.
+// .env (never argv), like scripts/cloud-db-apply.mjs: the SESSION pooler's
+// (5432), since the load is one session's long transaction.
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -38,9 +44,9 @@ const arg = (name) => {
 	return i === -1 ? undefined : argv[i + 1];
 };
 
+// Thrown, never an exit: inside the load the transaction has to roll back.
 function fail(msg) {
-	console.error(`\ncloud-catalog-push: ${msg}`);
-	process.exit(1);
+	throw new Error(msg);
 }
 
 function loadDotEnv(path) {
@@ -71,6 +77,8 @@ const TABLES = [
 	'catalog_edge',
 	'catalog_edge_evidence',
 	'catalog_playlist_item',
+	'catalog_page_check',
+	'catalog_name_lookup',
 	'catalog_not_same',
 	'catalog_signal',
 	'catalog_audio',
@@ -91,8 +99,11 @@ const TABLES = [
 	'tracker',
 	'tracker_run',
 	'catalog_watch',
+	'catalog_connect_vote',
 	'admin_user',
 ];
+// Keyed by a user: only those the target knows arrive.
+const PER_USER = ['catalog_watch', 'catalog_connect_vote', 'admin_user'];
 const SKIP = new Set(['catalog_worker']);
 // Tables the migrations seed, children before parents (the order they are cleared in).
 const SEEDED = ['genre_alias', 'catalog_enrich_task', 'catalog_cursor', 'catalog_source_object', 'catalog_genre', 'tracker', 'provider_budget', 'catalog_object'];
@@ -100,6 +111,17 @@ const SELF_REF = { catalog_object: 'merged_into', catalog_genre: 'parent_id' };
 // Big uuid-keyed tables go in 16 slices by the first hex digit of the key so
 // no single CSV blob has to fit in PGlite's memory at once.
 const SLICE_BY = { catalog_object: 'id', catalog_source_object: 'id', catalog_fact: 'object_id', catalog_edge: 'id', catalog_edge_evidence: 'edge_id', catalog_identifier: 'value', catalog_enrich_task: 'object_id' };
+
+// apps/cloud's own TypeScript, through tsx.
+async function cloudModules() {
+	const { register } = await import(pathToFileURL(require.resolve('tsx/esm/api')).href);
+	register();
+	const load = (file) => import(pathToFileURL(join(cloudDir, file)).href);
+	const { migrate, findSqlDir } = await load('src/db/migrate.ts');
+	const { pgliteDb, STORAGE_SQL } = await load('src/test/harness.ts');
+	const { SUPABASE_SHIM_SQL } = await load('src/test/supabase-shim.ts');
+	return { migrate, findSqlDir, pgliteDb, STORAGE_SQL, SUPABASE_SHIM_SQL };
+}
 
 async function openSource(dir) {
 	const { PGlite } = await import(pathToFileURL(require.resolve('@electric-sql/pglite')).href);
@@ -110,6 +132,10 @@ async function openSource(dir) {
 		if (alive) fail(`${dir} belongs to a running local catalogue (pid ${pid}); stop it or point --from at a copy`);
 	}
 	const pg = await PGlite.create(dir);
+	// The checkout may be newer than the last `pnpm local` that opened this folder.
+	const { migrate, findSqlDir, pgliteDb } = await cloudModules();
+	const done = await migrate(pgliteDb(pg), findSqlDir(join(cloudDir, 'src/db')));
+	if (done.applied.length) console.log(`  source migrated: ${done.applied.join(', ')}`);
 	return {
 		rows: async (sql, params = []) => (await pg.query(sql, params)).rows,
 		csv: async (select) => (await pg.query(`copy (${select}) to '/dev/blob' with (format csv)`)).blob,
@@ -120,10 +146,10 @@ async function openSource(dir) {
 async function openPostgresTarget(url) {
 	const postgres = (await import(pathToFileURL(require.resolve('postgres')).href)).default;
 	const sql = postgres(url, { prepare: false, max: 1, connect_timeout: 15, idle_timeout: 0, onnotice: () => {} });
-	return {
-		rows: (q) => sql.unsafe(q),
+	const on = (q) => ({
+		rows: (text) => q.unsafe(text),
 		copyIn: async (copySql, blob) => {
-			const w = await sql.unsafe(copySql).writable();
+			const w = await q.unsafe(copySql).writable();
 			const buf = Buffer.from(await blob.arrayBuffer());
 			await new Promise((resolve, reject) => {
 				w.on('error', reject);
@@ -131,6 +157,15 @@ async function openPostgresTarget(url) {
 				w.end(buf);
 			});
 		},
+	});
+	return {
+		...on(sql),
+		load: (fn) =>
+			sql.begin(async (tx) => {
+				await tx.unsafe('set local statement_timeout = 0');
+				await tx.unsafe('set local idle_in_transaction_session_timeout = 0');
+				return fn(on(tx));
+			}),
 		close: () => sql.end({ timeout: 5 }),
 	};
 }
@@ -139,21 +174,21 @@ async function openPostgresTarget(url) {
 // the same way apps/cloud/src/cli/local.ts builds the local catalogue.
 async function openPgliteTarget(dir) {
 	const { PGlite } = await import(pathToFileURL(require.resolve('@electric-sql/pglite')).href);
-	const tsx = pathToFileURL(require.resolve('tsx/esm/api')).href;
-	const { register } = await import(tsx);
-	register();
-	const { pgliteDb, STORAGE_SQL } = await import(pathToFileURL(join(cloudDir, 'src/test/harness.ts')).href);
-	const { SUPABASE_SHIM_SQL } = await import(pathToFileURL(join(cloudDir, 'src/test/supabase-shim.ts')).href);
-	const { migrate, findSqlDir } = await import(pathToFileURL(join(cloudDir, 'src/db/migrate.ts')).href);
+	const { migrate, findSqlDir, pgliteDb, STORAGE_SQL, SUPABASE_SHIM_SQL } = await cloudModules();
+	mkdirSync(dir, { recursive: true });
 	const pg = await PGlite.create(join(dir, 'pgdata'));
 	const [fresh] = (await pg.query(`select to_regclass('auth.users') is null as missing`)).rows;
 	if (fresh?.missing) await pg.exec(SUPABASE_SHIM_SQL);
 	await migrate(pgliteDb(pg), findSqlDir(join(cloudDir, 'src/db')));
 	if (fresh?.missing) await pg.exec(STORAGE_SQL);
-	return {
-		rows: async (q) => (await pg.query(q)).rows,
+	const on = (q) => ({
+		rows: async (text) => (await q.query(text)).rows,
 		// PGlite's COPY reads the blob handed to query(), named as '/dev/blob'.
-		copyIn: async (copySql, blob) => { await pg.query(copySql.replace(/from stdin/, `from '/dev/blob'`), [], { blob }); },
+		copyIn: async (copySql, blob) => { await q.query(copySql.replace(/from stdin/, `from '/dev/blob'`), [], { blob }); },
+	});
+	return {
+		...on(pg),
+		load: (fn) => pg.transaction((tx) => fn(on(tx))),
 		seedUser: async (id) => { await pg.query(`insert into auth.users (id) values ($1) on conflict do nothing`, [id]); },
 		close: () => pg.close(),
 	};
@@ -161,7 +196,7 @@ async function openPgliteTarget(dir) {
 
 async function main() {
 	const from = arg('--from');
-	if (!from) fail('usage: --from <pgdata dir> [--to-pglite <dir>]');
+	if (!from) fail('usage: --from <pgdata dir> [--to-pglite <dir> | --to-postgres <env variable>]');
 	if (!existsSync(join(from, 'PG_VERSION'))) fail(`${from} is not a PGlite data folder (no PG_VERSION)`);
 	const toPglite = arg('--to-pglite');
 	let target;
@@ -169,11 +204,14 @@ async function main() {
 		target = await openPgliteTarget(toPglite);
 	} else {
 		const env = { ...loadDotEnv(join(repoRoot, '.env')), ...process.env };
-		const url = env.CURATOR_DB_OWNER_URL?.trim();
-		if (!url) fail('CURATOR_DB_OWNER_URL is not set in .env (the owner connection, postgres.<ref>…)');
+		const name = arg('--to-postgres') ?? 'CURATOR_DB_OWNER_URL';
+		const url = env[name]?.trim();
+		if (!url) fail(`${name} is not set (the owner connection, postgres.<ref>…)`);
 		let u;
 		try { u = new URL(url); } catch { fail('the owner connection string is not a URL (value not shown)'); }
 		if (!/^postgres([.]|$)/.test(decodeURIComponent(u.username))) fail('expected the owner user postgres.<ref> (value not shown)');
+		// Transaction mode hands each statement whatever server connection is free.
+		if (u.port === '6543') fail('that is the transaction pooler (6543): use the session pooler, port 5432');
 		target = await openPostgresTarget(url);
 	}
 	const source = await openSource(from);
@@ -205,96 +243,100 @@ async function main() {
 				if (Number(other) > 0) fail(`target curator.catalog_object holds ${other} non-genre rows; this script fills an empty catalogue only`);
 			}
 		}
-		for (const t of SEEDED) {
-			const [{ n }] = await target.rows(`select count(*)::int as n from curator.${t}`);
-			if (Number(n) === 0) continue;
-			await target.rows(`delete from curator.${t}`);
-			console.log(`  cleared ${n} seeded rows from curator.${t}`);
-		}
-
 		const targetUsers = new Set((await target.rows(`select id::text as id from auth.users`)).map((r) => r.id));
-		const watchUsers = await source.rows(`select user_id::text as user_id, count(*)::int as n from curator.catalog_watch group by 1`);
-		for (const w of watchUsers) {
-			if (targetUsers.has(w.user_id)) continue;
-			if (target.seedUser) { await target.seedUser(w.user_id); targetUsers.add(w.user_id); continue; }
-			console.warn(`  warning: ${w.n} catalog_watch rows of user ${w.user_id} dropped (no such user on the target)`);
+		for (const t of PER_USER) {
+			for (const w of await source.rows(`select user_id::text as user_id, count(*)::int as n from curator.${t} group by 1`)) {
+				if (targetUsers.has(w.user_id)) continue;
+				if (target.seedUser) { await target.seedUser(w.user_id); targetUsers.add(w.user_id); continue; }
+				console.warn(`  warning: ${w.n} ${t} rows of user ${w.user_id} dropped (no such user on the target)`);
+			}
 		}
-		const adminUsers = await source.rows(`select user_id::text as user_id from curator.admin_user`);
-		for (const a of adminUsers) if (!targetUsers.has(a.user_id) && target.seedUser) await target.seedUser(a.user_id);
 
 		const columnsOf = async (t) => (await source.rows(`select attname from pg_attribute where attrelid = 'curator.${t}'::regclass and attnum > 0 and not attisdropped order by attnum`)).map((r) => r.attname);
-		const targetColumns = async (t) => (await target.rows(`select attname from pg_attribute where attrelid = 'curator.${t}'::regclass and attnum > 0 and not attisdropped order by attnum`)).map((r) => r.attname);
+		const targetColumns = async (q, t) => (await q.rows(`select attname from pg_attribute where attrelid = 'curator.${t}'::regclass and attnum > 0 and not attisdropped order by attnum`)).map((r) => r.attname);
 
-		await target.rows(`alter table curator.catalog_watch disable trigger catalog_watch_count`);
 		const started = Date.now();
 		const totals = {};
-		for (const t of TABLES) {
-			const cols = await columnsOf(t);
-			const tcols = await targetColumns(t);
-			if (cols.join() !== tcols.join()) fail(`curator.${t}: columns differ (source ${cols.join(',')} / target ${tcols.join(',')})`);
-			const colList = cols.map((c) => `"${c}"`).join(', ');
-			const base = `select ${colList} from curator.${t}`;
-			const filters = [];
-			if (t === 'catalog_watch') {
-				const ids = [...targetUsers].map((id) => `'${id}'`).join(',');
-				filters.push(`user_id in (${ids || `'00000000-0000-0000-0000-000000000000'`})`);
+		await target.load(async (tx) => {
+			for (const t of SEEDED) {
+				const [{ n }] = await tx.rows(`select count(*)::int as n from curator.${t}`);
+				if (Number(n) === 0) continue;
+				await tx.rows(`delete from curator.${t}`);
+				console.log(`  cleared ${n} seeded rows from curator.${t}`);
 			}
-			const where = (extra) => {
-				const all = [...filters, ...(extra ? [extra] : [])];
-				return all.length ? ` where ${all.join(' and ')}` : '';
-			};
-			const copyIn = `copy curator.${t} (${colList}) from stdin with (format csv)`;
-			let moved = 0;
-			const ship = async (select) => {
-				const blob = await source.csv(select);
-				// PGlite hands back no blob at all for an empty result.
-				if (!blob || blob.size === 0) return;
-				await target.copyIn(copyIn, blob);
-			};
-			if (SELF_REF[t]) {
-				// Parents first: depth 0 has no parent, depth n's parent sits at n-1.
-				const ref = SELF_REF[t];
-				const pk = t === 'catalog_genre' ? 'object_id' : 'id';
-				const depths = await source.rows(`with recursive d as (select ${pk} as id, 0 as depth from curator.${t} where ${ref} is null union all select o.${pk}, d.depth + 1 from curator.${t} o join d on o.${ref} = d.id) select depth, count(*)::int as n from d group by 1 order by 1`);
-				for (const { depth } of depths) {
-					const depthSelect = `with recursive d as (select ${pk} as id, 0 as depth from curator.${t} where ${ref} is null union all select o.${pk}, d.depth + 1 from curator.${t} o join d on o.${ref} = d.id) ${base} where ${pk} in (select id from d where depth = ${Number(depth)})`;
-					if (SLICE_BY[t] && Number(depth) === 0) {
-						for (const h of '0123456789abcdef') await ship(`${depthSelect} and left(${SLICE_BY[t]}::text, 1) = '${h}'`);
-					} else {
-						await ship(depthSelect);
-					}
+			await tx.rows(`alter table curator.catalog_watch disable trigger catalog_watch_count`);
+			for (const t of TABLES) {
+				const cols = await columnsOf(t);
+				const tcols = await targetColumns(tx, t);
+				if (cols.join() !== tcols.join()) fail(`curator.${t}: columns differ (source ${cols.join(',')} / target ${tcols.join(',')})`);
+				const colList = cols.map((c) => `"${c}"`).join(', ');
+				const base = `select ${colList} from curator.${t}`;
+				const filters = [];
+				if (PER_USER.includes(t)) {
+					const ids = [...targetUsers].map((id) => `'${id}'`).join(',');
+					filters.push(`user_id in (${ids || `'00000000-0000-0000-0000-000000000000'`})`);
 				}
-			} else if (SLICE_BY[t]) {
-				const k = SLICE_BY[t];
-				for (const h of '0123456789abcdef') await ship(`${base}${where(`left(${k}::text, 1) = '${h}'`)}`);
-				// Keys that are not hex-led (text keys such as identifier values).
-				await ship(`${base}${where(`left(${k}::text, 1) !~ '^[0-9a-f]$'`)}`);
-			} else {
-				await ship(`${base}${where()}`);
+				const where = (extra) => {
+					const all = [...filters, ...(extra ? [extra] : [])];
+					return all.length ? ` where ${all.join(' and ')}` : '';
+				};
+				const copyIn = `copy curator.${t} (${colList}) from stdin with (format csv)`;
+				let moved = 0;
+				const ship = async (select) => {
+					const blob = await source.csv(select);
+					// PGlite hands back no blob at all for an empty result.
+					if (!blob || blob.size === 0) return;
+					await tx.copyIn(copyIn, blob);
+				};
+				if (SELF_REF[t]) {
+					// Parents first: depth 0 has no parent, depth n's parent sits at n-1.
+					const ref = SELF_REF[t];
+					const pk = t === 'catalog_genre' ? 'object_id' : 'id';
+					const depths = await source.rows(`with recursive d as (select ${pk} as id, 0 as depth from curator.${t} where ${ref} is null union all select o.${pk}, d.depth + 1 from curator.${t} o join d on o.${ref} = d.id) select depth, count(*)::int as n from d group by 1 order by 1`);
+					for (const { depth } of depths) {
+						const depthSelect = `with recursive d as (select ${pk} as id, 0 as depth from curator.${t} where ${ref} is null union all select o.${pk}, d.depth + 1 from curator.${t} o join d on o.${ref} = d.id) ${base} where ${pk} in (select id from d where depth = ${Number(depth)})`;
+						if (SLICE_BY[t] && Number(depth) === 0) {
+							for (const h of '0123456789abcdef') await ship(`${depthSelect} and left(${SLICE_BY[t]}::text, 1) = '${h}'`);
+						} else {
+							await ship(depthSelect);
+						}
+					}
+				} else if (SLICE_BY[t]) {
+					const k = SLICE_BY[t];
+					for (const h of '0123456789abcdef') await ship(`${base}${where(`left(${k}::text, 1) = '${h}'`)}`);
+					// Keys that are not hex-led (text keys such as identifier values).
+					await ship(`${base}${where(`left(${k}::text, 1) !~ '^[0-9a-f]$'`)}`);
+				} else {
+					await ship(`${base}${where()}`);
+				}
+				const [{ n: srcN }] = await source.rows(`select count(*)::int as n from curator.${t}${where()}`);
+				const [{ n: dstN }] = await tx.rows(`select count(*)::int as n from curator.${t}`);
+				moved = Number(dstN);
+				totals[t] = [Number(srcN), moved];
+				console.log(`  ${t.padEnd(26)} ${String(moved).padStart(9)} rows${Number(srcN) !== moved ? `   MISMATCH (source ${srcN})` : ''}`);
+				if (Number(srcN) !== moved) fail(`curator.${t}: moved ${moved} of ${srcN} rows`);
 			}
-			const [{ n: srcN }] = await source.rows(`select count(*)::int as n from curator.${t}${where()}`);
-			const [{ n: dstN }] = await target.rows(`select count(*)::int as n from curator.${t}`);
-			moved = Number(dstN);
-			totals[t] = [Number(srcN), moved];
-			console.log(`  ${t.padEnd(26)} ${String(moved).padStart(9)} rows${Number(srcN) !== moved ? `   MISMATCH (source ${srcN})` : ''}`);
-			if (Number(srcN) !== moved) fail(`curator.${t}: moved ${moved} of ${srcN} rows`);
-		}
-		await target.rows(`alter table curator.catalog_watch enable trigger catalog_watch_count`);
+			await tx.rows(`alter table curator.catalog_watch enable trigger catalog_watch_count`);
 
-		// Identity / serial keys continue after the highest value that arrived.
-		const serials = await source.rows(`select c.relname as t, a.attname as col from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relnamespace = 'curator'::regnamespace and a.attnum > 0 and not a.attisdropped and (a.attidentity <> '' or exists (select 1 from pg_attrdef d where d.adrelid = c.oid and d.adnum = a.attnum and pg_get_expr(d.adbin, d.adrelid) like 'nextval%'))`);
-		for (const { t, col } of serials) {
-			if (!TABLES.includes(t)) continue;
-			await target.rows(`select setval(pg_get_serial_sequence('curator.${t}', '${col}'), coalesce((select max("${col}") from curator.${t}), 0) + 1, false)`);
-		}
-		for (const t of TABLES) await target.rows(`analyze curator.${t}`);
+			// Identity / serial keys continue after the highest value that arrived.
+			const serials = await source.rows(`select c.relname as t, a.attname as col from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relnamespace = 'curator'::regnamespace and a.attnum > 0 and not a.attisdropped and (a.attidentity <> '' or exists (select 1 from pg_attrdef d where d.adrelid = c.oid and d.adnum = a.attnum and pg_get_expr(d.adbin, d.adrelid) like 'nextval%'))`);
+			for (const { t, col } of serials) {
+				if (!TABLES.includes(t)) continue;
+				await tx.rows(`select setval(pg_get_serial_sequence('curator.${t}', '${col}'), coalesce((select max("${col}") from curator.${t}), 0) + 1, false)`);
+			}
+			for (const t of TABLES) await tx.rows(`analyze curator.${t}`);
+		});
 		console.log(`\nDone in ${Math.round((Date.now() - started) / 1000)} s: ${Object.values(totals).reduce((a, [, n]) => a + n, 0)} rows across ${TABLES.length} tables.`);
-	} catch (e) {
-		fail(`${e?.code ? e.code + ' ' : ''}${String(e?.message ?? e).slice(0, 400)}`);
+		const [{ bytes }] = await target.rows(`select sum(pg_total_relation_size(c.oid))::bigint::text as bytes from pg_class c where c.relnamespace = 'curator'::regnamespace and c.relkind = 'r' and c.relname in (${TABLES.map((t) => `'${t}'`).join(', ')})`);
+		console.log(`On the target, with indexes: ${(Number(bytes) / 1024 ** 3).toFixed(2)} GB.`);
 	} finally {
 		await source.close();
 		await target.close();
 	}
 }
 
-main().catch((e) => fail(e instanceof Error ? e.stack ?? e.message : String(e)));
+// postgres.js errors carry no connection string; the code and message suffice.
+main().catch((e) => {
+	console.error(`\ncloud-catalog-push: ${e?.code ? `${e.code} ` : ''}${String(e?.message ?? e).slice(0, 400)}`);
+	process.exit(1);
+});

@@ -1,5 +1,5 @@
 // The reasoner's configuration, from the environment like every other
-// provider of the worker (worker/main.ts): on when CURATOR_ANTHROPIC_API_KEY
+// provider of the worker (worker/pass.ts): on when CURATOR_ANTHROPIC_API_KEY
 // is set or the Claude Code backend is chosen, off otherwise — disabled is a
 // supported state, the cases still queue and the inbox detectors raise their
 // items as before.

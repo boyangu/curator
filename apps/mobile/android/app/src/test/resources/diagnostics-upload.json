@@ -1,0 +1,18 @@
+{
+	"installId": "3f0c8a52-6f0e-4a3c-9c53-0f2f6d0f7a11",
+	"appVersion": "0.4.0",
+	"device": "Sony XQ-EC72 (Android 16)",
+	"records": [
+		{ "n": 41, "ts": 1764050400123, "level": "info", "proc": "phone-core", "area": "cloud-sync", "msg": "sync cycle", "data": { "pulled": 12, "pushed": 1 } },
+		{ "n": 42, "ts": 1764050400456, "level": "warn", "proc": "phone-ui", "area": "player", "msg": "play refused" },
+		{
+			"n": 43,
+			"ts": 1764050401000,
+			"level": "error",
+			"proc": "phone-ui",
+			"area": "crash",
+			"msg": "uncaught on main",
+			"err": { "name": "java.lang.IllegalStateException", "message": "no \"library\"", "stack": "at app.curator.mobile.Main.kt:1\nat …" }
+		}
+	]
+}

@@ -17,6 +17,7 @@
 		"db:migrate": "tsx src/cli/migrate.ts",
 		"snapshot": "tsx src/cli/snapshot.ts",
 		"local": "tsx --env-file-if-exists=../../.env src/cli/local.ts",
+		"worker": "tsx --env-file-if-exists=../../.env src/cli/cloud-worker.ts",
 		"catalog": "tsx --env-file-if-exists=../../.env src/cli/catalog.ts",
 		"backoffice": "tsx --env-file-if-exists=../../.env src/cli/backoffice.ts",
 		"test": "vitest run",

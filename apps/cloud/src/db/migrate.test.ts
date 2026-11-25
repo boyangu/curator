@@ -21,6 +21,7 @@ const USER_TABLES = [
 	'request_log',
 	'spotify_grant',
 	'catalog_watch',
+	'client_log',
 ];
 
 // The Global Catalog (sql/0011): shared across accounts, reachable only as curator_api.

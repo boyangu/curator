@@ -11,6 +11,7 @@ import { createServer } from 'node:http';
 import { createBackofficeHandler } from '../backoffice/handler.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
+import { fromThisMachinesPages } from './loopback.js';
 
 const PORT = Number(process.env.CURATOR_BACKOFFICE_PORT ?? 8790);
 const localPort = process.env.CURATOR_LOCAL_CLOUD_PORT ?? '8787';
@@ -25,8 +26,8 @@ const db = createPostgresDb(url, { max: 4 });
 const backoffice = createBackofficeHandler(db);
 // The page's one write path: the operator resolving inbox items and asking for
 // a check. Only those ops reach the cloud from here; the rest of the back
-// office stays the CLI's. A check only makes cursors due: the cloud's worker
-// reads them, under its own budgets.
+// office stays the CLI's. A check only makes cursors due: the desktops
+// and the upkeep (cli/cloud-worker.ts) read them, under their own budgets.
 const PAGE_OPS: readonly (keyof AdminOps)[] = ['inboxList', 'inboxCounts', 'inboxGet', 'inboxDecide', 'inboxSnooze', 'trackingCheck'];
 const admin = adminOps(db, {});
 const handler = async (req: Request): Promise<Response> => {
@@ -46,6 +47,10 @@ const handler = async (req: Request): Promise<Response> => {
 
 const server = createServer((req, res) => {
 	void (async () => {
+		if (!fromThisMachinesPages({ method: req.method ?? 'GET', host: req.headers.host, contentType: req.headers['content-type'] }, PORT)) {
+			res.writeHead(403).end();
+			return;
+		}
 		const chunks: Buffer[] = [];
 		for await (const c of req) chunks.push(c as Buffer);
 		const body = chunks.length && req.method !== 'GET' ? Buffer.concat(chunks) : null;

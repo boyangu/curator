@@ -1,4 +1,4 @@
-// The reasoner pass (worker/main.ts, cli/local.ts): queued cases, a few per
+// The reasoner pass (worker/pass.ts): queued cases, a few per
 // pass, each in three steps that never share a transaction — the evidence
 // pack in one short tx, the model call outside any tx (PGlite has one
 // connection; a model call inside a tx would hold the local server for the

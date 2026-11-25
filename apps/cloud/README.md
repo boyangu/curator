@@ -271,6 +271,20 @@ Analysis one device computed, shared with the same user's other devices (workstr
 
 **Stages (D-a / D-b)** are the `CURATOR_CATALOGUE` setting, not code. D-a (now, Supabase Free): `rhythm,key,structure,advanced,fingerprint,peaks:lo`; hi peaks and vectors are refused as `unit_disabled`. D-b (after a plan upgrade): add `peaks:hi,vectors` in `fly.toml`, raise the account's `quota_bytes`, release. The server advertises its policy in `health` (`features` lists `catalogue`, `catalogue.policy` names the units) and on every inventory page; the desktop uploads and hydrates only what it allows. With the setting off, `features` omits `catalogue` and the procedures answer `catalogue_disabled`.
 
+## Global Catalog upkeep (`pnpm cloud:worker`)
+
+The cloud runs no worker. Sources are read by the desktops (`catalog.workerDue` / `workerReport`, applied by the API, which raises the feed's events) and by the upkeep (`src/worker/pass.ts`: identity, store links, fills, label profiles, detectors, the reasoner), which the operator runs from their own machine against this database: `pnpm cloud:worker`, or `--once`, or `--once --only "trackers"`. It serves the back office and the `catalog` CLI's `/admin` on `127.0.0.1:8787` while it runs.
+
+It connects as `curator_worker` (`sql/roles.sql`: the catalogue's tables, device names, nothing of a library). Once, as `postgres`: `alter role curator_worker with password '<generate 32+ random chars>';`, then `CURATOR_WORKER_DATABASE_URL` in the root `.env` (`.env.example`).
+
+The catalogue is filled once from the local one: `pnpm cloud:catalog-push` (one transaction; rehearse with `--to-pglite`).
+
+## Phone logs (`client_logs`, `sql/0036_client_log.sql`)
+
+A phone whose owner allows it sends its log (`diagnostics.upload`). Kept 7 days; only the owner reads it: `pnpm cloud:logs [--since 2h] [--level warn] [--follow]`. Not gated on the device, so one that was removed can still report.
+
+**Release order:** migration `0036` → `roles.sql` → cloud release → the phone.
+
 ## Spotify gateway (`spotify_gateway`, `sql/0010_spotify_grant.sql`)
 
 The account's Spotify grant lives here, not on any device (decision 2026-10-25; the protocol is `packages/protocol/src/spotify-gateway.ts`). Every device signs in to Spotify once through it and asks it for short-lived access tokens. One holder of the refresh token also ends the refresh race: Spotify may rotate the refresh token on every refresh, and two holders refreshing on their own strand one of them. Stage 1 is sign-in and token vending only; nothing here reads the user's library or writes to Spotify, and the desktop-only rule for Spotify writes (root `CLAUDE.md`) still stands.

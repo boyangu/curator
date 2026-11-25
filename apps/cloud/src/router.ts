@@ -75,7 +75,9 @@ import * as workers from './catalog/workers.js';
 import { ZCatalogConnectAnswerInput, ZCatalogConnectQueueInput, ZCatalogConnectSearchInput, type CatalogConnectAnswerResult, type CatalogConnectQueueResult, type CatalogConnectSearchResult } from '@curator/protocol';
 import { ZCatalogWorkerDueInput, ZCatalogWorkerReportInput, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
 import { ZCatalogTracksInput, type CatalogTracksResult } from '@curator/protocol';
+import { ZDiagnosticsUploadInput, type DiagnosticsUploadResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
+import { storeClientLog } from './diagnostics.js';
 import { CloudError } from './errors.js';
 import { BaseInvariantError } from './sync/base.js';
 import { batchAbort, batchBegin, batchCommit, batchPush, type BatchDeps } from './sync/batch.js';
@@ -326,6 +328,16 @@ export const appRouter = router({
 			const r = await revokeDevice(ctx.deps.db, ctx.user.id, input.deviceId, callerOf(ctx));
 			ctx.call.audit('device_revoked', {}, { deviceId: input.deviceId });
 			return r;
+		}),
+	}),
+
+	// 'client_logs' (src/diagnostics.ts): no device gate, on purpose.
+	// request_log: ops_in = records sent.
+	diagnostics: router({
+		upload: authedProcedure.input(ZDiagnosticsUploadInput).mutation(async ({ ctx, input }): Promise<DiagnosticsUploadResult> => {
+			ctx.call.opsIn = input.records.length;
+			rateLimit(ctx, 'clientLog', `${ctx.user.id}:${input.installId}`);
+			return storeClientLog(ctx.deps.db, ctx.user.id, input);
 		}),
 	}),
 

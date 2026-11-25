@@ -12,6 +12,8 @@
     "release:mobile": "node scripts/release-mobile.mjs",
     "cloud:rotate-db-password": "node scripts/rotate-cloud-db-password.mjs",
     "cloud:db-apply": "node scripts/cloud-db-apply.mjs",
+    "cloud:worker": "pnpm --filter @curator/cloud worker",
+    "cloud:logs": "node scripts/cloud-logs.mjs",
     "cloud:catalog-push": "node scripts/cloud-catalog-push.mjs",
     "cloud:export-ops": "node scripts/cloud-export-ops.mjs",
     "cloud:set-token-key": "node scripts/cloud-set-token-key.mjs",

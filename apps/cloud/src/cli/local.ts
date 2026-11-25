@@ -5,7 +5,12 @@
 // One process runs what production splits in two: the API (only the
 // catalog.* and feed.* procedures matter; the desktop's library sync keeps
 // talking to the real cloud, see apps/desktop CURATOR_CATALOG_API_URL) and the
-// worker's tracking pass + identity planner every minute.
+// upkeep pass (worker/pass.ts) every minute.
+//
+// Its catalogue was moved to the cloud once (scripts/cloud-catalog-push.mjs).
+// The data folder then holds a MIGRATED file, and this refuses to open it: a
+// second copy that keeps growing is one nothing reads any more. Trying things
+// locally takes a folder of its own (CURATOR_LOCAL_CLOUD_DIR).
 //
 // The database is PGlite with the Supabase shim, persisted on disk
 // (CURATOR_LOCAL_CLOUD_DIR, default ~/.curator-local-cloud): follows and the
@@ -14,9 +19,7 @@
 // (CURATOR_SUPABASE_URL from the repo .env), and the user's id gets its
 // auth.users row here on first sight, which the shim's foreign keys need.
 //
-// Providers: Deezer (key-less) always; Spotify app credentials only when
-// CURATOR_SPOTIFY_APP_CLIENT_SECRET is in the environment (the id is
-// CURATOR_SPOTIFY_APP_CLIENT_ID, else the desktop's CURATOR_SPOTIFY_CLIENT_ID).
+// Providers: worker/pass.ts.
 // Spotify playlists need a person's login. The local catalogue keeps one of
 // its own, signed in from the back office (local-spotify.ts), so it reads them
 // with nothing else running. Without it, a dev desktop's current access token
@@ -37,35 +40,11 @@ import { createFetchHandler } from '../app.js';
 import { createBackofficeHandler, type WorkerStatus } from '../backoffice/handler.js';
 import { AuditWriter } from '../audit.js';
 import { createTokenVerifier, remoteKeys } from '../auth/jwt.js';
-import { DeezerFinder, runIsrcFill, runPlanner, runRecordingResolver, SpotifyFinder, type IdentityFinder } from '../catalog/planner.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
-import { runLabelProfiler } from '../catalog/profile/label-profiler.js';
-import { runCataloguePlaylists } from '../catalog/profile/catalogue-playlists.js';
-import { runBackfill } from '../catalog/trackers/backfill.js';
-import { BandcampTracker } from '@curator/catalog-readers';
-import { BeatportTracker } from '@curator/catalog-readers';
-import { DeezerTracker } from '@curator/catalog-readers';
-import { SoundCloudTracker } from '@curator/catalog-readers';
-import { YouTubeTracker } from '@curator/catalog-readers';
-import { soundcloudCredentials, tidalCredentials } from '../config.js';
-import { runInboxDetectors } from '../catalog/inbox-detectors.js';
 import { agentReasonerConfig, describeReasoner, reasonerModel } from '../catalog/agent/config.js';
-import { runAgentReasoner } from '../catalog/agent/reasoner.js';
 import { loadLocalLibrary, type LocalLibrary } from '../catalog/local-library.js';
-import { runLabelDedupe } from '../catalog/label-related.js';
-import { runReleaseFiller } from '../catalog/release-fill.js';
-import { runCreditFill } from '../catalog/credit-fill.js';
-import { runPageValidation } from '../catalog/artist-validation.js';
-import { audienceReaders, runAudience } from '../catalog/audience.js';
-import { runReachScores } from '../catalog/reach.js';
-import { LastfmReader } from '@curator/catalog-readers';
-import { runStoreLinker } from '../catalog/store-links.js';
-import { AppleLookup } from '../catalog/trackers/apple.js';
-import { TidalApp } from '../catalog/trackers/tidal-app.js';
-import { SpotifyTracker } from '@curator/catalog-readers';
 import { SpotifyUserPlaylistTracker } from '@curator/catalog-readers';
 import { createLocalSpotifyLogin } from './local-spotify.js';
-import { runTrackers } from '../catalog/trackers/sweep.js';
 import type { TrackerAdapter } from '@curator/catalog-readers';
 import { findSqlDir, migrate } from '../db/migrate.js';
 import { toNodeListener } from '../http.js';
@@ -76,8 +55,9 @@ import { DEFAULT_PULL_OPTIONS } from '../sync/pull.js';
 import { pgliteDb, STORAGE_SQL } from '../test/harness.js';
 import { SUPABASE_SHIM_SQL } from '../test/supabase-shim.js';
 
-import { appCredentialsToken, watcherPlaylistToken } from '../catalog/spotify-app-token.js';
-import { createSpotifyPace } from '../catalog/spotify-pace.js';
+import { watcherPlaylistToken } from '../catalog/spotify-app-token.js';
+import { readersFromEnv, runPass } from '../worker/pass.js';
+import { fromThisMachinesPages } from './loopback.js';
 const PORT = Number(process.env.CURATOR_LOCAL_CLOUD_PORT ?? 8787);
 const PASS_EVERY_MS = 60_000;
 
@@ -115,6 +95,11 @@ if (process.argv.includes('--stop')) {
 	process.exit(1);
 }
 rmSync(stopPath, { force: true });
+
+if (existsSync(join(dir, 'MIGRATED'))) {
+	console.error(`The catalogue in ${dir} was moved to the cloud: run \`pnpm cloud:worker\` for its upkeep, or set CURATOR_LOCAL_CLOUD_DIR to a new folder.`);
+	process.exit(1);
+}
 
 // One process per data folder: PGlite is single-process, and a second copy
 // opening the same folder can corrupt it. The lock names the holder's pid;
@@ -179,6 +164,7 @@ async function analyze(): Promise<void> {
 }
 await analyze();
 
+const readers = readersFromEnv(process.env, db);
 const audit = new AuditWriter({ db, log });
 audit.start();
 const handler = createFetchHandler({
@@ -194,55 +180,22 @@ const handler = createFetchHandler({
 	batch: DEFAULT_BATCH_OPTIONS,
 	spotify: null,
 	catalog: true,
-	connectSoundcloud: soundcloudCredentials(process.env) ? new SoundCloudTracker(soundcloudCredentials(process.env)!) : null,
+	connectSoundcloud: readers.soundcloud,
 });
-
-// Beatport's pages (labels, genre charts) and Bandcamp too, unless switched off.
-const beatport = process.env.CURATOR_FEED_BEATPORT !== '0';
-const bandcamp = process.env.CURATOR_FEED_BANDCAMP !== '0';
-const adapters: TrackerAdapter[] = [new DeezerTracker(), ...(beatport ? [new BeatportTracker()] : []), ...(bandcamp ? [new BandcampTracker()] : [])];
-const finders: IdentityFinder[] = [new DeezerFinder()];
-let spotify: SpotifyTracker | null = null;
-// Spotify allows one app per developer, so the app credentials' id is the
-// desktop's PKCE client id unless set apart.
-const spotifyId = (process.env.CURATOR_SPOTIFY_APP_CLIENT_ID || process.env.CURATOR_SPOTIFY_CLIENT_ID)?.trim();
-const spotifySecret = process.env.CURATOR_SPOTIFY_APP_CLIENT_SECRET?.trim();
-// One pace for every Spotify read this process makes (catalog/spotify-pace.ts):
-// the client id is the desktop's, so its ban is ours and our share of the
-// window is kept small. The database opens further down; the pace reads it
-// on its first call.
-const spotifyPace = createSpotifyPace({ db: () => db });
-if (spotifyId && spotifySecret) {
-	spotify = new SpotifyTracker({ token: appCredentialsToken({ clientId: spotifyId, clientSecret: spotifySecret }) }, spotifyPace.fetch);
-	adapters.push(spotify);
-	finders.push(new SpotifyFinder(spotify));
-}
 
 // The back office (cli/catalog.ts) reaches this process's database here:
 // PGlite is single-process, so the CLI cannot open it beside the server.
 // Loopback only, no auth, dev only — like the rest of this file. The app's
 // Spotify lets `label link` name a playlist it attaches.
-const tidalCreds = tidalCredentials(process.env);
-const tidal = tidalCreds ? new TidalApp(tidalCreds) : null;
-const apple = process.env.CURATOR_FEED_APPLE !== '0' ? new AppleLookup() : null;
-// A library's releases read in full from their stores (release-fill.ts).
-const fillFetchers = {
-	spotify,
-	tidal,
-	apple,
-	deezer: (adapters.find((a) => a instanceof DeezerTracker) as DeezerTracker | undefined) ?? null,
-	beatport: (adapters.find((a) => a instanceof BeatportTracker) as BeatportTracker | undefined) ?? null,
-	bandcamp: (adapters.find((a) => a instanceof BandcampTracker) as BandcampTracker | undefined) ?? null,
-};
 // The catalogue reasoner (catalog/agent): on with CURATOR_ANTHROPIC_API_KEY in the root .env.
 const agentCfg = agentReasonerConfig(process.env);
-const agentModel = agentCfg ? reasonerModel(agentCfg) : null;
+const agent = agentCfg ? { model: reasonerModel(agentCfg), cfg: agentCfg } : null;
 console.log(`Reasoner: ${describeReasoner(agentCfg)}`);
-const admin = adminOps(db, { spotify, tidal, apple }, { pass: () => freshPass(), kick: () => void pass(), agent: agentCfg && agentModel ? { model: agentModel, cfg: agentCfg } : null });
+const admin = adminOps(db, readers.stores, { pass: () => freshPass(), kick: () => void pass(), agent });
 const adminHandler = async (req: Request): Promise<Response> => {
 	try {
 		const { op, args } = (await req.json()) as { op: keyof AdminOps; args: never };
-		if (!(op in admin)) return Response.json({ ok: false, error: `unknown op ${String(op)}` }, { status: 400 });
+		if (!Object.hasOwn(admin, op)) return Response.json({ ok: false, error: `unknown op ${String(op)}` }, { status: 400 });
 		return Response.json({ ok: true, result: await admin[op](args) });
 	} catch (e) {
 		return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
@@ -294,8 +247,8 @@ const playlistReader = new SpotifyUserPlaylistTracker({
 		if (!token) throw new Error('no Spotify login: connect one in the back office, or run the dev desktop');
 		return token;
 	}),
-}, spotifyPace.fetch);
-const trackerAdapters = (): TrackerAdapter[] => (spotifyLogin.connected() || liveUserToken() ? [...adapters, playlistReader] : adapters);
+}, readers.spotifyFetch);
+const trackerAdapters = (): TrackerAdapter[] => (spotifyLogin.connected() || liveUserToken() ? [...readers.adapters, playlistReader] : readers.adapters);
 
 // `worker` is the page's answer to "why has my check not run yet".
 const worker: WorkerStatus = { running: false, step: null, stepStartedAt: null, startedAt: null, finishedAt: null, steps: [], lastPass: null };
@@ -320,7 +273,10 @@ const backoffice = createBackofficeHandler(db, {
 // is made on first sight (the token is still verified by the API itself).
 const seen = new Set<string>();
 const withUser = async (req: Request): Promise<Response> => {
-	if (new URL(req.url).pathname === '/admin' && req.method === 'POST') return adminHandler(req);
+	if (new URL(req.url).pathname === '/admin' && req.method === 'POST') {
+		if (!fromThisMachinesPages({ method: req.method, host: req.headers.get('host'), contentType: req.headers.get('content-type') }, PORT)) return new Response('not from here', { status: 403 });
+		return adminHandler(req);
+	}
 	if (new URL(req.url).pathname === '/local/spotify-user-token' && req.method === 'POST') {
 		// JSON only: a web page cannot send that here without a preflight, which
 		// this server does not answer. Nothing reads the token back.
@@ -361,24 +317,9 @@ server.listen(PORT, '127.0.0.1', () => {
 	console.log(`Desktop: set CURATOR_CATALOG_API_URL=http://127.0.0.1:${PORT} and run pnpm dev.`);
 });
 
-const youtubeKey = process.env.CURATOR_YOUTUBE_API_KEY?.trim();
-if (youtubeKey) adapters.push(new YouTubeTracker(youtubeKey));
-const sc = soundcloudCredentials(process.env);
-if (sc) adapters.push(new SoundCloudTracker(sc));
-// An artist's audience at each store, for its Reach score: Spotify's public
-// pages too, unless switched off; Last.fm with CURATOR_LASTFM_API_KEY.
-const lastfmKey = process.env.CURATOR_LASTFM_API_KEY?.trim();
-const audience = audienceReaders({
-	deezer: fillFetchers.deezer,
-	tidal,
-	soundcloud: (adapters.find((a) => a instanceof SoundCloudTracker) as SoundCloudTracker | undefined) ?? null,
-	youtube: (adapters.find((a) => a instanceof YouTubeTracker) as YouTubeTracker | undefined) ?? null,
-	lastfm: lastfmKey ? new LastfmReader(lastfmKey) : null,
-	spotifyPages: process.env.CURATOR_FEED_SPOTIFY_PAGES !== '0',
-});
-console.log(`Trackers: ${adapters.map((a) => a.provider).join(', ')}`);
-console.log(`Store links by UPC/ISRC: ${[spotify && 'spotify', tidal && 'tidal', apple && 'apple'].filter(Boolean).join(', ') || 'none'}${tidal ? '' : ' (no CURATOR_TIDAL_CLIENT_ID/SECRET)'}`);
-if (!(spotifyId && spotifySecret)) {
+console.log(`Trackers: ${readers.adapters.map((a) => a.provider).join(', ')}`);
+console.log(`Store links by UPC/ISRC: ${Object.entries(readers.stores).filter(([, r]) => r).map(([name]) => name).join(', ') || 'none'}${readers.stores.tidal ? '' : ' (no CURATOR_TIDAL_CLIENT_ID/SECRET)'}`);
+if (!readers.spotify) {
 	console.log(
 		'No Spotify app credentials: artists followed on Spotify are not tracked, and Discover shows Spotify releases only.\n' +
 			'  Add CURATOR_SPOTIFY_APP_CLIENT_SECRET (and CURATOR_SPOTIFY_CLIENT_ID, if missing) to the root .env and restart.',
@@ -395,40 +336,7 @@ function pass(): Promise<void> {
 	worker.startedAt = Date.now();
 	worker.steps = [];
 	current = (async () => {
-		stepTo('trackers');
-		await runTrackers({ db, log, adapters: trackerAdapters(), holder: 'local' }).catch((e: unknown) => log.error('tracker_pass_failed', { error: e }));
-		stepTo('identity planner');
-		await runPlanner({ db, log, finders }).catch((e: unknown) => log.error('identity_pass_failed', { error: e }));
-		stepTo('page validation');
-		await runPageValidation({ db, log, reader: fillFetchers.deezer }).catch((e: unknown) => log.error('page_validation_failed', { error: e }));
-		stepTo('audience');
-		await runAudience({ db, log, readers: audience, holder: 'local' }).catch((e: unknown) => log.error('audience_pass_failed', { error: e }));
-		stepTo('reach scores');
-		await runReachScores({ db, log }).catch((e: unknown) => log.error('reach_pass_failed', { error: e }));
-		stepTo('recording resolver');
-		if (spotify) await runRecordingResolver({ db, log, spotify }).catch((e: unknown) => log.error('recording_resolve_failed', { error: e }));
-		stepTo('isrc fill');
-		if (spotify) await runIsrcFill({ db, log, spotify }).catch((e: unknown) => log.error('isrc_fill_failed', { error: e }));
-		stepTo('store links');
-		await runStoreLinker({ db, log, readers: { spotify, tidal, apple } }).catch((e: unknown) => log.error('store_link_pass_failed', { error: e }));
-		stepTo('release fill');
-		await runReleaseFiller({ db, log, fetchers: fillFetchers, holder: 'local' }).catch((e: unknown) => log.error('release_fill_pass_failed', { error: e }));
-		stepTo('track credits');
-		await runCreditFill({ db, log, spotify, beatport: fillFetchers.beatport }).catch((e: unknown) => log.error('credit_fill_pass_failed', { error: e }));
-		stepTo('label profiles');
-		await runLabelProfiler({ db, log, spotify, providers: { beatport, bandcamp }, batch: 10 }).catch((e: unknown) => log.error('label_profile_pass_failed', { error: e }));
-		stepTo('backfill');
-		await runBackfill({ db, log, adapters, holder: 'local', batch: 20 }).catch((e: unknown) => log.error('catalog_backfill_failed', { error: e }));
-		stepTo('catalogue playlists');
-		await runCataloguePlaylists({ db, log, spotify, holder: 'local', batch: 10 }).catch((e: unknown) => log.error('catalogue_playlists_pass_failed', { error: e }));
-		stepTo('label dedupe');
-		if (process.env.CURATOR_DEBUG_PASS === '1') log.info('pass_step', { step: 'label-dedupe' });
-		await runLabelDedupe({ db, log }).catch((e: unknown) => log.error('label_dedupe_pass_failed', { error: e }));
-		stepTo('inbox detectors');
-		if (process.env.CURATOR_DEBUG_PASS === '1') log.info('pass_step', { step: 'detectors' });
-		await runInboxDetectors({ db, log, agent: agentModel !== null }).catch((e: unknown) => log.error('inbox_detectors_failed', { error: e }));
-		stepTo('reasoner');
-		if (agentCfg && agentModel) await runAgentReasoner({ db, log, model: agentModel, cfg: agentCfg, holder: 'local' }).catch((e: unknown) => log.error('agent_reasoner_failed', { error: e }));
+		await runPass({ db, log, holder: 'local', readers, adapters: trackerAdapters, agent }, { onStep: stepTo });
 		if (Date.now() - analyzedAt > ANALYZE_EVERY_MS) await analyze().catch((e: unknown) => log.error('analyze_failed', { error: e }));
 	})().finally(() => {
 		current = null;

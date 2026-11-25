@@ -111,13 +111,20 @@ async function verify(sql) {
 			exists (select 1 from storage.buckets where id = 'catalogue' and public = false) as bucket,
 			(select count(*)::int from pg_policies where schemaname = 'storage' and tablename = 'objects' and policyname like 'curator_catalogue%') as policies,
 			(select count(*)::int from curator.catalogue_account) as entitled_accounts,
-			coalesce((select relrowsecurity from pg_class where oid = to_regclass('curator.spotify_grant')), false) as spotify_rls`;
+			coalesce((select relrowsecurity from pg_class where oid = to_regclass('curator.spotify_grant')), false) as spotify_rls,
+			(select count(*)::int from pg_policies where schemaname = 'curator' and tablename = 'catalog_watch' and policyname = 'catalog_watch_service' and roles @> array['curator_api', 'curator_worker']::name[]) as watch_policy,
+			has_table_privilege('curator_worker', 'curator.catalog_object', 'update') as worker_grant,
+			has_function_privilege('curator_api', 'curator.log_client(uuid, uuid, text, text, jsonb, int)', 'execute') as client_log_grant`;
 	rows.push(['roles.sql grants (API role)', g.gate_grant && g.log_grant]);
 	rows.push(['storage bucket "catalogue", private', g.bucket]);
 	rows.push([`storage policies (${g.policies} of 3)`, g.policies === 3]);
 	rows.push([`catalogue accounts entitled (${g.entitled_accounts})`, g.entitled_accounts > 0]);
 	// 0010: the Spotify grant holds sealed tokens; RLS is its second wall.
 	rows.push(['curator.spotify_grant under RLS', g.spotify_rls]);
+	// Without it the API finds no watch: no work for the desktops, an empty feed.
+	rows.push(['catalogue watches readable by the API and the upkeep', g.watch_policy === 1]);
+	rows.push(['roles.sql grants (upkeep role)', g.worker_grant]);
+	rows.push(['phone logs writable by the API', g.client_log_grant]);
 	return rows;
 }
 

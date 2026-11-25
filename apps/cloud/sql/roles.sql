@@ -1,4 +1,5 @@
--- The API's login role. Run once as `postgres` in the Supabase SQL editor AFTER the migrations
+-- The login roles: the API's (`curator_api`), and the one the catalogue's upkeep runs as from the
+-- operator's own machine (`curator_worker`, `pnpm cloud:worker`). Run once as `postgres` in the Supabase SQL editor AFTER the migrations
 -- (it grants on objects they create), and again after any migration that adds a function the API
 -- calls directly. Re-runnable: every statement is idempotent.
 --
@@ -9,7 +10,11 @@
 -- per forged claim at most, never a policy bypass, and never DDL. The service-role key and the
 -- `postgres` password stay out of the API entirely.
 --
--- No password here: set it separately so it never lands in the repo, e.g.
+-- `curator_worker` is the same shape (NOINHERIT, switches to `authenticated` to move a watcher's
+-- rows when two objects merge) with its own password, so the operator's machine never holds the
+-- API's, and a longer statement timeout: its passes sweep the whole catalogue.
+--
+-- No passwords here: set them separately so they never land in the repo, e.g.
 --   alter role curator_api with password '<generated, 32+ chars>';
 -- then build DATABASE_URL from it (README "Database setup").
 
@@ -18,14 +23,18 @@ begin
 	if not exists (select 1 from pg_roles where rolname = 'curator_api') then
 		create role curator_api login;
 	end if;
+	if not exists (select 1 from pg_roles where rolname = 'curator_worker') then
+		create role curator_worker login;
+	end if;
 end
 $$;
 
 alter role curator_api with login noinherit;
+alter role curator_worker with login noinherit;
 
 -- Supabase's `postgres` is not a superuser, and Postgres refuses to even name
 -- SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE from a non-superuser
--- (42501), so the role cannot be stripped of them here. They are off for any
+-- (42501), so the roles cannot be stripped of them here. They are off for any
 -- role `create role` makes, and a non-superuser could never have granted them;
 -- this asserts it instead, so a pre-existing over-powered role fails the
 -- script rather than serving the API.
@@ -33,19 +42,21 @@ do $$
 declare
 	r pg_roles%rowtype;
 begin
-	select * into r from pg_roles where rolname = 'curator_api';
-	if r.rolsuper or r.rolreplication or r.rolbypassrls or r.rolcreaterole or r.rolcreatedb or r.rolinherit or not r.rolcanlogin then
-		raise exception 'curator_api has unexpected attributes (super %, replication %, bypassrls %, createrole %, createdb %, inherit %, login %); drop and recreate it',
-			r.rolsuper, r.rolreplication, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolinherit, r.rolcanlogin;
-	end if;
+	for r in select * from pg_roles where rolname in ('curator_api', 'curator_worker') loop
+		if r.rolsuper or r.rolreplication or r.rolbypassrls or r.rolcreaterole or r.rolcreatedb or r.rolinherit or not r.rolcanlogin then
+			raise exception '% has unexpected attributes (super %, replication %, bypassrls %, createrole %, createdb %, inherit %, login %); drop and recreate it',
+				r.rolname, r.rolsuper, r.rolreplication, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb, r.rolinherit, r.rolcanlogin;
+		end if;
+	end loop;
 end
 $$;
 
--- Membership is what lets the API `set role authenticated`; with NOINHERIT it confers nothing
+-- Membership is what lets them `set role authenticated`; with NOINHERIT it confers nothing
 -- until that switch happens.
 grant authenticated to curator_api;
+grant authenticated to curator_worker;
 
-grant usage on schema curator to curator_api;
+grant usage on schema curator to curator_api, curator_worker;
 
 -- The sweeps' cross-user reads and the compaction writers, ids and counts only, so never
 -- `authenticated`. Conditional so this script still runs on a database that has not had the
@@ -74,7 +85,7 @@ end
 $$;
 
 -- The Global Catalog (sql/0011_catalog.sql): shared across accounts, so no `authenticated` grant at
--- all; the API and the worker read and write it as this role, outside any user transaction, and
+-- all; the API and the upkeep worker read and write it as these roles, outside any user transaction, and
 -- what a user may see leaves through the tRPC procedures only (src/catalog). The deliberate
 -- exception to "no privileges of its own": these rows belong to no user, so RLS has nothing to
 -- judge. catalog_watch is the per-user table among them: written as the user (RLS), read here by
@@ -93,17 +104,29 @@ begin
 		'catalog_connect_vote', 'catalog_page_check', 'catalog_name_lookup'
 	] loop
 		if to_regclass('curator.' || t) is not null then
-			execute format('grant select, insert, update, delete on curator.%I to curator_api', t);
+			execute format('grant select, insert, update, delete on curator.%I to curator_api, curator_worker', t);
 		end if;
 	end loop;
 	if to_regclass('curator.catalog_watch') is not null then
-		grant select on curator.catalog_watch to curator_api;
+		grant select on curator.catalog_watch to curator_api, curator_worker;
+		-- RLS is on there with policies for `authenticated` alone, and NOINHERIT keeps those from
+		-- applying to a login role: without one of its own, the fan-out (feed.events) and the
+		-- lease (workerDue) would find no watch at all, silently.
+		drop policy if exists catalog_watch_service on curator.catalog_watch;
+		create policy catalog_watch_service on curator.catalog_watch for select to curator_api, curator_worker using (true);
+	end if;
+	-- The back office names the desktop reading for a user (catalog/tracking.ts workersNow); it
+	-- runs beside the upkeep worker, and reads no other column of the account's devices.
+	if to_regclass('curator.device') is not null then
+		grant select (user_id, device_id, name) on curator.device to curator_worker;
+		drop policy if exists device_worker_names on curator.device;
+		create policy device_worker_names on curator.device for select to curator_worker using (true);
 	end if;
 	if to_regclass('curator.admin_user') is not null then
-		grant select on curator.admin_user to curator_api;
+		grant select on curator.admin_user to curator_api, curator_worker;
 	end if;
 	if to_regprocedure('curator.catalog_reserve_calls(text, integer, integer)') is not null then
-		grant execute on function curator.catalog_reserve_calls(text, integer, integer) to curator_api;
+		grant execute on function curator.catalog_reserve_calls(text, integer, integer) to curator_api, curator_worker;
 	end if;
 end
 $$;
@@ -115,12 +138,25 @@ grant execute on function curator.log_requests(jsonb) to curator_api;
 grant execute on function curator.log_audit_events(jsonb) to curator_api;
 grant execute on function curator.prune_request_log(interval) to curator_api;
 
+-- Phones' log records (sql/0036_client_log.sql): the same, write-only through definer functions.
+do $$
+begin
+	if to_regclass('curator.client_log') is not null then
+		grant execute on function curator.log_client(uuid, uuid, text, text, jsonb, int) to curator_api;
+		grant execute on function curator.prune_client_log(interval) to curator_api;
+	end if;
+end
+$$;
+
 -- The boot-time migration gate (sql/0003_migration_check.sql): the applied migration names, and
 -- no other access to curator.schema_migration.
-grant execute on function curator.applied_migrations() to curator_api;
+grant execute on function curator.applied_migrations() to curator_api, curator_worker;
 
 -- A runaway query should fail, not hold a pooled connection; the slowest legitimate statements are
 -- one chunk of a batch commit's move (sized by time to a few seconds, src/sync/batch.ts) and one
 -- compact_ops call (5,000 rows, src/sync/compact.ts).
 alter role curator_api set statement_timeout = '30s';
 alter role curator_api set idle_in_transaction_session_timeout = '60s';
+-- The upkeep passes (inbox detectors, label dedupe) read the catalogue whole.
+alter role curator_worker set statement_timeout = '5min';
+alter role curator_worker set idle_in_transaction_session_timeout = '60s';

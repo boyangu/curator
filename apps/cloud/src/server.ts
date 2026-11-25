@@ -12,6 +12,7 @@ import { createTokenVerifier, remoteKeys } from './auth/jwt.js';
 import { SoundCloudTracker } from '@curator/catalog-readers';
 import { loadConfig, soundcloudCredentials } from './config.js';
 import { createPostgresDb } from './db/db.js';
+import { pruneClientLog } from './diagnostics.js';
 import { migrationGate } from './db/migration-gate.js';
 import { toNodeListener } from './http.js';
 import { createLogger } from './log.js';
@@ -95,6 +96,9 @@ async function maintenance(): Promise<void> {
 		await pruneRequestLog(db)
 			.then((deleted) => log.info('request_log_pruned', { deleted }))
 			.catch((e: unknown) => log.error('request_log_prune_failed', { error: e }));
+		await pruneClientLog(db)
+			.then((deleted) => log.info('client_log_pruned', { deleted }))
+			.catch((e: unknown) => log.error('client_log_prune_failed', { error: e }));
 	}
 }
 

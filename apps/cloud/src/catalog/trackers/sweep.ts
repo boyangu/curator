@@ -1,4 +1,4 @@
-// The worker's tracking pass (src/worker/main.ts runs it every minute), and
+// The worker's tracking pass (src/worker/pass.ts runs it every minute), and
 // the pieces a desktop worker's polls go through (../workers.ts).
 //
 // Per enabled tracker (kind × provider) with an adapter on this worker:

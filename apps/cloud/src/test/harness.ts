@@ -67,6 +67,33 @@ export function pgliteDb(pg: PGlite): Db {
 	};
 }
 
+// The same database as one of sql/roles.sql's login roles sees it. PGlite's
+// session is a superuser's, which no grant or policy judges: an app run on it
+// passes while production reads nothing (2026-11-25: catalog_watch had no
+// policy for curator_api, so feed.events and workerDue came back empty there).
+// Every statement runs under the role, and `set role none` (system-tx.ts) goes
+// back to it rather than to the session's own.
+export function roleDb(pg: PGlite, role: 'curator_api' | 'curator_worker'): Db {
+	const under = (tx: Transaction): Queryable => {
+		const q = wrap(tx);
+		return {
+			query: (text, params) => q.query(text.replace(`set_config('role', 'none', true)`, `set_config('role', '${role}', true)`), params),
+			exec: q.exec,
+		};
+	};
+	const begin = <T>(fn: (tx: Queryable) => Promise<T>): Promise<T> =>
+		pg.transaction(async (tx) => {
+			await tx.query(`select set_config('role', $1, true)`, [role]);
+			return fn(under(tx));
+		}) as Promise<T>;
+	return {
+		query: (text, params) => begin((tx) => tx.query(text, params)),
+		exec: (text) => begin((tx) => tx.exec(text)),
+		begin,
+		close: () => pg.close(),
+	};
+}
+
 export type TestDb = {
 	pg: PGlite;
 	db: Db;
@@ -255,13 +282,16 @@ export async function createTestApp(
 	} = {},
 ): Promise<TestApp> {
 	const tdb = await createTestDb();
+	await tdb.db.exec(ROLES_SQL);
+	// What the app runs on; `tdb.db` stays the owner's, for seeding and asserting.
+	const apiDb = roleDb(tdb.pg, 'curator_api');
 	const keys = await createKeys();
 	const logs: TestApp['logs'] = [];
 	const log: Logger = createLogger((line) => logs.push(JSON.parse(line) as TestApp['logs'][number]));
-	const audit = new AuditWriter({ db: opts.auditDb ?? tdb.db, log, ...opts.auditOptions });
+	const audit = new AuditWriter({ db: opts.auditDb ?? apiDb, log, ...opts.auditOptions });
 	const spotify = opts.spotify === null ? null : (opts.spotify?.fake ?? new FakeSpotify());
 	const deps: AppDeps = {
-		db: tdb.db,
+		db: apiDb,
 		log,
 		auth: createTokenVerifier({ supabaseUrl: SUPABASE_URL, keys: keys.keys }),
 		// Generous by default so suites that are not about rate limits never
@@ -317,6 +347,7 @@ function defaultRateLimitsUnbounded(): RateLimits {
 		spotifyConnect: unbounded(),
 		catalogRead: unbounded(),
 		catalogWrite: unbounded(),
+		clientLog: unbounded(),
 	};
 }
 

@@ -113,7 +113,7 @@ export async function retimeCursors(tx: Queryable, userId: string, before: Catal
 }
 
 // The devices reading for their users this week, as the back office shows
-// them (cli/local.ts / worker/main.ts hand their own adapters in beside).
+// them (cli/local.ts / cloud-worker.ts hand their own adapters in beside).
 // `providers`: what the device can read right now; `trackers`: what its user
 // checked ('kind/provider'), null when it never said.
 // `cadence`: how often its user wants each kind read, null when it never said
