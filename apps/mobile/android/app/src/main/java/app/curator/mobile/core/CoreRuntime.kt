@@ -3,7 +3,7 @@ package app.curator.mobile.core
 import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.Log
+import app.curator.mobile.diag.DiagLog
 import androidx.annotation.Keep
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.BufferOverflow
@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -39,7 +40,7 @@ import java.util.concurrent.Executors
  * HTTP is the platform's (TLS, transparent gzip) on a small pool; answers go
  * back to the core's thread.
  */
-class CoreRuntime(private val context: Context) {
+class CoreRuntime(private val context: Context, private val onSession: (Account?) -> Unit) {
 	private val thread = HandlerThread("curator-core").apply { start() }
 	private val handler = Handler(thread.looper)
 	private val http = Executors.newFixedThreadPool(4)
@@ -66,7 +67,10 @@ class CoreRuntime(private val context: Context) {
 	init {
 		handler.post {
 			val bytes = context.assets.open("core.hbc").use { it.readBytes() }
-			if (!nativeCreate(bytes)) _phase.value = "failed"
+			if (!nativeCreate(bytes)) {
+				_phase.value = "failed"
+				DiagLog.e("core", "the bundle did not load")
+			}
 			runLoop()
 		}
 	}
@@ -109,7 +113,13 @@ class CoreRuntime(private val context: Context) {
 				lastSeq = e["lastSeq"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0,
 				pending = e["pending"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
 				error = (e["error"] as? JsonPrimitive)?.contentOrNull,
+				revoked = e["revoked"]?.jsonPrimitive?.booleanOrNull == true,
+				needsUpdate = e["needsUpdate"]?.jsonPrimitive?.booleanOrNull == true,
+				waiting = e["waiting"]?.jsonPrimitive?.booleanOrNull == true,
+				joining = e["joining"]?.jsonPrimitive?.booleanOrNull == true,
 			)
+			"session" -> onSession(e["account"]?.takeIf { it !is JsonNull }?.let { Json.decodeFromJsonElement(Account.serializer(), it) })
+			"log" -> (e["record"] as? JsonObject)?.let(DiagLog::record)
 			"feed" -> _feed.tryEmit(Unit)
 			"applied" -> _applied.tryEmit(Applied(tracks = e["tracks"]?.jsonPrimitive?.int ?: 0, playlists = e["playlists"]?.jsonPrimitive?.int ?: 0))
 		}
@@ -146,7 +156,7 @@ class CoreRuntime(private val context: Context) {
 			handler.post {
 				val handed = android.os.SystemClock.elapsedRealtime()
 				nativeHttpDone(id, status, bytes, error)
-				if ((bytes?.size ?: 0) > 1 shl 20) Log.d("curator-core", "http ${bytes!!.size shr 10} KB: fetch ${fetched - t0} ms, wait ${handed - fetched} ms, hand-over ${android.os.SystemClock.elapsedRealtime() - handed} ms")
+				if ((bytes?.size ?: 0) > 1 shl 20) DiagLog.d("core", "http ${bytes!!.size shr 10} KB: fetch ${fetched - t0} ms, wait ${handed - fetched} ms, hand-over ${android.os.SystemClock.elapsedRealtime() - handed} ms")
 				runLoop()
 			}
 		}
@@ -180,7 +190,8 @@ class CoreRuntime(private val context: Context) {
 	private external fun nativeHttpDone(id: Int, status: Int, body: ByteArray?, error: String?)
 	private external fun nativeRun(budgetMs: Int): Int
 
-	data class SyncStatus(val lastSeq: Long, val pending: Int, val error: String?)
+	/** [waiting]: the account has no library to bring here yet (its computer publishes it); [joining]: it is being brought, row by row. */
+	data class SyncStatus(val lastSeq: Long, val pending: Int, val error: String?, val revoked: Boolean, val needsUpdate: Boolean, val waiting: Boolean, val joining: Boolean)
 	data class Applied(val tracks: Int, val playlists: Int)
 	class CoreError(message: String) : Exception(message)
 
@@ -193,7 +204,7 @@ class CoreRuntime(private val context: Context) {
 			// fbjni first: its JNI_OnLoad keeps the VM, which Hermes needs for
 			// Unicode work and its finalizer thread.
 			for (lib in listOf("fbjni", "jsi", "hermesvm", "curator")) System.loadLibrary(lib)
-			Log.i("curator-core", "native libraries loaded")
+			DiagLog.d("core", "native libraries loaded")
 		}
 	}
 }

@@ -25,6 +25,12 @@ fun config(name: String): String = System.getenv(name)?.takeIf { it.isNotBlank()
 // and each signing key's SHA-1 (Android packages, in Spotify's dashboard).
 val spotifyClientId = config("CURATOR_SPOTIFY_CLIENT_ID")
 
+// Curator's cloud, as the desktop build reads it. Empty: the app says it isn't
+// set up and goes no further.
+val cloudApiUrl = config("CURATOR_CLOUD_API_URL").trimEnd('/')
+val supabaseUrl = config("CURATOR_SUPABASE_URL").trimEnd('/')
+val supabaseKey = config("CURATOR_SUPABASE_PUBLISHABLE_KEY")
+
 // Where released builds look for their updates: the release list of the
 // GitHub repo ("owner/name") whose mobile-v* releases carry them
 // (scripts/release-mobile.mjs). CURATOR_MOBILE_UPDATE_FEED names another list
@@ -62,6 +68,11 @@ android {
 		buildConfigField("String", "SPOTIFY_CLIENT_ID", "\"$spotifyClientId\"")
 		buildConfigField("String", "SPOTIFY_REDIRECT_URI", "\"curator-mobile://spotify-callback\"")
 		buildConfigField("String", "UPDATE_FEED", "\"$updateFeed\"")
+		buildConfigField("String", "CLOUD_API_URL", "\"$cloudApiUrl\"")
+		buildConfigField("String", "SUPABASE_URL", "\"$supabaseUrl\"")
+		buildConfigField("String", "SUPABASE_PUBLISHABLE_KEY", "\"$supabaseKey\"")
+		// Only a development build may be pointed at another cloud (core/CloudConfig.kt).
+		buildConfigField("boolean", "DEV_SERVER", "${curatorVersion == null}")
 		// The auth library's redirect activity answers that URI.
 		manifestPlaceholders["redirectSchemeName"] = "curator-mobile"
 		manifestPlaceholders["redirectHostName"] = "spotify-callback"

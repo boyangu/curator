@@ -21,7 +21,8 @@ private val Context.viewStore by preferencesDataStore("view-state")
  * device by design (§3, §5): nothing here rides an op. The streaming service
  * too, as the desktop keeps its primary one (app_setting primary_streaming,
  * not an account setting): what a device can play through is its own.
- * Whether it updates itself too: each phone's choice.
+ * Whether it updates itself, and whether it sends its log, too: each phone's
+ * choice.
  */
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
@@ -29,6 +30,7 @@ class ViewState(private val context: Context) {
 	private val rotatedKey = booleanPreferencesKey("rotated-once")
 	private val streamingKey = stringPreferencesKey("streaming")
 	private val autoUpdateKey = booleanPreferencesKey("auto-update")
+	private val diagnosticsKey = booleanPreferencesKey("diagnostics")
 	private fun listKey(list: String) = stringPreferencesKey("list:$list")
 
 	@Serializable
@@ -78,6 +80,20 @@ class ViewState(private val context: Context) {
 
 	suspend fun setAutoUpdate(on: Boolean) {
 		context.viewStore.edit { it[autoUpdateKey] = on }
+	}
+
+	/** Send this phone's log to the account (diag/Uploader); on unless turned off. */
+	val diagnostics: Flow<Boolean> = context.viewStore.data.map { it[diagnosticsKey] ?: true }
+
+	suspend fun setDiagnostics(on: Boolean) {
+		context.viewStore.edit { it[diagnosticsKey] = on }
+	}
+
+	/** What was seen of a library that is gone from this phone; the phone's own choices stay. */
+	suspend fun forgetLibrary() {
+		context.viewStore.edit { p ->
+			for (k in p.asMap().keys) if (k.name == "recent" || k.name.startsWith("list:") || k.name.startsWith("pick:")) p.remove(k)
+		}
 	}
 
 	companion object {

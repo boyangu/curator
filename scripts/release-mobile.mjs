@@ -20,7 +20,8 @@
 //   CURATOR_MOBILE_KEYSTORE_PASSWORD  its password
 //   CURATOR_MOBILE_KEY_ALIAS          the key's alias (default: curator)
 //   CURATOR_MOBILE_UPDATE_REPO        owner/name of the repo the releases go to
-//   CURATOR_SPOTIFY_CLIENT_ID         baked into the build, as for the desktop
+//   CURATOR_SPOTIFY_CLIENT_ID, CURATOR_CLOUD_API_URL, CURATOR_SUPABASE_URL,
+//   CURATOR_SUPABASE_PUBLISHABLE_KEY  baked into the build, as for the desktop
 // The password reaches Gradle and keytool through their environment only;
 // it is never printed or passed on a command line.
 
@@ -72,6 +73,12 @@ async function main() {
 	if (!repo || !REPO_RE.test(repo)) fail('CURATOR_MOBILE_UPDATE_REPO is not set to owner/name (root .env or shell)');
 	// A published build plays Spotify: an unconfigured one would reach every installed app.
 	if (!env.CURATOR_SPOTIFY_CLIENT_ID?.trim()) fail('CURATOR_SPOTIFY_CLIENT_ID is not set (root .env or shell)');
+	// And signs in, to the cloud and nothing on this machine.
+	for (const name of ['CURATOR_CLOUD_API_URL', 'CURATOR_SUPABASE_URL', 'CURATOR_SUPABASE_PUBLISHABLE_KEY']) {
+		const value = env[name]?.trim();
+		if (!value) fail(`${name} is not set (root .env or shell)`);
+		if (name.endsWith('_URL') && !value.startsWith('https://')) fail(`${name} must be https:// in a release`);
+	}
 
 	const sdk = env.ANDROID_HOME ?? env.ANDROID_SDK_ROOT ?? (process.platform === 'win32' ? join(env.LOCALAPPDATA ?? '', 'Android', 'Sdk') : join(env.HOME ?? '', 'Android', 'Sdk'));
 	const tools = buildTools(sdk);
@@ -113,6 +120,9 @@ async function main() {
 			// The repo's own release list, never a test feed from the shell.
 			CURATOR_MOBILE_UPDATE_FEED: '',
 			CURATOR_SPOTIFY_CLIENT_ID: env.CURATOR_SPOTIFY_CLIENT_ID,
+			CURATOR_CLOUD_API_URL: env.CURATOR_CLOUD_API_URL,
+			CURATOR_SUPABASE_URL: env.CURATOR_SUPABASE_URL,
+			CURATOR_SUPABASE_PUBLISHABLE_KEY: env.CURATOR_SUPABASE_PUBLISHABLE_KEY,
 		};
 		run('pnpm', ['install', '--frozen-lockfile', '--filter', '@curator/mobile...'], { cwd: dir, env: buildEnv, shell: process.platform === 'win32' });
 		// No daemons: one left running from the export holds its files (its JDK

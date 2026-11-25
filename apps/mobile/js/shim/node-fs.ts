@@ -53,6 +53,6 @@ export function mkdirSync(path: string): void {
 export const openSync = unsupported('openSync');
 export const readSync = unsupported('readSync');
 export const closeSync = unsupported('closeSync');
-// migrate.ts's backups, which a phone's library never takes.
+// migrate.ts's backups, which a phone's library never takes (entry.ts setMigrationBackups).
 export const readdirSync = unsupported('readdirSync');
 export const unlinkSync = unsupported('unlinkSync');

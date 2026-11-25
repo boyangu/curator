@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@curator/protocol": "workspace:*",
+    "@curator/shared": "workspace:*",
     "@curator/sync-core": "workspace:*"
   },
   "devDependencies": {

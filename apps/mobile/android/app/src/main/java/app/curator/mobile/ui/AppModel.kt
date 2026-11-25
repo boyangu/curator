@@ -1,5 +1,8 @@
 package app.curator.mobile.ui
 
+import android.os.Build
+import app.curator.mobile.diag.DiagLog
+import app.curator.mobile.diag.Uploader
 import app.curator.mobile.CuratorApp
 import app.curator.mobile.data.Library
 import app.curator.mobile.data.ListQuery
@@ -29,6 +32,7 @@ import java.io.File
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * What every screen shares: the library (once open), a change counter the
@@ -73,6 +77,31 @@ class AppModel(val app: CuratorApp) {
 	/** Installs new releases: never mid-play, since an update restarts the app and the player follows the service from it. */
 	val updater = Updater(app, app.scope, autoUpdate, playing = { player.state.value.playing })
 
+	val diagnostics: StateFlow<Boolean> = viewState.diagnostics.stateIn(app.scope, SharingStarted.Eagerly, true)
+
+	fun setDiagnostics(on: Boolean) {
+		app.scope.launch { viewState.setDiagnostics(on) }
+	}
+
+	/** Sends this phone's log while its owner allows it. */
+	val logs = Uploader(
+		app.scope,
+		allowed = { diagnostics.value && app.account.value?.tokens != null },
+		apiUrl = app.cloud?.apiUrl,
+		appVersion = app.version,
+		device = "${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE})",
+		token = { (app.core.call("accessToken") as? JsonPrimitive)?.contentOrNull },
+	)
+
+	// ── the account ──
+
+	// A phone that was removed from the account signs in as a new device.
+	private suspend fun freshDevice() { if (app.core.status.value?.revoked == true) app.relink() }
+
+	suspend fun signInPassword(email: String, password: String) { freshDevice(); ask("signInPassword", "email" to JsonPrimitive(email), "password" to JsonPrimitive(password)) }
+	suspend fun requestCode(email: String) { ask("requestCode", "email" to JsonPrimitive(email)) }
+	suspend fun verifyCode(email: String, code: String) { freshDevice(); ask("verifyCode", "email" to JsonPrimitive(email), "code" to JsonPrimitive(code)) }
+
 	private val _lists = MutableStateFlow<Lists?>(null)
 	/**
 	 * Home's and Library's lists. Opening the app shows the copy kept on the
@@ -81,7 +110,7 @@ class AppModel(val app: CuratorApp) {
 	 * core start up), then the library's own, read again on every change.
 	 */
 	val lists: StateFlow<Lists?> = _lists
-	private val listsFile = File(app.filesDir, "lists.json")
+	private val listsFile = app.files.lists
 	private val json = Json { ignoreUnknownKeys = true }
 
 	/** The Feed tab's list: lives with the process, so a visit elsewhere keeps its place. */
@@ -134,7 +163,7 @@ class AppModel(val app: CuratorApp) {
 			val tmp = File(listsFile.path + ".part")
 			tmp.writeText(json.encodeToString(fresh))
 			tmp.renameTo(listsFile)
-		}.onFailure { android.util.Log.w("curator-ui", "keeping the lists failed", it) }
+		}.onFailure { DiagLog.w("ui", "keeping the lists failed", it) }
 	}
 
 	private suspend fun reloadMetrics(lib: Library) = withContext(Dispatchers.IO) {
@@ -147,7 +176,7 @@ class AppModel(val app: CuratorApp) {
 	private fun call(name: String, vararg args: Pair<String, JsonElement>, then: () -> Unit = {}) {
 		app.scope.launch {
 			runCatching { ask(name, *args) }
-				.onFailure { android.util.Log.w("curator-ui", "$name failed", it) }
+				.onFailure { DiagLog.w("ui", "$name failed", it) }
 			then()
 		}
 	}

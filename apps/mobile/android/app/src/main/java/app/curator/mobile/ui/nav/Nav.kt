@@ -46,6 +46,8 @@ sealed interface Screen {
 	data class RowFields(val sample: ListSource?) : Screen { override val isPage get() = true }
 	data class TrackActions(val trackId: String) : Screen { override val isPage get() = true; override val rotates get() = true }
 	data object Settings : Screen { override val isPage get() = true }
+	/** Signing in again: the session ended, the library is still here. */
+	data object SignIn : Screen { override val isPage get() = true }
 }
 
 /** One back stack per tab; the tab bar switches stacks, back pops the current one. */

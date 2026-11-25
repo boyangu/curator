@@ -2,7 +2,6 @@ package app.curator.mobile.ui.settings
 
 import android.app.Activity
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -66,12 +65,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * This phone's settings: the streaming service the library's own files play
- * from, each service shown with how many of those files it has (their
- * recordings' claims there), and how the app updates itself.
+ * This phone's settings: the account, the streaming service the library's own
+ * files play from, each service shown with how many of those files it has
+ * (their recordings' claims there), how the app updates itself, and whether it
+ * sends its log.
  */
 @Composable
-fun SettingsPage(model: AppModel, back: () -> Unit) {
+fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
 	val lib by model.library.collectAsState()
 	val version by model.version.collectAsState()
 	val picked by model.streaming.collectAsState()
@@ -92,6 +92,7 @@ fun SettingsPage(model: AppModel, back: () -> Unit) {
 			BasicText("Settings", Modifier.semantics { heading() }, style = T.screenTitle)
 		}
 
+		AccountSection(model, signIn)
 		Column(Modifier.fillMaxWidth().topLine().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
 			BasicText("Streaming service", Modifier.semantics { heading() }, style = T.label)
 			BasicText(
@@ -103,13 +104,14 @@ fun SettingsPage(model: AppModel, back: () -> Unit) {
 			for (s in StreamingService.entries) ServiceRow(s, s == picked, coverage) { model.setStreaming(s) }
 		}
 		Updates(model)
+		Diagnostics(model)
 		Spacer(Modifier.height(24.dp))
 	}
 }
 
 /** The version, where the updater is, the automatic switch, and the one action that fits (check, install, allow installs). */
 @Composable
-private fun Updates(model: AppModel) {
+fun Updates(model: AppModel) {
 	val updater = model.updater
 	val state by updater.state.collectAsState()
 	val auto by model.autoUpdate.collectAsState()
@@ -154,18 +156,6 @@ private fun describe(s: UpdateState, auto: Boolean): String = when (s) {
 	is UpdateState.Ready -> if (auto) "${s.version} is ready: it installs when you leave Curator" else "${s.version} is ready to install"
 	is UpdateState.Installing -> "Installing ${s.version}…"
 	is UpdateState.Failed -> "Update failed: ${s.reason}"
-}
-
-@Composable
-private fun Action(text: String, onClick: () -> Unit) {
-	Box(
-		Modifier
-			.heightIn(min = 40.dp)
-			.border(1.dp, C.line, RoundedCornerShape(4.dp))
-			.clickable(role = Role.Button, onClick = onClick)
-			.padding(horizontal = 14.dp),
-		contentAlignment = Alignment.Center,
-	) { BasicText(text, style = T.of(14.sp, color = C.fg)) }
 }
 
 @Composable

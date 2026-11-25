@@ -31,6 +31,7 @@ class MainActivity : ComponentActivity() {
 		// Spotify's consent screen opens over the screen in front.
 		(application as CuratorApp).model.player.attach(this) { spotifyConsent.launch(it) }
 		(application as CuratorApp).model.updater.onForeground(this)
+		(application as CuratorApp).model.logs.onForeground()
 	}
 
 	override fun onStop() {
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
 		setActive(false)
 		(application as CuratorApp).model.player.attach(null, null)
 		(application as CuratorApp).model.updater.onBackground()
+		(application as CuratorApp).model.logs.onBackground()
 	}
 
 	private fun setActive(active: Boolean) {

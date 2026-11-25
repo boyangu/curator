@@ -5,8 +5,15 @@
 // `__dispatch(name, argJson, callId)`; each call answers once through
 // `emit({ type: 'result', id, ok, value | error })`. Between calls the core
 // emits `phase`, `status`, `applied` and `feed` events, which the app's
-// repositories turn into refreshes. HTTP goes out through Kotlin and comes back through
-// `__httpDone`.
+// repositories turn into refreshes, `session` (the account to keep, Kotlin's
+// to seal) and `log` (a record for the phone's own log). HTTP goes out through
+// Kotlin and comes back through `__httpDone`.
+//
+// The account comes first: `boot` takes what was kept of it, `signIn*` opens
+// one, and `open` then opens (or first installs) its library. A library is
+// open with or without a live session; without one it only does not sync.
+// Nothing closes a library again: `signOut` ends the account and the app
+// restarts, wiping it on the way up (CuratorApp.kt).
 //
 // Every edit here is a library write the desktop makes the same way, so it
 // becomes the same op (D4): a rating, an Interested / Basket tag, a setting,
@@ -15,21 +22,26 @@
 
 import './shim/globals.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { CATALOGUE_BUCKET, SNAPSHOT_BUCKET } from '@curator/protocol';
+import { consoleSink, createLogger } from '@curator/shared/log';
+import { AuthError, createGotrue, type AuthAccount, type Gotrue } from '@curator/sync-core/auth/gotrue';
 import { fetchPeaks } from '@curator/sync-core/catalogue/peaks';
 import { createDb, type Db } from '@curator/sync-core/db/client';
 import { getDeviceId } from '@curator/sync-core/sync-log/device';
-import { migrate } from '@curator/sync-core/db/migrate';
+import { migrate, setMigrationBackups } from '@curator/sync-core/db/migrate';
 import { createDeviceFeed, queueKnownSuppressions, type DeviceFeed, type FeedArtistRef, type FeedInterestedInput } from '@curator/sync-core/feed/device-feed';
 import { SqliteFeedStore } from '@curator/sync-core/feed/store';
 import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, feedBackfillPending, feedPendingCount, syncedItemsFor } from '@curator/sync-core/feed/sync';
 import { setRating, setSetting, tagTracks, untagTracks } from '@curator/sync-core/library/mutators';
-import { createSyncClient, type SyncClient } from '@curator/sync-core/sync-log/client';
+import { setCoreLogger } from '@curator/sync-core/log';
+import { CloudTransportError, createSyncClient, type SyncClient } from '@curator/sync-core/sync-log/client';
 import { createFetchCloudTransport } from '@curator/sync-core/sync-log/fetch-transport';
 import { joinFromReplica } from '@curator/sync-core/sync-log/replica';
+import { createStorageDownload, StorageGoneError } from '@curator/sync-core/sync-log/supabase-storage';
 import { host } from './shim/host.js';
 import type Database from 'better-sqlite3';
 
-type StartConfig = {
+type BootConfig = {
 	dbPath: string;
 	// The Discover feed's own database (the views read it too) and where its
 	// watch list is kept between runs.
@@ -39,14 +51,30 @@ type StartConfig = {
 	// (the Track view reads them there: ui/track/PeaksLoader.kt).
 	peaksDir: string;
 	apiUrl: string;
-	userId: string;
-	token: string;
+	supabaseUrl: string;
+	publishableKey: string;
+	// What the last run kept (its `session` events); null: signed out.
+	account: AuthAccount | null;
 	deviceName: string;
 	appVersion: string;
 };
 
 const g = globalThis as Record<string, unknown>;
 const emit = (event: Record<string, unknown>): void => host.emit(JSON.stringify(event));
+
+// ── the log ──────────────────────────────────────────────────────────────────
+
+// Everything to logcat; info and above to the phone's own log, which its
+// owner may let it send (Kotlin diag/).
+const RANK = { debug: 0, info: 1, warn: 2, error: 3 } as const;
+setCoreLogger(createLogger({
+	proc: 'phone-core',
+	level: 'debug',
+	replayBuffer: 0,
+	sinks: [consoleSink(), { write: (rec) => { if (RANK[rec.level] >= RANK.info) emit({ type: 'log', record: rec }); } }],
+}));
+
+setMigrationBackups(false);
 
 // ── HTTP through Kotlin ──────────────────────────────────────────────────────
 
@@ -101,42 +129,116 @@ function* inflateText(body: Uint8Array): Iterable<string> {
 	if (carry.length > 0) yield host.utf8Decode(carry);
 }
 
-// ── the library ──────────────────────────────────────────────────────────────
+// ── the account and its library ──────────────────────────────────────────────
 
-let library: { db: Db; raw: Database.Database; client: SyncClient; transport: ReturnType<typeof createFetchCloudTransport>; feed: DeviceFeed; cfg: StartConfig } | null = null;
+let account: { auth: Gotrue; cfg: BootConfig } | null = null;
+let library: { db: Db; raw: Database.Database; client: SyncClient; transport: ReturnType<typeof createFetchCloudTransport>; feed: DeviceFeed; cfg: BootConfig; blob: (bucket: string, path: string) => Promise<Uint8Array> } | null = null;
 
-function transportFor(cfg: StartConfig) {
-	const auth = { authorization: `Bearer ${cfg.token}` };
-	let signedIn = true;
-	return createFetchCloudTransport({
+function boot(cfg: BootConfig): { signedIn: boolean } {
+	if (!account) {
+		let live = !!cfg.account?.tokens;
+		const auth = createGotrue({
+			supabaseUrl: cfg.supabaseUrl,
+			publishableKey: cfg.publishableKey,
+			request: async (req) => {
+				const res = await http(req.method, req.url, req.headers, req.body);
+				return { status: res.status, body: host.utf8Decode(res.bytes) };
+			},
+			initial: cfg.account,
+			holdsLibrary: () => existsSync(cfg.dbPath),
+			onChange: (a) => {
+				emit({ type: 'session', account: a });
+				// Signed in again, or the session is over (not a mere refresh): the
+				// client's status says so.
+				if (live !== !!a?.tokens && library) library.client.wake('session');
+				live = !!a?.tokens;
+			},
+		});
+		account = { auth, cfg };
+	}
+	return { signedIn: !!account.auth.account()?.tokens };
+}
+
+function acct(): NonNullable<typeof account> {
+	if (!account) throw new Error('not booted');
+	return account;
+}
+
+// The auth client's refusals in the words the sync client branches on.
+async function tokenFor(auth: Gotrue, opts?: { refresh?: boolean }): Promise<string | null> {
+	try {
+		return await auth.accessToken(opts);
+	} catch (err) {
+		if (!(err instanceof AuthError)) throw err;
+		throw new CloudTransportError(err.code === 'network' || err.code === 'server' || err.status === 429 ? 'network' : 'auth', err.code);
+	}
+}
+
+function transportFor({ auth, cfg }: NonNullable<typeof account>) {
+	const blob = createStorageDownload({
+		supabaseUrl: cfg.supabaseUrl,
+		publishableKey: cfg.publishableKey,
+		get: (url, headers) => http('GET', url, headers),
+		accessToken: (o) => tokenFor(auth, o),
+		utf8: (bytes) => host.utf8Decode(bytes),
+	});
+	const transport = createFetchCloudTransport({
 		apiUrl: cfg.apiUrl,
 		request: async (req) => {
 			const res = await http(req.method, req.url, req.headers, req.body);
 			return { status: res.status, body: host.utf8Decode(res.bytes) };
 		},
-		session: () => (signedIn ? { userId: cfg.userId, email: null } : null),
-		accessToken: async () => cfg.token,
-		signOut: async () => { signedIn = false; },
-		// The local test server serves the bucket's bytes under /storage
-		// (research/mobile/sync-core-spike/scripts/serve-cloud.ts); Supabase
-		// Storage with the user's token comes with real sign-in.
+		session: () => {
+			const a = auth.account();
+			return a?.tokens ? { userId: a.userId, email: a.email } : null;
+		},
+		accessToken: (o) => tokenFor(auth, o),
+		// The client's unlink: the session ends, the library stays its owner's.
+		signOut: () => auth.endSession(),
 		snapshots: {
 			upload: async () => { throw new Error('a phone publishes no snapshot'); },
 			remove: async () => {},
-			download: async (path) => {
-				const res = await http('GET', `${cfg.apiUrl}/storage/${path}`, auth);
-				if (res.status !== 200) throw new Error(`storage answered ${res.status} for ${path}`);
-				return res.bytes;
-			},
+			download: (path) => blob(SNAPSHOT_BUCKET, path),
 		},
+		partGone: (err) => err instanceof StorageGoneError,
 		inflate: (body) => inflateText(body),
 		client: `android/${cfg.appVersion}`,
 	});
+	return { transport, blob };
 }
 
-async function start(cfg: StartConfig): Promise<Record<string, unknown>> {
+async function signedIn(a: Promise<AuthAccount>): Promise<{ email: string | null }> {
+	return { email: (await a).email };
+}
+
+// Ends the account on this phone. What was edited and not sent gets a moment
+// to go up; offline it is lost with the library, which the caller said.
+async function signOut(): Promise<void> {
+	const { auth } = acct();
+	if (library) {
+		const { client, feed } = library;
+		feed.setActive(false);
+		const moment = new Promise<void>((r) => { setTimeout(r, 8_000); });
+		await Promise.race([client.syncNow().then(() => {}, () => {}), moment]);
+		// Takes this phone off the account's devices too.
+		await client.unlink().catch((err: unknown) => { console.warn('unlink failed', err instanceof Error ? err.message : String(err)); });
+		client.stop();
+	}
+	await auth.signOut();
+}
+
+// Opens the account's library, once; installs it first on a phone without one.
+// May be called again after it failed (offline during the install, say).
+let opening: Promise<Record<string, unknown>> | null = null;
+function open(): Promise<Record<string, unknown>> {
+	opening ??= openLibrary().finally(() => { opening = null; });
+	return opening;
+}
+
+async function openLibrary(): Promise<Record<string, unknown>> {
 	if (library) return { already: true };
-	const transport = transportFor(cfg);
+	const { cfg } = acct();
+	const { transport, blob } = transportFor(acct());
 	let installed: Record<string, unknown> | null = null;
 	if (!existsSync(cfg.dbPath)) {
 		emit({ type: 'phase', phase: 'installing' });
@@ -192,9 +294,9 @@ async function start(cfg: StartConfig): Promise<Record<string, unknown>> {
 	client.subscribe(() => {
 		feed.onStatus();
 		const s = client.status();
-		emit({ type: 'status', lastSeq: s.lastSeq, pending: s.pending, error: s.lastError, bootstrap: s.bootstrap ?? null });
+		emit({ type: 'status', lastSeq: s.lastSeq, pending: s.pending, error: s.lastError, signedIn: s.signedIn, revoked: s.revoked, needsUpdate: s.needsUpdate, waiting: s.phase === 'waiting_for_snapshot', joining: s.bootstrap !== null });
 	});
-	library = { db, raw: sqlite, client, transport, feed, cfg };
+	library = { db, raw: sqlite, client, transport, feed, cfg, blob };
 	client.start();
 	emit({ type: 'phase', phase: 'ready' });
 	return { installed };
@@ -212,7 +314,20 @@ function wrote(): void {
 }
 
 const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
-	start: (a) => start(a as unknown as StartConfig),
+	// ── the account ──
+	boot: (a) => boot(a as unknown as BootConfig),
+	signInPassword: (a) => signedIn(acct().auth.signInPassword(a['email'] as string, a['password'] as string)),
+	requestCode: (a) => acct().auth.requestCode(a['email'] as string),
+	verifyCode: (a) => signedIn(acct().auth.verifyCode(a['email'] as string, a['code'] as string)),
+	// A token for the log upload, which Kotlin sends itself; null: signed out.
+	accessToken: () => acct().auth.accessToken(),
+	// This phone was removed from the account: a fresh device id, and the
+	// session that acted as the removed one ended. Signing in carries on.
+	relink: async () => { await lib().client.unlink(); },
+	signOut: () => signOut(),
+	open: () => open(),
+
+	// ── the library ──
 	setRating: (a) => { setRating(lib().db, [a['trackId'] as string], (a['rating'] as number | null) ?? null); wrote(); },
 	setTag: (a) => {
 		const ids = [a['trackId'] as string];
@@ -229,14 +344,13 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 	// A track's waveform from the account's analysis catalogue, cached for the
 	// views; answers the tier it got, or null when the account has none.
 	fetchPeaks: async (a) => {
-		const { raw, transport, cfg } = lib();
+		const { raw, transport, cfg, blob } = lib();
 		const trackId = a['trackId'] as string;
-		if (!transport.catalogue || !transport.snapshots) return null;
+		if (!transport.catalogue) return null;
 		const got = await fetchPeaks({
 			raw, deviceId: getDeviceId(raw),
 			lookup: (input) => transport.catalogue!.lookup(input),
-			// The test server serves both buckets' bytes under /storage.
-			download: (path) => transport.snapshots!.download(path),
+			download: (path) => blob(CATALOGUE_BUCKET, path),
 		}, trackId);
 		if (!got) return null;
 		mkdirSync(cfg.peaksDir);
@@ -262,6 +376,9 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 	feedArtists: (a) => lib().feed.artistPictures(a['refs'] as FeedArtistRef[]),
 };
 
+// A refused sign-in is its code (Kotlin words it); anything else says where.
+const failure = (e: unknown): string => (e instanceof AuthError ? e.code : e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e));
+
 g['__dispatch'] = (name: string, argJson: string, id: number): void => {
 	const fn = CALLS[name];
 	const answer = (ok: boolean, value: unknown): void => emit({ type: 'result', id, ok, ...(ok ? { value: value ?? null } : { error: value }) });
@@ -269,9 +386,9 @@ g['__dispatch'] = (name: string, argJson: string, id: number): void => {
 	try {
 		const r = fn(JSON.parse(argJson) as Record<string, unknown>);
 		if (r && typeof (r as Promise<unknown>).then === 'function') {
-			(r as Promise<unknown>).then((v) => answer(true, v), (e: unknown) => answer(false, e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e)));
+			(r as Promise<unknown>).then((v) => answer(true, v), (e: unknown) => answer(false, failure(e)));
 		} else answer(true, r);
 	} catch (e) {
-		answer(false, e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e));
+		answer(false, failure(e));
 	}
 };

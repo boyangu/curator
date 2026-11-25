@@ -10,14 +10,18 @@
 	     install, no prompt. -->
 	<uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
-	<!-- networkSecurityConfig: cleartext only to the local test server
-	     (adb reverse onto 127.0.0.1); everything else is TLS. -->
+	<!-- networkSecurityConfig: TLS only (debug builds add the local test
+	     server, adb reverse onto 127.0.0.1). No backup: the library comes from
+	     the account, and a copy of it on another phone would carry this one's
+	     device id. -->
 	<application
 		android:name=".CuratorApp"
 		android:label="Curator"
 		android:icon="@drawable/ic_launcher"
 		android:roundIcon="@drawable/ic_launcher"
 		android:theme="@style/Theme.Curator"
+		android:allowBackup="false"
+		android:dataExtractionRules="@xml/no_backup"
 		android:networkSecurityConfig="@xml/network_security"
 		android:supportsRtl="true">
 
@@ -38,5 +42,14 @@
 		<!-- An update's install outcome, from the installer through our own
 		     PendingIntent only. -->
 		<receiver android:name=".update.InstallResult" android:exported="false" />
+
+		<!-- Hands the exported log to whatever the user shares it with. -->
+		<provider
+			android:name="androidx.core.content.FileProvider"
+			android:authorities="${applicationId}.files"
+			android:exported="false"
+			android:grantUriPermissions="true">
+			<meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/shared_files" />
+		</provider>
 	</application>
 </manifest>

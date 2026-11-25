@@ -2,7 +2,7 @@ package app.curator.mobile.player
 
 import android.content.Intent
 import android.os.SystemClock
-import android.util.Log
+import app.curator.mobile.diag.DiagLog
 import app.curator.mobile.BuildConfig
 import app.curator.mobile.model.StreamingService
 import com.spotify.android.appremote.api.ConnectionParams
@@ -96,7 +96,7 @@ internal class SpotifyRemote(private val host: BackendHost) : Backend {
 				connecting = false
 				val then = afterConnect
 				afterConnect = null
-				Log.w("curator-player", "Spotify did not connect", err)
+				DiagLog.w("player", "Spotify did not connect", err)
 				// First time on this phone: ask for the consent, then connect again.
 				if (err is UserNotAuthorizedException && !askedConsent && then != null) {
 					val ask = launchAuth ?: return host.onFail("Open Curator to connect Spotify")

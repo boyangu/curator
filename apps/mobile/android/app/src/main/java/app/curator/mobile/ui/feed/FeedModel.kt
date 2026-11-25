@@ -1,12 +1,12 @@
 package app.curator.mobile.ui.feed
 
-import android.util.Log
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import app.curator.mobile.diag.DiagLog
 import app.curator.mobile.data.FeedDb
 import app.curator.mobile.data.FeedKey
 import app.curator.mobile.data.FeedRow
@@ -126,7 +126,7 @@ class FeedModel(private val model: AppModel) {
 		unavailable = u
 		read++
 		reloadHoldings()
-		Log.d("curator-ui", "feed: ${r.size} cards, ${k.size} tracks read in ${android.os.SystemClock.elapsedRealtime() - t0} ms")
+		DiagLog.d("ui", "feed: ${r.size} cards, ${k.size} tracks read in ${android.os.SystemClock.elapsedRealtime() - t0} ms")
 	}
 
 	// The cards left out here are the desktop's (feed/service.ts
@@ -230,7 +230,7 @@ class FeedModel(private val model: AppModel) {
 					}
 				}
 			} catch (e: Exception) {
-				Log.w("curator-ui", "feedInterested failed", e)
+				DiagLog.w("ui", "feedInterested failed", e)
 				"That did not work."
 			}
 			if (failure == null) reloadHoldings() else notice = failure
@@ -252,7 +252,7 @@ class FeedModel(private val model: AppModel) {
 	private fun act(name: String, vararg args: Pair<String, kotlinx.serialization.json.JsonElement>) {
 		scope.launch(Dispatchers.Main) {
 			runCatching { model.ask(name, *args) }.onFailure {
-				Log.w("curator-ui", "$name failed", it)
+				DiagLog.w("ui", "$name failed", it)
 				notice = "That did not work."
 			}
 		}
@@ -276,7 +276,7 @@ class FeedModel(private val model: AppModel) {
 					else -> "$n new"
 				}
 			} catch (e: Exception) {
-				Log.w("curator-ui", "feedRefresh failed", e)
+				DiagLog.w("ui", "feedRefresh failed", e)
 				toTop = false
 				notice = "Could not refresh"
 			} finally {
@@ -308,7 +308,7 @@ class FeedModel(private val model: AppModel) {
 		if (player.state.value.unavailable != null) return
 		scope.launch {
 			runCatching { model.ask("feedPlayed", "itemId" to JsonPrimitive(item.id), "sourceTrackId" to (t.sourceTrackId?.let(::JsonPrimitive) ?: JsonNull)) }
-				.onFailure { Log.w("curator-ui", "feedPlayed failed", it) }
+				.onFailure { DiagLog.w("ui", "feedPlayed failed", it) }
 		}
 	}
 
@@ -318,7 +318,7 @@ class FeedModel(private val model: AppModel) {
 
 	fun picture(a: FeedArtist): String? = a.key?.let { pictures[it] }
 
-	private val picturesFile = File(model.app.filesDir, "feed-artists.json")
+	private val picturesFile = model.app.files.feedArtists
 
 	private suspend fun loadPictures() {
 		val kept = withContext(Dispatchers.IO) { runCatching { Json.decodeFromString<Map<String, String>>(picturesFile.readText()) }.getOrNull() } ?: return
@@ -334,7 +334,7 @@ class FeedModel(private val model: AppModel) {
 				put("spotifyId", a.spotifyId?.let(::JsonPrimitive) ?: JsonNull)
 			}
 		})
-		val answer = runCatching { model.ask("feedArtists", "refs" to refs) as? JsonObject }.onFailure { Log.w("curator-ui", "feedArtists failed", it) }.getOrNull()
+		val answer = runCatching { model.ask("feedArtists", "refs" to refs) as? JsonObject }.onFailure { DiagLog.w("ui", "feedArtists failed", it) }.getOrNull()
 		// What it could not ask is asked again when another card needs it.
 		for (a in want) if (answer == null || a.key !in answer) askedFor -= a.key!!
 		val found = answer.orEmpty().mapNotNull { (k, v) -> (v as? JsonPrimitive)?.contentOrNull?.let { k to it } }
@@ -346,7 +346,7 @@ class FeedModel(private val model: AppModel) {
 				val tmp = File(picturesFile.path + ".part")
 				tmp.writeText(Json.encodeToString(all))
 				tmp.renameTo(picturesFile)
-			}.onFailure { Log.w("curator-ui", "keeping the artist pictures failed", it) }
+			}.onFailure { DiagLog.w("ui", "keeping the artist pictures failed", it) }
 		}
 	}
 

@@ -7,6 +7,7 @@
 //
 //   cd apps/cloud && npx tsx ../../research/mobile/sync-core-spike/scripts/serve-cloud.ts
 //       [--port 8799] [--name main] [--work c:/tmp/curator-mobile-spike] [--ops <ops.json>] [--feed <feed.json>]
+//       [--token-ttl 120]
 //
 // (Run from apps/cloud so tsx and the server's dependencies resolve there.)
 //
@@ -17,14 +18,22 @@
 //   POST /control/tail     pushes --ops into the account's log as the master
 //   POST /control/feed     raises the next of --feed's `later` events
 //   GET  /control/ops      the log's newest ops, as JSON (what a device pushed)
+//   GET  /control/logs     the phone log records taken, as JSON
+//   GET  /control/auth     the sessions open, and the code last sent
+//   POST /control/revoke   removes the account's newest phone
+//   POST /control/kill-session   ends every session, as signing out elsewhere does
 //   POST /control/exit     stops the server
+// The app signs in to it (fake-gotrue.ts): dev@curator.test / curator, or a code
+// (printed here); other@curator.test / curator is somebody else's account.
 // One account per process, so a fresh process gives every run the same log
 // positions. Nothing real is reached: no Supabase, no network beyond loopback.
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { gunzipSync } from 'node:zlib';
 import { join, resolve } from 'node:path';
+import { createFakeGotrue } from './fake-gotrue.js';
 import { createTestApp, entitle, masterOp, uploadBlob } from '../../../../apps/cloud/src/test/harness.js';
 import { CATALOGUE_UNIT_SCHEMA, catalogueBlobPath, MAX_CATALOGUE_PUT_ITEMS, MAX_PUSH_BYTES, MAX_PUSH_OPS, snapshotPartPath, type CatalogueItem, type Op, type ReplicaManifest, type SnapshotManifest } from '../../../../packages/protocol/src/index.js';
 
@@ -46,6 +55,15 @@ const userId = await app.createUser(arg('user', DEV_USER));
 // Long enough for a phone left installed between dev sessions.
 const token = await app.sign(userId, { exp: '30d' });
 const api = app.client(token);
+const gotrue = createFakeGotrue({
+	users: [
+		{ id: userId, email: 'dev@curator.test', password: 'curator' },
+		{ id: await app.createUser(), email: 'other@curator.test', password: 'curator' },
+	],
+	ttlSec: Number(arg('token-ttl', '120')),
+	sign: (id, o) => app.sign(id, o),
+	log: (line) => console.log(line),
+});
 
 // The master and its snapshot, as a desktop leaves an account.
 const given = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as { masterDevice: string | null; manifest: SnapshotManifest };
@@ -193,10 +211,37 @@ const server = createServer((req, res) => {
 				res.end(buf);
 			};
 			try {
-				if (url.startsWith('/storage/')) {
+				if (url.startsWith('/storage/') && !url.startsWith('/storage/v1/')) {
 					if (req.headers.authorization !== `Bearer ${token}`) return send(401, '{"error":"unauthorized"}');
 					const blob = blobs.get(decodeURIComponent(url.slice('/storage/'.length)));
 					return blob ? send(200, blob, 'application/octet-stream') : send(404, '{"error":"not_found"}');
+				}
+				if (url.startsWith('/auth/v1/')) {
+					const text = Buffer.concat(chunks).toString('utf8');
+					const r = await gotrue.handle(url.slice('/auth/v1/'.length), text ? (JSON.parse(text) as Record<string, unknown>) : {}, req.headers.authorization?.replace(/^Bearer /, '') ?? null);
+					return send(r.status, r.body === null ? '' : JSON.stringify(r.body));
+				}
+				// Storage's authenticated read, judged as its policy does: the caller's
+				// own prefix. A refusal is worded as Storage words it.
+				if (url.startsWith('/storage/v1/object/authenticated/')) {
+					const [bucket, ...rest] = decodeURIComponent(url.slice('/storage/v1/object/authenticated/'.length)).split('/');
+					const path = rest.join('/');
+					const who = await app.deps.auth.verify(req.headers.authorization ?? null).catch(() => null);
+					if (!who) return send(400, '{"statusCode":"403","error":"Unauthorized","message":"jwt expired"}');
+					const blob = path.startsWith(`${who.id}/`) && (bucket === 'snapshots') === path.includes('/snap/') ? blobs.get(path) : undefined;
+					return blob ? send(200, blob, 'application/octet-stream') : send(400, '{"statusCode":"404","error":"not_found","message":"Object not found"}');
+				}
+				if (url === '/control/auth') return send(200, JSON.stringify({ sessions: gotrue.open(), code: gotrue.lastCode('dev@curator.test') }));
+				if (url === '/control/kill-session' && req.method === 'POST') return send(200, JSON.stringify({ ended: gotrue.killAll() }));
+				if (url === '/control/revoke' && req.method === 'POST') {
+					const phone = (await api.account.devices.query()).filter((d) => d.platform === 'android' && d.revokedAt === null).sort((a, b) => b.registeredAt - a.registeredAt)[0];
+					if (phone) await api.account.revokeDevice.mutate({ deviceId: phone.deviceId });
+					return send(200, JSON.stringify({ revoked: phone?.name ?? null }));
+				}
+				if (url === '/control/devices') return send(200, JSON.stringify(await api.account.devices.query()));
+				if (url === '/control/logs') {
+					const r = await app.pg.query(`select n::float8 as n, ts, level, proc, area, msg, data, err, app_version from curator.client_log order by received_at, n`);
+					return send(200, JSON.stringify(r.rows));
 				}
 				if (url === '/control/tail' && req.method === 'POST') return send(200, JSON.stringify(await pushTail()));
 				if (url === '/control/feed' && req.method === 'POST') return send(200, JSON.stringify(await raiseLater()));
@@ -210,8 +255,10 @@ const server = createServer((req, res) => {
 					return;
 				}
 				const headers = new Headers();
-				for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string' && k !== 'content-length' && k !== 'connection') headers.set(k, v);
-				const body = Buffer.concat(chunks);
+				for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string' && k !== 'content-length' && k !== 'connection' && k !== 'content-encoding') headers.set(k, v);
+				// The API's node listener inflates a gzipped body (apps/cloud http.ts).
+				const sent = Buffer.concat(chunks);
+				const body = req.headers['content-encoding'] === 'gzip' ? gunzipSync(sent) : sent;
 				const answer = await app.handler(new Request(`http://127.0.0.1:${port}${url}`, { method: req.method, headers, ...(req.method === 'POST' ? { body } : {}) }));
 				send(answer.status, Buffer.from(await answer.arrayBuffer()), answer.headers.get('content-type') ?? 'application/json', answer.headers.get('content-encoding'));
 			} catch (err) {
@@ -221,6 +268,6 @@ const server = createServer((req, res) => {
 	});
 });
 server.listen(port, '127.0.0.1', () => {
-	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, userId, token, snapshotSeq }, null, 1));
+	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, supabaseUrl: `http://127.0.0.1:${port}`, publishableKey: 'test', userId, token, snapshotSeq }, null, 1));
 	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${replicaSeq !== null ? `, replica at seq ${replicaSeq}` : ''}${opsFile ? ', later ops on request' : ''}${peaksCount ? `, waveforms for ${peaksCount} recordings` : ''}${feed ? `, ${feed.events.length} feed events` : ''}`);
 });

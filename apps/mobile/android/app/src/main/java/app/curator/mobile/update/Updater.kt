@@ -11,7 +11,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.util.Log
+import app.curator.mobile.diag.DiagLog
 import app.curator.mobile.BuildConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -79,7 +79,7 @@ class Updater(
 
 	// Every change but a download's progress goes to the log: what to read when an update didn't happen.
 	private fun set(s: UpdateState) {
-		if (s !is UpdateState.Downloading || s.fraction == 0f) Log.i(TAG, s.toString())
+		if (s !is UpdateState.Downloading || s.fraction == 0f) DiagLog.i("update", s.toString())
 		_state.value = s
 	}
 
@@ -133,7 +133,7 @@ class Updater(
 				set(UpdateState.Ready(f.manifest.version))
 				if (installAfter || (activity.get() == null && !playing())) withContext(Dispatchers.Main) { install() }
 			} catch (e: Exception) {
-				Log.w(TAG, "update failed", e)
+				DiagLog.w("update", "update failed", e)
 				set(UpdateState.Failed(e.message ?: e.javaClass.simpleName))
 			}
 		}
@@ -218,14 +218,14 @@ class Updater(
 				session.commit(done.intentSender)
 			}
 		} catch (e: Exception) {
-			Log.w(TAG, "install failed", e)
+			DiagLog.w("update", "install failed", e)
 			set(UpdateState.Failed(e.message ?: e.javaClass.simpleName))
 		}
 	}
 
 	// The installer's answer ([InstallResult]). Success needs nothing: the app restarts as the new version.
 	internal fun onInstallResult(status: Int, message: String?, confirmation: Intent?) {
-		Log.i(TAG, "installer: status $status ${message.orEmpty()}")
+		DiagLog.i("update", "installer: status $status ${message.orEmpty()}")
 		val version = found?.manifest?.version ?: return
 		when (status) {
 			PackageInstaller.STATUS_SUCCESS -> {}
@@ -270,7 +270,6 @@ class Updater(
 
 	companion object {
 		private const val CHECK_EVERY_MS = 6 * 60 * 60 * 1000L
-		private const val TAG = "curator-update"
 	}
 }
 

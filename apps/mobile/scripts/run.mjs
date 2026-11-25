@@ -1,12 +1,13 @@
 // Puts the debug app on a device wired to the local test server and starts it:
 // the server's port reversed onto the device, its server.json handed to the
-// app (core/DevServer.kt), the APK installed, the app launched, its core's log
+// app (core/CloudConfig.kt), the APK installed, the app launched, its core's log
 // followed until Ctrl-C.
 //
 //   node scripts/run.mjs --server <dir holding server.json> [--serial <id>] [--fresh] [--no-log]
 //
 // The server is the sync-core spike's (research/mobile/sync-core-spike/scripts/
 // serve-cloud.ts, started from apps/cloud): local testing only, for now.
+// Sign in there as dev@curator.test / curator (serve-cloud.ts).
 // --fresh clears the app's data first, so it joins as a new device.
 // --apk <file> installs that APK instead of the debug build (a release, which
 // then updates itself; a phone holds one signing key's install at a time).
