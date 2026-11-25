@@ -2,6 +2,7 @@
 // The engine itself is a Python sidecar; everything here is what CoreService
 // exposes over IPC/agent tools, so treat it as part of the public contract.
 
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import type { ZTrackFilterT } from '@curator/shared';
 
 export type MirExecutor = 'local' | 'cloud';
@@ -19,6 +20,14 @@ export interface MirSettings {
 	models: string[];
 }
 
+export const AUDIOBOX_MODEL_KEY = 'audiobox-aesthetics';
+// Row layout of the stored Audiobox vector.
+export const AUDIOBOX_AXES = ['CE', 'CU', 'PC', 'PQ'] as const;
+
+// Models the engine's registry knows but the app neither runs nor lists.
+// Audiobox only serves the production-quality feature.
+export const DISABLED_MIR_MODELS: ReadonlySet<string> = new Set(PRODUCTION_QUALITY_ENABLED ? [] : [AUDIOBOX_MODEL_KEY]);
+
 // Default models = the Phase 0 bake-off winner (research/mir/FINDINGS.md):
 // MERT-v2 + MuQ-MuLan blended beat every single model on the user's own tags
 // and DJ-set adjacency; MuQ-MuLan also brings text search.
@@ -28,12 +37,8 @@ export interface MirSettings {
 export const DEFAULT_MIR_SETTINGS: MirSettings = {
 	enabled: false,
 	executor: 'local',
-	models: ['mert-v2-fullsong', 'muq-mulan-large', 'audiobox-aesthetics'],
+	models: ['mert-v2-fullsong', 'muq-mulan-large', AUDIOBOX_MODEL_KEY].filter((m) => !DISABLED_MIR_MODELS.has(m)),
 };
-
-export const AUDIOBOX_MODEL_KEY = 'audiobox-aesthetics';
-// Row layout of the stored Audiobox vector.
-export const AUDIOBOX_AXES = ['CE', 'CU', 'PC', 'PQ'] as const;
 
 export interface MirModelInfo {
 	key: string;

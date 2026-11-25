@@ -220,7 +220,7 @@ export async function acceptCataloguePlaylist(tx: Queryable, labelId: string, p:
 	await addEdge(tx, labelId, 'label-playlist', playlistId, rep!.id, 'catalogue');
 	// An edge from before the role existed keeps its null on conflict.
 	await tx.query(`update curator.catalog_edge set role = 'catalogue' where src = $1 and kind = 'label-playlist' and dst = $2 and role is null`, [labelId, playlistId]);
-	await ensureCursors(tx, labelId);
+	await ensureCursors(tx, [labelId]);
 	return playlistId;
 }
 

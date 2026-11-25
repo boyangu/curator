@@ -18,6 +18,7 @@ import { createSignal, Show } from 'solid-js';
 import type { Accessor } from 'solid-js';
 import { render } from 'solid-js/web';
 import { registerModalOpenSignal } from '../modalGate.js';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import type { AnalysisFlags } from '@curator/core';
 import { AnalysisFlagsForm, BASIC_FLAGS } from '../features/analysisFlagsForm.jsx';
 import { loadManualFlags, saveManualFlags } from '../features/analysisFlags.js';
@@ -58,7 +59,7 @@ export interface AnalyzeModalHandle {
 const ASPECT_KEYS: (keyof AnalysisFlags)[] = [
 	...BASIC_FLAGS.map((f) => f.key),
 	'advanced',
-	'production',
+	...(PRODUCTION_QUALITY_ENABLED ? ['production' as const] : []),
 ];
 
 export function mountAnalyzeModal(host: HTMLElement, props: AnalyzeModalProps): AnalyzeModalHandle {

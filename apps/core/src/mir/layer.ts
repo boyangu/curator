@@ -14,7 +14,7 @@ import { MirSidecar, type MirCapabilities, type MirSidecarSpec } from './sidecar
 import { SqliteMirStore } from './store.js';
 import { normalise, VectorIndex } from './vector-index.js';
 import {
-	DEFAULT_MIR_SETTINGS, MIR_K_DEFAULT, MIR_K_MAX,
+	DEFAULT_MIR_SETTINGS, DISABLED_MIR_MODELS, MIR_K_DEFAULT, MIR_K_MAX,
 	type MirEvent, type MirModelInfo, type MirSettings, type MirStatus, type SimilarResult,
 } from './types.js';
 
@@ -64,9 +64,10 @@ export interface MirLayer {
 	close(): Promise<void>;
 }
 
+// Settings persisted before a model was disabled still name it.
 function sanitize(raw: Partial<MirSettings> | null | undefined): MirSettings {
 	const s = raw ?? {};
-	const models = Array.isArray(s.models) ? s.models.filter((m) => typeof m === 'string' && m.length > 0) : [];
+	const models = Array.isArray(s.models) ? s.models.filter((m) => typeof m === 'string' && m.length > 0 && !DISABLED_MIR_MODELS.has(m)) : [];
 	return {
 		enabled: s.enabled === true,
 		executor: s.executor === 'cloud' ? 'cloud' : 'local',
@@ -91,9 +92,10 @@ export function createMirLayer(deps: MirLayerDeps): MirLayer {
 		const known = store.knownModels().filter((m) => m.key === key);
 		return known.length ? known[known.length - 1]!.modelId : null;
 	};
-	const modelInfos = (): MirModelInfo[] => caps
+	const modelInfos = (): MirModelInfo[] => (caps
 		? caps.models.map((m) => ({ ...m, similarity: m.similarity !== false }))
-		: store.knownModels().map((m) => ({ key: m.key, modelId: m.modelId, dim: m.dim, sampleRate: 0, text: m.text, similarity: m.similarity, license: '', repo: '', summary: '' }));
+		: store.knownModels().map((m) => ({ key: m.key, modelId: m.modelId, dim: m.dim, sampleRate: 0, text: m.text, similarity: m.similarity, license: '', repo: '', summary: '' }))
+	).filter((m) => !DISABLED_MIR_MODELS.has(m.key));
 	// Enabled models that live in a similarity space (score models such as
 	// Audiobox are stored and pooled like vectors but never ranked).
 	const rankable = (): string[] => {

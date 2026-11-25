@@ -14,6 +14,7 @@ import { library } from '../data/library.js';
 import { fmtRelative, escapeHtml } from '../ui/format.js';
 import { showToast } from '../ui/toast.js';
 import { mountAutoAnalyzeSettings } from './analysisFlagsForm.jsx';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { mountProductionSettings } from './productionSettings.js';
 import { log } from '../data/log.js';
 
@@ -98,7 +99,7 @@ function renderFolderListInner(): string {
 function renderLibraryFoldersModalShellHtml(): string {
 	return `
 		<div id="auto-analyze-host" class="lib-settings-host"></div>
-		<div id="production-settings-host" class="lib-settings-host"></div>
+		${PRODUCTION_QUALITY_ENABLED ? '<div id="production-settings-host" class="lib-settings-host"></div>' : ''}
 		<div class="lib-folders__actions">
 			<button class="btn-primary" data-action="add-library-folder">Add Folder…</button>
 		</div>

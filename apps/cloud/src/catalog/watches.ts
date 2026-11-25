@@ -28,13 +28,13 @@ import { summaries } from './objects.js';
 // watched object a new representation. A tracker's `requires`: an id on its
 // provider ('representation', the default), nothing ('name'), or — the
 // Spotify label tracker — a catalogue playlist ('catalogue_playlist').
-export async function ensureCursors(tx: Queryable, objectId: string): Promise<number> {
+export async function ensureCursors(tx: Queryable, objectIds: readonly string[]): Promise<number> {
 	const rows = await tx.query(
 		`insert into curator.catalog_cursor (object_id, provider)
 		select o.id, t.provider
 		from curator.catalog_object o
 		join curator.tracker t on t.kind = o.kind and t.enabled
-		where o.id = $1 and o.watch_count > 0 and o.merged_into is null
+		where o.id = any($1::uuid[]) and o.watch_count > 0 and o.merged_into is null
 			and (coalesce(t.config->>'requires', 'representation') = 'name'
 				or (t.config->>'requires' = 'catalogue_playlist' and exists (
 					select 1 from curator.catalog_edge e join curator.catalog_source_object so on so.object_id = e.dst and so.provider = t.provider
@@ -43,7 +43,7 @@ export async function ensureCursors(tx: Queryable, objectId: string): Promise<nu
 					and exists (select 1 from curator.catalog_source_object so where so.object_id = o.id and so.provider = t.provider)))
 		on conflict do nothing
 		returning 1`,
-		[objectId],
+		[`{${objectIds.join(',')}}`],
 	);
 	return rows.length;
 }
@@ -92,7 +92,7 @@ export async function addWatch(tx: SystemTx, userId: string, objectId: string, s
 		on conflict do nothing`,
 		[objectId],
 	);
-	await ensureCursors(tx, objectId);
+	await ensureCursors(tx, [objectId]);
 	return inserted;
 }
 

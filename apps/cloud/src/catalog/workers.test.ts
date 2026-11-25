@@ -206,6 +206,46 @@ describe('workerReport', () => {
 		expect(await app.db.query(`select count(*)::int as n from curator.catalog_event`)).toEqual([{ n: 1 }]);
 	});
 
+	it('a result it must refuse costs its own cursor alone, which backs off and says why', async () => {
+		const { app, fan, objectId, due } = await setup();
+		await due();
+		const other = '00000000-0000-4000-8000-000000000000';
+		const roster = Array.from({ length: 101 }, (_, i) => artist(`sa${i}`, `Artist ${i}`));
+		const refused = { poll: { ...pollOf([], 1), self: { ...artist('sl1', 'Northfold'), kind: 'label', artists: roster } } };
+		const r = await fan.api.catalog.workerReport.mutate({
+			deviceId: fan.deviceId,
+			results: [
+				{ objectId: other, provider: 'spotify', outcome: { poll: pollOf([], 1) } },
+				{ objectId, provider: 'spotify', outcome: refused as never },
+				{ objectId: other, provider: 'spotify', outcome: 'nonsense' as never },
+			],
+		});
+		// The neighbours were judged on their own (stale here: not this device's).
+		expect(r).toEqual({ applied: 1, stale: 2, events: 0 });
+		const c = await cursorOf(app, objectId);
+		expect(c).toMatchObject({ lease_holder: null, last_error: expect.stringMatching(/^refused: self\.artists: /) });
+		expect(Number(c.due_in_s)).toBeGreaterThan(0);
+	});
+
+	it('a poll the database refuses fails alone; the ones reported with it are applied', async () => {
+		const { app, fan, objectId, due } = await setup();
+		const other = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: artist('sa2', 'Amber Tide'), source: 'manual' });
+		expect((await due()).tasks).toHaveLength(2);
+		const date = iso(Date.now() - 2 * DAY);
+		const r = await fan.api.catalog.workerReport.mutate({
+			deviceId: fan.deviceId,
+			results: [
+				{ objectId: other.watch.object.id, provider: 'spotify', outcome: { poll: pollOf([release('bad', 'No pe', [artist('sa2', 'Amber Tide')], date)]) } },
+				{ objectId, provider: 'spotify', outcome: { poll: pollOf([release('new', 'New Single', [artist('sa1', 'Northfold')], date)]) } },
+			],
+		});
+		expect(r).toEqual({ applied: 2, stale: 0, events: 1 });
+		expect(await cursorOf(app, objectId)).toMatchObject({ lease_holder: null, last_error: null });
+		const bad = await cursorOf(app, other.watch.object.id);
+		expect(bad.last_error).toBeTruthy();
+		expect(Number(bad.fail_count)).toBe(1);
+	});
+
 	it('is stale for a cursor the device does not hold', async () => {
 		const { app, fan, objectId } = await setup();
 		await fan.api.account.registerDevice.mutate({ deviceId: 'desk-2', name: 'Studio', platform: 'win32' });

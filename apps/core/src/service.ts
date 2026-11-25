@@ -272,7 +272,7 @@ export type TrackPlaylistEntry = {
 };
 import { CancelToken } from './sync/cancellation.js';
 import { sortColumn as sharedSortColumn, indexSortColumn } from './sync/sort.js';
-import { applyOverrides, computePositionalMoves, nameFold, normalizeIsrc, planRowRemoval, type RowRemovalPlan } from '@curator/library-logic';
+import { applyOverrides, computePositionalMoves, nameFold, normalizeIsrc, planRowRemoval, PRODUCTION_QUALITY_ENABLED, type RowRemovalPlan } from '@curator/library-logic';
 
 // A provider's own track id, as the upstream API takes it: Spotify's 22-char
 // base62 id, Tidal's numeric id. Anything else on a streaming playlist row
@@ -309,7 +309,7 @@ import { remapLocalPaths } from './backup/apply.js';
 import type { BackupEngineConfig, BackupEvent, BackupHost, BackupRestorePreview, BackupRestoreRequest, BackupSettings, BackupSnapshotSummary, BackupStatus, BackupTargetStat, GoogleAuthStatus } from './backup/types.js';
 import { createMirLayer } from './mir/layer.js';
 import { AUDIOBOX_MODEL_KEY } from './mir/types.js';
-import { createProductionLayer, PRODUCTION_MODEL_KEY } from './production/layer.js';
+import { createProductionLayer, PRODUCTION_MODEL_KEY, type ProductionLayer } from './production/layer.js';
 import type { ProductionModelInfo, ProductionPair, ProductionProfile, ProductionStats, ProductionWinner } from './production/types.js';
 import { createCatalogueLayer, type CatalogueLayer } from './catalogue/layer.js';
 import { readCatalogueSettings, writeCatalogueSettings, clampKbps } from './catalogue/mirror.js';
@@ -1484,7 +1484,8 @@ export interface CoreService {
 	// ─── Production quality (see production/layer.ts) ───────────────────
 	// Reads the analyzer's production stage (opt-in flag) + Audiobox PQ:
 	// integrity flags, cohort-relative deviations with explanations, the
-	// learned probe's score. Pairs + judgments feed the probe.
+	// learned probe's score. Pairs + judgments feed the probe. Every method
+	// rejects while PRODUCTION_QUALITY_ENABLED (library-logic) is off.
 	getProductionProfile(trackId: string): Promise<ProductionProfile>;
 	nextProductionPair(opts?: { genre?: string | null; playlistId?: string | null }): Promise<ProductionPair | null>;
 	recordProductionJudgment(aTrackId: string, bTrackId: string, winner: ProductionWinner): Promise<ProductionStats>;
@@ -2411,7 +2412,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 				cutoffStore.scheduleRecompute();
 				// A fresh production row gets the stored probe's score at once
 				// (no-op without a fitted model or measurements).
-				try { productionLayer.scoreTrack(evt.trackId); }
+				try { productionLayer?.scoreTrack(evt.trackId); }
 				catch (err) { log.for('production').warn('scoring after analysis failed', { trackId: evt.trackId }, err); }
 			}
 		});
@@ -2435,7 +2436,8 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		busyElsewhere: () => analysisQueue?.busy ?? false,
 	});
 
-	const productionLayer = createProductionLayer({
+	// Null while the feature is off: no scoring, no mirror, no IPC answers.
+	const productionLayer = !PRODUCTION_QUALITY_ENABLED ? null : createProductionLayer({
 		sqlite,
 		audioboxVectors: () => mirLayer.trackVectors(AUDIOBOX_MODEL_KEY),
 		audioboxVector: (id) => mirLayer.trackVector(id, AUDIOBOX_MODEL_KEY),
@@ -2445,34 +2447,40 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 		saveModel: (m) => { mut.setSetting(db, PRODUCTION_MODEL_KEY, m); },
 	});
+	const requireProduction = (): ProductionLayer => {
+		if (!productionLayer) throw new Error('Production quality is disabled');
+		return productionLayer;
+	};
 
 	// Audiobox PQ mirror: the engine stores its scores in mir.db like any
 	// vector; the list sorts on curator.db, so the PQ axis is copied onto the
 	// track row when a score lands, and once at boot for scores already there.
-	const writeAudioboxPq = sqlite.prepare(`UPDATE track SET audiobox_pq = ? WHERE id = ? AND audiobox_pq IS NOT ?`);
-	const mirrorAudioboxPq = (trackId: string): void => {
-		const v = mirLayer.trackVector(trackId, AUDIOBOX_MODEL_KEY);
-		if (v && v.length >= 4 && Number.isFinite(v[3]!)) writeAudioboxPq.run(v[3], trackId, v[3]);
-	};
-	mirLayer.subscribe((e) => {
-		if (e.kind !== 'analyzed' || !e.modelIds.some((id) => id.startsWith(`${AUDIOBOX_MODEL_KEY}@`))) return;
-		try { mirrorAudioboxPq(e.trackId); productionLayer.scoreTrack(e.trackId); }
-		catch (err) { log.for('production').warn('audiobox mirror failed', { trackId: e.trackId }, err); }
-	});
-	setTimeout(() => {
-		try {
-			const vectors = mirLayer.trackVectors(AUDIOBOX_MODEL_KEY);
-			if (vectors.size === 0) return;
-			const n = sqlite.transaction(() => {
-				let changed = 0;
-				for (const [id, v] of vectors) {
-					if (v.length >= 4 && Number.isFinite(v[3]!)) changed += writeAudioboxPq.run(v[3], id, v[3]).changes;
-				}
-				return changed;
-			})();
-			if (n > 0) log.for('production').info('mirrored Audiobox PQ onto tracks', { tracks: n });
-		} catch (err) { log.for('production').warn('Audiobox PQ boot sync failed', undefined, err); }
-	}, 20_000).unref();
+	if (productionLayer) {
+		const writeAudioboxPq = sqlite.prepare(`UPDATE track SET audiobox_pq = ? WHERE id = ? AND audiobox_pq IS NOT ?`);
+		const mirrorAudioboxPq = (trackId: string): void => {
+			const v = mirLayer.trackVector(trackId, AUDIOBOX_MODEL_KEY);
+			if (v && v.length >= 4 && Number.isFinite(v[3]!)) writeAudioboxPq.run(v[3], trackId, v[3]);
+		};
+		mirLayer.subscribe((e) => {
+			if (e.kind !== 'analyzed' || !e.modelIds.some((id) => id.startsWith(`${AUDIOBOX_MODEL_KEY}@`))) return;
+			try { mirrorAudioboxPq(e.trackId); productionLayer.scoreTrack(e.trackId); }
+			catch (err) { log.for('production').warn('audiobox mirror failed', { trackId: e.trackId }, err); }
+		});
+		setTimeout(() => {
+			try {
+				const vectors = mirLayer.trackVectors(AUDIOBOX_MODEL_KEY);
+				if (vectors.size === 0) return;
+				const n = sqlite.transaction(() => {
+					let changed = 0;
+					for (const [id, v] of vectors) {
+						if (v.length >= 4 && Number.isFinite(v[3]!)) changed += writeAudioboxPq.run(v[3], id, v[3]).changes;
+					}
+					return changed;
+				})();
+				if (n > 0) log.for('production').info('mirrored Audiobox PQ onto tracks', { tracks: n });
+			} catch (err) { log.for('production').warn('Audiobox PQ boot sync failed', undefined, err); }
+		}, 20_000).unref();
+	}
 
 	// `filter.similarTo` → ranked ids. Every other filter field narrows the
 	// candidate set first (SQL pushdown), so the ranking happens inside the
@@ -6557,11 +6565,11 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return mirLayer.subscribe(cb);
 		},
 
-		async getProductionProfile(trackId) { return productionLayer.profile(trackId); },
-		async nextProductionPair(opts) { return productionLayer.nextPair(opts); },
-		async recordProductionJudgment(a, b, winner) { return productionLayer.recordJudgment(a, b, winner); },
-		async productionStats() { return productionLayer.stats(); },
-		async fitProductionModel() { return productionLayer.fitModel(); },
+		async getProductionProfile(trackId) { return requireProduction().profile(trackId); },
+		async nextProductionPair(opts) { return requireProduction().nextPair(opts); },
+		async recordProductionJudgment(a, b, winner) { return requireProduction().recordJudgment(a, b, winner); },
+		async productionStats() { return requireProduction().stats(); },
+		async fitProductionModel() { return requireProduction().fitModel(); },
 
 		async getBackupSettings() { return backupService.getSettings(); },
 		async setBackupSettings(patch) { return backupService.setSettings(patch); },

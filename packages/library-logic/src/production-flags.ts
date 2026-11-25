@@ -5,6 +5,12 @@
 // tonal balance looks like. Shared by the core profile and the renderer's list
 // badge so both read the same thresholds.
 
+// The whole production-quality feature: the analyzer's stage 7, the Audiobox
+// model in the AI engine, profile, compare, probe, columns. Off since
+// 2026-11-25; code and stored measurements stay. Nothing is measured and no
+// surface offers the feature while this is false.
+export const PRODUCTION_QUALITY_ENABLED: boolean = false;
+
 export type ProductionFlagKind = 'transcode' | 'clipping' | 'overs' | 'stereo_sub' | 'crushed' | 'phase';
 export type ProductionFlagSeverity = 'warn' | 'bad';
 

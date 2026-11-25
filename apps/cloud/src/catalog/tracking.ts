@@ -68,18 +68,29 @@ export const SWITCHED_OFF = 'switched off by its followers';
 // the watchers who want the tracker at all — the same watchers as wantedSql,
 // so one who switched the source off does not speed it up for the rest. A
 // watcher who never said has the default.
-export async function readCadenceOf(q: Queryable, objectId: string, kind: string, provider: string): Promise<CatalogReadCadence> {
-	const rows = await q.query<{ choice: string | null }>(
-		`select k.cadence ->> $2::text as choice
-		from curator.catalog_watch w left join curator.catalog_worker k on k.user_id = w.user_id
-		where w.object_id = $1 and (k.trackers is null or $3 = any(k.trackers))`,
-		[objectId, kind, `${kind}/${provider}`],
+export async function readCadencesOf(q: Queryable, cursors: readonly { objectId: string; kind: string; provider: string }[]): Promise<Map<string, CatalogReadCadence>> {
+	if (!cursors.length) return new Map();
+	const rows = await q.query<{ object_id: string; kind: string; provider: string; choice: string | null }>(
+		`select w.object_id, x.kind, x.provider, k.cadence ->> x.kind as choice
+		from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, kind text, provider text)
+		join curator.catalog_watch w on w.object_id = x.object_id
+		left join curator.catalog_worker k on k.user_id = w.user_id
+		where k.trackers is null or (x.kind || '/' || x.provider) = any(k.trackers)`,
+		[JSON.stringify(cursors.map((c) => ({ object_id: c.objectId, kind: c.kind, provider: c.provider })))],
 	);
 	const rank = (c: string | null): number => {
 		const i = CATALOG_READ_CADENCES.indexOf(c as CatalogReadCadence);
 		return i < 0 ? CATALOG_READ_CADENCES.indexOf(CATALOG_READ_CADENCE_DEFAULT) : i;
 	};
-	return rows.length ? CATALOG_READ_CADENCES[Math.min(...rows.map((r) => rank(r.choice)))]! : CATALOG_READ_CADENCE_DEFAULT;
+	const ranks = new Map<string, number>();
+	for (const r of rows) {
+		const key = `${r.object_id}|${r.provider}`;
+		ranks.set(key, Math.min(ranks.get(key) ?? Infinity, rank(r.choice)));
+	}
+	return new Map(cursors.map((c) => {
+		const r = ranks.get(`${c.objectId}|${c.provider}`);
+		return [`${c.objectId}|${c.provider}`, r === undefined ? CATALOG_READ_CADENCE_DEFAULT : CATALOG_READ_CADENCES[r]!];
+	}));
 }
 
 // A user's choices changed (workers.ts workerDue): where a kind is now read

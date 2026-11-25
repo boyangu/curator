@@ -56,7 +56,7 @@ export function nextDueAt(now: number, cadence: Cadence, spread = 0): number {
 }
 
 // When a cursor is next due under its followers' choice (protocol
-// CatalogReadCadence; tracking.ts readCadenceOf picks the most frequent among
+// CatalogReadCadence; tracking.ts readCadencesOf picks the most frequent among
 // them). A choice only ever slows the tracker:
 //   'source'  the tracker's own cadence, above;
 //   'daily'   a day from now, with no tightening through Friday;

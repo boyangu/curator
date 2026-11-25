@@ -57,7 +57,12 @@ const log = createLogger((line) => {
 	if (j.level !== 'debug') console.log(`[${j.level}] ${j.msg}`, Object.fromEntries(Object.entries(j).filter(([k]) => !['level', 'msg', 'ts', 'time'].includes(k))));
 });
 
-const db = createPostgresDb(url, { max: 4 });
+// On the session pooler whatever port the URL names: it keeps prepared
+// statements, and from here a statement is a trip around half the world (130 ms
+// against 280, and several issued together share one; 2026-11-25).
+const sessionUrl = new URL(url);
+if (sessionUrl.hostname.endsWith('.pooler.supabase.com')) sessionUrl.port = '5432';
+const db = createPostgresDb(sessionUrl.toString(), { max: 4, prepare: true });
 const schemaOk = await migrationGate(db, log).catch((e: unknown) => {
 	log.error('migration_gate_failed', { error: e });
 	return false;

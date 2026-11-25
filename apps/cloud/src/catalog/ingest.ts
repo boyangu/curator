@@ -12,6 +12,10 @@
 //   - its relationships (credited artists, tracklist, label, genres), each a
 //     canonical edge with this source's evidence beside it;
 //   - the gaps the planner should fill (catalog_enrich_task).
+// A batch of claims is read and written as one: ingest-batch.ts holds what the
+// claims name and queues what they decide, so a listing costs a handful of
+// statements whatever its length. The rules here run over that, claim by
+// claim and in order.
 // What it never does: raise an event. Events are a tracker's call
 // (events.ts), made after its ingest committed, and only for recent children
 // of the object it tracks; imports and registrations populate silently.
@@ -27,25 +31,18 @@ import { nameFold, recordingKey } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { isCreditStore, queueCredits } from './credits.js';
 import { foldAttrs, releaseAtOf, type FactRow } from './fold.js';
-import {
-	type ClaimParent,
-	corroborated,
-	findByIdentifier,
-	findRepresentation,
-	NAMESPACE_KIND,
-	normalizeIdentifier,
-	recordingByIsrcOk,
-	recordingByKey,
-	releaseByTitle,
-} from './identity.js';
-import { heldTracks, slotMatch, type HeldTrack } from './slots.js';
+import { type ClaimParent, NAMESPACE_KIND, normalizeIdentifier } from './identity.js';
+import { type FlatClaim, IngestBatch, type Obj } from './ingest-batch.js';
+import { slotMatch, type HeldTrack } from './slots.js';
 import { ensureCursors } from './watches.js';
 
 export type IngestContext = { reason: CatalogIngestReason };
 
 export type IngestOutcome = { objectId: string; kind: CatalogKind; created: boolean };
 
-const str = (n: number | null | undefined): string | null => (n === null || n === undefined ? null : String(n));
+// Claims resolved together, nested ones counted: several listings' worth. Past
+// it a batch is split, so no statement carries an unbounded parameter.
+export const BATCH_NODES = 2000;
 
 export class Ingester {
 	readonly stats = { created: 0, attached: 0 };
@@ -58,13 +55,74 @@ export class Ingester {
 		private readonly ctx: IngestContext,
 	) {}
 
+	// Every call below runs in a batch: its own, or the caller's (`batch`,
+	// around several calls). What the batch queued is written when it ends, so
+	// a caller reading the catalogue between two calls must not share one.
+	private b: IngestBatch | null = null;
+	// Releases whose track credits may be short, and watched objects that may
+	// gain a tracker: both read what the batch wrote, so they follow it.
+	private readonly credits = new Set<string>();
+	private readonly cursors = new Set<string>();
+
+	async batch<T>(claims: readonly CatalogClaim[], fn: () => Promise<T>, objectIds: readonly string[] = []): Promise<T> {
+		if (this.b) return fn();
+		const b = new IngestBatch(this.tx, this.ctx.reason);
+		const flat: FlatClaim[] = [];
+		for (const c of claims) await this.flatten(c, null, flat);
+		await b.prefetch(flat, objectIds);
+		this.b = b;
+		try {
+			const out = await fn();
+			await b.flush();
+			if (this.cursors.size) await ensureCursors(this.tx, [...this.cursors].sort());
+			if (this.credits.size) await queueCredits(this.tx, [...this.credits].sort());
+			return out;
+		} finally {
+			this.b = null;
+			this.cursors.clear();
+			this.credits.clear();
+		}
+	}
+
+	// The claims a claim will resolve, as it will resolve them: what the batch
+	// reads for.
+	private async flatten(c: CatalogClaim, parent: CatalogClaim | null, out: FlatClaim[]): Promise<void> {
+		const own = await this.blocked(c);
+		out.push({ claim: own, parent });
+		const credited = own.kind === 'release' || own.kind === 'recording' ? await this.creditRules(own.artists ?? []) : own.kind === 'label' ? (own.artists ?? []) : [];
+		for (const a of credited) await this.flatten(a, own, out);
+		if (own.kind !== 'release') return;
+		for (const r of own.recordings ?? []) await this.flatten({ ...r, artists: r.artists?.length ? r.artists : own.artists }, own, out);
+		if (own.label) await this.flatten(own.label, own, out);
+	}
+
+	// The object the claim's representation already sits on.
+	holder(c: CatalogClaim): Promise<string | null> {
+		return this.batch([alone(c)], () => this.b!.representation(c));
+	}
+
+	// The object the claim's identifiers already name, and whether its length
+	// allows it to be the same recording (identity.ts recordingByIsrcOk).
+	named(c: CatalogClaim, durationSec?: number): Promise<{ id: string; fits: boolean } | null> {
+		return this.batch([alone(c)], async () => {
+			const hit = await this.b!.byIdentifier(c);
+			return hit && { id: hit.id, fits: hit.namespace !== 'isrc' || (await this.b!.isrcOk(hit.id, durationSec)) };
+		});
+	}
+
 	// Attaches a claim to an object already decided (the planner confirmed it
 	// by evidence ingestion cannot see): representation, identifiers, facts.
-	async attachTo(objectId: string, c: CatalogClaim): Promise<void> {
-		const rep = await this.attachRepresentation(c, objectId);
-		await this.attachIdentifiers(c, objectId, rep.id);
-		await this.attachFacts(c, objectId);
-		if (rep.inserted) await this.creditsGap(c, objectId);
+	attachTo(objectId: string, c: CatalogClaim): Promise<void> {
+		return this.batch(
+			[alone(c)],
+			async () => {
+				const rep = await this.b!.represent(c, objectId);
+				this.attachIdentifiers(c, objectId, rep.id);
+				await this.attachFacts(c, objectId);
+				if (rep.inserted) this.creditsGap(c, objectId);
+			},
+			[objectId],
+		);
 	}
 
 	// A release gains a page on a store that credits every track in full, and
@@ -72,17 +130,18 @@ export class Ingester {
 	// device's match): if Deezer alone credited the release's tracks, the page
 	// is read for their credits (credits.ts). A claim carrying its tracklist
 	// brings the credits itself.
-	private async creditsGap(c: CatalogClaim, objectId: string): Promise<void> {
+	private creditsGap(c: CatalogClaim, objectId: string): void {
 		if (c.kind !== 'release' || c.recordings?.length || !isCreditStore(c.provider)) return;
-		await queueCredits(this.tx, [objectId]);
+		this.credits.add(objectId);
 	}
 
 	// A claim's identifiers onto an object the claim's representation already
 	// sits on (the ISRC fill, planner.ts): nothing else of the claim is read.
-	async attachIdentifiersOnly(objectId: string, c: CatalogClaim): Promise<void> {
-		const [rep] = await this.tx.query<{ id: string }>(`select id from curator.catalog_source_object where provider = $1 and kind = $2 and provider_id = $3`, [c.provider, c.kind, c.providerId]);
-		if (!rep) return;
-		await this.attachIdentifiers(c, objectId, rep.id);
+	attachIdentifiersOnly(objectId: string, c: CatalogClaim): Promise<void> {
+		return this.batch([alone(c)], async () => {
+			const rep = await this.b!.heldRepresentation(c);
+			if (rep) this.attachIdentifiers(c, objectId, rep);
+		});
 	}
 
 	// Attaches a claim to the object it names only if the catalogue already has
@@ -90,19 +149,49 @@ export class Ingester {
 	// created and no relationship written — except the claim's genres when
 	// asked (a device's facts-up: a store's genre is a fact about the
 	// recording, not a tie to another object). Null when it names nothing known.
-	async attachIfKnown(c: CatalogClaim, opts: { genres?: boolean } = {}): Promise<IngestOutcome | null> {
-		const objectId = (await findRepresentation(this.tx, c)) ?? (await this.candidate(c));
-		if (!objectId) return null;
-		const rep = await this.attachRepresentation(c, objectId);
-		if (rep.inserted) this.stats.attached++;
-		await this.attachIdentifiers(c, objectId, rep.id);
-		await this.attachFacts(c, objectId);
-		if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
-		if (rep.inserted) await this.creditsGap(c, objectId);
-		return { objectId, kind: c.kind, created: false };
+	attachIfKnown(c: CatalogClaim, opts: { genres?: boolean } = {}): Promise<IngestOutcome | null> {
+		return this.batch([c], async () => {
+			const objectId = (await this.b!.representation(c)) ?? (await this.candidate(c));
+			if (!objectId) return null;
+			const rep = await this.b!.represent(c, objectId);
+			if (rep.inserted) this.stats.attached++;
+			this.attachIdentifiers(c, objectId, rep.id);
+			await this.attachFacts(c, objectId);
+			if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
+			if (rep.inserted) this.creditsGap(c, objectId);
+			return { objectId, kind: c.kind, created: false };
+		});
 	}
 
-	claim(c: CatalogClaim, parent?: ClaimParent): Promise<IngestOutcome> {
+	// Each claim resolved afresh from here on, as by a new ingester: the next
+	// poll of a batch may say more of a claim than an earlier one did (a
+	// listing's bare release, then the release in full).
+	forget(): void {
+		this.memo.clear();
+		this.heldMemo.clear();
+	}
+
+	// Several claims, in as few batches as they fit in. In order, not in
+	// parallel: claims in one batch often share artists and releases.
+	async claims(claims: readonly CatalogClaim[]): Promise<IngestOutcome[]> {
+		const out: IngestOutcome[] = [];
+		for (let i = 0; i < claims.length; ) {
+			let j = i;
+			for (let n = 0; j < claims.length && (j === i || n + nodes(claims[j]!) <= BATCH_NODES); j++) n += nodes(claims[j]!);
+			const chunk = claims.slice(i, j);
+			await this.batch(chunk, async () => {
+				for (const c of chunk) out.push(await this.claim(c));
+			});
+			i = j;
+		}
+		return out;
+	}
+
+	claim(c: CatalogClaim): Promise<IngestOutcome> {
+		return this.batch([c], () => this.nested(c));
+	}
+
+	private nested(c: CatalogClaim, parent?: ClaimParent): Promise<IngestOutcome> {
 		const key = `${c.provider}|${c.kind}|${c.providerId}`;
 		let p = this.memo.get(key);
 		if (!p) {
@@ -119,10 +208,14 @@ export class Ingester {
 	private rules() {
 		this.rulesMemo ??= (async () => {
 			const credits = new Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>();
-			for (const r of await this.tx.query<{ name_fold: string; name: string; kind: 'compound' | 'split'; pieces: string }>(`select name_fold, name, kind, pieces::text as pieces from curator.catalog_credit_rule`)) {
-				credits.set(r.name_fold, { name: r.name, kind: r.kind, pieces: r.pieces === '{}' ? [] : r.pieces.slice(1, -1).split(',').map((p) => p.replace(/^"|"$/g, '')) });
+			const blocked = new Set<string>();
+			for (const r of await this.tx.query<{ k: string; name: string | null; kind: 'compound' | 'split' | null; pieces: string | null }>(
+				`select name_fold as k, name, kind, pieces::text as pieces from curator.catalog_credit_rule
+				union all select provider || '|' || kind || '|' || provider_id, null, null, null from curator.catalog_source_block`,
+			)) {
+				if (r.kind === null) blocked.add(r.k);
+				else credits.set(r.k, { name: r.name!, kind: r.kind, pieces: !r.pieces || r.pieces === '{}' ? [] : r.pieces.slice(1, -1).split(',').map((p) => p.replace(/^"|"$/g, '')) });
 			}
-			const blocked = new Set((await this.tx.query<{ k: string }>(`select provider || '|' || kind || '|' || provider_id as k from curator.catalog_source_block`)).map((r) => r.k));
 			return { credits, blocked };
 		})();
 		return this.rulesMemo;
@@ -168,41 +261,43 @@ export class Ingester {
 	private async held(releaseId: string): Promise<HeldTrack[]> {
 		let h = this.heldMemo.get(releaseId);
 		if (!h) {
-			h = await heldTracks(this.tx, releaseId);
+			h = await this.b!.held(releaseId);
 			this.heldMemo.set(releaseId, h);
 		}
 		return h;
 	}
 
 	private async resolve(c: CatalogClaim, parent?: ClaimParent): Promise<IngestOutcome> {
-		let objectId = await findRepresentation(this.tx, c);
+		const b = this.b!;
+		let objectId = await b.representation(c);
 		let created = false;
 		if (!objectId) objectId = await this.candidate(c, parent);
 		if (!objectId) {
-			objectId = await this.create(c);
+			objectId = this.create(c).id;
 			created = true;
 			this.stats.created++;
 		}
-		const repNew = await this.attachRepresentation(c, objectId);
+		const repNew = await b.represent(c, objectId);
 		if (!created && repNew.inserted) {
 			this.stats.attached++;
 			// A watched object reachable on one more provider gains that
 			// provider's tracker.
-			if (isLiveKind(c.kind)) await ensureCursors(this.tx, objectId);
+			if (isLiveKind(c.kind)) this.cursors.add(objectId);
 		}
-		await this.attachIdentifiers(c, objectId, repNew.id);
+		this.attachIdentifiers(c, objectId, repNew.id);
 		await this.attachFacts(c, objectId);
 		await this.attachRelationships(c, objectId, repNew.id, parent);
-		if (!created && repNew.inserted) await this.creditsGap(c, objectId);
-		if (created) await this.recordGaps(c, objectId);
+		if (!created && repNew.inserted) this.creditsGap(c, objectId);
+		if (created) this.recordGaps(c, objectId);
 		return { objectId, kind: c.kind, created };
 	}
 
 	// An existing object this claim is about, by the rules of identity.ts.
 	private async candidate(c: CatalogClaim, parent?: ClaimParent): Promise<string | null> {
-		const byId = await findByIdentifier(this.tx, c);
+		const b = this.b!;
+		const byId = await b.byIdentifier(c);
 		if (byId) {
-			if (byId.namespace !== 'isrc' || (await recordingByIsrcOk(this.tx, byId.id, c.facts?.durationSec))) return byId.id;
+			if (byId.namespace !== 'isrc' || (await b.isrcOk(byId.id, c.facts?.durationSec))) return byId.id;
 		}
 		const fold = nameFold(c.name);
 		switch (c.kind) {
@@ -217,77 +312,40 @@ export class Ingester {
 						return hit.id;
 					}
 				}
-				return recordingByKey(this.tx, recordingKey(c.name, (c.artists ?? []).map((a) => a.name)), c.facts?.durationSec);
+				return b.recordingByKey(recordingKey(c.name, (c.artists ?? []).map((a) => a.name)), c.facts?.durationSec);
 			}
 			case 'release':
 				// By credited names, before any artist is resolved: the artists
 				// then corroborate through the release found (attachRelationships).
-				return releaseByTitle(
-					this.tx,
+				return b.releaseByTitle(
 					fold,
 					(c.artists ?? []).map((a) => a.name).filter((n) => !!nameFold(n)),
 					releaseAtOf(c.facts?.releaseDate),
 				);
 			case 'artist':
 			case 'label':
-				return parent ? corroborated(this.tx, c.kind, fold, parent, c.provider) : null;
+				return parent ? b.corroborated(c.kind, fold, parent, c.provider) : null;
 			default:
 				return null;
 		}
 	}
 
-	private async create(c: CatalogClaim): Promise<string> {
-		const f = c.facts ?? {};
-		const recKey = c.kind === 'recording' ? recordingKey(c.name, (c.artists ?? []).map((a) => a.name)) : null;
-		const releaseAt = c.kind === 'release' ? releaseAtOf(f.releaseDate) : null;
-		const [row] = await this.tx.query<{ id: string }>(
-			`insert into curator.catalog_object
-				(kind, name, name_fold, discovered_via, duration_sec, rec_key, release_at, release_type, label_text, home_provider)
-			values ($1, $2, $3, $4, $5::float8, $6, to_timestamp($7::float8 / 1000), $8, $9, $10)
-			returning id`,
-			[
-				c.kind,
-				c.name,
-				nameFold(c.name),
-				this.ctx.reason,
-				c.kind === 'recording' ? str(f.durationSec) : null,
-				recKey,
-				str(releaseAt),
-				c.kind === 'release' ? (f.releaseType ?? null) : null,
-				c.kind === 'release' ? (f.labelText ?? null) : null,
-				c.kind === 'playlist' ? c.provider : null,
-			],
-		);
+	private create(c: CatalogClaim): Obj {
+		const o = this.b!.create(c, c.kind === 'recording' ? recordingKey(c.name, (c.artists ?? []).map((a) => a.name)) : null);
 		// A new label may be one the catalogue holds under another name: checked
 		// now and while its releases arrive (label-related.ts).
-		if (c.kind === 'label') await this.tx.query(`insert into curator.catalog_enrich_task (object_id, need, provider) values ($1, 'dedupe', 'catalog') on conflict do nothing`, [row!.id]);
-		return row!.id;
-	}
-
-	private async attachRepresentation(c: CatalogClaim, objectId: string): Promise<{ id: string; inserted: boolean }> {
-		const [row] = await this.tx.query<{ id: string; inserted: boolean }>(
-			`insert into curator.catalog_source_object (object_id, provider, kind, provider_id, url, payload)
-			values ($1, $2, $3, $4, $5, $6::text::jsonb)
-			on conflict (provider, kind, provider_id) do update set last_seen_at = now(),
-				url = coalesce(excluded.url, curator.catalog_source_object.url)
-			returning id, (xmax = 0) as inserted`,
-			[objectId, c.provider, c.kind, c.providerId, c.url ?? null, JSON.stringify({ name: c.name, ...(c.facts ? { facts: c.facts } : {}) })],
-		);
-		return { id: row!.id, inserted: row!.inserted === true };
+		if (c.kind === 'label') this.b!.task(o.id, 'dedupe', 'catalog');
+		return o;
 	}
 
 	// Identifiers of the wrong kind, malformed, or already naming another
 	// object are dropped: an ISRC on two recordings is a provider's error the
 	// catalogue does not copy.
-	private async attachIdentifiers(c: CatalogClaim, objectId: string, sourceObjectId: string): Promise<void> {
+	private attachIdentifiers(c: CatalogClaim, objectId: string, sourceObjectId: string): void {
 		for (const ident of c.identifiers ?? []) {
 			if (NAMESPACE_KIND[ident.namespace] !== c.kind) continue;
 			const value = normalizeIdentifier(ident.namespace, ident.value);
-			if (!value) continue;
-			await this.tx.query(
-				`insert into curator.catalog_identifier (namespace, value, object_id, source_object_id) values ($1, $2, $3, $4) on conflict do nothing`,
-				[ident.namespace, value, objectId, sourceObjectId],
-			);
+			if (value) this.b!.identify(ident.namespace, value, objectId, sourceObjectId);
 		}
 	}
 
@@ -296,42 +354,12 @@ export class Ingester {
 		const facts: FactRow[] = Object.entries(c.facts ?? {})
 			.filter(([, v]) => v !== undefined && v !== null)
 			.map(([field, value]) => ({ field, source: c.provider, value }));
-		for (const f of facts) {
-			// Static: the first value a source gave is the one kept. Live: the
-			// source's current value replaces its previous one.
-			await this.tx.query(
-				`insert into curator.catalog_fact (object_id, field, source, value) values ($1, $2, $3, $4::text::jsonb)
-				on conflict (object_id, field, source) do ${live ? 'update set value = excluded.value, at = now()' : 'nothing'}`,
-				[objectId, f.field, f.source, JSON.stringify(f.value)],
-			);
-		}
-		const [row] = await this.tx.query<{ attrs: unknown; name: string }>(`select attrs::text as attrs, name from curator.catalog_object where id = $1`, [objectId]);
-		const current = JSON.parse(String(row!.attrs)) as Record<string, unknown>;
-		const next = foldAttrs(current, facts, { live, liveSource: c.provider });
-		const rename = live && c.name !== row!.name;
-		if (JSON.stringify(next) === JSON.stringify(current) && !rename) return;
-		const f = c.facts ?? {};
-		await this.tx.query(
-			`update curator.catalog_object set attrs = $2::text::jsonb, updated_at = now(),
-				name = case when $3 then $4 else name end,
-				name_fold = case when $3 then $5 else name_fold end,
-				duration_sec = coalesce(duration_sec, $6::float8),
-				release_at = coalesce(release_at, to_timestamp($7::float8 / 1000)),
-				release_type = coalesce(release_type, $8),
-				label_text = coalesce(label_text, $9)
-			where id = $1`,
-			[
-				objectId,
-				JSON.stringify(next),
-				rename ? 'true' : 'false',
-				c.name,
-				nameFold(c.name),
-				c.kind === 'recording' ? str(f.durationSec) : null,
-				c.kind === 'release' ? str(releaseAtOf(f.releaseDate)) : null,
-				c.kind === 'release' ? (f.releaseType ?? null) : null,
-				c.kind === 'release' ? (f.labelText ?? null) : null,
-			],
-		);
+		for (const f of facts) this.b!.fact(objectId, f.field, f.source, f.value, live);
+		const o = await this.b!.object(objectId);
+		const next = foldAttrs(o.attrs, facts, { live, liveSource: c.provider });
+		const rename = live && c.name !== o.name;
+		if (JSON.stringify(next) === JSON.stringify(o.attrs) && !rename) return;
+		this.b!.fold(o, next, c, rename);
 	}
 
 	private async attachRelationships(c: CatalogClaim, objectId: string, sourceObjectId: string, parent?: ClaimParent): Promise<void> {
@@ -341,36 +369,36 @@ export class Ingester {
 		const self: ClaimParent = { id: objectId, kind: c.kind, release: c.kind === 'recording' && parent?.kind === 'release' ? parent.id : undefined };
 		if (c.kind === 'release') {
 			for (const [i, a] of (await this.creditRules(c.artists ?? [])).entries()) {
-				const artist = await this.claim(a, self);
-				if (artist.kind === 'artist') await this.edge(artist.objectId, 'artist-release', objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
+				const artist = await this.nested(a, self);
+				if (artist.kind === 'artist') this.edge(artist.objectId, 'artist-release', objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
 			}
 			const artistFolds = (c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean);
 			for (const [i, r] of (c.recordings ?? []).entries()) {
 				// A tracklist entry without its own credits carries the release's.
 				const position = r.facts?.trackNumber ?? i + 1;
-				const rec = await this.claim({ ...r, artists: r.artists?.length ? r.artists : c.artists }, { ...self, position, artistFolds });
-				if (rec.kind === 'recording') await this.edge(objectId, 'release-recording', rec.objectId, sourceObjectId, null, position);
+				const rec = await this.nested({ ...r, artists: r.artists?.length ? r.artists : c.artists }, { ...self, position, artistFolds });
+				if (rec.kind === 'recording') this.edge(objectId, 'release-recording', rec.objectId, sourceObjectId, null, position);
 			}
 			// Deezer's tracklist names a track's primary artist only: where no
 			// other store credited these tracks, the release's Spotify or
 			// Beatport page is read for the rest (credits.ts).
-			if (c.provider === 'deezer' && c.recordings?.length) await queueCredits(this.tx, [objectId]);
+			if (c.provider === 'deezer' && c.recordings?.length) this.credits.add(objectId);
 			if (c.label) {
-				const label = await this.claim(c.label, self);
-				if (label.kind === 'label') await this.edge(objectId, 'release-label', label.objectId, sourceObjectId, null, null);
+				const label = await this.nested(c.label, self);
+				if (label.kind === 'label') this.edge(objectId, 'release-label', label.objectId, sourceObjectId, null, null);
 			}
 		}
 		if (c.kind === 'recording') {
 			for (const [i, a] of (await this.creditRules(c.artists ?? [])).entries()) {
-				const artist = await this.claim(a, self);
-				if (artist.kind === 'artist') await this.edge(objectId, 'recording-artist', artist.objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
+				const artist = await this.nested(a, self);
+				if (artist.kind === 'artist') this.edge(objectId, 'recording-artist', artist.objectId, sourceObjectId, i === 0 ? 'main' : 'credited', i);
 			}
 		}
 		// A label's roster, as the provider lists it (Bandcamp's artists page).
 		if (c.kind === 'label') {
 			for (const [i, a] of (c.artists ?? []).entries()) {
-				const artist = await this.claim(a, self);
-				if (artist.kind === 'artist') await this.edge(objectId, 'label-artist', artist.objectId, sourceObjectId, null, i);
+				const artist = await this.nested(a, self);
+				if (artist.kind === 'artist') this.edge(objectId, 'label-artist', artist.objectId, sourceObjectId, null, i);
 			}
 		}
 		if (c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, sourceObjectId);
@@ -380,28 +408,21 @@ export class Ingester {
 	// recorded as unmapped (an operator maps it or leaves it orthogonal) and
 	// kept as the source's 'genres' fact.
 	private async attachGenres(provider: CatalogProvider, genres: string[], objectId: string, sourceObjectId: string): Promise<void> {
-		await this.tx.query(
-			`insert into curator.catalog_fact (object_id, field, source, value) values ($1, 'genres', $2, $3::text::jsonb) on conflict do nothing`,
-			[objectId, provider, JSON.stringify(genres)],
-		);
+		this.b!.fact(objectId, 'genres', provider, genres, false);
 		for (const raw of genres) {
 			const fold = nameFold(raw);
 			if (!fold) continue;
-			const [alias] = await this.tx.query<{ genre_id: string | null }>(
-				`with ins as (insert into curator.genre_alias (provider, raw_fold, genre_id) values ($1, $2, null) on conflict do nothing returning genre_id)
-				select genre_id from curator.genre_alias where provider = $1 and raw_fold = $2`,
-				[provider, fold],
-			);
-			if (alias?.genre_id) await this.edge(objectId, 'object-genre', alias.genre_id, sourceObjectId, null, null);
+			const genre = await this.b!.alias(provider, fold);
+			if (genre) this.edge(objectId, 'object-genre', genre, sourceObjectId, null, null);
 		}
 	}
 
-	private edge(src: string, kind: string, dst: string, sourceObjectId: string, role: string | null, position: number | null): Promise<void> {
-		return addEdge(this.tx, src, kind, dst, sourceObjectId, role, position);
+	private edge(src: string, kind: string, dst: string, sourceObjectId: string, role: string | null, position: number | null): void {
+		this.b!.edge(src, kind, dst, sourceObjectId, role, position);
 	}
 
 	// What a new static object is missing that another provider can supply.
-	private async recordGaps(c: CatalogClaim, objectId: string): Promise<void> {
+	private recordGaps(c: CatalogClaim, objectId: string): void {
 		const has = (ns: string) => (c.identifiers ?? []).some((i) => i.namespace === ns);
 		const gaps: [string, string][] = [];
 		if (c.kind === 'recording' && !has('isrc')) gaps.push(['isrc', 'deezer']);
@@ -412,11 +433,14 @@ export class Ingester {
 		if (c.kind === 'recording' && has('isrc') && c.provider !== 'spotify' && (this.ctx.reason === 'tracker' || this.ctx.reason === 'library_import')) gaps.push(['representation', 'spotify']);
 		if (c.kind === 'release' && !has('upc')) gaps.push(['upc', 'deezer']);
 		if (c.kind === 'release' && !c.label && !c.facts?.labelText) gaps.push(['label', 'deezer']);
-		for (const [need, provider] of gaps) {
-			await this.tx.query(`insert into curator.catalog_enrich_task (object_id, need, provider) values ($1, $2, $3) on conflict do nothing`, [objectId, need, provider]);
-		}
+		for (const [need, provider] of gaps) this.b!.task(objectId, need, provider);
 	}
 }
+
+// A claim without the ones it names: only the claim itself is read for.
+export const alone = (c: CatalogClaim): CatalogClaim => ({ ...c, artists: undefined, recordings: undefined, label: undefined });
+
+export const nodes = (c: CatalogClaim): number => 1 + (c.artists?.length ?? 0) + (c.label ? 1 : 0) + (c.recordings ?? []).reduce((n, r) => n + nodes(r), 0);
 
 // A canonical edge with one source's evidence beside it; the edge is made
 // once, the evidence once per source.
@@ -427,7 +451,7 @@ export async function addEdge(tx: Queryable, src: string, kind: string, dst: str
 			on conflict (src, kind, dst) do nothing returning id
 		)
 		select id from ins union all select id from curator.catalog_edge where src = $1 and kind = $2 and dst = $3 limit 1`,
-		[src, kind, dst, role, str(position)],
+		[src, kind, dst, role, position === null ? null : String(position)],
 	);
 	await tx.query(`insert into curator.catalog_edge_evidence (edge_id, source_object_id) values ($1, $2) on conflict do nothing`, [row!.id, sourceObjectId]);
 }
@@ -435,21 +459,28 @@ export async function addEdge(tx: Queryable, src: string, kind: string, dst: str
 // Releases a source lists as a label's (its catalogue playlist), tied to the
 // label, each by its own representation's evidence: `release-label`.
 export async function linkReleasesToLabel(tx: Queryable, labelId: string, releases: { objectId: string; claim: Pick<CatalogClaim, 'provider' | 'kind' | 'providerId'> }[]): Promise<number> {
-	let linked = 0;
-	for (const r of releases) {
-		const [rep] = await tx.query<{ id: string }>(`select id from curator.catalog_source_object where provider = $1 and kind = $2 and provider_id = $3`, [r.claim.provider, r.claim.kind, r.claim.providerId]);
-		if (!rep) continue;
-		await addEdge(tx, r.objectId, 'release-label', labelId, rep.id);
-		linked++;
-	}
-	return linked;
+	if (!releases.length) return 0;
+	const rows = await tx.query(
+		`with x as (
+			select distinct on (w.o) w.o, s.id as so from jsonb_to_recordset($2::text::jsonb) as w(o uuid, p text, k text, i text)
+			join curator.catalog_source_object s on s.provider = w.p and s.kind = w.k and s.provider_id = w.i order by w.o, s.id
+		), ins as (
+			insert into curator.catalog_edge (src, kind, dst) select x.o, 'release-label', $1::uuid from x order by x.o
+			on conflict (src, kind, dst) do nothing returning id, src
+		), e as (
+			select id, src from ins union all
+			select e.id, e.src from x join curator.catalog_edge e on e.src = x.o and e.kind = 'release-label' and e.dst = $1::uuid
+		), ev as (
+			insert into curator.catalog_edge_evidence (edge_id, source_object_id) select e.id, x.so from e join x on x.o = e.src on conflict do nothing
+		)
+		select 1 as linked from x`,
+		[labelId, JSON.stringify(releases.map((r) => ({ o: r.objectId, p: r.claim.provider, k: r.claim.kind, i: r.claim.providerId })))],
+	);
+	return rows.length;
 }
 
 export async function ingestClaims(tx: Queryable, claims: CatalogClaim[], ctx: IngestContext): Promise<{ outcomes: IngestOutcome[]; created: number; attached: number }> {
 	const ingester = new Ingester(tx, ctx);
-	const outcomes: IngestOutcome[] = [];
-	// In order, not in parallel: claims in one batch often share artists and
-	// releases, and one transaction is one connection anyway.
-	for (const c of claims) outcomes.push(await ingester.claim(c));
+	const outcomes = await ingester.claims(claims);
 	return { outcomes, ...ingester.stats };
 }

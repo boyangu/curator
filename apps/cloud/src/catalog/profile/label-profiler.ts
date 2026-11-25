@@ -281,7 +281,7 @@ export class LabelProfiler {
 				// label's releases first; what it cannot settle stays a review.
 				if (opened.length) await enqueueCase(tx, { kind: 'label_pages', subjects: [label.id], input: { label: label.id, reviews: opened }, key: opened.join(',') });
 			}
-			await ensureCursors(tx, label.id);
+			await ensureCursors(tx, [label.id]);
 			// Its releases, once, from every provider that can list them
 			// (trackers/backfill.ts): what a label looks like in the catalogue
 			// whether or not anyone watches it. Deezer lists by name.

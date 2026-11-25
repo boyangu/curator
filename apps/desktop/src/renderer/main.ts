@@ -43,6 +43,7 @@ import { mountDeleteTracksDialog, type DeleteTracksDialogHandle } from './layout
 import { mountConfirmDialog, type ConfirmDialogHandle } from './layouts/ConfirmDialog.jsx';
 import { mountProductionProfileDialog, type ProductionProfileDialogHandle } from './layouts/ProductionProfileDialog.jsx';
 import { mountProductionCompareDialog, type ProductionCompareDialogHandle } from './layouts/ProductionCompareDialog.jsx';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { configureProductionSettings } from './features/productionSettings.js';
 import { mountWavConvertDialog, type WavConvertDialogHandle } from './layouts/WavConvertDialog.jsx';
 import { mountBackupProgressDialog, type BackupProgressDialogHandle } from './layouts/BackupProgressDialog.jsx';
@@ -88,8 +89,12 @@ type SortDir = 'asc' | 'desc';
 const KNOWN_SORT_COLUMNS = new Set<SortColumn>([
 	'index', 'title', 'artist', 'album', 'releaseDate', 'label', 'genre', 'bpm', 'keyCamelot',
 	'duration', 'createdAt', 'loudnessRangeLu', 'dissonance', 'density',
-	'brightness', 'power', 'dynamicComplexity', 'prodLufs', 'prodPlr', 'prodScore', 'audioboxPq',
+	'brightness', 'power', 'dynamicComplexity',
+	...(PRODUCTION_QUALITY_ENABLED ? ['prodLufs', 'prodPlr', 'prodScore', 'audioboxPq'] as const : []),
 ]);
+// Persisted sorts (last session, pinned searches) may name a column of a
+// feature that is off now — there is no header left to undo it with.
+const OFF_SORT_COLUMNS: ReadonlySet<string> = new Set(PRODUCTION_QUALITY_ENABLED ? [] : ['prodLufs', 'prodPlr', 'prodScore', 'audioboxPq']);
 // One-time migration. For every Spotify playlist already in the user's
 // library, pre-seed a `playlistSorts` entry with `{ column: 'createdAt',
 // dir: 'desc' }` (= "Added ↓", which mirrors Spotify's "Recently added"
@@ -1627,7 +1632,7 @@ function loadUiState(): void {
 			// on the Spotify default. (A backup restore can re-seed this too.)
 			shell.hydrate({ activeSource: 'rekordbox' });
 		}
-		if (typeof data.sortColumn === 'string') state.sortColumn = data.sortColumn as SortColumn;
+		if (typeof data.sortColumn === 'string' && !OFF_SORT_COLUMNS.has(data.sortColumn)) state.sortColumn = data.sortColumn as SortColumn;
 		if (data.sortDir === 'asc' || data.sortDir === 'desc') state.sortDir = data.sortDir;
 
 		if (data.playlistAnchors && typeof data.playlistAnchors === 'object') {
@@ -5792,13 +5797,13 @@ async function boot(): Promise<void> {
 	// Remove-from-playlist confirmation).
 	const confirmDialogHost = document.getElementById('confirm-dialog-host');
 	if (confirmDialogHost) confirmDialog = mountConfirmDialog(confirmDialogHost);
-	const productionCompareHost = document.getElementById('production-compare-host');
+	const productionCompareHost = PRODUCTION_QUALITY_ENABLED ? document.getElementById('production-compare-host') : null;
 	if (productionCompareHost) {
 		productionCompareDialog = mountProductionCompareDialog(productionCompareHost, {
 			currentPlaylist: () => { const p = currentEditablePlaylist(); return p ? { id: p.id, name: p.name } : null; },
 		});
 	}
-	const productionProfileHost = document.getElementById('production-profile-host');
+	const productionProfileHost = PRODUCTION_QUALITY_ENABLED ? document.getElementById('production-profile-host') : null;
 	if (productionProfileHost) {
 		productionProfileDialog = mountProductionProfileDialog(productionProfileHost, {
 			onAnalyze: (trackId) => analyzeModal?.open([trackId]),
@@ -6604,7 +6609,7 @@ async function boot(): Promise<void> {
 				// Restore the sort captured at pin time before the JIT loads so
 				// the re-run reflects the ordering the user saved (null → keep
 				// whatever sort is active).
-				if (p.sortColumn) {
+				if (p.sortColumn && !OFF_SORT_COLUMNS.has(p.sortColumn)) {
 					state.sortColumn = p.sortColumn as SortColumn;
 					state.sortDir = (p.sortDir ?? 'asc') as SortDir;
 				}
@@ -7231,7 +7236,7 @@ async function createPlaylistFromPinned(id: string): Promise<void> {
 	const p = pinnedSearches().find((x) => x.id === id);
 	if (!p) return;
 	if (shell.currentJit()?.pinnedId !== id) {
-		if (p.sortColumn) {
+		if (p.sortColumn && !OFF_SORT_COLUMNS.has(p.sortColumn)) {
 			state.sortColumn = p.sortColumn as SortColumn;
 			state.sortDir = (p.sortDir ?? 'asc') as SortDir;
 		}

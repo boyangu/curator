@@ -64,13 +64,19 @@ export function assertConnectionString(url: string): void {
 	}
 }
 
-export function createPostgresDb(url: string, opts: { max?: number } = {}): Db {
+// `prepare`: named statements, for a connection that keeps them (Postgres
+// itself or the session pooler, never the transaction pooler). A statement
+// then costs one trip to the server instead of two, and statements issued
+// together share it.
+export function createPostgresDb(url: string, opts: { max?: number; prepare?: boolean } = {}): Db {
 	assertConnectionString(url);
+	const prepare = opts.prepare ?? false;
 	const sql = postgres(url, {
-		// Unnamed statements only: Supabase's pooler (Supavisor in transaction
-		// mode) cannot keep prepared statements across transactions. Every
-		// request is one short transaction, so nothing is lost.
-		prepare: false,
+		// Unnamed statements unless asked: Supabase's pooler (Supavisor in
+		// transaction mode) cannot keep prepared statements across transactions.
+		// Every API request is one short transaction, a millisecond from its
+		// database, so nothing is lost.
+		prepare,
 		max: opts.max ?? 10,
 		idle_timeout: 30,
 		connect_timeout: 10,
@@ -81,7 +87,8 @@ export function createPostgresDb(url: string, opts: { max?: number } = {}): Db {
 	});
 	const wrap = (q: postgres.Sql | postgres.TransactionSql): Queryable => ({
 		async query<T extends Row = Row>(text: string, params: readonly Param[] = []): Promise<T[]> {
-			const rows = await q.unsafe(text, params as Param[]);
+			// `unsafe` prepares nothing unless told, whatever the pool says.
+			const rows = await q.unsafe(text, params as Param[], { prepare: prepare && params.length > 0 });
 			return rows as unknown as T[];
 		},
 		async exec(text: string): Promise<void> {

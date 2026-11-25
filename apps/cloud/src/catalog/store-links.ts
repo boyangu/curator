@@ -22,7 +22,7 @@ import type { Logger } from '../log.js';
 import { openReview } from './admin.js';
 import { reannounceCard } from './events.js';
 import { findRepresentation } from './identity.js';
-import { Ingester } from './ingest.js';
+import { alone, Ingester } from './ingest.js';
 import { heldTracks, slotMatch } from './slots.js';
 import type { AppleLookup } from './trackers/apple.js';
 import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
@@ -141,11 +141,15 @@ export async function joinTracks(tx: Queryable, ingester: Ingester, releaseId: s
 	const held = await heldTracks(tx, releaseId);
 	if (!held.length) return;
 	const artists = (c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean);
-	for (const [i, r] of c.recordings.entries()) {
-		if (await findRepresentation(tx, r)) continue;
-		const hit = slotMatch(held, { title: r.name, position: r.facts?.trackNumber ?? i + 1, durationSec: r.facts?.durationSec }, artists, { anyTitle: true });
-		if (hit) await ingester.attachTo(hit.id, r);
-	}
+	const recordings = c.recordings;
+	const join = async (): Promise<void> => {
+		for (const [i, r] of recordings.entries()) {
+			if (await ingester.holder(r)) continue;
+			const hit = slotMatch(held, { title: r.name, position: r.facts?.trackNumber ?? i + 1, durationSec: r.facts?.durationSec }, artists, { anyTitle: true });
+			if (hit) await ingester.attachTo(hit.id, r);
+		}
+	};
+	await ingester.batch(recordings.map(alone), join, held.map((h) => h.id));
 }
 
 export type LinkerDeps = { db: Db; log: Logger; readers: StoreReaders; batch?: number; now?: () => number };
@@ -176,30 +180,48 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 	);
 
 	const parked = new Set<StoreProvider>();
+	// Calls are reserved for ten lookups at once; what the pass ends without
+	// using is a few calls of a day's thousands.
+	const credit = new Map<StoreProvider, number>();
 	const reserve = async (p: StoreProvider, n: number): Promise<boolean> => {
 		if (parked.has(p)) return false;
-		const [g] = await deps.db.query<{ n: unknown }>(`select curator.catalog_reserve_calls($1, $2::int, $3::int) as n`, [p, String(n), String(BUDGET[p].perDay)]);
-		if (num(g!.n) >= n) return true;
+		if ((credit.get(p) ?? 0) < n) {
+			const [g] = await deps.db.query<{ n: unknown }>(`select curator.catalog_reserve_calls($1, $2::int, $3::int) as n`, [p, String(10 * n), String(BUDGET[p].perDay)]);
+			credit.set(p, (credit.get(p) ?? 0) + num(g!.n));
+		}
+		if (credit.get(p)! >= n) {
+			credit.set(p, credit.get(p)! - n);
+			return true;
+		}
 		parked.add(p);
 		return false;
 	};
-	const settle = async (objectId: string, p: StoreProvider, hit: boolean, attempts: number) => {
-		if (hit) {
-			await deps.db.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = $2`, [objectId, p]);
-			return;
-		}
-		const days = RETRY_DAYS[Math.min(attempts, RETRY_DAYS.length - 1)]!;
+	// What the stores said is written with what they were asked about, ten
+	// objects at a time: an answer lost with the process is asked again.
+	let settled: { id: string; provider: StoreProvider; hit: boolean; days: number }[] = [];
+	const settle = (objectId: string, p: StoreProvider, hit: boolean, attempts: number): void => {
+		settled.push({ id: objectId, provider: p, hit, days: RETRY_DAYS[Math.min(attempts, RETRY_DAYS.length - 1)]! });
+	};
+	const writeSettled = async (): Promise<void> => {
+		const rows = settled;
+		settled = [];
+		if (!rows.length) return;
 		await deps.db.query(
-			`insert into curator.catalog_enrich_task (object_id, need, provider, next_due_at, attempts, last_error)
-			values ($1, 'representation', $2, now() + make_interval(days => $3::int), 1, 'not_found')
+			`with x as materialized (select * from jsonb_to_recordset($1::text::jsonb) as x(id uuid, provider text, hit boolean, days int)),
+			hit as (delete from curator.catalog_enrich_task et using x where x.hit and et.object_id = x.id and et.need = 'representation' and et.provider = x.provider)
+			insert into curator.catalog_enrich_task (object_id, need, provider, next_due_at, attempts, last_error)
+			select id, 'representation', provider, now() + make_interval(days => days), 1, 'not_found' from x where not hit
 			on conflict (object_id, need, provider) do update set next_due_at = excluded.next_due_at, attempts = curator.catalog_enrich_task.attempts + 1, last_error = excluded.last_error`,
-			[objectId, p, String(days)],
+			[JSON.stringify(rows)],
 		);
 	};
+	// The providers an object waits on (asked, and not due again yet).
+	const WAITING = (id: string): string => `(select string_agg(et.provider, '|') from curator.catalog_enrich_task et where et.object_id = ${id} and et.need = 'representation' and et.next_due_at > now()) as waiting`;
+	const parts = (v: string | null): string[] => (v ?? '').split('|').filter(Boolean);
 
 	// Releases: newest first, those no configured store has been asked about yet ahead of retries.
-	const releases = await deps.db.query<{ id: string; name: string; upcs: string; on_providers: string | null; attempts: string | null }>(
-		`select r.id, r.name,
+	const releases = await deps.db.query<{ id: string; name: string; upcs: string; on_providers: string | null; attempts: string | null; waiting: string | null }>(
+		`select r.id, r.name, ${WAITING('r.id')},
 			(select string_agg(i.value, '|' order by i.at) from curator.catalog_identifier i where i.object_id = r.id and i.namespace = 'upc') as upcs,
 			(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = r.id) as on_providers,
 			(select string_agg(et.provider || ':' || et.attempts, '|') from curator.catalog_enrich_task et where et.object_id = r.id and et.need = 'representation' and et.provider = any($1::text[])) as attempts
@@ -216,13 +238,14 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 	const signal = AbortSignal.timeout(15 * 60_000);
 	for (const r of releases) {
 		report.releases++;
-		const on = (r.on_providers ?? '').split('|').filter(Boolean);
+		if (report.releases % 10 === 0) await writeSettled();
+		const on = parts(r.on_providers);
+		const waiting = parts(r.waiting);
 		const attempts = new Map((r.attempts ?? '').split('|').filter(Boolean).map((x) => x.split(':') as [string, string]));
 		const readers: StoreReaders = {};
 		for (const p of providers) {
 			if (on.includes(p)) continue;
-			const due = await deps.db.query(`select 1 from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = $2 and next_due_at > now()`, [r.id, p]);
-			if (due.length) continue;
+			if (waiting.includes(p)) continue;
 			// Two calls each: Spotify's search then its album, Apple's two storefronts, Tidal per UPC.
 			if (await reserve(p, 2)) readers[p] = deps.readers[p] as never;
 		}
@@ -235,7 +258,7 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 		for (const p of Object.keys(readers) as StoreProvider[]) {
 			if (parked.has(p) && found.notes.some((n) => n.provider === p && /rate limited/.test(n.note))) continue;
 			const hit = found.claims.some((c) => c.provider === p);
-			await settle(r.id, p, hit, Number(attempts.get(p) ?? 0));
+			settle(r.id, p, hit, Number(attempts.get(p) ?? 0));
 			if (hit) report.linked[p] = (report.linked[p] ?? 0) + 1;
 		}
 		if (found.claims.length) {
@@ -250,11 +273,13 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 		await sleep(Math.max(...Object.keys(readers).map((p) => BUDGET[p as StoreProvider].gapMs)));
 	}
 
+	await writeSettled();
+
 	// Tracks by ISRC, on the stores whose album lookup did not reach them.
 	const byIsrc = providers.filter((p): p is 'tidal' | 'apple' => p === 'tidal' || p === 'apple');
 	if (byIsrc.length) {
-		const recs = await deps.db.query<{ id: string; isrc: string; duration_sec: unknown; on_providers: string | null; attempts: string | null }>(
-			`select o.id, i.value as isrc, o.duration_sec,
+		const recs = await deps.db.query<{ id: string; isrc: string; duration_sec: unknown; on_providers: string | null; attempts: string | null; waiting: string | null }>(
+			`select o.id, i.value as isrc, o.duration_sec, ${WAITING('o.id')},
 				(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = o.id) as on_providers,
 				(select string_agg(et.provider || ':' || et.attempts, '|') from curator.catalog_enrich_task et where et.object_id = o.id and et.need = 'representation' and et.provider = any($1::text[])) as attempts
 			from curator.catalog_object o
@@ -273,14 +298,34 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 			limit $2::int`,
 			[`{${byIsrc.join(',')}}`, String(batch)],
 		);
+		// A recording with two ISRCs is listed once for each.
+		const asked = new Set<string>();
+		// Found tracks, attached ten recordings at a time.
+		let found: { id: string; claim: CatalogClaim }[] = [];
+		const writeFound = async (): Promise<void> => {
+			const rows = found;
+			found = [];
+			if (rows.length) {
+				await withSystemTx(deps.db, async (tx) => {
+					const ingester = new Ingester(tx, { reason: 'enrichment' });
+					await ingester.batch(rows.map((r) => r.claim), async () => {
+						for (const r of rows) {
+							const owner = await ingester.holder(r.claim);
+							if (!owner || owner === r.id) await ingester.attachTo(r.id, r.claim);
+						}
+					}, rows.map((r) => r.id));
+				});
+			}
+			await writeSettled();
+		};
 		for (const rec of recs) {
+			if (report.recordings % 10 === 0) await writeFound();
 			report.recordings++;
-			const on = (rec.on_providers ?? '').split('|').filter(Boolean);
+			const on = parts(rec.on_providers);
+			const waiting = parts(rec.waiting);
 			const attempts = new Map((rec.attempts ?? '').split('|').filter(Boolean).map((x) => x.split(':') as [string, string]));
 			for (const p of byIsrc) {
-				if (on.includes(p) || !(await reserve(p, 2))) continue;
-				const due = await deps.db.query(`select 1 from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = $2 and next_due_at > now()`, [rec.id, p]);
-				if (due.length) continue;
+				if (on.includes(p) || waiting.includes(p) || asked.has(`${rec.id}|${p}`) || !(await reserve(p, 2))) continue;
 				let claim: CatalogClaim | null = null;
 				try {
 					claim = p === 'tidal' ? await deps.readers.tidal!.trackByIsrc(rec.isrc, signal) : (await deps.readers.apple!.trackByIsrc(rec.isrc, signal)).claim;
@@ -296,18 +341,16 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 				const ours = numOrNull(rec.duration_sec);
 				const len = claim?.facts?.durationSec;
 				if (claim && ours !== null && len !== undefined && Math.abs(len - ours) > 10) claim = null;
-				await settle(rec.id, p, !!claim, Number(attempts.get(p) ?? 0));
+				asked.add(`${rec.id}|${p}`);
+				settle(rec.id, p, !!claim, Number(attempts.get(p) ?? 0));
 				if (claim) {
 					report.recordingsLinked++;
-					await withSystemTx(deps.db, async (tx) => {
-						const owner = await findRepresentation(tx, claim!);
-						if (owner && owner !== rec.id) return;
-						await new Ingester(tx, { reason: 'enrichment' }).attachTo(rec.id, claim!);
-					});
+					found.push({ id: rec.id, claim });
 				}
 				await sleep(BUDGET[p].gapMs);
 			}
 		}
+		await writeFound();
 	}
 	report.parked = [...parked];
 	if (report.releases || report.recordings) deps.log.info('store_link_pass', report);

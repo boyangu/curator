@@ -14,6 +14,7 @@
 // one of the label's releases.
 
 import type { CatalogClaim, CatalogKind } from '@curator/protocol';
+import { CATALOG_MAX_NESTED } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { getJson, listingHash, rememberSeen, type FetchLike } from './http.js';
 import type { TrackerAdapter, TrackerPoll, TrackerTarget } from './types.js';
@@ -72,7 +73,9 @@ export class BandcampTracker implements TrackerAdapter {
 			providerId: bandId,
 			name: band.name || target.object.name,
 			url: band.bandcamp_url ?? target.representation.url,
-			artists: (band.artists ?? []).map((a) => ({ provider: 'bandcamp' as const, kind: 'artist' as const, providerId: String(a.id), name: a.name })),
+			// A big label's roster runs past what a claim may nest; every release
+			// names its own artists all the same.
+			artists: (band.artists ?? []).slice(0, CATALOG_MAX_NESTED).map((a) => ({ provider: 'bandcamp' as const, kind: 'artist' as const, providerId: String(a.id), name: a.name })),
 		};
 		const items = (band.discography ?? []).filter((i) => i.release_date).sort((a, b) => (isoDate(b.release_date) ?? '').localeCompare(isoDate(a.release_date) ?? ''));
 		const seen = new Set(Array.isArray(target.cursor.seen) ? (target.cursor.seen as string[]) : []);

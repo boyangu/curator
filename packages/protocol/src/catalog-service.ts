@@ -851,6 +851,27 @@ export const ZCatalogWorkerReportInput = z
 	})
 	.strict();
 
+// The report as the server takes it: each outcome is judged on its own
+// (parseWorkerOutcome), so one poll it must refuse costs that cursor alone.
+// One label with a roster past the cap refused every report it rode in, and
+// its nine neighbours were read again every ten minutes (2026-11-25).
+export const ZCatalogWorkerReportWire = z
+	.object({
+		deviceId: ZDeviceId,
+		results: z.array(z.object({ objectId: ZObjectId, provider: ZProvider, outcome: z.unknown() }).strict()).max(CATALOG_WORKER_MAX_RESULTS),
+	})
+	.strict();
+
+// An outcome the schema refuses becomes a failed poll that says where, so its
+// cursor backs off like any other failure.
+export function parseWorkerOutcome(outcome: unknown): CatalogWorkerOutcome {
+	const r = ZOutcome.safeParse(outcome);
+	if (r.success) return r.data;
+	const polled = typeof outcome === 'object' && outcome !== null && 'poll' in outcome;
+	const issue = (polled ? ZCatalogTrackerPoll.safeParse((outcome as { poll: unknown }).poll).error : undefined)?.issues[0] ?? r.error.issues[0];
+	return { error: { message: `refused: ${issue?.path.join('.') || 'outcome'}: ${issue?.message ?? 'not a poll'}`.slice(0, 300), rateLimitedSec: null } };
+}
+
 // The schemas and the types above must say the same thing.
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const _claim: Same<z.infer<typeof ZCatalogClaim>, CatalogClaim> = true;

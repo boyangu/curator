@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { migrate } from '@curator/sync-core/db/migrate';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { createCoreService, type CoreService } from '../service.js';
 import { SqliteMirStore } from './store.js';
 import { removeDir } from '@curator/sync-core/test-support/tmp';
@@ -45,6 +46,24 @@ afterEach(async () => {
 	await svc.close();
 	mir.close();
 	await removeDir(dir);
+});
+
+describe('disabled models', () => {
+	// Settings saved before production quality was switched off name Audiobox,
+	// and mir.db still knows the model.
+	it('are neither run nor listed', async () => {
+		mir.upsertModel({ key: 'audiobox-aesthetics', modelId: 'audiobox-aesthetics@1', dim: 4, sampleRate: 16000, text: false, similarity: false, license: '', repo: '', summary: '' });
+		const st = await svc.setMirSettings({ models: ['mert-v2-fullsong', 'audiobox-aesthetics'] });
+		const on = PRODUCTION_QUALITY_ENABLED ? ['mert-v2-fullsong', 'audiobox-aesthetics'] : ['mert-v2-fullsong'];
+		expect(st.settings.models).toEqual(on);
+		expect(st.models.map((m) => m.key).sort()).toEqual([...on].sort());
+	});
+
+	it('production methods reject while the feature is off', async () => {
+		if (PRODUCTION_QUALITY_ENABLED) return;
+		await expect(svc.productionStats()).rejects.toThrow(/disabled/);
+		await expect(svc.getProductionProfile('a')).rejects.toThrow(/disabled/);
+	});
 });
 
 describe('similarTo through getTracksPage', () => {

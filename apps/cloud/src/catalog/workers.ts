@@ -13,7 +13,7 @@
 //                  Refresh menu; cloud-only ones included, so the master
 //                  knows whether anyone wants them) and how often the user
 //                  wants each kind read (the cursors are timed by it:
-//                  tracking.ts readCadenceOf), takes or keeps the week, runs
+//                  tracking.ts readCadencesOf), takes or keeps the week, runs
 //                  the check a Refresh asked for, and is handed its due
 //                  cursors of the checked trackers under a ten-minute lease
 //                  with the poll's calls reserved.
@@ -35,7 +35,7 @@ import { num } from '../db/db.js';
 import type { Logger } from '../log.js';
 import { gated, type CatalogDeps } from './catalog.js';
 import { checkNow, providerPauses, retimeCursors } from './tracking.js';
-import { applyPoll, deviceHolder, leaseDue, loadTarget, loadTrackers, releaseLease, reserveCalls, WORKER_LIVE_WINDOW, type TrackerRow } from './trackers/sweep.js';
+import { applyPolls, deviceHolder, leaseDue, loadTargets, loadTrackers, releaseLeases, reserveCalls, WORKER_LIVE_WINDOW, type LeasedCursor, type PollToApply, type TrackerRow } from './trackers/sweep.js';
 
 export type WorkerDeps = CatalogDeps & { log: Logger };
 
@@ -104,15 +104,13 @@ export async function workerDue(deps: WorkerDeps, userId: string, caller: Caller
 	for (const t of await loadTrackers(deps.db)) {
 		if (!offered.has(t.provider) || paused.has(t.provider) || !wanted.has(`${t.kind}/${t.provider}`)) continue;
 		const want = callsPerPoll(t.provider, t.kind);
-		let budgetOut = false;
-		for (const c of await leaseDue(deps.db, t, { holder, batch: BATCH, leaseMin: LEASE_MIN, worker: { userId } })) {
-			if (!budgetOut && (await reserveCalls(deps.db, t.provider, want, t.budget.perDay)) < want) budgetOut = true;
-			if (budgetOut) {
-				await releaseLease(deps.db, c.objectId, t.provider, holder);
-				continue;
-			}
-			const { target } = await loadTarget(deps.db, t, c);
-			tasks.push({ objectId: c.objectId, provider: t.provider as CatalogProvider, kind: t.kind, target, minGapMs: t.budget.minGapMs, timeoutMs: POLL_TIMEOUT_MS });
+		const leased = await leaseDue(deps.db, t, { holder, batch: BATCH, leaseMin: LEASE_MIN, worker: { userId } });
+		if (!leased.length) continue;
+		const granted = Math.floor((await reserveCalls(deps.db, t.provider, want * leased.length, t.budget.perDay)) / want);
+		await releaseLeases(deps.db, leased.slice(granted).map((c) => ({ objectId: c.objectId, provider: t.provider })), holder);
+		const targets = await loadTargets(deps.db, t, leased.slice(0, granted));
+		for (const c of leased.slice(0, granted)) {
+			tasks.push({ objectId: c.objectId, provider: t.provider as CatalogProvider, kind: t.kind, target: targets.get(c.objectId)!.target, minGapMs: t.budget.minGapMs, timeoutMs: POLL_TIMEOUT_MS });
 		}
 	}
 	return withCheck({ active: true, weekEndsAt: ends, tasks, pauses: pauses.map((p) => ({ provider: p.provider as CatalogProvider, until: p.until })) });
@@ -125,36 +123,51 @@ export async function workerReport(deps: WorkerDeps, userId: string, caller: Cal
 	const out: CatalogWorkerReportResult = { applied: 0, stale: 0, events: 0 };
 	const runs = new Map<string, { t: TrackerRow; claimed: number; calls: number; events: number; failed: number; errors: string[] }>();
 	const nowMs = Date.now();
-	for (const r of input.results) {
-		// The apply takes the lease over from the device, atomically: a lapsed
-		// or foreign lease, or a result already applied, is stale.
-		const [c] = await deps.db.query<{ kind: string; name: string; cursor: string; fail_count: unknown }>(
-			`update curator.catalog_cursor c set lease_holder = $4, lease_until = now() + ${APPLY_LEASE}
-			from curator.catalog_object o
-			where c.object_id = $1 and c.provider = $2 and o.id = c.object_id and c.lease_holder = $3 and c.lease_until > now()
-			returning o.kind, o.name, c.cursor::text as cursor, c.fail_count`,
-			[r.objectId, r.provider, holder, `apply:${holder}`],
-		);
-		if (!c) {
-			out.stale++;
-			continue;
-		}
-		const t = trackers.get(`${c.kind}/${r.provider}`);
+	// The apply takes the leases over from the device, atomically: a lapsed or
+	// foreign lease, or a result already applied, is stale.
+	const keyOf = (objectId: string, provider: string): string => `${objectId}|${provider}`;
+	const results = new Map<string, CatalogWorkerReportInput['results'][number]>();
+	for (const r of input.results) if (!results.has(keyOf(r.objectId, r.provider))) results.set(keyOf(r.objectId, r.provider), r);
+	const taken = input.results.length
+		? await deps.db.query<{ object_id: string; provider: string; kind: string; name: string; cursor: string; fail_count: unknown }>(
+				`update curator.catalog_cursor c set lease_holder = $3, lease_until = now() + ${APPLY_LEASE}
+				from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, provider text), curator.catalog_object o
+				where c.object_id = x.object_id and c.provider = x.provider and o.id = c.object_id and c.lease_holder = $2 and c.lease_until > now()
+				returning c.object_id, c.provider, o.kind, o.name, c.cursor::text as cursor, c.fail_count`,
+				[JSON.stringify([...results.values()].map((r) => ({ object_id: r.objectId, provider: r.provider }))), holder, `apply:${holder}`],
+			)
+		: [];
+	const off: { objectId: string; provider: string }[] = [];
+	const byTracker = new Map<TrackerRow, LeasedCursor[]>();
+	for (const c of taken) {
+		const t = trackers.get(`${c.kind}/${c.provider}`);
+		// The tracker was switched off since the lease: let the cursor go.
 		if (!t) {
-			// The tracker was switched off since the lease: let the cursor go.
-			await releaseLease(deps.db, r.objectId, r.provider, `apply:${holder}`);
-			out.stale++;
+			off.push({ objectId: c.object_id, provider: c.provider });
 			continue;
 		}
-		const cursor = { objectId: r.objectId, name: c.name, cursor: JSON.parse(c.cursor) as Record<string, unknown>, failCount: num(c.fail_count) };
-		const { rep } = await loadTarget(deps.db, t, cursor);
-		const a = await applyPoll(deps, t, cursor, rep, r.outcome, { holder, nowMs });
+		const list = byTracker.get(t) ?? [];
+		list.push({ objectId: c.object_id, name: c.name, cursor: JSON.parse(c.cursor) as Record<string, unknown>, failCount: num(c.fail_count) });
+		byTracker.set(t, list);
+	}
+	await releaseLeases(deps.db, off, `apply:${holder}`);
+	const applying = new Map<string, PollToApply>();
+	for (const [t, cursors] of byTracker) {
+		const targets = await loadTargets(deps.db, t, cursors);
+		for (const c of cursors) applying.set(keyOf(c.objectId, t.provider), { t, c, rep: targets.get(c.objectId)!.rep, outcome: results.get(keyOf(c.objectId, t.provider))!.outcome });
+	}
+	// In the order reported.
+	const polls = [...results.keys()].flatMap((k) => applying.get(k) ?? []);
+	out.stale = input.results.length - polls.length;
+	const extra = new Map<string, { t: TrackerRow; calls: number }>();
+	for (const [i, a] of (await applyPolls(deps, polls, { holder, nowMs })).entries()) {
+		const { t, outcome } = polls[i]!;
 		out.applied++;
 		out.events += a.events;
-		if ('poll' in r.outcome) {
+		if ('poll' in outcome) {
 			// Reserved at due; only what the poll used beyond that is debited now.
-			const extra = r.outcome.poll.calls - callsPerPoll(t.provider, t.kind);
-			if (extra > 0) await reserveCalls(deps.db, t.provider, extra, t.budget.perDay);
+			const over = outcome.poll.calls - callsPerPoll(t.provider, t.kind);
+			if (over > 0) extra.set(t.provider, { t, calls: (extra.get(t.provider)?.calls ?? 0) + over });
 		}
 		const key = `${t.kind}/${t.provider}`;
 		const run = runs.get(key) ?? { t, claimed: 0, calls: 0, events: 0, failed: 0, errors: [] };
@@ -167,11 +180,13 @@ export async function workerReport(deps: WorkerDeps, userId: string, caller: Cal
 		}
 		runs.set(key, run);
 	}
-	for (const run of runs.values()) {
+	for (const { t, calls } of extra.values()) await reserveCalls(deps.db, t.provider, calls, t.budget.perDay);
+	if (runs.size) {
 		await deps.db.query(
 			`insert into curator.tracker_run (kind, provider, worker, finished_at, claimed, calls, events, failed, errors)
-			values ($1, $2, $3, now(), $4::int, $5::int, $6::int, $7::int, $8::text::jsonb)`,
-			[run.t.kind, run.t.provider, holder, String(run.claimed), String(run.calls), String(run.events), String(run.failed), JSON.stringify(run.errors.slice(0, 20))],
+			select x.kind, x.provider, $2, now(), x.claimed, x.calls, x.events, x.failed, x.errors
+			from jsonb_to_recordset($1::text::jsonb) as x(kind text, provider text, claimed int, calls int, events int, failed int, errors jsonb)`,
+			[JSON.stringify([...runs.values()].map((r) => ({ kind: r.t.kind, provider: r.t.provider, claimed: r.claimed, calls: r.calls, events: r.events, failed: r.failed, errors: r.errors.slice(0, 20) }))), holder],
 		);
 	}
 	if (out.applied) deps.log.info('worker_report', { by: holder, ...out });

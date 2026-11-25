@@ -89,6 +89,26 @@ export async function findRepresentation(tx: Queryable, claim: Pick<CatalogClaim
 	return row ? follow(tx, row.object_id) : null;
 }
 
+// The same for several claims at once, by `provider|kind|providerId`; one the
+// catalogue does not hold is absent.
+export async function findRepresentations(tx: Queryable, claims: readonly Pick<CatalogClaim, 'provider' | 'kind' | 'providerId'>[]): Promise<Map<string, string>> {
+	if (!claims.length) return new Map();
+	const rows = await tx.query<{ k: string; id: string }>(
+		`with recursive hit as (
+			select distinct s.provider || '|' || s.kind || '|' || s.provider_id as k, s.object_id
+			from jsonb_to_recordset($1::text::jsonb) as w(p text, k text, i text)
+			join curator.catalog_source_object s on s.provider = w.p and s.kind = w.k and s.provider_id = w.i
+		), chain (k, id, merged_into, depth) as (
+			select hit.k, o.id, o.merged_into, 0 from hit join curator.catalog_object o on o.id = hit.object_id
+			union all
+			select c.k, o.id, o.merged_into, c.depth + 1 from chain c join curator.catalog_object o on o.id = c.merged_into where c.depth < ${MAX_MERGE_HOPS}
+		)
+		select k, id from chain where merged_into is null`,
+		[JSON.stringify(claims.map((c) => ({ p: c.provider, k: c.kind, i: c.providerId })))],
+	);
+	return new Map(rows.map((r) => [r.k, r.id]));
+}
+
 // The object a global identifier on the claim already names.
 export async function findByIdentifier(tx: Queryable, claim: CatalogClaim): Promise<{ id: string; namespace: CatalogIdNamespace } | null> {
 	for (const ident of claim.identifiers ?? []) {

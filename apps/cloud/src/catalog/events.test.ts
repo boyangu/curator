@@ -8,7 +8,7 @@ import type { CatalogEventCardV2, CatalogEventTrackCardV2 } from '@curator/proto
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
 import { mergeObjects } from './admin.js';
-import { raisePlaylistAdd, raiseReleaseEvent, reannounce, reannounceCard, releaseCard } from './events.js';
+import { raisePlaylistAdds, raiseReleaseEvent, reannounce, reannounceCard, releaseCard } from './events.js';
 import { ingestClaims, Ingester } from './ingest.js';
 
 const today = new Date().toISOString().slice(0, 10);
@@ -69,7 +69,7 @@ describe('event cards v2', () => {
 	it('a playlist addition’s track card carries the recording’s facts and its release’s label', async () => {
 		const { app, playlistId, recordingId, labelId } = await seed();
 		const card = await withSystemTx(app.db, async (tx) => {
-			const seq = await raisePlaylistAdd(tx, { playlistId, recordingId, sourceObjectId: null, addedAt: Date.now(), position: 0 }, { nowMs: Date.now(), windowDays: 14 });
+			const seq = (await raisePlaylistAdds(tx, [{ playlistId, recordingId, sourceObjectId: null, addedAt: Date.now(), position: 0 }], { nowMs: Date.now(), windowDays: 14 }))[0]!;
 			const [ev] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
 			return JSON.parse(ev!.card) as CatalogEventTrackCardV2;
 		});

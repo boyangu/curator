@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { analysisFlagsToOptions, DEFAULT_AUTO_FLAGS, DEFAULT_MANUAL_FLAGS } from './flags.js';
 
 describe('analysisFlagsToOptions', () => {
@@ -22,5 +23,9 @@ describe('analysisFlagsToOptions', () => {
 		expect(everythingOn.features).toHaveLength(6);
 		expect(everythingOn).toMatchObject({ overrideBeatgrid: true, overrideBpm: true, overrideKey: true, overrideSegments: true, overridePeaks: true });
 		expect(everythingOn.skipFingerprint).toBeUndefined();
+	});
+
+	it('requests the production stage only while the feature is on, whatever a stored selection says', () => {
+		expect(analysisFlagsToOptions({ ...DEFAULT_AUTO_FLAGS, production: true }).production).toBe(PRODUCTION_QUALITY_ENABLED ? true : undefined);
 	});
 });

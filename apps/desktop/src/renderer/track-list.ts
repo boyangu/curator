@@ -40,7 +40,7 @@ import { setTrackDragPayload } from './dnd.js';
 import { isRemoteRow, remoteMarkSource, remoteRowTitle } from './remoteRows.js';
 import { isCatalogRow } from './catalogRows.js';
 import { fmtReleaseLabel } from './ui/format.js';
-import { productionFlags, worstProductionSeverity } from '@curator/library-logic';
+import { PRODUCTION_QUALITY_ENABLED, productionFlags, worstProductionSeverity } from '@curator/library-logic';
 import {
 	buildDisplayList, groupHeadInnerHeight, groupIdentity, rowHeight, GROUP_GAP_H, TRACK_ROW_H,
 	type DisplayList, type DisplayRow, type GroupBy, type GroupInfo, type RowLines,
@@ -279,7 +279,10 @@ function sourcesTitle(own: readonly (typeof SOURCE_ORDER)[number][], derived: re
 	const parts = [...own.map((s) => SOURCE_NAMES[s]), ...derived.map((s) => `${SOURCE_NAMES[s]} ${note}`)];
 	return parts.length ? `Sources: ${parts.join(', ')}` : '';
 }
-export const ALL_COLUMNS: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'loud', 'plr', 'prodq', 'pq', 'tags', 'added'];
+// Columns of the production-quality feature, gone from every list while it is off.
+const PRODUCTION_COLUMNS: ReadonlySet<Column> = new Set<Column>(['loud', 'plr', 'prodq', 'pq']);
+const EVERY_COLUMN: Column[] = ['src', 'idx', 'match', 'art', 'title', 'artist', 'album', 'rel', 'label', 'genre', 'bpm', 'key', 'time', 'rating', 'lra', 'diss', 'dens', 'bright', 'power', 'punch', 'loud', 'plr', 'prodq', 'pq', 'tags', 'added'];
+export const ALL_COLUMNS: Column[] = EVERY_COLUMN.filter((c) => PRODUCTION_QUALITY_ENABLED || !PRODUCTION_COLUMNS.has(c));
 
 // The two-line layout's columns from the visible fields. idx / title are
 // always there (locked); a paired column shows when any of its fields is
@@ -515,7 +518,7 @@ export function createTrackRow(t: Track, opts: TrackRowOptions = {}): HTMLTableR
 	// Integrity badge on the PLR cell — the same thresholds the profile uses
 	// (library-logic productionFlags), read off the mirrored track scalars.
 	const prodBadge = ((): { cls: string; title: string; dot: string } => {
-		if (t.prodPlr == null) return { cls: '', title: '', dot: '' };
+		if (!PRODUCTION_QUALITY_ENABLED || t.prodPlr == null) return { cls: '', title: '', dot: '' };
 		const flags = productionFlags({ prodCutoffHz: t.prodCutoffHz, prodClipPct: t.prodClipPct, prodSubCorr: t.prodSubCorr, prodPlr: t.prodPlr, prodLufs: t.prodLufs });
 		const worst = worstProductionSeverity(flags);
 		if (!worst) return { cls: '', title: '', dot: '' };

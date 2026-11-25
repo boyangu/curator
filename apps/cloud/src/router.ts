@@ -73,7 +73,7 @@ import * as catalog from './catalog/catalog.js';
 import * as connect from './catalog/connect.js';
 import * as workers from './catalog/workers.js';
 import { ZCatalogConnectAnswerInput, ZCatalogConnectQueueInput, ZCatalogConnectSearchInput, type CatalogConnectAnswerResult, type CatalogConnectQueueResult, type CatalogConnectSearchResult } from '@curator/protocol';
-import { ZCatalogWorkerDueInput, ZCatalogWorkerReportInput, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
+import { parseWorkerOutcome, ZCatalogWorkerDueInput, ZCatalogWorkerReportWire, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
 import { ZCatalogTracksInput, type CatalogTracksResult } from '@curator/protocol';
 import { ZDiagnosticsUploadInput, type DiagnosticsUploadResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
@@ -428,9 +428,9 @@ export const appRouter = router({
 			ctx.call.opsOut = r.tasks.length;
 			return r;
 		}),
-		workerReport: authedProcedure.input(ZCatalogWorkerReportInput).mutation(({ ctx, input }): Promise<CatalogWorkerReportResult> => {
+		workerReport: authedProcedure.input(ZCatalogWorkerReportWire).mutation(({ ctx, input }): Promise<CatalogWorkerReportResult> => {
 			ctx.call.opsIn = input.results.length;
-			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workers.workerReport({ ...d, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), input));
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workers.workerReport({ ...d, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), { deviceId: input.deviceId, results: input.results.map((r) => ({ ...r, outcome: parseWorkerOutcome(r.outcome) })) }));
 		}),
 		// 'catalog_connect' (src/catalog/connect.ts): "Help us connect the dots".
 		connectQueue: authedProcedure.input(ZCatalogConnectQueueInput).mutation(({ ctx, input }): Promise<CatalogConnectQueueResult> =>

@@ -18,6 +18,7 @@
 
 import type { EntityRef, Playlist, Track } from '@curator/shared';
 import { artistNames } from '@curator/shared';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { artistOpenSubmenu } from './artistOpenMenu.js';
 import type { RemovableTrackSource } from '@curator/core';
 import type { ActiveView, JitPlaylist, SourceTab } from '../viewmodel/shell.js';
@@ -458,7 +459,7 @@ const TRACK_COMMANDS: TrackCommand[] = [
 		// deviations, sections, Audiobox PQ, learned score. The dialog offers
 		// to run the (opt-in) production stage when the track lacks it.
 		// Below the similarity pair, which stays together.
-		id: 'production-profile', group: 'navigate', isAvailable: single, iconHtml: ICON_ANALYZE,
+		id: 'production-profile', group: 'navigate', isAvailable: (c) => PRODUCTION_QUALITY_ENABLED && single(c), iconHtml: ICON_ANALYZE,
 		label: () => 'Production Profile…',
 		run: (c) => {
 			const t = c.tracks[0]!;

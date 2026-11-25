@@ -17,6 +17,7 @@
 // dynamic_complexity, loudness_range_lu, dissonance, density) and persists them
 // together. So they collapse to ONE `advanced` toggle rather than per-feature
 // checkboxes that would all do the same thing.
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import { type AnalyzeOptions, ADVANCED_FEATURES } from './sidecar.js';
 
 // One checkbox per analysis aspect. The four basic stages are independently
@@ -158,7 +159,9 @@ export function analysisFlagsToOptions(f: AnalysisFlags): AnalyzeOptions {
 
 	if (!f.fingerprint) opts.skipFingerprint = true;
 
-	if (f.production) opts.production = true;
+	// Gated here as well as in the form: persisted selections (and callers
+	// off the UI) may still carry `production: true`.
+	if (PRODUCTION_QUALITY_ENABLED && f.production) opts.production = true;
 
 	return opts;
 }

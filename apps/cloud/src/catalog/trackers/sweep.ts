@@ -8,9 +8,11 @@
 //   2. per cursor, reserve the poll's calls from the provider's daily budget
 //      (catalog_reserve_calls: shared by every worker, never overspent), poll,
 //      and spread polls by the tracker's minGapMs;
-//   3. an unchanged listing costs one cursor update; a changed one is ingested
-//      (reason 'tracker') in one transaction, then the recent releases among
-//      the children raise events in a second, short one (events.ts);
+//   3. polls are applied ten at a time (applyPolls): the changed listings are
+//      ingested (reason 'tracker') in one transaction, then the recent
+//      releases among their children raise events in a second, short one
+//      (events.ts), and the cursors move in one statement — a poll that fails
+//      is applied alone, and fails alone;
 //   4. the cursor moves to its next due time — the tracker's cadence, slowed
 //      to what its followers chose (cadence.ts nextDueFor) — or backs off on a
 //      failure; a provider's rate limit parks every tracker of that provider
@@ -26,18 +28,18 @@
 // both wants it and can read its provider, unless the cursor is overdue by a
 // day (or its cadence, if longer): the worker was not there, the cloud reads
 // it once. A tracker every follower switched off is read by nobody.
-// `applyPoll` takes a poll, or the error the reader met, from either.
+// `applyPolls` takes the polls, or the errors the readers met, from either.
 
 import type { CatalogKind, CatalogProvider } from '@curator/protocol';
 import { num } from '../../db/db.js';
-import type { Db } from '../../db/db.js';
+import type { Db, Queryable } from '../../db/db.js';
 import { withSystemTx } from '../../db/system-tx.js';
 import type { Logger } from '../../log.js';
-import { raiseChartEntry, raisePlaylistAdd, raiseReleaseEvent } from '../events.js';
-import { findRepresentation } from '../identity.js';
-import { ingestClaims, Ingester, linkReleasesToLabel } from '../ingest.js';
+import { raiseChartEntries, raisePlaylistAdds, raiseReleaseEvents } from '../events.js';
+import { findRepresentations } from '../identity.js';
+import { BATCH_NODES, Ingester, linkReleasesToLabel, nodes, type IngestOutcome } from '../ingest.js';
 import { repointRepresentation } from '../profile/label-profiler.js';
-import { providerPauses, readCadenceOf, wantedSql } from '../tracking.js';
+import { providerPauses, readCadencesOf, wantedSql } from '../tracking.js';
 import { collectCursors } from '../watches.js';
 import { backoffAt, nextDueFor, spreadOf, type Cadence } from './cadence.js';
 import { TrackerRateLimitedError, type TrackerAdapter, type TrackerPoll, type TrackerTarget } from '@curator/catalog-readers';
@@ -137,8 +139,14 @@ export async function leaseDue(
 	return rows.map((c) => ({ objectId: c.object_id, name: c.name, cursor: JSON.parse(c.cursor) as Record<string, unknown>, failCount: num(c.fail_count) }));
 }
 
-export function releaseLease(db: Pick<Db, 'query'>, objectId: string, provider: string, holder: string): Promise<unknown> {
-	return db.query(`update curator.catalog_cursor set lease_holder = null, lease_until = null where object_id = $1 and provider = $2 and lease_holder = $3`, [objectId, provider, holder]);
+export function releaseLeases(db: Pick<Db, 'query'>, cursors: readonly { objectId: string; provider: string }[], holder: string): Promise<unknown> {
+	if (!cursors.length) return Promise.resolve();
+	return db.query(
+		`update curator.catalog_cursor c set lease_holder = null, lease_until = null
+		from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, provider text)
+		where c.object_id = x.object_id and c.provider = x.provider and c.lease_holder = $2`,
+		[JSON.stringify(cursors.map((c) => ({ object_id: c.objectId, provider: c.provider }))), holder],
+	);
 }
 
 // Calls granted from the provider's day, up to `want`.
@@ -149,29 +157,34 @@ export async function reserveCalls(db: Pick<Db, 'query'>, provider: string, want
 
 export type Representation = { providerId: string; url: string | null };
 
-// What a reader is handed for one cursor: the object's representation on
-// the provider and, for a label, the catalogue playlists it is read through.
-export async function loadTarget(db: Pick<Db, 'query'>, t: TrackerRow, c: Pick<LeasedCursor, 'objectId' | 'name' | 'cursor'>): Promise<{ target: TrackerTarget; rep: Representation | null }> {
-	const [rep] = await db.query<{ provider_id: string; url: string | null }>(
-		`select provider_id, url from curator.catalog_source_object where object_id = $1 and provider = $2 order by first_seen_at limit 1`,
-		[c.objectId, t.provider],
+export type Target = { target: TrackerTarget; rep: Representation | null };
+
+// What a reader is handed for each cursor, by object id: the object's
+// representation on the provider and, for a label, the catalogue playlists it
+// is read through.
+export async function loadTargets(db: Pick<Db, 'query'>, t: TrackerRow, cursors: readonly Pick<LeasedCursor, 'objectId' | 'name' | 'cursor'>[]): Promise<Map<string, Target>> {
+	const out = new Map<string, Target>();
+	if (!cursors.length) return out;
+	const rows = await db.query<{ object_id: string; related: boolean; provider_id: string; url: string | null }>(
+		`select * from (
+			select distinct on (so.object_id) so.object_id, false as related, so.provider_id, so.url, so.first_seen_at
+			from curator.catalog_source_object so where so.object_id = any($1::uuid[]) and so.provider = $2
+			order by so.object_id, so.first_seen_at
+		) own
+		union all
+		select e.src, true, so.provider_id, so.url, so.first_seen_at
+		from curator.catalog_edge e join curator.catalog_source_object so on so.object_id = e.dst and so.provider = $2 and so.kind = 'playlist'
+		where $3 = 'label' and e.src = any($1::uuid[]) and e.kind = 'label-playlist' and e.role = 'catalogue'
+		order by 5`,
+		[`{${cursors.map((c) => c.objectId).join(',')}}`, t.provider, t.kind],
 	);
-	const related = t.kind === 'label'
-		? await db.query<{ provider_id: string; url: string | null }>(
-				`select so.provider_id, so.url from curator.catalog_edge e join curator.catalog_source_object so on so.object_id = e.dst and so.provider = $2 and so.kind = 'playlist'
-				where e.src = $1 and e.kind = 'label-playlist' and e.role = 'catalogue' order by so.first_seen_at`,
-				[c.objectId, t.provider],
-			)
-		: [];
-	return {
-		target: {
-			object: { id: c.objectId, kind: t.kind, name: c.name },
-			representation: rep ? { providerId: rep.provider_id, url: rep.url } : null,
-			cursor: c.cursor,
-			...(related.length ? { related: related.map((r) => ({ providerId: r.provider_id, url: r.url })) } : {}),
-		},
-		rep: rep ? { providerId: rep.provider_id, url: rep.url } : null,
-	};
+	for (const c of cursors) {
+		const own = rows.find((r) => r.object_id === c.objectId && !r.related);
+		const rep = own ? { providerId: own.provider_id, url: own.url } : null;
+		const related = rows.filter((r) => r.object_id === c.objectId && r.related).map((r) => ({ providerId: r.provider_id, url: r.url }));
+		out.set(c.objectId, { target: { object: { id: c.objectId, kind: t.kind, name: c.name }, representation: rep, cursor: c.cursor, ...(related.length ? { related } : {}) }, rep });
+	}
+	return out;
 }
 
 // What a poll came to: the reader's result, or the error it met (a rate
@@ -179,21 +192,28 @@ export async function loadTarget(db: Pick<Db, 'query'>, t: TrackerRow, c: Pick<L
 export type PollOutcome = { poll: TrackerPoll } | { error: { message: string; rateLimitedSec: number | null } };
 export type ApplyResult = { polled: boolean; unchanged: boolean; calls: number; events: number; failed: boolean; limited: boolean; error: string | null };
 
-// Applies one poll's outcome to its cursor: ingest and events for a changed
-// listing, the cursor's next due time, the object's scanned_at; or the
-// failure's backoff. `holder` is recorded as the cursor's `last_reported_by`
-// and the events' `raised_by`. The lease is cleared either way.
-export async function applyPoll(
-	deps: { db: Db; log: Logger },
-	t: TrackerRow,
-	c: Pick<LeasedCursor, 'objectId' | 'cursor' | 'failCount'>,
-	rep: Representation | null,
-	outcome: PollOutcome,
-	opts: { holder: string; nowMs: number },
-): Promise<ApplyResult> {
-	const r: ApplyResult = { polled: false, unchanged: false, calls: 0, events: 0, failed: false, limited: false, error: null };
-	let err: { message: string; rateLimitedSec: number | null } | null = 'error' in outcome ? outcome.error : null;
-	if ('poll' in outcome) {
+export type PollToApply = { t: TrackerRow; c: Pick<LeasedCursor, 'objectId' | 'cursor' | 'failCount'>; rep: Representation | null; outcome: PollOutcome };
+
+const errorOf = (e: unknown): { message: string; rateLimitedSec: number | null } => ({
+	message: e instanceof Error ? e.message : String(e),
+	rateLimitedSec: e instanceof TrackerRateLimitedError ? e.retryAfterSec : null,
+});
+
+// Applies polls' outcomes to their cursors: ingest and events for the changed
+// listings, each cursor's next due time, the objects' scanned_at; or a
+// failure's backoff. `holder` is recorded as the cursors' `last_reported_by`
+// and the events' `raised_by`. The leases are cleared either way. The polls
+// share their transactions; where one fails, each is applied on its own, so
+// it fails alone.
+export async function applyPolls(deps: { db: Db; log: Logger }, polls: readonly PollToApply[], opts: { holder: string; nowMs: number }): Promise<ApplyResult[]> {
+	const results: ApplyResult[] = polls.map(() => ({ polled: false, unchanged: false, calls: 0, events: 0, failed: false, limited: false, error: null }));
+	const errors = new Map<number, { message: string; rateLimitedSec: number | null }>();
+	const changed: Found[] = [];
+	for (const [i, { t, c, rep, outcome }] of polls.entries()) {
+		if ('error' in outcome) {
+			errors.set(i, outcome.error);
+			continue;
+		}
 		const { poll } = outcome;
 		try {
 			// Before the ingest: the poll's claims name the label by that id.
@@ -201,42 +221,91 @@ export async function applyPoll(
 				const o = await repointRepresentation(deps.db, c.objectId, { provider: t.provider as CatalogProvider, from: rep.providerId, to: poll.resolvedId, url: rep.url ?? '' });
 				if (o === 'owned_elsewhere') throw new Error(`${t.provider}:${poll.resolvedId} (${rep.providerId}) already belongs to another label`);
 			}
-			r.polled = true;
-			r.calls = poll.calls;
-			const changed = poll.listingHash !== c.cursor.listingHash;
-			if (!changed) r.unchanged = true;
-			else r.events = await ingestFound(deps.db, t, c.objectId, poll, opts.nowMs, opts.holder);
-			const choice = await readCadenceOf(deps.db, c.objectId, t.kind, t.provider);
-			await deps.db.query(
-				`update curator.catalog_cursor set cursor = $3::text::jsonb, next_due_at = to_timestamp($4::float8 / 1000), last_run_at = now(),
-					fail_count = 0, last_error = null, last_reported_by = $5, lease_holder = null, lease_until = null
-				where object_id = $1 and provider = $2`,
-				[c.objectId, t.provider, JSON.stringify({ ...poll.cursor, listingHash: poll.listingHash }), String(nextDueFor(opts.nowMs, t.cadence, choice, spreadOf(c.objectId))), opts.holder],
-			);
-			// Read through, changed or not: the back office's "last scanned".
-			await deps.db.query(`update curator.catalog_object set scanned_at = now() where id = $1`, [c.objectId]);
-			return r;
 		} catch (e) {
-			err = { message: e instanceof Error ? e.message : String(e), rateLimitedSec: e instanceof TrackerRateLimitedError ? e.retryAfterSec : null };
+			errors.set(i, errorOf(e));
+			continue;
 		}
+		results[i]!.polled = true;
+		results[i]!.calls = poll.calls;
+		if (poll.listingHash === c.cursor.listingHash) results[i]!.unchanged = true;
+		else changed.push({ i, t, trackedId: c.objectId, poll });
 	}
-	const { message, rateLimitedSec } = err!;
-	r.failed = true;
-	r.limited = rateLimitedSec !== null;
-	r.error = message;
-	const fails = c.failCount + 1;
-	const due = rateLimitedSec !== null ? opts.nowMs + rateLimitedSec * 1000 : backoffAt(opts.nowMs, fails);
-	// tracking.ts providerPauses matches this text.
-	const lastError = rateLimitedSec !== null ? new TrackerRateLimitedError(rateLimitedSec).message : message.slice(0, 300);
-	await deps.db.query(
-		`update curator.catalog_cursor set next_due_at = to_timestamp($3::float8 / 1000), last_run_at = now(), fail_count = $4::int,
-			last_error = $5, last_reported_by = $6, lease_holder = null, lease_until = null
-		where object_id = $1 and provider = $2`,
-		[c.objectId, t.provider, String(due), String(rateLimitedSec !== null ? c.failCount : fails), lastError, opts.holder],
-	);
-	deps.log.warn('tracker_poll_failed', { kind: t.kind, provider: t.provider, objectId: c.objectId, limited: r.limited, by: opts.holder, error: message.slice(0, 200) });
-	return r;
+	// Together, then one by one if that failed.
+	const each = async <T>(found: readonly Found[], run: (f: readonly Found[]) => Promise<T[]>): Promise<[Found, T][]> => {
+		if (!found.length) return [];
+		try {
+			return (await run(found)).map((r, k) => [found[k]!, r]);
+		} catch (e) {
+			if (found.length === 1) {
+				errors.set(found[0]!.i, errorOf(e));
+				return [];
+			}
+			const out: [Found, T][] = [];
+			for (const f of found) out.push(...(await each([f], run)));
+			return out;
+		}
+	};
+	const ingested = await each(changed, (f) => ingestFound(deps.db, f));
+	const outcomes = new Map(ingested.map(([f, o]) => [f.i, o]));
+	for (const [f, n] of await each(ingested.map(([f]) => f), (found) => raiseFound(deps.db, found.map((f) => ({ ...f, outcomes: outcomes.get(f.i)! })), opts.nowMs, opts.holder))) results[f.i]!.events = n;
+
+	const done = polls.map((p, i) => ({ ...p, i })).filter((p): p is typeof p & { outcome: { poll: TrackerPoll } } => 'poll' in p.outcome && !errors.has(p.i));
+	if (done.length) {
+		const choices = await readCadencesOf(deps.db, done.map((p) => ({ objectId: p.c.objectId, kind: p.t.kind, provider: p.t.provider })));
+		// scanned_at: read through, changed or not — the back office's "last scanned".
+		await deps.db.query(
+			`with x as materialized (select * from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, provider text, cursor jsonb, due float8)),
+			seen as (update curator.catalog_object o set scanned_at = now() where o.id in (select object_id from x))
+			update curator.catalog_cursor c set cursor = x.cursor, next_due_at = to_timestamp(x.due / 1000), last_run_at = now(),
+				fail_count = 0, last_error = null, last_reported_by = $2, lease_holder = null, lease_until = null
+			from x where c.object_id = x.object_id and c.provider = x.provider`,
+			[
+				JSON.stringify(
+					done.map((p) => ({
+						object_id: p.c.objectId,
+						provider: p.t.provider,
+						cursor: { ...p.outcome.poll.cursor, listingHash: p.outcome.poll.listingHash },
+						due: nextDueFor(opts.nowMs, p.t.cadence, choices.get(`${p.c.objectId}|${p.t.provider}`)!, spreadOf(p.c.objectId)),
+					})),
+				),
+				opts.holder,
+			],
+		);
+	}
+	const failed: unknown[] = [];
+	for (const [i, { message, rateLimitedSec }] of errors) {
+		const { t, c } = polls[i]!;
+		const r = results[i]!;
+		r.events = 0;
+		r.failed = true;
+		r.limited = rateLimitedSec !== null;
+		r.error = message;
+		const fails = c.failCount + 1;
+		failed.push({
+			object_id: c.objectId,
+			provider: t.provider,
+			due: rateLimitedSec !== null ? opts.nowMs + rateLimitedSec * 1000 : backoffAt(opts.nowMs, fails),
+			fails: rateLimitedSec !== null ? c.failCount : fails,
+			// tracking.ts providerPauses matches this text.
+			error: rateLimitedSec !== null ? new TrackerRateLimitedError(rateLimitedSec).message : message.slice(0, 300),
+		});
+		deps.log.warn('tracker_poll_failed', { kind: t.kind, provider: t.provider, objectId: c.objectId, limited: r.limited, by: opts.holder, error: message.slice(0, 200) });
+	}
+	if (failed.length) {
+		await deps.db.query(
+			`update curator.catalog_cursor c set next_due_at = to_timestamp(x.due / 1000), last_run_at = now(), fail_count = x.fails,
+				last_error = x.error, last_reported_by = $2, lease_holder = null, lease_until = null
+			from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, provider text, due float8, fails int, error text)
+			where c.object_id = x.object_id and c.provider = x.provider`,
+			[JSON.stringify(failed), opts.holder],
+		);
+	}
+	return results;
 }
+
+// Polls applied together: a minute's reading at the slowest provider's pace,
+// well inside the lease.
+const APPLY_EVERY = 10;
 
 async function runTracker(deps: SweepDeps, t: TrackerRow, adapter: TrackerAdapter, now: () => number): Promise<TrackerPassResult> {
 	const sleep = deps.sleep ?? defaultSleep;
@@ -245,36 +314,44 @@ async function runTracker(deps: SweepDeps, t: TrackerRow, adapter: TrackerAdapte
 	const errors: string[] = [];
 	const leased = await leaseDue(deps.db, t, { holder: deps.holder, batch: deps.batch ?? 50, leaseMin: deps.leaseMin ?? 10 });
 	r.claimed = leased.length;
-	for (let i = 0; i < leased.length; i++) {
-		const c = leased[i]!;
-		if (r.budgetOut) {
-			await releaseLease(deps.db, c.objectId, t.provider, deps.holder);
-			continue;
-		}
-		if ((await reserveCalls(deps.db, t.provider, adapter.callsPerPoll, t.budget.perDay)) < adapter.callsPerPoll) {
-			r.budgetOut = true;
-			await releaseLease(deps.db, c.objectId, t.provider, deps.holder);
-			continue;
-		}
-		if (i > 0 && t.budget.minGapMs > 0) await sleep(t.budget.minGapMs);
-		const { target, rep } = await loadTarget(deps.db, t, c);
-		let outcome: PollOutcome;
-		try {
-			outcome = { poll: await adapter.poll(target, AbortSignal.timeout(deps.pollTimeoutMs ?? 30_000)) };
-		} catch (e) {
-			outcome = { error: { message: e instanceof Error ? e.message : String(e), rateLimitedSec: e instanceof TrackerRateLimitedError ? e.retryAfterSec : null } };
-		}
-		const a = await applyPoll(deps, t, c, rep, outcome, { holder: deps.holder, nowMs: now() });
-		if (a.polled) r.polled++;
-		if (a.unchanged) r.unchanged++;
-		r.calls += a.calls;
-		r.events += a.events;
-		if (a.failed) {
-			r.failed++;
-			errors.push((a.error ?? '').slice(0, 200));
+	for (let at = 0; at < leased.length; at += APPLY_EVERY) {
+		const chunk = leased.slice(at, at + APPLY_EVERY);
+		// The chunk's calls in one reservation; what was not granted ends the pass.
+		const granted = r.budgetOut ? 0 : Math.floor((await reserveCalls(deps.db, t.provider, adapter.callsPerPoll * chunk.length, t.budget.perDay)) / adapter.callsPerPoll);
+		if (granted < chunk.length) r.budgetOut = true;
+		const targets = await loadTargets(deps.db, t, chunk.slice(0, granted));
+		const polls: PollToApply[] = [];
+		const left: LeasedCursor[] = [...chunk.slice(granted)];
+		let limited = false;
+		for (const [k, c] of chunk.slice(0, granted).entries()) {
 			// The provider asked us to wait: every other cursor of it would too.
-			if (a.limited) r.budgetOut = true;
+			if (limited) {
+				left.push(c);
+				continue;
+			}
+			if (at + k > 0 && t.budget.minGapMs > 0) await sleep(t.budget.minGapMs);
+			const { target, rep } = targets.get(c.objectId)!;
+			let outcome: PollOutcome;
+			try {
+				outcome = { poll: await adapter.poll(target, AbortSignal.timeout(deps.pollTimeoutMs ?? 30_000)) };
+			} catch (e) {
+				outcome = { error: errorOf(e) };
+			}
+			limited = 'error' in outcome && outcome.error.rateLimitedSec !== null;
+			polls.push({ t, c, rep, outcome });
 		}
+		if (limited) r.budgetOut = true;
+		for (const a of await applyPolls(deps, polls, { holder: deps.holder, nowMs: now() })) {
+			if (a.polled) r.polled++;
+			if (a.unchanged) r.unchanged++;
+			r.calls += a.calls;
+			r.events += a.events;
+			if (a.failed) {
+				r.failed++;
+				errors.push((a.error ?? '').slice(0, 200));
+			}
+		}
+		await releaseLeases(deps.db, left.map((c) => ({ objectId: c.objectId, provider: t.provider })), deps.holder);
 	}
 	await deps.db.query(
 		`update curator.tracker_run set finished_at = now(), claimed = $2::int, calls = $3::int, events = $4::int, failed = $5::int, errors = $6::text::jsonb where id = $1::bigint`,
@@ -284,70 +361,110 @@ async function runTracker(deps: SweepDeps, t: TrackerRow, adapter: TrackerAdapte
 	return r;
 }
 
-// Ingests a changed listing, then raises events for its recent releases.
-async function ingestFound(db: Db, t: TrackerRow, trackedId: string, poll: TrackerPoll, nowMs: number, by: string): Promise<number> {
-	const { children, self } = poll;
-	const outcomes = await withSystemTx(db, async (tx) => {
-		if (self) await ingestClaims(tx, [self], { reason: 'tracker' });
-		if (poll.tentative?.length) {
-			// An upload the catalogue can place joins its recording; one it
-			// cannot is noted on the tracked object, never minted.
-			const ingester = new Ingester(tx, { reason: 'tracker' });
-			const [rep] = await tx.query<{ id: string }>(`select id from curator.catalog_source_object where object_id = $1 and provider = $2 limit 1`, [trackedId, t.provider]);
-			for (const c of poll.tentative) {
-				if (await ingester.attachIfKnown(c)) continue;
-				await tx.query(
-					`insert into curator.catalog_signal (object_id, source_object_id, kind, value, observed_at)
-					values ($1, $2, 'announcement', $3::text::jsonb, coalesce(to_timestamp($4::float8 / 1000), now()))`,
-					[trackedId, rep?.id ?? null, JSON.stringify({ provider: c.provider, id: c.providerId, title: c.name, url: c.url ?? null, artists: (c.artists ?? []).map((a) => a.name) }), c.publishedAt == null ? null : String(c.publishedAt)],
-				);
-			}
-		}
-		const ingested = (await ingestClaims(tx, children, { reason: 'tracker' })).outcomes;
-		if (poll.labelOf) {
-			await linkReleasesToLabel(tx, trackedId, ingested.map((o, i) => ({ objectId: o.objectId, claim: children[i]! })).filter((r) => r.claim.kind === 'release'));
-		}
-		return ingested;
-	});
-	const windowDays = t.config.eventWindowDays ?? 14;
+type Found = { i: number; t: TrackerRow; trackedId: string; poll: TrackerPoll };
+
+// Ingests changed listings in one transaction: what each poll's children are.
+async function ingestFound(db: Db, found: readonly Found[]): Promise<IngestOutcome[][]> {
 	return withSystemTx(db, async (tx) => {
-		let raised = 0;
-		// A genre's children are chart rows: the entries are the events, not
-		// the releases behind them (a chart carries old releases too).
-		if (t.kind === 'genre') {
-			for (const e of poll.chart ?? []) {
-				const recordingId = await findRepresentation(tx, e.recording);
-				if (!recordingId) continue;
-				if ((await raiseChartEntry(tx, { genreId: trackedId, recordingId, provider: t.provider as CatalogProvider, rank: e.rank }, { nowMs, by })) === null) continue;
-				raised++;
+		const ingester = new Ingester(tx, { reason: 'tracker' });
+		const selves = found.flatMap((f) => (f.poll.self ? [f.poll.self] : []));
+		await ingester.claims(selves);
+		const out: IngestOutcome[][] = [];
+		const unplaced: { object_id: string; provider: string; at: number | null; value: unknown }[] = [];
+		const claimsOf = (f: Found) => [...(f.poll.tentative ?? []), ...f.poll.children];
+		const size = (f: Found): number => claimsOf(f).reduce((n, c) => n + nodes(c), 0);
+		for (let at = 0; at < found.length; ) {
+			let end = at;
+			for (let n = 0; end < found.length && (end === at || n + size(found[end]!) <= BATCH_NODES); end++) n += size(found[end]!);
+			const chunk = found.slice(at, end);
+			const run = async (): Promise<void> => {
+				for (const f of chunk) {
+					ingester.forget();
+					// An upload the catalogue can place joins its recording; one it
+					// cannot is noted on the tracked object, never minted.
+					for (const c of f.poll.tentative ?? []) {
+						if (await ingester.attachIfKnown(c)) continue;
+						unplaced.push({ object_id: f.trackedId, provider: f.t.provider, at: c.publishedAt ?? null, value: { provider: c.provider, id: c.providerId, title: c.name, url: c.url ?? null, artists: (c.artists ?? []).map((a) => a.name) } });
+					}
+					ingester.forget();
+					out.push(await ingester.claims(f.poll.children));
+				}
+			};
+			// One listing larger than a batch splits itself (Ingester.claims).
+			if (chunk.length === 1 && size(chunk[0]!) > BATCH_NODES) await run();
+			else await ingester.batch(chunk.flatMap(claimsOf), run);
+			at = end;
+		}
+		if (unplaced.length) await noteUnplaced(tx, unplaced);
+		for (const [k, f] of found.entries()) {
+			if (f.poll.labelOf) await linkReleasesToLabel(tx, f.trackedId, out[k]!.map((o, j) => ({ objectId: o.objectId, claim: f.poll.children[j]! })).filter((r) => r.claim.kind === 'release'));
+		}
+		return out;
+	});
+}
+
+function noteUnplaced(tx: Queryable, unplaced: readonly { object_id: string; provider: string; at: number | null; value: unknown }[]): Promise<unknown> {
+	return tx.query(
+		`insert into curator.catalog_signal (object_id, source_object_id, kind, value, observed_at)
+		select x.object_id, (select s.id from curator.catalog_source_object s where s.object_id = x.object_id and s.provider = x.provider limit 1),
+			'announcement', x.value, coalesce(to_timestamp(x.at / 1000), now())
+		from jsonb_to_recordset($1::text::jsonb) as x(object_id uuid, provider text, at float8, value jsonb)`,
+		[JSON.stringify(unplaced)],
+	);
+}
+
+// Raises the events of ingested listings: how many, per listing.
+async function raiseFound(db: Db, found: readonly (Found & { outcomes: IngestOutcome[] })[], nowMs: number, by: string): Promise<number[]> {
+	const raised = found.map(() => 0);
+	const windowOf = (t: TrackerRow): number => t.config.eventWindowDays ?? 14;
+	await withSystemTx(db, async (tx) => {
+		const releases: { k: number; releaseId: string; trackedId: string; publishedAt: number | null; windowDays: number }[] = [];
+		for (const [k, f] of found.entries()) {
+			const { t, trackedId, poll, outcomes } = f;
+			// A genre's children are chart rows: the entries are the events, not
+			// the releases behind them (a chart carries old releases too).
+			if (t.kind === 'genre') {
+				const chart = poll.chart ?? [];
+				const ids = await findRepresentations(tx, chart.map((e) => e.recording));
+				const entries = chart.flatMap((e) => {
+					const recordingId = ids.get(`${e.recording.provider}|${e.recording.kind}|${e.recording.providerId}`);
+					return recordingId ? [{ genreId: trackedId, recordingId, provider: t.provider as CatalogProvider, rank: e.rank }] : [];
+				});
+				const seqs = await raiseChartEntries(tx, entries, { nowMs, by });
+				const fresh = entries.filter((_, j) => seqs[j] !== null).map((e) => e.recordingId);
+				raised[k] = fresh.length;
 				// A charted track the catalogue knew already was never queued for
 				// its Spotify id; the chart makes it worth one (planner.ts).
-				await tx.query(
-					`insert into curator.catalog_enrich_task (object_id, need, provider)
-					select $1, 'representation', 'spotify'
-					where exists (select 1 from curator.catalog_identifier i where i.object_id = $1 and i.namespace = 'isrc')
-						and not exists (select 1 from curator.catalog_source_object so where so.object_id = $1 and so.provider = 'spotify')
-					on conflict do nothing`,
-					[recordingId],
+				if (fresh.length) {
+					await tx.query(
+						`insert into curator.catalog_enrich_task (object_id, need, provider)
+						select x.id, 'representation', 'spotify' from unnest($1::uuid[]) as x(id)
+						where exists (select 1 from curator.catalog_identifier i where i.object_id = x.id and i.namespace = 'isrc')
+							and not exists (select 1 from curator.catalog_source_object so where so.object_id = x.id and so.provider = 'spotify')
+						on conflict do nothing`,
+						[`{${fresh.join(',')}}`],
+					);
+				}
+				continue;
+			}
+			// A playlist's children are its tracks, each an addition; an artist's
+			// or label's are releases.
+			const adds = t.kind === 'playlist' ? outcomes.flatMap((o, j) => (o.kind === 'recording' ? [{ o, child: poll.children[j]! }] : [])) : [];
+			if (adds.length) {
+				const [rep] = await tx.query<{ id: string }>(`select id from curator.catalog_source_object where object_id = $1 and provider = $2 limit 1`, [trackedId, t.provider]);
+				const seqs = await raisePlaylistAdds(
+					tx,
+					adds.map(({ o, child }) => ({ playlistId: trackedId, recordingId: o.objectId, sourceObjectId: rep?.id ?? null, addedAt: child.publishedAt ?? null, position: child.facts?.trackNumber ?? null })),
+					{ nowMs, windowDays: windowOf(t), by },
 				);
+				raised[k] = seqs.filter((s) => s !== null).length;
 			}
-			return raised;
-		}
-		// A playlist's children are its tracks, each an addition; an artist's
-		// or label's are releases.
-		const rep = t.kind === 'playlist'
-			? (await tx.query<{ id: string }>(`select id from curator.catalog_source_object where object_id = $1 and provider = $2 limit 1`, [trackedId, t.provider]))[0]?.id ?? null
-			: null;
-		for (const [i, o] of outcomes.entries()) {
-			const child = children[i]!;
-			let seq: number | null = null;
-			if (t.kind === 'playlist' && o.kind === 'recording') {
-				seq = await raisePlaylistAdd(tx, { playlistId: trackedId, recordingId: o.objectId, sourceObjectId: rep, addedAt: child.publishedAt ?? null, position: child.facts?.trackNumber ?? null }, { nowMs, windowDays, by });
-			} else if (o.kind === 'release') {
-				seq = await raiseReleaseEvent(tx, { releaseId: o.objectId, trackedId, publishedAt: child.publishedAt ?? null }, { nowMs, windowDays, by });
+			for (const [j, o] of outcomes.entries()) {
+				if (o.kind === 'release') releases.push({ k, releaseId: o.objectId, trackedId, publishedAt: poll.children[j]!.publishedAt ?? null, windowDays: windowOf(t) });
 			}
-			if (seq !== null) raised++;
 		}
-		return raised;
+		const seqs = await raiseReleaseEvents(tx, releases, { nowMs, by });
+		for (const [j, r] of releases.entries()) if (seqs[j] !== null) raised[r.k]!++;
 	});
+	return raised;
 }

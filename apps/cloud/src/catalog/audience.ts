@@ -154,20 +154,30 @@ export function audienceReaders(s: AudienceSources): AudienceReader[] {
 	return out;
 }
 
-// What can be read of an artist at a store; null when the artist is gone
-// (merged away).
-async function pagesOf(q: Queryable, artistId: string, provider: AudienceProvider): Promise<AudiencePage[] | null> {
-	const [o] = await q.query<{ name: string }>(`select name from curator.catalog_object where id = $1 and kind = 'artist' and merged_into is null`, [artistId]);
-	if (!o) return null;
-	if (provider === 'lastfm') return [{ sourceId: null, providerId: o.name, url: null }];
-	return (
-		await q.query<{ id: string; provider_id: string; url: string | null }>(
-			`select s.id, s.provider_id, s.url from curator.catalog_source_object s
-			where s.object_id = $1 and s.provider = $2 and s.kind = 'artist' and ${USABLE_SQL}
-			order by s.provider_id`,
-			[artistId, provider],
-		)
-	).map((p) => ({ sourceId: p.id, providerId: p.provider_id, url: p.url }));
+// What can be read of artists at a store, by artist; one that is gone (merged
+// away) is absent.
+async function pagesOf(q: Queryable, artistIds: readonly string[], provider: AudienceProvider): Promise<Map<string, AudiencePage[]>> {
+	const rows = await q.query<{ artist: string; name: string; id: string | null; provider_id: string | null; url: string | null }>(
+		`select o.id as artist, o.name, p.id, p.provider_id, p.url from curator.catalog_object o
+		left join lateral (
+			select s.id, s.provider_id, s.url from curator.catalog_source_object s
+			where s.object_id = o.id and s.provider = $2 and s.kind = 'artist' and ${USABLE_SQL}
+		) p on true
+		where o.id = any($1::uuid[]) and o.kind = 'artist' and o.merged_into is null
+		order by p.provider_id`,
+		[`{${artistIds.join(',')}}`, provider],
+	);
+	const out = new Map<string, AudiencePage[]>();
+	for (const r of rows) {
+		if (provider === 'lastfm') {
+			out.set(r.artist, [{ sourceId: null, providerId: r.name, url: null }]);
+			continue;
+		}
+		const list = out.get(r.artist) ?? [];
+		if (r.id !== null) list.push({ sourceId: r.id, providerId: r.provider_id!, url: r.url });
+		out.set(r.artist, list);
+	}
+	return out;
 }
 
 // Someone opened an artist's page, or a library holds the artist: each store
@@ -269,47 +279,63 @@ async function readStore(deps: AudiencePassDeps, reader: AudienceReader): Promis
 	);
 	if (!due.length) return { read: 0, failed: 0 };
 	const tasks: { artist: string; pages: AudiencePage[] }[] = [];
+	const pagesBy = await pagesOf(db, due.map((t) => t.object_id), reader.provider);
+	const gone: string[] = [];
 	for (const t of due) {
-		const pages = await pagesOf(db, t.object_id, reader.provider);
+		const pages = pagesBy.get(t.object_id);
 		// Merged away, or no page left to read there: nothing to wait for.
-		if (!pages?.length) await db.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = $2 and provider = $3`, [t.object_id, AUDIENCE_NEED, reader.provider]);
+		if (!pages?.length) gone.push(t.object_id);
 		else tasks.push({ artist: t.object_id, pages });
 	}
+	if (gone.length) await db.query(`delete from curator.catalog_enrich_task where object_id = any($1::uuid[]) and need = $2 and provider = $3`, [`{${gone.join(',')}}`, AUDIENCE_NEED, reader.provider]);
 	// The store is read outside any transaction: none is held across a call out.
 	const { values, stop } = tasks.length ? await reader.read(tasks.flatMap((t) => t.pages), AbortSignal.timeout(120_000)) : { values: new Map(), stop: undefined };
 	let read = 0;
 	let failed = 0;
+	// Kept in one transaction, a statement per table and outcome.
+	const signals: unknown[] = [];
+	const unreached: string[] = [];
+	const erred: { id: string; error: string }[] = [];
+	const done: string[] = [];
+	for (const t of tasks) {
+		const got = t.pages.map((p) => ({ page: p, v: values.get(p) }));
+		const counted = got.filter((g): g is { page: AudiencePage; v: number } => typeof g.v === 'number');
+		const errors = got.filter((g) => g.v instanceof Error).map((g) => (g.v as Error).message);
+		for (const g of counted) signals.push({ artist: t.artist, so: g.page.sourceId, value: { provider: reader.provider, metric: AUDIENCE_METRIC[reader.provider], n: g.v } });
+		if (!got.every((g) => g.v !== undefined)) unreached.push(t.artist);
+		else if (!counted.length && errors.length) {
+			failed++;
+			erred.push({ id: t.artist, error: errors[0]!.slice(0, 200) });
+		} else {
+			read++;
+			done.push(t.artist);
+		}
+	}
 	await withSystemTx(db, async (tx) => {
-		for (const t of tasks) {
-			const got = t.pages.map((p) => ({ page: p, v: values.get(p) }));
-			const done = got.every((g) => g.v !== undefined);
-			const counted = got.filter((g): g is { page: AudiencePage; v: number } => typeof g.v === 'number');
-			const errors = got.filter((g) => g.v instanceof Error).map((g) => (g.v as Error).message);
-			for (const g of counted) {
-				await tx.query(
-					`insert into curator.catalog_signal (object_id, source_object_id, kind, value) values ($1, $2, 'audience', $3::text::jsonb)`,
-					[t.artist, g.page.sourceId, JSON.stringify({ provider: reader.provider, metric: AUDIENCE_METRIC[reader.provider], n: g.v })],
-				);
-			}
-			if (!done) {
-				// Not reached this pass: due again at once.
-				await tx.query(`update curator.catalog_enrich_task set lease_holder = null, lease_until = null where object_id = $1 and need = $2 and provider = $3`, [t.artist, AUDIENCE_NEED, reader.provider]);
-			} else if (!counted.length && errors.length) {
-				failed++;
-				await tx.query(
-					`update curator.catalog_enrich_task set next_due_at = now() + make_interval(mins => ${RETRY_AFTER_ERROR_MINUTES}), attempts = attempts + 1, last_error = $4, lease_holder = null, lease_until = null
-					where object_id = $1 and need = $2 and provider = $3`,
-					[t.artist, AUDIENCE_NEED, reader.provider, errors[0]!.slice(0, 200)],
-				);
-			} else {
-				read++;
-				await tx.query(
-					`update curator.catalog_enrich_task set next_due_at = now() + make_interval(days => ${READ_EVERY_DAYS}) + random() * make_interval(hours => ${JITTER_HOURS}),
-						attempts = 0, last_error = null, lease_holder = null, lease_until = null
-					where object_id = $1 and need = $2 and provider = $3`,
-					[t.artist, AUDIENCE_NEED, reader.provider],
-				);
-			}
+		const key = [AUDIENCE_NEED, reader.provider];
+		if (signals.length) {
+			await tx.query(
+				`insert into curator.catalog_signal (object_id, source_object_id, kind, value)
+				select x.artist, x.so, 'audience', x.value from jsonb_to_recordset($1::text::jsonb) as x(artist uuid, so uuid, value jsonb)`,
+				[JSON.stringify(signals)],
+			);
+		}
+		// Not reached this pass: due again at once.
+		if (unreached.length) await tx.query(`update curator.catalog_enrich_task set lease_holder = null, lease_until = null where object_id = any($1::uuid[]) and need = $2 and provider = $3`, [`{${unreached.join(',')}}`, ...key]);
+		if (erred.length) {
+			await tx.query(
+				`update curator.catalog_enrich_task t set next_due_at = now() + make_interval(mins => ${RETRY_AFTER_ERROR_MINUTES}), attempts = t.attempts + 1, last_error = x.error, lease_holder = null, lease_until = null
+				from jsonb_to_recordset($1::text::jsonb) as x(id uuid, error text) where t.object_id = x.id and t.need = $2 and t.provider = $3`,
+				[JSON.stringify(erred), ...key],
+			);
+		}
+		if (done.length) {
+			await tx.query(
+				`update curator.catalog_enrich_task set next_due_at = now() + make_interval(days => ${READ_EVERY_DAYS}) + random() * make_interval(hours => ${JITTER_HOURS}),
+					attempts = 0, last_error = null, lease_holder = null, lease_until = null
+				where object_id = any($1::uuid[]) and need = $2 and provider = $3`,
+				[`{${done.join(',')}}`, ...key],
+			);
 		}
 	});
 	return { read, failed, ...(stop ? { stop } : {}) };

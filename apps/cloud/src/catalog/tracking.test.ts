@@ -33,9 +33,9 @@ async function seeded(): Promise<{ app: TestApp; fan: Awaited<ReturnType<TestApp
 	const fan = await app.signIn('desk-1');
 	for (const objectId of [ids.north, ids.amber, ids.glass]) await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, objectId, source: 'manual' });
 	await withSystemTx(app.db, async (tx) => {
-		await ensureCursors(tx, ids.north);
-		await ensureCursors(tx, ids.amber);
-		await ensureCursors(tx, ids.glass);
+		await ensureCursors(tx, [ids.north]);
+		await ensureCursors(tx, [ids.amber]);
+		await ensureCursors(tx, [ids.glass]);
 		// Deezer tracks labels by name too; one source per label reads simpler here.
 		await tx.query(`delete from curator.catalog_cursor where provider = 'deezer' and object_id = any($1::uuid[])`, [`{${ids.north},${ids.amber}}`]);
 		// Nothing is due unless a test says so.

@@ -136,18 +136,20 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
 	const ingester = new Ingester(tx, { reason: 'enrichment' });
 	const outcomes: (IngestOutcome | undefined)[] = [];
-	for (const c of claims) {
-		let known: IngestOutcome | null = null;
-		if (c.kind === 'recording') known = await ingester.attachIfKnown(c, { genres: true });
-		else if (c.kind === 'release') known = await ingester.attachIfKnown(c);
-		else if (c.kind === 'artist') {
-			// Only onto the artist that store id already names: a picture never
-			// goes by the identity rules, and never makes a representation.
-			const picture = artistPicture(c);
-			if (picture && (await findRepresentation(tx, picture))) known = await ingester.attachIfKnown(picture);
+	await ingester.batch(claims, async () => {
+		for (const c of claims) {
+			let known: IngestOutcome | null = null;
+			if (c.kind === 'recording') known = await ingester.attachIfKnown(c, { genres: true });
+			else if (c.kind === 'release') known = await ingester.attachIfKnown(c);
+			else if (c.kind === 'artist') {
+				// Only onto the artist that store id already names: a picture never
+				// goes by the identity rules, and never makes a representation.
+				const picture = artistPicture(c);
+				if (picture && (await ingester.holder(picture))) known = await ingester.attachIfKnown(picture);
+			}
+			outcomes.push(known ?? undefined);
 		}
-		outcomes.push(known ?? undefined);
-	}
+	});
 	return { outcomes, created: 0, attached: ingester.stats.attached };
 }
 

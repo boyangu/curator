@@ -9,6 +9,7 @@
 
 import { createSignal, For, onMount, Show, type JSX } from 'solid-js';
 import { render } from 'solid-js/web';
+import { PRODUCTION_QUALITY_ENABLED } from '@curator/library-logic';
 import type { AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources } from '@curator/core';
 import { loadAutoAnalyzeSettings, saveAutoAnalyzeSettings, pushAutoAnalyzeToCore } from './analysisFlags.js';
 import { analysisApi } from '../data/api.js';
@@ -74,7 +75,7 @@ export function AnalysisFlagsForm(props: {
 			</div>
 			<div class="analysis-flags__group analysis-flags__group--advanced">
 				{row(ADVANCED_FLAG)}
-				{row(PRODUCTION_FLAG)}
+				<Show when={PRODUCTION_QUALITY_ENABLED}>{row(PRODUCTION_FLAG)}</Show>
 			</div>
 		</div>
 	);

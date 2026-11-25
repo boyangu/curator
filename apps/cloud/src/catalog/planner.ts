@@ -21,7 +21,7 @@ import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { mergeObjects, openReview, ruledNotSame } from './admin.js';
 import { reannounceFor, reannounceCard } from './events.js';
-import { findByIdentifier, findRepresentation, recordingByIsrcOk, storeTagless } from './identity.js';
+import { findRepresentation, storeTagless } from './identity.js';
 import { Ingester } from './ingest.js';
 import { ensureCursors } from './watches.js';
 import { DEEZER_GENRES, getJson, type FetchLike } from '@curator/catalog-readers';
@@ -192,7 +192,7 @@ export async function runPlanner(deps: PlannerDeps): Promise<{ attempted: number
 				// one artist, an operator's merge to make, not this planner's.
 				if (owner && owner !== o.id) return `owned_by:${owner}`;
 				await new Ingester(tx, { reason: 'enrichment' }).attachTo(o.id, r.claim);
-				await ensureCursors(tx, o.id);
+				await ensureCursors(tx, [o.id]);
 				await tx.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = $2`, [o.id, o.provider]);
 				return null;
 			});
@@ -413,30 +413,47 @@ export async function runIsrcFill(deps: ResolverDeps): Promise<{ attempted: numb
 			break;
 		}
 		const byId = new Map(tracks.map((t) => [t.id, t]));
+		attempted += batch.length;
+		const claims = new Map<string, CatalogClaim>();
 		for (const r of batch) {
-			attempted++;
-			const t = byId.get(r.spotify_id);
-			const isrc = t?.external_ids?.isrc;
-			await withSystemTx(deps.db, async (tx) => {
-				// The gap is closed first: a merge below carries the recording's
-				// tasks onto the ISRC's holder, which has its ISRC already.
-				await tx.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'isrc'`, [r.id]);
-				if (isrc) {
-					const ingester = new Ingester(tx, { reason: 'enrichment' });
-					const claim: CatalogClaim = { provider: 'spotify', kind: 'recording', providerId: r.spotify_id, name: '', identifiers: [{ namespace: 'isrc', value: isrc }] };
-					const holder = await findByIdentifier(tx, claim);
-					if (holder && holder.id !== r.id && (await recordingByIsrcOk(tx, holder.id, numOrNull(r.duration_sec) ?? undefined))) {
-						// Two recordings of one ISRC: the ISRC's holder keeps the id
-						// and this copy folds into it, releases re-announced.
-						const releases = await tx.query<{ id: string }>(`select src as id from curator.catalog_edge where dst = $1 and kind = 'release-recording'`, [r.id]);
-						await mergeObjects(tx, r.id, holder.id, 'worker', 'same ISRC after the Spotify fill', { isrc });
-						for (const rel of releases) await reannounceCard(tx, rel.id);
-						merged++;
-					} else if (!holder || holder.id === r.id) {
+			const isrc = byId.get(r.spotify_id)?.external_ids?.isrc;
+			if (isrc) claims.set(r.id, { provider: 'spotify', kind: 'recording', providerId: r.spotify_id, name: '', identifiers: [{ namespace: 'isrc', value: isrc }] });
+		}
+		// Two recordings of one ISRC: the ISRC's holder keeps the id and the copy
+		// folds into it.
+		const twins: { r: (typeof batch)[number]; holder: string; isrc: string }[] = [];
+		await withSystemTx(deps.db, async (tx) => {
+			const ingester = new Ingester(tx, { reason: 'enrichment' });
+			await ingester.batch([...claims.values()], async () => {
+				for (const r of batch) {
+					const claim = claims.get(r.id);
+					if (!claim) continue;
+					const holder = await ingester.named(claim, numOrNull(r.duration_sec) ?? undefined);
+					if (holder && holder.id !== r.id && holder.fits) twins.push({ r, holder: holder.id, isrc: claim.identifiers![0]!.value });
+					else if (!holder || holder.id === r.id) {
 						await ingester.attachIdentifiersOnly(r.id, claim);
 						filled++;
 					}
 				}
+			});
+			const settled = batch.filter((r) => !twins.some((t) => t.r.id === r.id)).map((r) => r.id);
+			await tx.query(`delete from curator.catalog_enrich_task where need = 'isrc' and object_id = any($1::uuid[])`, [`{${settled.join(',')}}`]);
+		});
+		const gone = new Map<string, string>();
+		for (const { r, holder, isrc } of twins) {
+			// A holder merged a moment ago answers through the one it went into.
+			let into = holder;
+			while (gone.has(into)) into = gone.get(into)!;
+			await withSystemTx(deps.db, async (tx) => {
+				// The gap is closed first: the merge carries the recording's tasks
+				// onto the ISRC's holder, which has its ISRC already.
+				await tx.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'isrc'`, [r.id]);
+				if (into === r.id) return;
+				const releases = await tx.query<{ id: string }>(`select src as id from curator.catalog_edge where dst = $1 and kind = 'release-recording'`, [r.id]);
+				await mergeObjects(tx, r.id, into, 'worker', 'same ISRC after the Spotify fill', { isrc });
+				for (const rel of releases) await reannounceCard(tx, rel.id);
+				gone.set(r.id, into);
+				merged++;
 			});
 		}
 	}

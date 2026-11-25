@@ -499,23 +499,30 @@ export async function runReleaseFiller(deps: FillerDeps): Promise<{ attempted: n
 	const fill = await fillReleases(deps.db, deps.fetchers, { ids: due.map((d) => d.object_id) }, { limit: Math.min(n, MAX_LIMIT) });
 	report.parked = fill.parked;
 	const attempts = new Map(due.map((d) => [d.object_id, num(d.attempts)]));
+	const settled: string[] = [];
+	const again: { id: string; hours: number; tried: number; error: string }[] = [];
 	for (const o of fill.outcomes) {
 		const complete = o.after >= Math.max(o.expected ?? 1, 1);
 		const parkedHere = o.sources.some((s) => s.note?.startsWith('parked') || (s.note && /rate limited/i.test(s.note)));
 		const failedHere = o.sources.some((s) => s.note?.startsWith('failed'));
 		if (complete || (!parkedHere && !failedHere)) {
-			await deps.db.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'fill' and provider = 'catalog'`, [o.id]);
+			settled.push(o.id);
 			report.done++;
 			continue;
 		}
 		const tries = attempts.get(o.id) ?? 0;
 		const hours = parkedHere ? FILL_PARK_HOURS : FILL_RETRY_HOURS[Math.min(tries, FILL_RETRY_HOURS.length - 1)]!;
-		await deps.db.query(
-			`update curator.catalog_enrich_task set next_due_at = now() + make_interval(hours => $2::int), attempts = attempts + $3::int, last_error = $4, lease_holder = null, lease_until = null
-			where object_id = $1 and need = 'fill' and provider = 'catalog'`,
-			[o.id, String(hours), parkedHere ? '0' : '1', o.sources.filter((s) => s.note && (s.note.startsWith('parked') || s.note.startsWith('failed') || /rate limited/i.test(s.note))).map((s) => `${s.provider}: ${s.note}`).join('; ').slice(0, 300)],
-		);
+		again.push({ id: o.id, hours, tried: parkedHere ? 0 : 1, error: o.sources.filter((s) => s.note && (s.note.startsWith('parked') || s.note.startsWith('failed') || /rate limited/i.test(s.note))).map((s) => `${s.provider}: ${s.note}`).join('; ').slice(0, 300) });
 		report.later++;
+	}
+	if (settled.length) await deps.db.query(`delete from curator.catalog_enrich_task where need = 'fill' and provider = 'catalog' and object_id = any($1::uuid[])`, [`{${settled.join(',')}}`]);
+	if (again.length) {
+		await deps.db.query(
+			`update curator.catalog_enrich_task t set next_due_at = now() + make_interval(hours => x.hours), attempts = t.attempts + x.tried, last_error = x.error, lease_holder = null, lease_until = null
+			from jsonb_to_recordset($1::text::jsonb) as x(id uuid, hours int, tried int, error text)
+			where t.object_id = x.id and t.need = 'fill' and t.provider = 'catalog'`,
+			[JSON.stringify(again)],
+		);
 	}
 	// Leased but not reached (a fill run ends at its limit): back in the queue.
 	const reached = new Set(fill.outcomes.map((o) => o.id));

@@ -82,6 +82,51 @@ describe('ingestion', () => {
 		expect(await count(db, `select count(*) as n from curator.catalog_object where kind <> 'genre'`)).toBe(3);
 	});
 
+	// A hop per statement: the count is what a listing costs (ingest-batch.ts).
+	it('a listing costs a handful of statements, whatever its length', async () => {
+		const { db } = await createTestDb();
+		const listing = (n: number, isrc = true) =>
+			Array.from({ length: n }, (_, i) =>
+				release('spotify', `sr${i}`, `Glass Rivers ${i}`, [artist('spotify', `sa${i % 4}`, `Northfold ${i % 4}`)], {
+					tracks: Array.from({ length: 8 }, (_, k) => ({ id: `st${i}-${k}`, title: `Low Tide ${i}-${k}`, ...(isrc ? { isrc: `GBAAA26${String(i * 10 + k).padStart(5, '0')}` } : {}), dur: 200 + k })),
+				}),
+			);
+		const cost = async (claims: CatalogClaim[]) => {
+			let n = 0;
+			await withSystemTx(db, (tx) => ingestClaims({ query: (s, p) => (n++, tx.query(s, p)), exec: tx.exec }, claims, { reason: 'tracker' }));
+			return n;
+		};
+		expect(await cost(listing(2))).toBeLessThanOrEqual(5);
+		expect(await cost(listing(25))).toBeLessThanOrEqual(5);
+		// Nothing new: what is held, and what little changed.
+		expect(await cost(listing(25))).toBeLessThanOrEqual(3);
+		expect(await count(db, `select count(*) as n from curator.catalog_object where kind = 'recording'`)).toBe(200);
+	});
+
+	it('what it queued for a representation another transaction added meanwhile follows that one', async () => {
+		const { db } = await createTestDb();
+		const theirs = '00000000-0000-4000-8000-0000000000aa';
+		const c = release('spotify', 'sr1', 'Glass Rivers', [artist('spotify', 'sa1', 'Northfold')], { upc: '0123456789012', tracks: [] });
+		await withSystemTx(db, async (tx) => {
+			let raced = false;
+			const racing = {
+				exec: tx.exec,
+				query: async <T extends Record<string, unknown>>(s: string, p?: readonly (string | null)[]): Promise<T[]> => {
+					if (!raced && s.includes('insert into curator.catalog_source_object')) {
+						raced = true;
+						await tx.query(`insert into curator.catalog_object (id, kind, name, name_fold, discovered_via) values ($1, 'release', 'Glass Rivers', 'glass rivers', 'tracker')`, [theirs]);
+						await tx.query(`insert into curator.catalog_source_object (id, object_id, provider, kind, provider_id) values ($1, $1, 'spotify', 'release', 'sr1')`, [theirs]);
+					}
+					return tx.query<T>(s, p);
+				},
+			};
+			await ingestClaims(racing, [c], { reason: 'tracker' });
+		});
+		expect(await count(db, `select count(*) as n from curator.catalog_source_object where provider_id = 'sr1'`)).toBe(1);
+		expect(await count(db, `select count(*) as n from curator.catalog_identifier where source_object_id = $1`, [theirs])).toBe(1);
+		expect(await count(db, `select count(*) as n from curator.catalog_edge_evidence where source_object_id = $1`, [theirs])).toBe(1);
+	});
+
 	it("joins another provider's copy of a release by UPC and its artist by corroboration, never by name alone", async () => {
 		const { db } = await createTestDb();
 		const sp = release('spotify', 'sr1', 'Glass Rivers', [artist('spotify', 'sa1', 'Northfold')], { upc: '0123456789012' });

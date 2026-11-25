@@ -256,7 +256,7 @@ export async function mergeObjects(tx: SystemTx, fromId: string, intoId: string,
 		`insert into curator.catalog_merge_log (from_id, into_id, reason, by_whom, evidence, undo) values ($1, $2, $3, $4, $5::text::jsonb, $6::text::jsonb)`,
 		[fromId, intoId, reason, by, JSON.stringify(evidence), JSON.stringify({ moved })],
 	);
-	await ensureCursors(tx, intoId);
+	await ensureCursors(tx, [intoId]);
 	return { from: fromId, into: intoId, moved };
 }
 
@@ -268,7 +268,7 @@ export async function attachPage(tx: Queryable, objectId: string, c: ReviewCandi
 		: c.provider === 'discogs' && kind === 'artist' ? [{ namespace: 'discogs_artist' as const, value: c.providerId }]
 		: [];
 	await new Ingester(tx, { reason: 'enrichment' }).attachTo(objectId, { provider: c.provider, kind, providerId: c.providerId, name: c.name, url: c.url ?? null, identifiers: ids });
-	await ensureCursors(tx, objectId);
+	await ensureCursors(tx, [objectId]);
 }
 
 // A skip by the agent leaves the review to the operator (escalated, in the
@@ -441,7 +441,7 @@ export async function relinkPage(tx: Queryable, objectId: string, u: UnlinkResul
 	// The ruling the unlink recorded is withdrawn (the inbox item refers to the
 	// review, so it stays, decided as a skip): the profiler may attach it again.
 	if (u.review !== null) await tx.query(`update curator.catalog_review set decision = '{"action":"skip"}'::jsonb, note = coalesce(note || ' — ', '') || 'undone: the page was put back' where id = $1::bigint`, [String(u.review)]);
-	await ensureCursors(tx, objectId);
+	await ensureCursors(tx, [objectId]);
 }
 
 // Overrules a "not the same" ruling and merges: for when the owner says two
