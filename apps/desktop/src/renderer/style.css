@@ -2614,10 +2614,11 @@ body[data-player-mode="big"] .player-deck > .player-controls-row { flex: 0 0 aut
 	pointer-events: none;
 }
 .wavemap > .wave-inner > svg.t-waveform { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-/* No width transition: on a whole-track map one 50 ms position tick moves the
-   fill by a fraction of a pixel, so a transition smooths nothing and only
-   animates jumps — a click read as the fill "running" to the spot. */
-.wavemap .t-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: rgba(0, 0, 0, 0.55); pointer-events: none; z-index: 1; }
+/* No width transition (`none` overrides the base .t-fill's 120 ms): on a
+   whole-track map one 50 ms position tick moves the fill by a fraction of a
+   pixel, so a transition smooths nothing and only animates jumps — a click
+   read as the fill "running" to the spot. */
+.wavemap .t-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: rgba(0, 0, 0, 0.55); pointer-events: none; transition: none; z-index: 1; }
 .wavemap .t-cue-tick {
 	position: absolute;
 	top: 0;

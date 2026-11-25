@@ -147,6 +147,7 @@ import { feedActivity } from './data/feedActivity.js';
 import { statusTooltip } from './features/feedRefreshText.js';
 import { library } from './data/library.js';
 import { tracksData } from './data/tracks.js';
+import { sortLikeDb } from './track-sort.js';
 import { fmtTime, fmtAgo, coverGradient, escapeHtml } from './ui/format.js';
 import { showToast, showProgressToast } from './ui/toast.js';
 import { wireDataEvents } from './data/events.js';
@@ -440,6 +441,11 @@ let mainTrackList: TrackListHandle | null = null;
 // the result into the component. Keeping the unfiltered copy out-of-band
 // means re-typing the filter doesn't re-hit the IPC.
 let mainTracksUnfiltered: Track[] = [];
+// Set while mainTracksUnfiltered is a whole source / playlist / folder / tag
+// read: a header click re-sorts it in memory (sortLikeDb) instead of reading
+// it again. Null for a JIT search (capped at 2000, so another order can mean
+// other rows), an entity page and a smart playlist.
+let mainListResort: { playlistContext: boolean } | null = null;
 let mainFilterText: string = '';
 let filterDebounceHandle: ReturnType<typeof setTimeout> | null = null;
 // PlayerFooter (Phase 3.A) — single mount that composes every player-
@@ -941,6 +947,7 @@ async function renderTracks(): Promise<void> {
 	// files, or the catalogue's releases (renderEntityTracks).
 	const entityNow = shell.currentEntity();
 	if (entityNow) {
+		mainListResort = null;
 		await renderEntityTracks(entityNow, renderSeq);
 		return;
 	}
@@ -951,6 +958,7 @@ async function renderTracks(): Promise<void> {
 	// constraints SQL can't push (OR branches, attr substrings, analyzer-
 	// scalar comparisons). Same pattern the omnibar's runQuery uses.
 	if (jitNow) {
+		mainListResort = null;
 		const jit = jitNow;
 		const expr = parseQuery(jit.query);
 		const tagResolver = makeTagResolver();
@@ -1044,6 +1052,7 @@ async function renderTracks(): Promise<void> {
 	// no stale rows linger.
 	const currentPl = playlistIdNow ? library.getPlaylist(playlistIdNow) : undefined;
 	if (currentPl?.isSmart) {
+		mainListResort = null;
 		tracksData.setAll([]);
 		showSmartPlaylistWatermark(currentPl.name);
 		mainTrackList?.update([]);
@@ -1065,7 +1074,11 @@ async function renderTracks(): Promise<void> {
 			: null;
 	// The toolbar's "This device" chip, on every branch below.
 	const hideRemote = uiSettingsSignal().hideRemoteTracks ? { hideRemote: true } : {};
-	const allTracks = await window.api['tracks:list'](
+	// Only a single-playlist read carries playlist positions ('index' sorts by
+	// them); a folder, tag view or source root sorts 'index' by createdAt.
+	const resortCtx = { playlistContext: !tagView && !(folderPlaylistIds && folderPlaylistIds.length > 0) && !!playlistIdNow };
+	const requestedSort = { column: state.sortColumn, dir: state.sortDir };
+	let allTracks = await window.api['tracks:list'](
 		tagView
 			? { tagId: tagView, ...hideRemote }
 			: folderPlaylistIds && folderPlaylistIds.length > 0
@@ -1081,9 +1094,14 @@ async function renderTracks(): Promise<void> {
 					playlistId: playlistIdNow ?? undefined,
 					...hideRemote,
 				},
-		{ column: state.sortColumn, dir: state.sortDir },
+		requestedSort,
 	);
 	if (renderSeq !== renderTracksSeq) return; // superseded by a newer render
+	// A header click while this read was in flight re-sorted the old rows in
+	// memory; landing in the requested order would undo it.
+	if (state.sortColumn !== requestedSort.column || state.sortDir !== requestedSort.dir) {
+		allTracks = sortLikeDb(allTracks, { column: state.sortColumn, dir: state.sortDir }, resortCtx) ?? allTracks;
+	}
 
 	// Client-side SRC-filter — applied AFTER the server fetch so toggling
 	// "Show Unmatched X" doesn't round-trip the DB. The full set lives in
@@ -1104,6 +1122,7 @@ async function renderTracks(): Promise<void> {
 	// into the component. Selection-pruning happens inside the component
 	// when .update() is called.
 	mainTracksUnfiltered = tracks;
+	mainListResort = resortCtx;
 	applyFilterToMainList();
 	// Reorder affordance depends on the new sort + playlist context — re-
 	// evaluate now that the data set has been swapped.
@@ -6778,7 +6797,13 @@ function mountMainTrackList(): void {
 			const ent = shownEntity();
 			if (ent) updateUiSettings((d) => { d.entityLayout[ent.entity.kind].sort = { column: next.column, dir: next.dir }; });
 			persistUiState();
-			void renderTracks();
+			const resorted = mainListResort && sortLikeDb(mainTracksUnfiltered, next, mainListResort);
+			if (resorted) {
+				mainTracksUnfiltered = resorted;
+				applyFilterToMainList();
+			} else {
+				void renderTracks();
+			}
 		},
 		onPlay: (t, all) => {
 			shell.notePlaybackOrigin();

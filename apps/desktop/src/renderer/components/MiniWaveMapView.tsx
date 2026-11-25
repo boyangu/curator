@@ -44,9 +44,8 @@ export interface MiniWaveMapViewProps {
 	// inversion lives in the move handler below, not in these callbacks.
 	//
 	// onScrubStart's optional `targetSec` snaps the engine cursor to the
-	// click position on entry — the mini-map passes the clicked time so
-	// the playhead jumps immediately without producing a slewed scratch
-	// from the prior playhead.
+	// pointer on entry — the mini-map passes the drag's starting time so
+	// the scrub doesn't open with a slewed scratch from the prior playhead.
 	onScrubStart: (targetSec?: number) => void;
 	onScrubMove: (positionSec: number) => void;
 	onScrubEnd: (positionSec: number, resumePlaying: boolean) => void;
@@ -166,11 +165,12 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 
 	// ─── Pointer-event drag-or-click ───────────────────────────────────────
 	// Full-track view, so the drag geometry is direct: cursor x → track
-	// time via `ratio * duration`. mousedown pauses (scrubStart);
-	// pointermove past the 3 px threshold rate-controls audio via
-	// onScrubMove; pointerup commits via onScrubEnd. Under-threshold up
-	// = click-to-seek (delegated to onScrubEnd for state consistency,
-	// matches the big waveform's behaviour).
+	// time via `ratio * duration`. pointerdown seeks at once and playback
+	// carries on from there. Only a pointermove past the 3 px threshold
+	// enters scrub mode (scrubStart → onScrubMove rate-controls audio →
+	// onScrubEnd commits on up). A press used to enter scrub mode straight
+	// away, which silenced the deck until release. On Spotify that was a
+	// pause, seek and resume round-trip per click, heard as lag.
 	const DRAG_THRESHOLD_PX = 3;
 	let dragPointerId: number | null = null;
 	let dragX0 = 0;
@@ -200,55 +200,36 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 		dragPointerId = evt.pointerId;
 		dragX0 = evt.clientX;
 		dragStarted = false;
-		dragWasPlaying = untrack(() => props.isPlaying());
 
 		try { hostRef.setPointerCapture(evt.pointerId); }
 		catch { /* unsupported — moves outside the wavemap will stop, that's fine */ }
 
-		// Snap engine cursor to the click position and pause there.
-		// Audio is silent at scrub_begin (gap=0); the engine emits the
-		// new position so the optimistic state.position update + the
-		// fill render in lock-step.
-		const clickTarget = ratioToSec(evt.clientX);
-		props.onScrubStart(clickTarget);
+		props.onSeek(ratioToSec(evt.clientX));
 	};
 
 	const handlePointerMove = (evt: PointerEvent): void => {
 		if (dragPointerId !== evt.pointerId) return;
-		const deltaX = evt.clientX - dragX0;
-		if (!dragStarted) {
-			if (Math.abs(deltaX) < DRAG_THRESHOLD_PX) return;
-			dragStarted = true;
-		}
 		// Direct mapping — cursor x → position. Mouse right = time advances.
 		const targetT = ratioToSec(evt.clientX);
+		if (!dragStarted) {
+			if (Math.abs(evt.clientX - dragX0) < DRAG_THRESHOLD_PX) return;
+			dragStarted = true;
+			dragWasPlaying = untrack(() => props.isPlaying());
+			props.onScrubStart(targetT);
+		}
 		props.onScrubMove(targetT);
 	};
 
-	const handlePointerUp = (evt: PointerEvent): void => {
-		if (dragPointerId !== evt.pointerId) return;
-		const pointerId = dragPointerId;
-		dragPointerId = null;
-		dragStarted = false;
-		if (hostRef) {
-			try { hostRef.releasePointerCapture(pointerId); } catch { /* */ }
-		}
-		// Click and drag both terminate the same way — final position is
-		// derived from the up event's clientX. Under-threshold up
-		// effectively becomes a click-to-seek at that position.
-		const finalT = ratioToSec(evt.clientX);
-		props.onScrubEnd(finalT, dragWasPlaying);
-	};
-
-	const handlePointerCancel = (evt: PointerEvent): void => {
+	// A click already seeked on down — only a drag has a scrub to close.
+	const endDrag = (evt: PointerEvent): void => {
 		if (dragPointerId !== evt.pointerId) return;
 		dragPointerId = null;
-		dragStarted = false;
 		if (hostRef) {
 			try { hostRef.releasePointerCapture(evt.pointerId); } catch { /* */ }
 		}
-		const finalT = ratioToSec(evt.clientX);
-		props.onScrubEnd(finalT, dragWasPlaying);
+		if (!dragStarted) return;
+		dragStarted = false;
+		props.onScrubEnd(ratioToSec(evt.clientX), dragWasPlaying);
 	};
 
 	return (
@@ -257,8 +238,8 @@ export function MiniWaveMapView(props: MiniWaveMapViewProps) {
 			class="wavemap sunken"
 			onPointerDown={handlePointerDown}
 			onPointerMove={handlePointerMove}
-			onPointerUp={handlePointerUp}
-			onPointerCancel={handlePointerCancel}
+			onPointerUp={endDrag}
+			onPointerCancel={endDrag}
 		>
 			<div class="wave-inner">
 				<div class="t-fill" style={{ width: `${fillPct()}%` }} />
