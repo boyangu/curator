@@ -26,19 +26,31 @@ import kotlin.math.roundToInt
  * but does not play.
  *
  * The services report the position only when their state changes (play,
- * pause, seek); between those the position here runs on the clock, so the
- * playhead moves smoothly.
+ * pause, seek); between those the position here runs on the clock
+ * ([Playhead]), so the wave moves smoothly.
  */
 class AppPlayer : Player {
 	private val _state = MutableStateFlow(PlayerState())
 	override val state: StateFlow<PlayerState> = _state
 
+	private val playhead = Playhead()
+	private val _position = MutableStateFlow(0.0)
+	override val position: StateFlow<Double> = _position
+
 	private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 	private var activityRef = WeakReference<Activity>(null)
 	private var ticker: Job? = null
-	// The last position the service reported, and when (elapsed realtime ms).
-	private var anchorSec = 0.0
-	private var anchorAt = 0L
+
+	override fun positionAt(nanos: Long): Double {
+		val d = _state.value.track?.durationSec ?: 0.0
+		return playhead.position(nanos).let { if (d > 0) it.coerceAtMost(d) else it }
+	}
+
+	private fun now() = SystemClock.elapsedRealtimeNanos()
+
+	private fun showPosition() {
+		_position.value = positionAt(now())
+	}
 
 	private val host = object : BackendHost {
 		override val current get() = _state.value.track
@@ -46,22 +58,18 @@ class AppPlayer : Player {
 
 		override fun onState(playing: Boolean, positionSec: Double, atMs: Long, streamSec: Double?) {
 			val t = _state.value.track ?: return
-			anchorSec = positionSec
-			anchorAt = atMs
-			val now = positionSec + if (playing) (SystemClock.elapsedRealtime() - atMs) / 1000.0 else 0.0
-			_state.value = _state.value.copy(
-				playing = playing, positionSec = if (t.durationSec > 0) now.coerceAtMost(t.durationSec) else now,
-				unavailable = null, note = noteFor(t, streamSec),
-			)
+			playhead.report(positionSec, atMs * 1_000_000, playing, now())
+			showPosition()
+			_state.value = _state.value.copy(playing = playing, unavailable = null, note = noteFor(t, streamSec))
 			if (playing) startTicker() else stopTicker()
 		}
 
 		override fun onDisplaced() {
-			if (_state.value.playing) { stopTicker(); _state.value = _state.value.copy(playing = false) }
+			if (_state.value.playing) { halt(); _state.value = _state.value.copy(playing = false) }
 		}
 
 		override fun onFail(reason: String) {
-			stopTicker()
+			halt()
 			_state.value = _state.value.copy(playing = false, unavailable = reason)
 		}
 	}
@@ -88,20 +96,23 @@ class AppPlayer : Player {
 		if (now.track?.trackId == track.trackId && now.track.service == track.service) return
 		// The other service's app would play on under this one.
 		if (now.playing && now.track != null && now.track.service != track.service) backend(now.track.service)?.pause()
-		stopTicker()
+		halt()
+		playhead.reset(now())
 		_state.value = PlayerState(track = track, unavailable = reasonFor(track), note = noteFor(track, null))
+		showPosition()
 	}
 
 	override fun play() {
 		val t = _state.value.track ?: return
 		val reason = reasonFor(t)
 		if (reason != null) { _state.value = _state.value.copy(playing = false, unavailable = reason); return }
-		backend(t.service)?.play(t, _state.value.positionSec)
+		playhead.starting(now())
+		backend(t.service)?.play(t, positionAt(now()))
 	}
 
 	override fun pause() {
 		_state.value.track?.let { backend(it.service)?.pause() }
-		stopTicker()
+		halt()
 		_state.value = _state.value.copy(playing = false)
 	}
 
@@ -109,9 +120,8 @@ class AppPlayer : Player {
 		val s = _state.value
 		val d = s.track?.durationSec ?: 0.0
 		val at = sec.coerceIn(0.0, if (d > 0) d else sec)
-		anchorSec = at
-		anchorAt = SystemClock.elapsedRealtime()
-		_state.value = s.copy(positionSec = at)
+		playhead.seek(at, now(), service = s.playing)
+		showPosition()
 		// Only the track the service is playing for us moves there; otherwise this is the cue point.
 		if (s.playing && s.track != null) backend(s.track.service)?.seek(at)
 	}
@@ -140,13 +150,9 @@ class AppPlayer : Player {
 	private fun startTicker() {
 		if (ticker?.isActive == true) return
 		ticker = scope.launch {
-			while (isActive) {
-				val s = _state.value
-				if (!s.playing) break
-				val d = s.track?.durationSec ?: 0.0
-				val now = anchorSec + (SystemClock.elapsedRealtime() - anchorAt) / 1000.0
-				_state.value = s.copy(positionSec = if (d > 0) now.coerceAtMost(d) else now)
-				delay(50)
+			while (isActive && _state.value.playing) {
+				showPosition()
+				delay(100)
 			}
 		}
 	}
@@ -154,5 +160,12 @@ class AppPlayer : Player {
 	private fun stopTicker() {
 		ticker?.cancel()
 		ticker = null
+	}
+
+	// Not playing any more: the playhead stays where it got to.
+	private fun halt() {
+		stopTicker()
+		playhead.stop(now())
+		showPosition()
 	}
 }

@@ -91,7 +91,7 @@ fun MiniPlayer(
 ) {
 	val state by player.state.collectAsState()
 	val t = state.track ?: return
-	val progress = if (t.durationSec > 0) (state.positionSec / t.durationSec).toFloat().coerceIn(0f, 1f) else 0f
+	val position by player.position.collectAsState()
 	Row(
 		Modifier
 			.fillMaxWidth()
@@ -99,6 +99,7 @@ fun MiniPlayer(
 			.background(C.bg2)
 			.drawBehind {
 				drawLine(C.line, Offset(0f, 0f), Offset(size.width, 0f), 1.dp.toPx())
+				val progress = if (t.durationSec > 0) (position / t.durationSec).toFloat().coerceIn(0f, 1f) else 0f
 				drawLine(C.accent, Offset(0f, 0f), Offset(size.width * progress, 0f), 2.dp.toPx())
 			}
 			.padding(start = 12.dp, end = 4.dp),

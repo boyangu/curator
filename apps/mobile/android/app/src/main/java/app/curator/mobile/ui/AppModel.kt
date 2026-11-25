@@ -12,6 +12,7 @@ import app.curator.mobile.data.ViewState
 import app.curator.mobile.model.HomePin
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.TracklistRows
+import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.player.AppPlayer
 import app.curator.mobile.update.Updater
 import app.curator.mobile.ui.feed.FeedModel
@@ -66,6 +67,13 @@ class AppModel(val app: CuratorApp) {
 
 	fun setStreaming(s: StreamingService) {
 		app.scope.launch { viewState.setStreaming(s) }
+	}
+
+	/** How every waveform on this phone looks. */
+	val skin: StateFlow<WaveSkin> = viewState.skin.stateIn(app.scope, SharingStarted.Eagerly, WaveSkin.DEFAULT)
+
+	fun setSkin(s: WaveSkin) {
+		app.scope.launch { viewState.setSkin(s) }
 	}
 
 	val autoUpdate: StateFlow<Boolean> = viewState.autoUpdate.stateIn(app.scope, SharingStarted.Eagerly, true)

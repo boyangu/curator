@@ -49,16 +49,8 @@ object C {
 	val local = fg2
 	val onAccent = Color.Black
 
-	// Waveform, the "Silver" skin (desktop renderers/waveformStyles.ts).
-	val waveBass = Color(0xFF6E7378)
-	val waveMid = Color(0xFFA8ADB2)
-	val waveTreble = Color(0xFFDDE2E7)
+	/** Over the part of a wave already played. */
 	val played = Color(0x99000000)
-
-	// Phrase lane.
-	val phraseCalm = oklch(0.70f, 0.06f, 230f)	// intro, break, outro
-	val phraseBuild = oklch(0.75f, 0.10f, 90f)
-	val phraseDrop = oklch(0.75f, 0.15f, 40f)
 }
 
 /** The source dot of a playlist or a track's source. */

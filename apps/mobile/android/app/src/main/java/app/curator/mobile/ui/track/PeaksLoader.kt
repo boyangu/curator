@@ -3,6 +3,7 @@ package app.curator.mobile.ui.track
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import app.curator.mobile.model.Peaks
 import app.curator.mobile.ui.AppModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext

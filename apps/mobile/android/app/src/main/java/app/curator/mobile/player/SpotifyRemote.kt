@@ -15,6 +15,7 @@ import com.spotify.protocol.types.PlayerState as SpotifyState
 import com.spotify.sdk.android.auth.AuthorizationClient
 import com.spotify.sdk.android.auth.AuthorizationRequest
 import com.spotify.sdk.android.auth.AuthorizationResponse
+import kotlin.math.abs
 
 /**
  * Spotify through the installed Spotify app (App Remote): Spotify does the
@@ -58,7 +59,11 @@ internal class SpotifyRemote(private val host: BackendHost) : Backend {
 		withRemote { r ->
 			val uri = "spotify:track:${t.streamId}"
 			r.playerApi.playerState.setResultCallback { s ->
-				if (s.track?.uri == uri && s.isPaused) r.playerApi.resume()
+				if (s.track?.uri == uri && s.isPaused) {
+					// The playhead may have been moved since it paused: Spotify only learns of that here.
+					if (abs(s.playbackPosition / 1000.0 - fromSec) < 0.5) r.playerApi.resume()
+					else r.playerApi.seekTo((fromSec * 1000).toLong()).setResultCallback { r.playerApi.resume() }.setErrorCallback { host.onFail("Spotify couldn't move there") }
+				}
 				else r.playerApi.play(uri).setResultCallback { if (fromSec > 1.0) r.playerApi.seekTo((fromSec * 1000).toLong()) }
 			}
 		}

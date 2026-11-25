@@ -1,6 +1,7 @@
 package app.curator.mobile.ui.track
 
 import android.content.res.Configuration
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,15 +30,20 @@ import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -64,6 +70,9 @@ import app.curator.mobile.data.ArtistRef
 import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.TrackAnalysis
+import app.curator.mobile.model.Peaks
+import app.curator.mobile.model.WaveSkin
+import app.curator.mobile.player.Player
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.common.ContextMenu
 import app.curator.mobile.ui.common.Cover
@@ -74,6 +83,7 @@ import app.curator.mobile.ui.common.IconButton
 import app.curator.mobile.ui.common.IconGlyph
 import app.curator.mobile.ui.common.KeyChip
 import app.curator.mobile.ui.common.Line
+import app.curator.mobile.ui.common.PopupMenuAnchor
 import app.curator.mobile.ui.common.SourceDot
 import app.curator.mobile.ui.common.TagPill
 import app.curator.mobile.ui.common.formatBpm
@@ -118,6 +128,7 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 	// The list it was opened from, as shown there (view and search): the same pager, so Next is the row below.
 	val view = from?.let { rememberView(model, it) }
 	val pager = rememberPager(model, if (from == null || view == null) null else ListQuery(from.scope(), view, screen.search))
+	val skin by model.skin.collectAsState()
 	val rotatedOnce by model.viewState.rotatedOnce.collectAsState(true)
 
 	// The player follows the open track (rotating keeps it: same screen, same state).
@@ -133,10 +144,12 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 		return
 	}
 	val ours = player.track?.trackId == track.id
-	val position = scrub ?: if (ours) player.positionSec else 0.0
+	// Read as late as possible (while drawing, or by a small text), so playback recomposes nothing here.
+	val playhead = rememberPlayhead(model.player, track.id, everyFrame = landscape)
+	val position = remember(playhead) { { scrub ?: playhead.value } }
 	val duration = (track.durationSec ?: 0).toDouble().takeIf { it > 0 } ?: peaks?.seconds ?: 0.0
 	val seek: (Double) -> Unit = { s -> scrub = null; model.player.seek(s.coerceIn(0.0, duration)) }
-	val jump: (Int) -> Unit = { n -> seek(jumpBeats(analysis.beats, track.bpm, position, n)) }
+	val jump: (Int) -> Unit = { n -> seek(jumpBeats(analysis.beats, track.bpm, position(), n)) }
 	val cuePoint = analysis.cues.firstOrNull()?.positionSec ?: 0.0
 	val playPause = { if (player.playing && ours) model.player.pause() else model.player.play() }
 	// The row it was opened from (a track twice in a playlist is two rows), else where it is now.
@@ -160,17 +173,58 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 	val open = { push(Screen.TrackActions(track.id)) }
 
 	if (landscape) {
-		Landscape(track, analysis, peaks, position, duration, zoom, transport, back, open,
+		Landscape(track, analysis, peaks, skin, model::setSkin, position, duration, zoom, transport, back, open,
 			onZoom = { factor -> zoom = (zoom * factor).coerceIn(2f, 64f) },
 			onCycleZoom = { zoom = ZOOMS.firstOrNull { it > zoom + 0.01f } ?: ZOOMS.first() },
 			onScrub = { scrub = it }, onSeek = seek)
 	} else {
-		Portrait(track, artists, analysis, peaks, metrics, position, duration, transport,
+		Portrait(track, artists, analysis, peaks, skin, metrics, position, duration, transport,
 			from = listName?.name, index = screen.index, count = screen.count,
 			openArtist = { push(Screen.TrackList(ListSource.Artist(it.id))) },
 			showHint = !rotatedOnce, back = back, openActions = open,
 			onScrub = { scrub = it }, onSeek = seek,
 			modifier = Modifier.swipeToOpen(gestures) { Screen.TrackActions(track.id) })
+	}
+}
+
+/**
+ * Where the open track's playback is: each frame while it plays, when
+ * [everyFrame] (the big wave moves with it), else a few times a second.
+ */
+@Composable
+private fun rememberPlayhead(player: Player, trackId: String, everyFrame: Boolean): State<Double> {
+	val state by player.state.collectAsState()
+	val ours = state.track?.trackId == trackId
+	val at = remember(player, trackId) { mutableDoubleStateOf(if (ours) player.position.value else 0.0) }
+	LaunchedEffect(player, trackId, ours, state.playing, everyFrame) {
+		when {
+			!ours -> at.doubleValue = 0.0
+			// The frame's own time, not this call's: how late in the frame it runs would show as jitter.
+			everyFrame && state.playing -> while (true) withFrameNanos { frame ->
+				at.doubleValue = player.positionAt(SystemClock.elapsedRealtimeNanos() - (System.nanoTime() - frame))
+			}
+			else -> player.position.collect { at.doubleValue = it }
+		}
+	}
+	return at
+}
+
+/** A text of the position: recomposed when the text changes, not with every frame of it. */
+@Composable
+private fun Ticking(text: () -> String, content: @Composable (String) -> Unit) {
+	val now by rememberUpdatedState(text)
+	val shown by remember { derivedStateOf { now() } }
+	content(shown)
+}
+
+/** The waveform style: a swatch of the one on, opening the list. */
+@Composable
+private fun SkinPicker(skin: WaveSkin, onPick: (WaveSkin) -> Unit) {
+	PopupMenuAnchor(WaveSkin.entries.map { it.label }, skin.ordinal, { onPick(WaveSkin.entries[it]) }) { open ->
+		Box(
+			Modifier.size(56.dp, 44.dp).clickable(role = Role.Button, onClick = open).semantics { contentDescription = "Waveform style: ${skin.label}" },
+			contentAlignment = Alignment.Center,
+		) { SkinSwatch(skin, Modifier.size(44.dp, 24.dp).background(C.bg1)) }
 	}
 }
 
@@ -187,7 +241,7 @@ private class Transport(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Portrait(
-	t: Track, artists: List<ArtistRef>, a: TrackAnalysis, peaks: Peaks?, metrics: Metrics, position: Double, duration: Double, tr: Transport,
+	t: Track, artists: List<ArtistRef>, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, metrics: Metrics, position: () -> Double, duration: Double, tr: Transport,
 	from: String?, index: Int, count: Int, openArtist: (ArtistRef) -> Unit, showHint: Boolean,
 	back: () -> Unit, openActions: () -> Unit, onScrub: (Double) -> Unit, onSeek: (Double) -> Unit, modifier: Modifier,
 ) {
@@ -221,9 +275,9 @@ private fun Portrait(
 			Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
 				Facts(t)
 				Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-					BasicText(formatTime(position), Modifier.align(Alignment.End).semantics { contentDescription = "Elapsed ${formatTime(position)}" }, style = T.mono(12.sp, C.fg2))
-					OverviewMap(peaks, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onSeek = onSeek)
-					PhraseLane(a.phrases, duration, Modifier.fillMaxWidth().height(5.dp))
+					Ticking({ formatTime(position()) }) { BasicText(it, Modifier.align(Alignment.End).semantics { contentDescription = "Elapsed $it" }, style = T.mono(12.sp, C.fg2)) }
+					OverviewMap(peaks, skin, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onSeek = onSeek)
+					PhraseLane(a.phrases, skin, duration, Modifier.fillMaxWidth().height(5.dp))
 				}
 				Row(Modifier.fillMaxWidth().padding(top = 0.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
 					Boxed("-16", "Back 16 beats", 52.dp, 48.dp, mono = true) { tr.onJump(-16) }
@@ -372,11 +426,12 @@ private fun BoxedIcon(icon: Icon, label: String, w: Dp, h: Dp, enabled: Boolean,
 
 @Composable
 private fun Landscape(
-	t: Track, a: TrackAnalysis, peaks: Peaks?, position: Double, duration: Double, zoom: Float, tr: Transport,
+	t: Track, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, onSkin: (WaveSkin) -> Unit,
+	position: () -> Double, duration: Double, zoom: Float, tr: Transport,
 	back: () -> Unit, openActions: () -> Unit, onZoom: (Float) -> Unit, onCycleZoom: () -> Unit,
 	onScrub: (Double) -> Unit, onSeek: (Double) -> Unit,
 ) {
-	val span = zoom * 4 * beatLength(a.beats, t.bpm, position)
+	val span = windowSec(a.beats, t.bpm, zoom)
 	Column(Modifier.fillMaxSize().background(C.bg).windowInsetsPadding(WindowInsets.safeDrawing).padding(horizontal = 8.dp)) {
 		Row(Modifier.fillMaxWidth().height(46.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
 			IconButton(Icon.Back, "Back to portrait", size = 20.dp, onClick = back)
@@ -389,25 +444,26 @@ private fun Landscape(
 			KeyChip(t.key, height = 20.dp, fontSize = 12.5f)
 			// The track's power tag (p1–p5), when it carries one.
 			t.tags.firstOrNull { Regex("^p\\d$").matches(it) }?.let { BasicText(it, style = T.mono(12.5.sp, C.fg2)) }
+			SkinPicker(skin, onSkin)
 			IconButton(Icon.Menu, "Track actions", tint = C.fg, onClick = openActions)
 		}
 		androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth().height(192.dp)) {
-			BigWave(peaks, position, duration, a.beats, a.downbeats, t.bpm, zoom, a.cues, a.phrases,
+			BigWave(peaks, skin, position, duration, a.beats, a.downbeats, span, a.cues, a.phrases,
 				Modifier.fillMaxSize().semantics { contentDescription = "Waveform, ${zoom.toInt()} bars around the playhead. Drag to scrub" },
 				onScrub = onScrub, onSeek = onSeek, onZoom = onZoom)
 			// Just right of the centre playhead, over the bar numbers' row.
-			readout(a.beats, a.downbeats, a.phrases, position)?.let {
-				BasicText(it, Modifier.padding(start = maxWidth / 2 + 6.dp, top = 4.dp).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 4.dp, vertical = 1.dp), style = T.mono(11.sp, C.fg))
+			Ticking({ readout(a.beats, a.downbeats, a.phrases, position()) ?: "" }) {
+				if (it.isNotEmpty()) BasicText(it, Modifier.padding(start = maxWidth / 2 + 6.dp, top = 4.dp).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 4.dp, vertical = 1.dp), style = T.mono(11.sp, C.fg))
 			}
 		}
 		OverviewMap(
-			peaks, duration, position, a.cues,
+			peaks, skin, duration, position, a.cues,
 			Modifier.fillMaxWidth().height(42.dp).padding(top = 0.dp).semantics { contentDescription = "Track overview. The box is the window above" },
-			window = (position - span / 2)..(position + span / 2), badge = androidx.compose.ui.geometry.Size(13f, 12f),
+			windowSec = span, badge = androidx.compose.ui.geometry.Size(13f, 12f),
 			onScrub = onScrub, onSeek = onSeek,
 		)
 		Row(Modifier.fillMaxWidth().weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-			BasicText(formatTime(position), Modifier.width(64.dp), style = T.mono(13.sp, C.fg))
+			Ticking({ formatTime(position()) }) { BasicText(it, Modifier.width(64.dp), style = T.mono(13.sp, C.fg)) }
 			Spacer(Modifier.weight(1f))
 			Boxed("-16", "Back 16 beats", 52.dp, 44.dp, mono = true) { tr.onJump(-16) }
 			Boxed("-4", "Back 4 beats", 48.dp, 44.dp, mono = true) { tr.onJump(-4) }
@@ -420,7 +476,9 @@ private fun Landscape(
 			Boxed("+16", "Forward 16 beats", 52.dp, 44.dp, mono = true) { tr.onJump(16) }
 			Boxed("${zoom.toInt()} bars", "Zoom: ${zoom.toInt()} bars. Tap to change", 68.dp, 44.dp) { onCycleZoom() }
 			Spacer(Modifier.weight(1f))
-			BasicText("-" + formatTime(duration - position), Modifier.width(64.dp), style = T.mono(13.sp, C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.End))
+			Ticking({ "-" + formatTime(duration - position()) }) {
+				BasicText(it, Modifier.width(64.dp), style = T.mono(13.sp, C.fg2).copy(textAlign = androidx.compose.ui.text.style.TextAlign.End))
+			}
 		}
 	}
 }

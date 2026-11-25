@@ -14,6 +14,15 @@ import kotlinx.coroutines.flow.StateFlow
 interface Player {
 	val state: StateFlow<PlayerState>
 
+	/**
+	 * The position, a few times a second: for what shows it coarsely. Apart
+	 * from [state], whose readers (whole screens) would recompose on each step.
+	 */
+	val position: StateFlow<Double>
+
+	/** The position at a moment (elapsed realtime, ns): what a moving wave reads every frame. */
+	fun positionAt(nanos: Long): Double
+
 	/** Makes the track the current one, paused at its start (or keeps it if it already is). */
 	fun load(track: PlayerTrack)
 	fun play()
@@ -38,7 +47,6 @@ data class PlayerTrack(
 data class PlayerState(
 	val track: PlayerTrack? = null,
 	val playing: Boolean = false,
-	val positionSec: Double = 0.0,
 	/** Why the current track cannot play here, or null when it can. */
 	val unavailable: String? = null,
 	/** Where it plays from when that isn't where the library has it ("Plays from Spotify"). */

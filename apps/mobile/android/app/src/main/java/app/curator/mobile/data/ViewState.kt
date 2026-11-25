@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import app.curator.mobile.model.ListView
 import app.curator.mobile.model.StreamingService
+import app.curator.mobile.model.WaveSkin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
@@ -21,13 +22,14 @@ private val Context.viewStore by preferencesDataStore("view-state")
  * device by design (§3, §5): nothing here rides an op. The streaming service
  * too, as the desktop keeps its primary one (app_setting primary_streaming,
  * not an account setting): what a device can play through is its own.
- * Whether it updates itself, and whether it sends its log, too: each phone's
- * choice.
+ * Whether it updates itself, whether it sends its log, and its waveform style,
+ * too: each phone's choice.
  */
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
 	private val recentKey = stringPreferencesKey("recent")
 	private val rotatedKey = booleanPreferencesKey("rotated-once")
+	private val skinKey = stringPreferencesKey("waveform-skin")
 	private val streamingKey = stringPreferencesKey("streaming")
 	private val autoUpdateKey = booleanPreferencesKey("auto-update")
 	private val diagnosticsKey = booleanPreferencesKey("diagnostics")
@@ -73,6 +75,12 @@ class ViewState(private val context: Context) {
 
 	suspend fun setStreaming(s: StreamingService) {
 		context.viewStore.edit { it[streamingKey] = s.id }
+	}
+
+	val skin: Flow<WaveSkin> = context.viewStore.data.map { WaveSkin.of(it[skinKey]) }
+
+	suspend fun setSkin(s: WaveSkin) {
+		context.viewStore.edit { it[skinKey] = s.id }
 	}
 
 	/** Install new releases without asking (Updater); on unless turned off. */

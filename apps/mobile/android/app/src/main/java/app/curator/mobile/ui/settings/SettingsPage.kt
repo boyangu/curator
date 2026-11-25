@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.curator.mobile.data.StreamingCoverage
 import app.curator.mobile.model.StreamingService
+import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.common.Icon
 import app.curator.mobile.ui.common.IconButton
@@ -60,6 +61,7 @@ import app.curator.mobile.update.UpdateState
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import app.curator.mobile.ui.list.topLine
 import app.curator.mobile.ui.theme.C
+import app.curator.mobile.ui.track.SkinSwatch
 import app.curator.mobile.ui.theme.T
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -67,8 +69,8 @@ import kotlinx.coroutines.withContext
 /**
  * This phone's settings: the account, the streaming service the library's own
  * files play from, each service shown with how many of those files it has
- * (their recordings' claims there), how the app updates itself, and whether it
- * sends its log.
+ * (their recordings' claims there), how waveforms look, how the app updates
+ * itself, and whether it sends its log.
  */
 @Composable
 fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
@@ -103,9 +105,34 @@ fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
 		Column(Modifier.fillMaxWidth().selectableGroup().padding(vertical = 4.dp)) {
 			for (s in StreamingService.entries) ServiceRow(s, s == picked, coverage) { model.setStreaming(s) }
 		}
+		Waveform(model)
 		Updates(model)
 		Diagnostics(model)
 		Spacer(Modifier.height(24.dp))
+	}
+}
+
+/** How every waveform on this phone looks: the desktop's styles. */
+@Composable
+private fun Waveform(model: AppModel) {
+	val picked by model.skin.collectAsState()
+	Column(Modifier.fillMaxWidth().topLine().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp)) {
+		BasicText("Waveform", Modifier.semantics { heading() }, style = T.label)
+	}
+	Column(Modifier.fillMaxWidth().selectableGroup().padding(vertical = 4.dp)) {
+		for (s in WaveSkin.entries) Row(
+			Modifier
+				.fillMaxWidth()
+				.heightIn(min = 52.dp)
+				.selectable(selected = s == picked, role = Role.RadioButton, onClick = { model.setSkin(s) })
+				.padding(horizontal = 16.dp),
+			verticalAlignment = Alignment.CenterVertically,
+			horizontalArrangement = Arrangement.spacedBy(14.dp),
+		) {
+			Radio(s == picked)
+			BasicText(s.label, Modifier.weight(1f), style = T.of(15.sp, color = C.fg))
+			SkinSwatch(s, Modifier.size(96.dp, 32.dp).background(C.bg1))
+		}
 	}
 }
 

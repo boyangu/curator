@@ -11,7 +11,7 @@ import android.app.Activity
 internal interface Backend {
 	/** Why a track can't play through it on this phone (not configured, the app not installed), or null. */
 	fun unavailable(): String?
-	/** Plays [t] from [fromSec]: resumes it when the service's app has it already, else starts it there. */
+	/** Plays [t] from [fromSec]: resumes it (moved there first, if it stopped elsewhere) when the service's app has it already, else starts it there. */
 	fun play(t: PlayerTrack, fromSec: Double)
 	fun pause()
 	fun seek(sec: Double)
