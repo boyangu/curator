@@ -83,9 +83,10 @@ describe('account panel: library across devices', () => {
 		device({ deviceId: 'studio', name: 'Studio', lastSeenAt: NOW - 5 * 60_000 }),
 		device({ deviceId: 'this', name: 'Home', current: true, lastSeenAt: NOW - 10_000 }),
 		device({ deviceId: 'old', name: 'Old laptop', revokedAt: NOW - 3_600_000 }),
+		device({ deviceId: 'phone', name: 'Phone', platform: 'android' }),
 	];
 
-	it('offers the active devices, this computer first and named so, the master selected', () => {
+	it('offers the active computers (no phone), this one first and named so, the master selected', () => {
 		expect(masterChoices(devices, 'studio')).toEqual([
 			{ deviceId: 'this', label: 'Home (this computer)', selected: false },
 			{ deviceId: 'studio', label: 'Studio', selected: true },

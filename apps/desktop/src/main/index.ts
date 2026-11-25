@@ -1414,7 +1414,8 @@ app.whenReady().then(async () => {
 
 	// Development: the local Global Catalog reads followed Spotify playlists
 	// with this login (local-catalog-login.ts). Reads only; the token never
-	// leaves loopback, and a packaged app has no local catalogue at all.
+	// leaves loopback. The URL is baked from .env at build time, packaged
+	// builds included: clear CURATOR_CATALOG_API_URL before packaging one.
 	if (localCatalogUrl && cloudTransport) {
 		const coreForLogin = core;
 		shareSpotifyLogin(localCatalogUrl, () => coreForLogin.auth.getSpotifyAccessToken());

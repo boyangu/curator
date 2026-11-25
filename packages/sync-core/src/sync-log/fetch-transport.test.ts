@@ -65,6 +65,17 @@ describe('plain-HTTP transport', () => {
 			.toEqual(['GET feed.events', 'GET feed.recent', 'GET catalog.listWatches', 'GET catalog.get', 'POST catalog.resolve']);
 	});
 
+	it('asks again once with a fresh token when one was refused, and gives up when there is none', async () => {
+		const tokens = { current: 'old' };
+		const accessToken = async (o?: { refresh?: boolean }) => { if (o?.refresh) tokens.current = 'new'; return tokens.current; };
+		const back = rig((req) => (req.headers['authorization'] === 'Bearer new' ? ok([]) : refused(401, 'token_expired')), { accessToken });
+		expect(await back.transport.account.devices()).toEqual([]);
+		expect(back.sent.map((r) => r.headers['authorization'])).toEqual(['Bearer old', 'Bearer new']);
+		const same = rig(() => refused(401, 'token_expired'), { accessToken: async () => 'old' });
+		expect(await kindOf(same.transport.account.devices())).toBe('auth');
+		expect(same.sent).toHaveLength(1);
+	});
+
 	it('turns the server\'s refusals into the kinds the client branches on', async () => {
 		const cases: Array<[HttpResponse, string]> = [
 			[refused(403, 'device_revoked'), 'device_revoked'],

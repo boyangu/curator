@@ -141,7 +141,7 @@ import { drainPlaylistAttrsAsync, playlistAttrsBackfillPending, playlistAttrsDir
 import { backfillCueOriginsAsync, backfillPlayRefsAsync, backfillRbUnitsV4Async, v4BackfillsPending } from './v4-backfill.js';
 import { albumMetaBackfillAsync, albumMetaBackfillPending } from './album-meta.js';
 import {
-	defaultMasterDevice, drainTrackMetaAsync, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
+	defaultMasterDevice, drainTrackMetaAsync, isPhone, masterDevice, queueTrackMetaBackfillAsync, serverReadsTrackMeta, setMasterDevice, trackMetaBackfillPending, trackMetaDirtyCount,
 } from './track-meta.js';
 
 type Raw = Database.Database;
@@ -788,7 +788,7 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 
 	const counts = raw.prepare(`SELECT state, count(*) AS n FROM sync_outbox WHERE state IN ('pending', 'rejected') GROUP BY state`);
 
-	const REVOKED_MESSAGE = 'This computer was removed from your Curator account. Sign out to stop using that account here; your library stays on this computer.';
+	const REVOKED_MESSAGE = 'This device was removed from your Curator account. Sign out to stop using that account here; your library stays on this device.';
 	const isRevoked = (st: ClientState = readClientState(raw)): boolean => st.revoked?.deviceId === deviceId;
 
 	const status = (): CloudSyncStatus => {
@@ -1540,10 +1540,11 @@ export function createSyncClient(opts: SyncClientOptions): SyncClient {
 	// published the other's). No device listed (a test client never
 	// registered): this one.
 	type Devices = Awaited<ReturnType<CloudTransport['account']['devices']>>;
-	const founderOf = (devices: Devices): { deviceId: string; chosen: boolean } => {
+	// A phone alone on an empty account founds nothing: it waits for a desktop.
+	const founderOf = (devices: Devices): { deviceId: string | null; chosen: boolean } => {
 		const stated = masterDevice(raw);
 		if (stated !== null && devices.some((d) => d.deviceId === stated && d.revokedAt === null)) return { deviceId: stated, chosen: true };
-		return { deviceId: defaultMasterDevice(devices) ?? deviceId, chosen: false };
+		return { deviceId: defaultMasterDevice(devices) ?? (isPhone(opts.device?.platform) ? null : deviceId), chosen: false };
 	};
 	const wait = (id: string | null, devices: Devices): 'waiting' => {
 		waitingFor = id === null ? null : { deviceId: id, name: devices.find((d) => d.deviceId === id)?.name ?? null };

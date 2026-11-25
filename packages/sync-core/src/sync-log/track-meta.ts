@@ -37,6 +37,7 @@ import {
 	type SyncFeature,
 	type TrackMeta,
 	type TrackMetaSource,
+	type DevicePlatform,
 } from '@curator/protocol';
 import type { TrackArtist } from '@curator/shared/schema';
 import { artistsBaseOf } from '../library/artists.js';
@@ -304,12 +305,15 @@ export function setMasterDevice(raw: Raw, deviceId: string): void {
 	})();
 }
 
+export const isPhone = (platform: DevicePlatform | undefined): boolean => platform === 'android' || platform === 'ios';
+
 // Which device states the default master when the account has none: the
 // earliest-registered device still on the account (registration order is
 // the server's, so every device reads the same answer) — the desktop that
 // first linked the library. Only that device emits; the rest wait for its
-// op. Ties (same ms) break by device id.
-export function defaultMasterDevice(devices: ReadonlyArray<{ deviceId: string; registeredAt: number; revokedAt: number | null }>): string | null {
-	const active = devices.filter((d) => d.revokedAt === null).sort((a, b) => a.registeredAt - b.registeredAt || (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
+// op. Ties (same ms) break by device id. Never a phone: it publishes no
+// snapshot, so an account with one for its master has no base to join from.
+export function defaultMasterDevice(devices: ReadonlyArray<{ deviceId: string; registeredAt: number; revokedAt: number | null; platform?: DevicePlatform }>): string | null {
+	const active = devices.filter((d) => d.revokedAt === null && !isPhone(d.platform)).sort((a, b) => a.registeredAt - b.registeredAt || (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
 	return active[0]?.deviceId ?? null;
 }

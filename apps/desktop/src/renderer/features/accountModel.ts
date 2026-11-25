@@ -165,12 +165,12 @@ export const MASTER_UNAVAILABLE = 'Your sync server doesn’t share track detail
 
 export type MasterChoice = { deviceId: string; label: string; selected: boolean };
 
-// The selector's options: the account's active devices, this computer
-// first. A master that is no longer among them (removed, or a device this
+// The selector's options: the account's active computers, this one first
+// (a phone publishes no snapshot, so it cannot be the master). A master that is no longer among them (removed, or a device this
 // list hasn't seen) still shows, so the selector never silently claims a
 // different one; no master yet shows a placeholder.
 export function masterChoices(devices: readonly AccountDevice[], masterDeviceId: string | null): MasterChoice[] {
-	const active = deviceRows(devices).filter((d) => !d.revoked);
+	const active = deviceRows(devices.filter((d) => d.platform !== 'android' && d.platform !== 'ios')).filter((d) => !d.revoked);
 	const out: MasterChoice[] = active.map((d) => ({
 		deviceId: d.deviceId,
 		label: d.current ? `${d.name} (this computer)` : d.name,

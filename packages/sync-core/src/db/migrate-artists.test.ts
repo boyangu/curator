@@ -7,7 +7,7 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { migrate } from './migrate.js';
+import { migrate, setMigrationBackups } from './migrate.js';
 
 let dir: string;
 let path: string;
@@ -118,6 +118,14 @@ describe('artist backfill', () => {
 		expect((db.prepare(`SELECT value FROM app_setting WHERE key = 'artist_backfill_version'`).get() as { value: string }).value).toBe('1');
 		db.close();
 		expect(readdirSync(dir).some((f) => f.includes('.pre-artist-backfill-') && f.endsWith('.bak'))).toBe(true);
+	});
+
+	it('takes no backup where they are off (a phone, whose file system lists no folder)', () => {
+		seedLegacy();
+		const before = readdirSync(dir).filter((f) => f.endsWith('.bak')).length;
+		setMigrationBackups(false);
+		try { migrate(path); } finally { setMigrationBackups(true); }
+		expect(readdirSync(dir).filter((f) => f.endsWith('.bak'))).toHaveLength(before);
 	});
 
 	it('is a no-op on the second run and repairs rows written past the seam', () => {

@@ -2458,8 +2458,17 @@ function reshapeClaimLink(sqlite: Database.Database): void {
 	})();
 }
 
+// Off for a phone's library, whichever way it is migrated (opened, or staged
+// from a replica): the account holds it, and a copy beside it would only cost
+// the phone its space.
+let backups = true;
+
+export function setMigrationBackups(on: boolean): void {
+	backups = on;
+}
+
 export function backupDatabase(sqlite: Database.Database, dbPath: string, tag: string): void {
-	if (dbPath === ':memory:' || !existsSync(dbPath)) return;
+	if (!backups || dbPath === ':memory:' || !existsSync(dbPath)) return;
 	const dir = dirname(dbPath);
 	const base = basename(dbPath);
 	const stamp = new Date().toISOString().replace(/[:.]/g, '-');

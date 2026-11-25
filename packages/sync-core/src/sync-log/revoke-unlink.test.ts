@@ -216,3 +216,24 @@ describe('unlink', () => {
 		expect(b.deviceId()).not.toBe(oldId);
 	});
 });
+
+describe('a phone', () => {
+	it('alone on an empty account founds nothing: it waits for a desktop, which then founds it', async () => {
+		const cloud = new FakeCloud();
+		const phoneRaw = freshDb('phone');
+		const phone = createSyncClient({ db: phoneRaw, transport: cloud.transport('user-1'), device: { name: 'Phone', platform: 'android' }, backoffBaseMs: 5, backoffCapMs: 40, debounceMs: 1 });
+		clients.push(phone);
+		await phone.syncNow();
+		expect(phone.status()).toMatchObject({ phase: 'waiting_for_snapshot' });
+		expect(cloud.log).toHaveLength(0);
+
+		const deskRaw = freshDb('desk');
+		makeTags(deskRaw, 'd', 2);
+		const desk = createSyncClient({ db: deskRaw, transport: cloud.transport('user-1'), device: { name: 'Desk', platform: 'win32' }, backoffBaseMs: 5, backoffCapMs: 40, debounceMs: 1 });
+		clients.push(desk);
+		await desk.syncNow();
+		cloud.takeSnapshot();
+		await phone.syncNow();
+		expect(tagCount(phoneRaw)).toBe(2);
+	});
+});

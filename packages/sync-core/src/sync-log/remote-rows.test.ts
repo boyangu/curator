@@ -184,6 +184,12 @@ describe('master device', () => {
 			{ deviceId: 'c', registeredAt: 20, revokedAt: null },
 		])).toBe('b');
 		expect(defaultMasterDevice([])).toBeNull();
+		// A phone publishes no base: never it, however early it signed in.
+		expect(defaultMasterDevice([
+			{ deviceId: 'phone', registeredAt: 1, revokedAt: null, platform: 'android' },
+			{ deviceId: 'b', registeredAt: 20, revokedAt: null, platform: 'win32' },
+		])).toBe('b');
+		expect(defaultMasterDevice([{ deviceId: 'phone', registeredAt: 1, revokedAt: null, platform: 'ios' }])).toBeNull();
 	});
 
 	it('is stated as an account setting (op + mirror) and read from the records', () => {

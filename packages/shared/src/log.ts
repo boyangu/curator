@@ -28,7 +28,8 @@ export interface LogRecord {
 	// Which process produced the record. Forwarding boundaries (renderer→main
 	// IPC, core-sidecar→main port) must preserve/enforce this — it's the only
 	// field a reader can trust to reconstruct the multi-process timeline.
-	proc: 'main' | 'core' | 'renderer';
+	// 'phone-core' / 'phone-ui': the phone's sync core and its Kotlin side.
+	proc: 'main' | 'core' | 'renderer' | 'phone-core' | 'phone-ui';
 	// Feature area — the old '[scanner]' / '[feed]' console prefixes, minus
 	// the brackets. Console sink re-renders them so dev greps don't change.
 	area: string;

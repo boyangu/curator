@@ -115,7 +115,8 @@ export type FetchTransportDeps = {
 	// Who is signed in, or null; and the bearer token for the next call
 	// (refreshed by the host when it must be).
 	session(): CloudSession | null;
-	accessToken(): Promise<string | null>;
+	// `refresh`: the last one was refused, so have a new one made.
+	accessToken(opts?: { refresh?: boolean }): Promise<string | null>;
 	// Ends this install's session only (the sync client's unlink).
 	signOut(): Promise<void>;
 	// The `snapshots` bucket as the signed-in user; and whether a failed
@@ -167,10 +168,7 @@ export function cloudErrorOf(status: number, error: { message?: unknown; data?: 
 }
 
 export function createFetchCloudTransport(deps: FetchTransportDeps): CloudTransport {
-	const call = async <T>(type: 'query' | 'mutation', path: string, input?: unknown): Promise<T> => {
-		// No session: fail as auth instead of a guaranteed 401 round trip.
-		if (!deps.session()) throw new CloudTransportError('auth', 'signed out');
-		const token = await deps.accessToken();
+	const attempt = async <T>(type: 'query' | 'mutation', path: string, input: unknown, token: string | null): Promise<T> => {
 		const headers: Record<string, string> = {
 			...(token ? { authorization: `Bearer ${token}` } : {}),
 			'x-request-id': randomUUID(),
@@ -190,6 +188,22 @@ export function createFetchCloudTransport(deps: FetchTransportDeps): CloudTransp
 		try { answer = JSON.parse(res.body) as Answer; } catch { /* a proxy's page, an empty body: judged by the status below */ }
 		if (answer && typeof answer === 'object' && answer.result && res.status >= 200 && res.status < 300) return answer.result.data as T;
 		throw cloudErrorOf(res.status, answer && typeof answer === 'object' ? answer.error : undefined);
+	};
+	const call = async <T>(type: 'query' | 'mutation', path: string, input?: unknown): Promise<T> => {
+		// No session: fail as auth instead of a guaranteed 401 round trip.
+		if (!deps.session()) throw new CloudTransportError('auth', 'signed out');
+		const token = await deps.accessToken();
+		try {
+			return await attempt<T>(type, path, input, token);
+		} catch (err) {
+			// A token retired before this device expected it (its clock was
+			// changed, say): once more with a fresh one. A refusal is answered
+			// before anything runs, so asking again repeats nothing.
+			if (!(err instanceof CloudTransportError) || err.kind !== 'auth' || !token) throw err;
+			const fresh = await deps.accessToken({ refresh: true });
+			if (!fresh || fresh === token) throw err;
+			return attempt<T>(type, path, input, fresh);
+		}
 	};
 
 	return {
