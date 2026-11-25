@@ -100,14 +100,32 @@ export function soundcloudCredentials(env: NodeJS.ProcessEnv): { clientId: strin
 	return clientId && clientSecret ? { clientId, clientSecret } : null;
 }
 
-// Tidal through the app's own credentials (catalog/trackers/tidal-app.ts):
+// Tidal through an app's own credentials (catalog/trackers/tidal-app.ts):
 // the store linker's lookups by UPC and ISRC. Unset switches that store off.
-export function tidalCredentials(env: NodeJS.ProcessEnv): { clientId: string; clientSecret: string } | null {
-	const clientId = env.CURATOR_TIDAL_CLIENT_ID?.trim() || null;
-	const clientSecret = env.CURATOR_TIDAL_CLIENT_SECRET?.trim() || null;
-	if ((clientId === null) !== (clientSecret === null)) throw new ConfigError('set both CURATOR_TIDAL_CLIENT_ID and CURATOR_TIDAL_CLIENT_SECRET, or neither');
-	return clientId && clientSecret ? { clientId, clientSecret } : null;
+//
+// The back office has its own Tidal app, CURATOR_TIDAL_APP_CLIENT_ID +
+// _SECRET. The desktop's pair (CURATOR_TIDAL_CLIENT_ID + _SECRET) is baked
+// into every desktop build, where anyone can read the secret out, so the
+// upkeep must not stand on it: a pair Tidal revokes for what a stranger did
+// with it would take the store linker down too. Until the back office's app
+// is registered it borrows the desktop's, and `borrowed` lets the caller say
+// so at startup (TIDAL_BORROWED_NOTE).
+export function tidalCredentials(env: NodeJS.ProcessEnv): { clientId: string; clientSecret: string; borrowed: boolean } | null {
+	const pair = (idName: string, secretName: string): { clientId: string; clientSecret: string } | null => {
+		const clientId = env[idName]?.trim() || null;
+		const clientSecret = env[secretName]?.trim() || null;
+		if ((clientId === null) !== (clientSecret === null)) throw new ConfigError(`set both ${idName} and ${secretName}, or neither`);
+		return clientId && clientSecret ? { clientId, clientSecret } : null;
+	};
+	const own = pair('CURATOR_TIDAL_APP_CLIENT_ID', 'CURATOR_TIDAL_APP_CLIENT_SECRET');
+	if (own) return { ...own, borrowed: false };
+	const desktop = pair('CURATOR_TIDAL_CLIENT_ID', 'CURATOR_TIDAL_CLIENT_SECRET');
+	return desktop ? { ...desktop, borrowed: true } : null;
 }
+
+export const TIDAL_BORROWED_NOTE =
+	"Tidal: reading with the desktop app's credentials, which every desktop build carries.\n" +
+	'  Register a second Tidal app for the back office and set CURATOR_TIDAL_APP_CLIENT_ID + CURATOR_TIDAL_APP_CLIENT_SECRET in the root .env.';
 
 // Missing values switch the gateway off (a deployment that has not set the
 // secrets yet keeps serving sync); a value that is set but malformed fails

@@ -43,6 +43,7 @@ import { createTokenVerifier, remoteKeys } from '../auth/jwt.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { agentReasonerConfig, describeReasoner, reasonerModel } from '../catalog/agent/config.js';
 import { loadLocalLibrary, type LocalLibrary } from '../catalog/local-library.js';
+import { TIDAL_BORROWED_NOTE, tidalCredentials } from '../config.js';
 import { SpotifyUserPlaylistTracker } from '@curator/catalog-readers';
 import { createLocalSpotifyLogin } from './local-spotify.js';
 import type { TrackerAdapter } from '@curator/catalog-readers';
@@ -318,7 +319,8 @@ server.listen(PORT, '127.0.0.1', () => {
 });
 
 console.log(`Trackers: ${readers.adapters.map((a) => a.provider).join(', ')}`);
-console.log(`Store links by UPC/ISRC: ${Object.entries(readers.stores).filter(([, r]) => r).map(([name]) => name).join(', ') || 'none'}${readers.stores.tidal ? '' : ' (no CURATOR_TIDAL_CLIENT_ID/SECRET)'}`);
+console.log(`Store links by UPC/ISRC: ${Object.entries(readers.stores).filter(([, r]) => r).map(([name]) => name).join(', ') || 'none'}${readers.stores.tidal ? '' : ' (no CURATOR_TIDAL_APP_CLIENT_ID/SECRET)'}`);
+if (tidalCredentials(process.env)?.borrowed) console.log(TIDAL_BORROWED_NOTE);
 if (!readers.spotify) {
 	console.log(
 		'No Spotify app credentials: artists followed on Spotify are not tracked, and Discover shows Spotify releases only.\n' +

@@ -15,7 +15,7 @@ import {
 	type TidalUser,
 } from '@curator/tidal';
 import { SpotifyGateway, type SpotifyGatewayPort } from './spotify-gateway.js';
-import { TokenStore } from './store.js';
+import { TokenStore, type TokenSealer } from './store.js';
 import type { ExportedTokenRow } from '../backup/types.js';
 import { config } from '../config.js';
 import type { Db } from '@curator/sync-core/db/client';
@@ -59,6 +59,9 @@ export interface AuthStatus {
 export type AuthServiceOptions = {
 	// Test seam for the local refresh (the real one reaches Spotify).
 	refreshSpotify?: (refreshToken: string) => Promise<SpotifyTokens>;
+	// Seals token values at rest (store.ts). The desktop main's; absent
+	// everywhere else.
+	tokenSealer?: TokenSealer;
 };
 
 export class AuthService {
@@ -76,7 +79,7 @@ export class AuthService {
 	private localRefreshStopped = false;
 
 	constructor(private readonly db: Db, opts: AuthServiceOptions = {}) {
-		this.store = new TokenStore(db);
+		this.store = new TokenStore(db, opts.tokenSealer);
 		this.refreshSpotify = opts.refreshSpotify ?? ((t) => refreshTokens(config.spotify, t));
 	}
 
@@ -278,6 +281,11 @@ export class AuthService {
 
 	disconnectTidal(): void {
 		this.store.clear('tidal');
+	}
+
+	// Seals the rows still stored in plaintext (store.ts); how many there were.
+	sealStoredTokens(): number {
+		return this.store.sealPlaintext();
 	}
 
 	// ─── Backup token sidecar ───────────────────────────────────────────

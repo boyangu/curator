@@ -28,6 +28,7 @@ import { getGoogleAuthStatus, googleNeedsReconnect, getGoogleAccessToken } from 
 import { CoreSidecarHost } from './core-sidecar/host.js';
 import { AudioSidecarHost } from './audio-sidecar.js';
 import { SpotifySidecarHost } from './spotify-sidecar.js';
+import { createTokenSealer } from './token-sealer.js';
 import { LoadRecovery } from './load-recovery.js';
 import { CloudAccount } from './cloud/account.js';
 import { watchAppActivity } from './cloud/activity.js';
@@ -1394,6 +1395,9 @@ app.whenReady().then(async () => {
 		// A profile instance is off-product in that sense: never injected there,
 		// and deliberately no env override (profile.ts → rails.remoteWrites).
 		remoteWritePolicy: rails.remoteWrites ? { allow: () => true } : undefined,
+		// The Spotify/Tidal tokens are sealed at rest under this OS user's key
+		// (token-sealer.ts); rows from before are sealed at this launch.
+		tokenSealer: createTokenSealer(),
 		// Append-only forensics trail: every streaming remote-write attempt and
 		// every rekordbox write batch, one JSON line each. The 2026-07 playlist
 		// order investigation took hours of backup archaeology precisely because

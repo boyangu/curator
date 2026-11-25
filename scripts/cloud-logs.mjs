@@ -13,10 +13,10 @@
 // CURATOR_DB_OWNER_URL, as for scripts/cloud-db-apply.mjs; never printed.
 
 import { existsSync, readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { loadPostgres } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const LEVELS = ['debug', 'info', 'warn', 'error'];
@@ -67,8 +67,7 @@ try {
 	fail('the owner connection string is not a URL (value not shown)');
 }
 
-const require = createRequire(join(repoRoot, 'apps', 'cloud', 'package.json'));
-const postgres = (await import(pathToFileURL(require.resolve('postgres')).href)).default;
+const postgres = await loadPostgres();
 const sql = postgres(url, { prepare: false, max: 1, connect_timeout: 15, onnotice: () => {} });
 
 // A phone's log is whatever its apps and libraries said: no control character

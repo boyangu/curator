@@ -67,6 +67,7 @@ import { makeRemoteWriteGate, guardRemoteWrites, RemoteWriteDeniedError } from '
 import * as plays from './plays/plays.js';
 import type { PlayHistoryRow, PlaySessionSummary, SessionPlayRow, TopPlayedRow } from './plays/plays.js';
 import { AuthService, type AuthStatus } from './auth/service.js';
+import type { TokenSealer } from './auth/store.js';
 import { randomUUID } from 'node:crypto';
 import { dirname, join as joinPath } from 'node:path';
 import { SpotifySync, LIKED_SONGS_SENTINEL_ID, type ProgressFn } from './sync/spotify.js';
@@ -340,6 +341,14 @@ export interface CoreServiceOptions {
 	// read-only core-sidecar) must leave this unset. See CLAUDE.md "Streaming
 	// remote writes".
 	remoteWritePolicy?: RemoteWritePolicy;
+	// Seals the Spotify/Tidal tokens at rest in the `token` table
+	// (auth/store.ts). Injected by the desktop main process, whose key is the
+	// OS credential store's; core has none of its own. Without it tokens are
+	// written in plaintext and rows another process sealed read as "not
+	// connected", so a script or the CLI pointed at the real database cannot
+	// act as the user's account. The opt-in core sidecar has none either (the
+	// key is main's), so there the streaming accounts read as not connected.
+	tokenSealer?: TokenSealer;
 	// Write-audit sink. Called with one flat entry per external write: every
 	// streaming remote-write attempt (allowed AND denied — denials are the
 	// suspicious events) and every rekordbox write batch. The desktop main
@@ -1592,7 +1601,25 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	if (dbPath !== ':memory:') {
 		try { runRemixerPrefixRepair(db, dbPath); } catch (err) { log.for('artists').warn('remixer credit repair failed; retrying next launch', undefined, err); }
 	}
-	const auth = new AuthService(db);
+	const auth = new AuthService(db, { tokenSealer: opts.tokenSealer });
+	// Tokens stored before sealing existed, or written since by a process
+	// without the sealer: seal them now. secure_delete for the rewrite, so the
+	// plaintext does not stay behind in the page's freed bytes, then the WAL
+	// is emptied of the frames that still hold it. A handful of rows, once.
+	if (opts.tokenSealer) {
+		try {
+			const before = sqlite.pragma('secure_delete', { simple: true });
+			sqlite.pragma('secure_delete = ON');
+			const sealed = auth.sealStoredTokens();
+			sqlite.pragma(`secure_delete = ${Number(before)}`);
+			if (sealed > 0) {
+				sqlite.pragma('wal_checkpoint(TRUNCATE)');
+				log.for('auth').info('stored tokens sealed', { rows: sealed });
+			}
+		} catch (err) {
+			log.for('auth').warn('sealing the stored tokens failed; retrying next launch', undefined, err);
+		}
+	}
 	// One cancel token shared across both enrichers — cancelling fires
 	// whichever loop is currently active. Both classes reset it at the start
 	// of their own loops so a stale flag from a previous run can't carry over.

@@ -10,9 +10,9 @@
 // Transport: an Electron main process CANNOT reliably read piped stdin (it
 // sees immediate EOF) and leaks stray bytes onto stdout, so — unlike the Rust
 // audio sidecar — we don't use stdio for the protocol. The host listens on
-// 127.0.0.1 and passes --rpc-port/--rpc-nonce; we connect, prove ourselves
-// with the nonce, then exchange LF-delimited JSON frames over the socket.
-// stderr is still piped (for logs).
+// 127.0.0.1 and passes --rpc-port, and a nonce in the environment; we connect,
+// prove ourselves with the nonce, then exchange LF-delimited JSON frames over
+// the socket. stderr is still piped (for logs).
 
 import { app, BrowserWindow, components, ipcMain } from 'electron';
 import { connect, type Socket } from 'node:net';
@@ -42,7 +42,14 @@ function argValue(name: string): string {
 	return hit ? hit.slice(pref.length) : '';
 }
 const rpcPort = Number(argValue('rpc-port')) || 0;
-const rpcNonce = argValue('rpc-nonce');
+// The nonce arrives in the environment, not as an argument: a command line is
+// listed by any process viewer and recorded by endpoint monitoring, and
+// whoever holds the nonce can take this sidecar's place on the host's socket,
+// where the Spotify access token is handed over. Dropped from our own
+// environment once read, so Chromium's child processes do not inherit it.
+const NONCE_ENV = 'CURATOR_SPOTIFY_RPC_NONCE';
+const rpcNonce = process.env[NONCE_ENV] ?? '';
+delete process.env[NONCE_ENV];
 
 let sock: Socket | null = null;
 let sockConnected = false;

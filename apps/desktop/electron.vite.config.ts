@@ -35,6 +35,22 @@ const OPTIONAL_ENV = ['CURATOR_CLOUD_API_URL'] as const;
 // build must be made without the line.
 const DEV_ENV = ['CURATOR_CATALOG_API_URL'] as const;
 
+// The endpoints among them. Each carries the account's token (the Supabase
+// one the password too), so a build is refused unless it is https; plain http
+// is for a server on this machine only (the local catalogue, a test cloud),
+// where nothing crosses a network. Refused here rather than at run time: a
+// redirect to https answers after the token was already sent in the clear.
+const URL_ENV = ['CURATOR_SUPABASE_URL', 'CURATOR_CLOUD_API_URL', 'CURATOR_CATALOG_API_URL'] as const;
+
+function encryptedOrLocal(value: string): boolean {
+	try {
+		const u = new URL(value);
+		return u.protocol === 'https:' || (u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname));
+	} catch {
+		return false;
+	}
+}
+
 function bakedEnv(mode: string, command: 'build' | 'serve'): Record<string, string> {
 	const env = { ...loadEnv(mode, repoRoot, 'CURATOR_'), ...loadEnv(mode, __dirname, 'CURATOR_') };
 	const value = (k: string): string => (env[k] ?? '').trim();
@@ -51,6 +67,8 @@ function bakedEnv(mode: string, command: 'build' | 'serve'): Record<string, stri
 		}
 		console.warn(`[curator] ${verb} without ${list}: those features will report "not configured"`);
 	}
+	const insecure = URL_ENV.filter((k) => value(k) && !encryptedOrLocal(value(k)));
+	if (insecure.length) throw new Error(`[curator] refusing to ${command === 'build' ? 'build' : 'run'}: ${insecure.join(', ')} must be an https:// URL (http:// only for localhost)`);
 	for (const k of OPTIONAL_ENV) {
 		if (!value(k)) console.warn(`[curator] ${verb} without ${k}: library sync will be off`);
 	}

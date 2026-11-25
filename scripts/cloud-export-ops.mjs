@@ -22,17 +22,16 @@
 // handling as scripts/cloud-db-apply.mjs).
 
 import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { createGzip } from 'node:zlib';
+import { loadPostgres } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
-const cloudDir = join(repoRoot, 'apps', 'cloud');
 
 function fail(msg) {
 	console.error(`\ncloud-export-ops: ${msg}`);
@@ -85,11 +84,6 @@ function checkUrl(url) {
 	if (/pooler\.supabase\.com$/i.test(u.hostname) && !decodeURIComponent(u.username).includes('.')) {
 		fail('the pooler needs the user postgres.<project-ref>: copy the "Session pooler" URI, not "Direct connection" (value not shown)');
 	}
-}
-
-async function loadPostgres() {
-	const require = createRequire(join(cloudDir, 'package.json'));
-	return (await import(pathToFileURL(require.resolve('postgres')).href)).default;
 }
 
 async function main() {

@@ -21,11 +21,11 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { loadPostgres } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ROLE = 'curator_api';
@@ -67,12 +67,6 @@ function waitForEnter(prompt) {
 			resolve(answer.trim().toLowerCase());
 		});
 	});
-}
-
-// postgres.js lives in apps/cloud, not at the repo root.
-async function loadPostgres() {
-	const require = createRequire(join(repoRoot, 'apps', 'cloud', 'package.json'));
-	return (await import(pathToFileURL(require.resolve('postgres')).href)).default;
 }
 
 async function canLogin(postgres, url) {

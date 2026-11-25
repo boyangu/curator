@@ -10,8 +10,9 @@ Spotify in-app playback needs Widevine (EME), which requires a VMP-signed, castl
 Electron. Isolating that here keeps the main shell free to iterate without re-signing on every
 dev loop. Unlike the Rust audio sidecar (stdio), this one uses **TCP** — an Electron main
 process can't reliably read piped stdin and leaks bytes onto stdout. The host passes
-`--rpc-port` and `--rpc-nonce`; the sidecar connects to `127.0.0.1`, proves the nonce, and
-exchanges JSON frames terminated by `\n`.
+`--rpc-port`, and a nonce in the `CURATOR_SPOTIFY_RPC_NONCE` environment variable (never on
+the command line, which other processes can read); the sidecar connects to `127.0.0.1`,
+proves the nonce, and exchanges JSON frames terminated by `\n`.
 
 - Entry: `src/main.ts` → built to `out/main/index.cjs`
 - Renderer: `src/renderer/` (`sdk.ts` + `index.html`) hosts the Web Playback SDK in a hidden window

@@ -19,11 +19,11 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Writable } from 'node:stream';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { loadPostgres } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const cloudDir = join(repoRoot, 'apps', 'cloud');
@@ -70,11 +70,6 @@ function checkUrl(url) {
 	if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') fail('the owner connection string must start with postgresql:// (value not shown)');
 	if (/^curator_api[.]?/.test(decodeURIComponent(u.username))) fail('that is the API role (curator_api); migrations need the owner (user postgres.<ref>)');
 	if (!/^postgres([.]|$)/.test(decodeURIComponent(u.username))) fail('expected the owner user postgres.<ref> (value not shown)');
-}
-
-async function loadPostgres() {
-	const require = createRequire(join(cloudDir, 'package.json'));
-	return (await import(pathToFileURL(require.resolve('postgres')).href)).default;
 }
 
 function runMigrations(url) {

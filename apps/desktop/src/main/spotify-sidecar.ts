@@ -148,10 +148,15 @@ export class SpotifySidecarHost extends EventEmitter {
 
 	private spawnChild(port: number): void {
 		if (this.proc) return;
-		const args = [...(this.opts.args ?? []), `--rpc-port=${port}`, `--rpc-nonce=${this.nonce}`];
+		const args = [...(this.opts.args ?? []), `--rpc-port=${port}`];
 		const proc = spawn(this.opts.executable, args, {
 			cwd: this.opts.cwd,
-			env: { ...process.env, ...(this.opts.env ?? {}) },
+			// The nonce goes in the environment, never among the arguments: a
+			// command line is listed by any process viewer and recorded by
+			// endpoint monitoring, and the nonce is what lets a process onto the
+			// socket the access token crosses (apps/spotify-player/src/main.ts
+			// reads it).
+			env: { ...process.env, ...(this.opts.env ?? {}), CURATOR_SPOTIFY_RPC_NONCE: this.nonce },
 			// stdin/stdout unused (socket carries the protocol); stderr piped
 			// for the sidecar's logs.
 			stdio: ['ignore', 'ignore', 'pipe'],

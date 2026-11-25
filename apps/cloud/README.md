@@ -54,6 +54,8 @@ Once, in this order. Before you start, delete the spike's objects from `public` 
    postgres://curator_api.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
    ```
 
+   Every connection to a host other than this machine is TLS with the certificate verified against Supabase's roots, whatever the string's `sslmode` says (`src/db/tls.ts`; the scripts under `scripts/` go through the same rule). Once the API runs a release with that, switch on **Enforce SSL on incoming connections** (Project Settings → Database → SSL Configuration), so the pooler refuses a client that would connect in the clear.
+
 4. **Storage buckets**: paste `sql/storage.sql` into the SQL editor and run it (as `postgres`, after the migrations: it calls `curator.catalogue_entitled()` from 0004 and `curator.session_revoked()` from 0006). Idempotent; the runner skips it like `roles.sql`. It creates two private buckets (16 MiB per object, `application/octet-stream`), each with three policies on `storage.objects`: select / insert / delete under the caller's own `<uid>/` prefix, and no update policy (objects are immutable, content-addressed).
    - `catalogue`: insert only as `<uid>/peaks/<sha256>.cpk` or `<uid>/vec/<sha256>.cvec` and only while the account is entitled and under quota.
    - `snapshots` (`snapshot_storage`): insert only as `<uid>/snap/<sha256>.cgz` and only while the account holds under 512 MiB there (`curator.snapshot_upload_allowed()`). Not gated on the catalogue entitlement: snapshots are part of sync.

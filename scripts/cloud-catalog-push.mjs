@@ -34,6 +34,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadPostgres } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const cloudDir = join(repoRoot, 'apps', 'cloud');
@@ -144,7 +145,7 @@ async function openSource(dir) {
 }
 
 async function openPostgresTarget(url) {
-	const postgres = (await import(pathToFileURL(require.resolve('postgres')).href)).default;
+	const postgres = await loadPostgres();
 	const sql = postgres(url, { prepare: false, max: 1, connect_timeout: 15, idle_timeout: 0, onnotice: () => {} });
 	const on = (q) => ({
 		rows: (text) => q.unsafe(text),

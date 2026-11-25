@@ -18,7 +18,9 @@
 //     _APPLE / _SPOTIFY_PAGES is 0 (beatport-pages.ts and spotify-page.ts on
 //     the terms);
 //   CURATOR_YOUTUBE_API_KEY, CURATOR_SOUNDCLOUD_CLIENT_ID + _SECRET,
-//   CURATOR_TIDAL_CLIENT_ID + _SECRET, CURATOR_LASTFM_API_KEY.
+//   CURATOR_TIDAL_APP_CLIENT_ID + _SECRET (else the desktop's
+//     CURATOR_TIDAL_CLIENT_ID + _SECRET, config.ts on why not for long),
+//   CURATOR_LASTFM_API_KEY.
 // The label profiler (MusicBrainz, Discogs: key-less) always runs. A tracker
 // row whose provider has no adapter here is skipped, not failed.
 

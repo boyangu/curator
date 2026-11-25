@@ -3,6 +3,7 @@ export { migrate } from '@curator/sync-core/db/migrate';
 export { createDb } from '@curator/sync-core/db/client';
 export { seedIfEmpty, seed } from './db/seed.js';
 export { AuthService, NOT_CONFIGURED, type AuthStatus, type AuthStatusEntry } from './auth/service.js';
+export type { TokenSealer } from './auth/store.js';
 export { SpotifySync, type SyncProgress, type ProgressFn } from './sync/spotify.js';
 export { LibraryScanner, normalizePath, isCloudSyncPath, type ScanProgress, type ScanProgressFn } from './local/scanner.js';
 export type { AnalysisJobEvent } from './analyzer/queue.js';

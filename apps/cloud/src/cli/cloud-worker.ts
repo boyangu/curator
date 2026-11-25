@@ -21,6 +21,7 @@ import { hostname } from 'node:os';
 import { createBackofficeHandler, type WorkerStatus } from '../backoffice/handler.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { agentReasonerConfig, describeReasoner, reasonerModel } from '../catalog/agent/config.js';
+import { TIDAL_BORROWED_NOTE, tidalCredentials } from '../config.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
 import { migrationGate } from '../db/migration-gate.js';
 import { createLogger } from '../log.js';
@@ -71,6 +72,7 @@ const agentCfg = agentReasonerConfig(process.env);
 const agent = agentCfg ? { model: reasonerModel(agentCfg), cfg: agentCfg } : null;
 console.log(`Trackers: ${readers.adapters.map((a) => a.provider).join(', ')}`);
 console.log(`Reasoner: ${describeReasoner(agentCfg)}`);
+if (tidalCredentials(process.env)?.borrowed) console.log(TIDAL_BORROWED_NOTE);
 const deps = { db, log, holder: `upkeep:${hostname()}:${process.pid}`, readers, agent };
 
 const worker: WorkerStatus = { running: false, step: null, stepStartedAt: null, startedAt: null, finishedAt: null, steps: [], lastPass: null };

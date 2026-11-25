@@ -22,6 +22,7 @@
 // bigint columns, epoch-ms columns computed in SQL, jsonb read as text.
 
 import postgres from 'postgres';
+import { tlsOptions } from './tls.js';
 
 export type Param = string | null;
 export type Row = Record<string, unknown>;
@@ -75,6 +76,8 @@ export function createPostgresDb(url: string, opts: { max?: number } = {}): Db {
 		connect_timeout: 10,
 		onnotice: () => {},
 		connection: { application_name: 'curator-cloud' },
+		// TLS, verified, to any host but this machine (tls.ts).
+		...tlsOptions(url),
 	});
 	const wrap = (q: postgres.Sql | postgres.TransactionSql): Queryable => ({
 		async query<T extends Row = Row>(text: string, params: readonly Param[] = []): Promise<T[]> {
