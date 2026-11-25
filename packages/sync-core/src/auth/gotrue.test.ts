@@ -99,6 +99,34 @@ describe('sign-in', () => {
 	});
 });
 
+describe('a forgotten password', () => {
+	it('is replaced once a code signed the account in', async () => {
+		const { auth, sent } = rig([session(1), { status: 200, body: JSON.stringify(USER) }]);
+		await auth.verifyCode('guy@example.com', '123456');
+		await auth.setPassword(' new one ');
+		expect(sent[1]).toEqual({
+			method: 'PUT',
+			url: `${URL_}/auth/v1/user`,
+			headers: { apikey: 'pk', 'content-type': 'application/json', authorization: 'Bearer at1' },
+			body: JSON.stringify({ password: ' new one ' }),
+		});
+		expect(await auth.accessToken()).toBe('at1');
+	});
+
+	it('says why a new one was refused, and stays signed in', async () => {
+		const { auth } = rig([session(1), refused(422, 'weak_password')]);
+		await auth.verifyCode('guy@example.com', '123456');
+		expect(await codeOf(auth.setPassword('x'))).toBe('weak_password');
+		expect(auth.account()?.tokens).not.toBeNull();
+	});
+
+	it('needs a session', async () => {
+		const { auth, sent } = rig([]);
+		expect(await codeOf(auth.setPassword('x'))).toBe('session_not_found');
+		expect(sent).toEqual([]);
+	});
+});
+
 describe('the access token', () => {
 	it('is refreshed a minute ahead, once for every caller waiting, and the rotated session kept before they get it', async () => {
 		let answer!: (r: HttpResponse) => void;

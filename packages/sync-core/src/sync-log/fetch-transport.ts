@@ -99,7 +99,7 @@ import { CloudTransportError, type CloudSession, type CloudTransport } from './c
 import type { SnapshotText } from './snapshot.js';
 import { readStorageSnapshotBody, type SnapshotBlobStore } from './snapshot-storage.js';
 
-export type HttpRequest = { method: 'GET' | 'POST'; url: string; headers: Record<string, string>; body?: string };
+export type HttpRequest = { method: 'GET' | 'POST' | 'PUT'; url: string; headers: Record<string, string>; body?: string };
 export type HttpResponse = { status: number; body: string };
 
 export type FetchTransportDeps = {

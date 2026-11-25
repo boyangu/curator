@@ -2,7 +2,8 @@
 // Supabase Auth's REST endpoints through the host's one request function.
 // Sign-in as on the desktop (apps/desktop main/cloud/account.ts): email +
 // password, or a code sent by email. Accounts are made on the desktop, so a
-// code is never sent to an address that has none.
+// code is never sent to an address that has none. A forgotten password is a
+// code too: signed in with it, the account takes a new one (setPassword).
 //
 // The account outlives its tokens. A session the server refuses to refresh
 // (signed out elsewhere, a reused refresh token) leaves the account with
@@ -69,6 +70,9 @@ export type Gotrue = {
 	signInPassword(email: string, password: string): Promise<AuthAccount>;
 	requestCode(email: string): Promise<void>;
 	verifyCode(email: string, code: string): Promise<AuthAccount>;
+	// The signed-in account's new password. Supabase signs the account's other
+	// sessions out with it.
+	setPassword(password: string): Promise<void>;
 	// A token to call with, refreshed when due (or when asked); null without a
 	// session. Rejects (AuthError) when one is due and cannot be had now.
 	accessToken(opts?: { refresh?: boolean }): Promise<string | null>;
@@ -104,11 +108,11 @@ export function createGotrue(deps: GotrueDeps): Gotrue {
 	let account = deps.initial;
 	let refreshing: Promise<string> | null = null;
 
-	const post = async (path: string, body: unknown, bearer?: string): Promise<HttpResponse> => {
+	const send = async (method: 'POST' | 'PUT', path: string, body: unknown, bearer?: string): Promise<HttpResponse> => {
 		let res: HttpResponse;
 		try {
 			res = await deps.request({
-				method: 'POST',
+				method,
 				url: `${deps.supabaseUrl}/auth/v1/${path}`,
 				headers: { apikey: deps.publishableKey, 'content-type': 'application/json', ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) },
 				body: JSON.stringify(body),
@@ -119,6 +123,8 @@ export function createGotrue(deps: GotrueDeps): Gotrue {
 		if (res.status >= 200 && res.status < 300) return res;
 		throw new AuthError(errorCode(res.body) ?? (res.status >= 500 ? 'server' : `http_${res.status}`), res.status);
 	};
+
+	const post = (path: string, body: unknown, bearer?: string): Promise<HttpResponse> => send('POST', path, body, bearer);
 
 	const set = (next: AuthAccount | null): void => {
 		account = next;
@@ -196,6 +202,22 @@ export function createGotrue(deps: GotrueDeps): Gotrue {
 		}
 	};
 
+	const accessToken = async (opts?: { refresh?: boolean }): Promise<string | null> => {
+		const t = account?.tokens;
+		if (!t) return null;
+		const left = t.expiresAt - now();
+		if (!opts?.refresh && left > REFRESH_AHEAD_MS) return t.accessToken;
+		try {
+			return await refresh();
+		} catch (err) {
+			// Due soon but not expired, and the refresh only could not be made:
+			// the token in hand still works.
+			if (!opts?.refresh && left > 0 && account?.tokens === t) return t.accessToken;
+			if (!account?.tokens) return null;
+			throw err;
+		}
+	};
+
 	return {
 		account: () => account,
 		signInPassword: (email, password) => signIn('password', 'token?grant_type=password', { email: email.trim(), password }),
@@ -209,21 +231,18 @@ export function createGotrue(deps: GotrueDeps): Gotrue {
 			}
 		},
 		verifyCode: (email, code) => signIn('code', 'verify', { type: 'email', email: email.trim(), token: code.trim() }),
-		async accessToken(opts) {
-			const t = account?.tokens;
-			if (!t) return null;
-			const left = t.expiresAt - now();
-			if (!opts?.refresh && left > REFRESH_AHEAD_MS) return t.accessToken;
+		async setPassword(password) {
+			const token = await accessToken();
+			if (!token) throw new AuthError('session_not_found');
 			try {
-				return await refresh();
+				await send('PUT', 'user', { password }, token);
+				slog.info('password set', {});
 			} catch (err) {
-				// Due soon but not expired, and the refresh only could not be made:
-				// the token in hand still works.
-				if (!opts?.refresh && left > 0 && account?.tokens === t) return t.accessToken;
-				if (!account?.tokens) return null;
+				if (err instanceof AuthError) slog.warn('setting the password failed', { reason: err.code, status: err.status });
 				throw err;
 			}
 		},
+		accessToken,
 		async endSession() {
 			await logout();
 			if (account) set({ ...account, tokens: null });

@@ -10,6 +10,7 @@ class SignInTextTest {
 	@Test fun wordsARefusalAndNeverTheStackBehindIt() {
 		assertEquals("No connection to Curator’s cloud.", signInProblem("network"))
 		assertTrue(signInProblem("invalid_credentials").startsWith("That email and password"))
+		assertTrue(signInProblem("weak_password").contains("longer"))
 		val odd = signInProblem("something_new\nat x.ts:1")
 		assertEquals("Sign-in failed (something_new).", odd)
 	}

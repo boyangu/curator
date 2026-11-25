@@ -59,10 +59,12 @@ import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
 import kotlinx.coroutines.launch
 
+private enum class Way { PASSWORD, CODE, RESET }
+
 /**
  * Signing in to the Curator account, by password or a code sent by email, as
- * on the desktop (accounts are made there). On a phone without one it is the
- * whole app; [back] is there when a library is open and only its session
+ * on the desktop (accounts are made there). A forgotten password is a code
+ * and a new password. On a phone without an account it is the whole app; [back] is there when a library is open and only its session
  * ended.
  *
  * Updates and the log are within reach here too: without a cable they are the
@@ -77,7 +79,9 @@ fun SignInScreen(model: AppModel, back: (() -> Unit)?) {
 	// Not saveable: a password isn't written into the saved state.
 	var password by remember { mutableStateOf("") }
 	var code by remember { mutableStateOf("") }
-	var codeSent by rememberSaveable { mutableStateOf(false) }
+	var way by rememberSaveable { mutableStateOf(Way.PASSWORD) }
+	// The code was taken, and only the new password is still to be accepted.
+	var proven by remember { mutableStateOf(false) }
 	var busy by remember { mutableStateOf(false) }
 	var problem by remember { mutableStateOf<String?>(null) }
 
@@ -103,9 +107,19 @@ fun SignInScreen(model: AppModel, back: (() -> Unit)?) {
 		// Not this screen's scope: it goes as the library opens.
 		model.app.scope.launch { model.app.openLibrary() }
 	}
-	fun byPassword() = attempt { model.signInPassword(email, password); signedIn() }
-	fun byCode() = attempt { model.verifyCode(email, code); signedIn() }
-	fun sendCode() = attempt { model.requestCode(email); codeSent = true }
+	fun submit() = attempt {
+		when (way) {
+			Way.PASSWORD -> model.signInPassword(email, password)
+			Way.CODE -> model.verifyCode(email, code)
+			Way.RESET -> {
+				// A code works once: a password refused is tried again without it.
+				if (!proven) { model.verifyCode(email, code); proven = true }
+				model.setPassword(password)
+			}
+		}
+		signedIn()
+	}
+	fun sendCode(then: Way) = attempt { model.requestCode(email); password = ""; code = ""; proven = false; way = then }
 
 	Column(
 		Modifier
@@ -126,19 +140,20 @@ fun SignInScreen(model: AppModel, back: (() -> Unit)?) {
 				style = T.secondary,
 			)
 			Field("Email", email, { email = it }, KeyboardType.Email, ImeAction.Next)
-			if (codeSent) {
-				BasicText("A code was sent to that address.", style = T.secondary)
-				Field("Code", code, { code = it }, KeyboardType.Number, ImeAction.Done) { byCode() }
-			} else {
-				Field("Password", password, { password = it }, KeyboardType.Password, ImeAction.Done, secret = true) { byPassword() }
+			if (way != Way.PASSWORD) {
+				BasicText(if (proven) "The code was right. Choose a password." else "A code was sent to that address. Enter it here; a link in the email, if there is one, doesn’t open this app.", style = T.secondary)
+				if (!proven) Field("Code", code, { code = it }, KeyboardType.Number, if (way == Way.RESET) ImeAction.Next else ImeAction.Done) { submit() }
 			}
+			if (way == Way.RESET) BasicText("Your other devices are signed out with the new password and sign in again with it.", style = T.secondary)
+			if (way != Way.CODE) Field(if (way == Way.RESET) "New password" else "Password", password, { password = it }, KeyboardType.Password, ImeAction.Done, secret = true) { submit() }
 			problem?.let { BasicText(it, Modifier.semantics { liveRegion = LiveRegionMode.Assertive }, style = T.of(13.sp, color = C.fg)) }
-			val filled = email.isNotBlank() && (if (codeSent) code.isNotBlank() else password.isNotEmpty())
+			val filled = email.isNotBlank() && (way == Way.PASSWORD || proven || code.isNotBlank()) && (way == Way.CODE || password.isNotEmpty())
 			Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-				Action(if (busy) "One moment…" else "Sign in", strong = true, enabled = filled && !busy) { if (codeSent) byCode() else byPassword() }
-				if (codeSent) Action("Use a password", enabled = !busy) { codeSent = false; problem = null }
-				else Action("Email me a code", enabled = email.isNotBlank() && !busy) { sendCode() }
+				Action(if (busy) "One moment…" else if (way == Way.RESET) "Set password and sign in" else "Sign in", strong = true, enabled = filled && !busy) { submit() }
+				if (way == Way.PASSWORD) Action("Email me a code", enabled = email.isNotBlank() && !busy) { sendCode(Way.CODE) }
+				else Action("Back", enabled = !busy) { way = Way.PASSWORD; password = ""; problem = null }
 			}
+			if (way == Way.PASSWORD) Action("Forgot your password?", enabled = email.isNotBlank() && !busy) { sendCode(Way.RESET) }
 		}
 		Diagnostics(model)
 		Updates(model)

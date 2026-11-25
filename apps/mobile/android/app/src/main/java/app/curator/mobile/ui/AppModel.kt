@@ -100,6 +100,7 @@ class AppModel(val app: CuratorApp) {
 
 	suspend fun signInPassword(email: String, password: String) { freshDevice(); ask("signInPassword", "email" to JsonPrimitive(email), "password" to JsonPrimitive(password)) }
 	suspend fun requestCode(email: String) { ask("requestCode", "email" to JsonPrimitive(email)) }
+	suspend fun setPassword(password: String) { ask("setPassword", "password" to JsonPrimitive(password)) }
 	suspend fun verifyCode(email: String, code: String) { freshDevice(); ask("verifyCode", "email" to JsonPrimitive(email), "code" to JsonPrimitive(code)) }
 
 	private val _lists = MutableStateFlow<Lists?>(null)

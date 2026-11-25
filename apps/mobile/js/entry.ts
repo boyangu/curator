@@ -319,6 +319,7 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 	signInPassword: (a) => signedIn(acct().auth.signInPassword(a['email'] as string, a['password'] as string)),
 	requestCode: (a) => acct().auth.requestCode(a['email'] as string),
 	verifyCode: (a) => signedIn(acct().auth.verifyCode(a['email'] as string, a['code'] as string)),
+	setPassword: (a) => acct().auth.setPassword(a['password'] as string),
 	// A token for the log upload, which Kotlin sends itself; null: signed out.
 	accessToken: () => acct().auth.accessToken(),
 	// This phone was removed from the account: a fresh device id, and the

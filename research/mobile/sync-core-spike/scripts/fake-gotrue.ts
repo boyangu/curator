@@ -59,9 +59,20 @@ export function createFakeGotrue(opts: { users: FakeUser[]; ttlSec: number; sign
 				codes.delete(user.email);
 				return open(user);
 			}
+			const payload = bearer?.split('.')[1];
+			const id = payload ? (JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { session_id?: string }).session_id : undefined;
+			if (route === 'user') {
+				const s = id ? sessions.get(id) : undefined;
+				if (!s) return refused(403, 'session_not_found');
+				const next = String(body['password'] ?? '');
+				if (next.length < 6) return refused(422, 'weak_password');
+				if (next === s.user.password) return refused(422, 'same_password');
+				s.user.password = next;
+				// As Supabase does: the account's other sessions end.
+				for (const x of [...sessions.values()]) if (x.user === s.user && x.id !== s.id) sessions.delete(x.id);
+				return { status: 200, body: { id: s.user.id, email: s.user.email } };
+			}
 			if (route === 'logout') {
-				const payload = bearer?.split('.')[1];
-				const id = payload ? (JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { session_id?: string }).session_id : undefined;
 				if (id) sessions.delete(id);
 				return { status: 204, body: null };
 			}
