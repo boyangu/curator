@@ -112,7 +112,7 @@ fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
 	}
 }
 
-/** How every waveform on this phone looks: the desktop's styles. */
+/** How every waveform on this phone looks: the desktop's styles, and the big wave's grid. */
 @Composable
 private fun Waveform(model: AppModel) {
 	val picked by model.skin.collectAsState()
@@ -134,6 +134,13 @@ private fun Waveform(model: AppModel) {
 			SkinSwatch(s, Modifier.size(96.dp, 32.dp).background(C.bg1))
 		}
 	}
+	// The big wave's grid (turned sideways), as the desktop draws it.
+	val grid by model.grid.collectAsState()
+	Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp)) {
+		BasicText("Beat grid", Modifier.semantics { heading() }, style = T.label)
+	}
+	SwitchRow("Bars", grid.bars, Modifier.fillMaxWidth().heightIn(min = 52.dp)) { model.setGrid(grid.copy(bars = !grid.bars)) }
+	SwitchRow("Beats", grid.beats, Modifier.fillMaxWidth().heightIn(min = 52.dp)) { model.setGrid(grid.copy(beats = !grid.beats)) }
 }
 
 /** The version, where the updater is, the automatic switch, and the one action that fits (check, install, allow installs). */

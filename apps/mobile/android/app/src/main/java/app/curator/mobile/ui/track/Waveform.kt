@@ -23,6 +23,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -41,9 +42,12 @@ import app.curator.mobile.data.Cue
 import app.curator.mobile.data.Phrase
 import app.curator.mobile.model.Bands
 import app.curator.mobile.model.Finger
+import app.curator.mobile.model.GridMark
+import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.Peaks
 import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.model.WaveTouch
+import app.curator.mobile.model.gridMarks
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.CuePalette
 import app.curator.mobile.ui.theme.T
@@ -250,8 +254,9 @@ fun jumpBeats(beats: FloatArray, bpm: Double?, t: Double, n: Int): Double {
 }
 
 /**
- * The zoomed wave (landscape): the playhead fixed at the centre, [bars] bars
- * across, the grid's beats in line-soft and bars in fg-4 with their numbers,
+ * The zoomed wave (landscape): the playhead fixed at the centre, [span]
+ * seconds across, the grid over it as the desktop draws it ([grid]: beats,
+ * bars or both),
  * cue lines full height with their letter at the bottom, the phrase lane on
  * the bottom edge. A horizontal drag scrubs ([onScrub] as it moves, [onSeek]
  * on release: streaming sources only seek then); two fingers zoom and leave
@@ -270,6 +275,7 @@ fun BigWave(
 	beats: FloatArray,
 	downbeats: FloatArray,
 	span: Double,
+	grid: GridShow,
 	cues: List<Cue>,
 	phrases: List<Phrase>,
 	modifier: Modifier,
@@ -315,22 +321,12 @@ fun BigWave(
 			// A margin for what reaches past its own time (a number, a badge).
 			val from = (origin - 40.dp.toPx()) / pxPerSec
 			val to = (origin + size.width) / pxPerSec
-			val line = 1.dp.toPx()
-			// Grid: every beat line-soft, every bar fg-4 with its number.
-			for (i in beats.firstFrom(from) until beats.size) {
-				if (beats[i] > to) break
-				drawRect(C.lineSoft, Offset(x(beats[i].toDouble()), 0f), Size(line, size.height))
-			}
-			for (i in downbeats.firstFrom(from) until downbeats.size) {
-				if (downbeats[i] > to) break
-				val xx = x(downbeats[i].toDouble())
-				drawRect(C.fg4, Offset(xx, 0f), Size(line, size.height))
-				drawText(measurer.measure((i + 1).toString(), barNumber), topLeft = Offset(xx + 4.dp.toPx(), 3.dp.toPx()))
-			}
 			val top = 16.dp.roundToPx()
 			val height = size.height.toInt() - 2 * top
 			if (peaks == null || height <= 0) noWave(top.toFloat(), height.toFloat())
 			else tiles.draw(drawContext.canvas.nativeCanvas, WaveKey(peaks, skin, pxPerSec, height, density), origin, size.width.toInt(), top)
+			val lane = 5.dp.toPx()
+			if (grid.beats || grid.bars) drawGrid(gridMarks(beats, downbeats, from, to), grid, ::x, size.height - lane, measurer)
 			for (q in cues) {
 				if (q.positionSec < from || q.positionSec > to) continue
 				val xx = x(q.positionSec)
@@ -338,7 +334,6 @@ fun BigWave(
 				drawRect(col, Offset(xx, 0f), Size(2.dp.toPx(), size.height))
 				cueBadge(measurer, q, xx, size.height - 5.dp.toPx() - 15.dp.toPx(), 16.dp.toPx(), 15.dp.toPx(), 11f)
 			}
-			val lane = 5.dp.toPx()
 			for (p in phrases) {
 				if (p.endSec < from || p.startSec > to) continue
 				drawRect(phraseColor(skin, p.label), Offset(x(p.startSec), size.height - lane), Size(x(p.endSec) - x(p.startSec) - 2.dp.toPx(), lane))
@@ -350,8 +345,37 @@ fun BigWave(
 
 private val barNumber = T.mono(10.5.sp, C.fg3)
 
-/** The index of the first time at or after [t] (they are sorted). */
-private fun FloatArray.firstFrom(t: Double): Int = java.util.Arrays.binarySearch(this, t.toFloat()).let { if (it < 0) -it - 1 else it }
+// The desktop's grid (renderer/style.css .beat-line, .downbeat-marker, .beat-tick).
+private val barLine = Color(255, 60, 60).copy(alpha = 0.85f)
+private val barMark = Color(0xFFFF3030)
+private val beatTick = Color.White.copy(alpha = 0.55f)
+
+/**
+ * Over the wave, from the top to [bottom] (the phrase lane is under it): a bar
+ * is a red line with a triangle at each edge and its number, a beat a tick at
+ * each edge. Every mark sits at a whole pixel, so the grid moves with the wave.
+ */
+private fun DrawScope.drawGrid(marks: List<GridMark>, show: GridShow, x: (Double) -> Float, bottom: Float, measurer: TextMeasurer) {
+	val line = 1.dp.toPx()
+	val tick = 2.dp.toPx()
+	val half = 3.5.dp.toPx()
+	val tip = 5.dp.toPx()
+	for (m in marks) {
+		val at = x(m.sec.toDouble())
+		val bar = m.bar
+		if (bar == null) {
+			if (!show.beats) continue
+			drawRect(beatTick, Offset(at - tick / 2, 0f), Size(tick, tick))
+			drawRect(beatTick, Offset(at - tick / 2, bottom - tick), Size(tick, tick))
+			continue
+		}
+		if (!show.bars) continue
+		drawRect(barLine, Offset(at - line / 2, 0f), Size(line, bottom))
+		drawPath(Path().apply { moveTo(at - half, 0f); lineTo(at + half, 0f); lineTo(at, tip); close() }, barMark)
+		drawPath(Path().apply { moveTo(at - half, bottom); lineTo(at + half, bottom); lineTo(at, bottom - tip); close() }, barMark)
+		drawText(measurer.measure(bar.toString(), barNumber), topLeft = Offset(at + 4.dp.toPx(), 3.dp.toPx()))
+	}
+}
 
 /** A skin as a short wave in it: what its picker shows. */
 @Composable

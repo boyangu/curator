@@ -9,6 +9,7 @@ import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Lists
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.ViewState
+import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.HomePin
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.TracklistRows
@@ -74,6 +75,13 @@ class AppModel(val app: CuratorApp) {
 
 	fun setSkin(s: WaveSkin) {
 		app.scope.launch { viewState.setSkin(s) }
+	}
+
+	/** What of the beat grid the big wave shows on this phone. */
+	val grid: StateFlow<GridShow> = viewState.grid.stateIn(app.scope, SharingStarted.Eagerly, GridShow())
+
+	fun setGrid(g: GridShow) {
+		app.scope.launch { viewState.setGrid(g) }
 	}
 
 	val autoUpdate: StateFlow<Boolean> = viewState.autoUpdate.stateIn(app.scope, SharingStarted.Eagerly, true)

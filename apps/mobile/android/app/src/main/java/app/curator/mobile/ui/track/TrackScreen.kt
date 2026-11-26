@@ -70,6 +70,7 @@ import app.curator.mobile.data.ArtistRef
 import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.TrackAnalysis
+import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.Peaks
 import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.player.Player
@@ -129,6 +130,7 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 	val view = from?.let { rememberView(model, it) }
 	val pager = rememberPager(model, if (from == null || view == null) null else ListQuery(from.scope(), view, screen.search))
 	val skin by model.skin.collectAsState()
+	val grid by model.grid.collectAsState()
 	val rotatedOnce by model.viewState.rotatedOnce.collectAsState(true)
 
 	// The player follows the open track (rotating keeps it: same screen, same state).
@@ -173,7 +175,7 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 	val open = { push(Screen.TrackActions(track.id)) }
 
 	if (landscape) {
-		Landscape(track, analysis, peaks, skin, model::setSkin, position, duration, zoom, transport, back, open,
+		Landscape(track, analysis, peaks, skin, model::setSkin, grid, position, duration, zoom, transport, back, open,
 			onZoom = { factor -> zoom = (zoom * factor).coerceIn(2f, 64f) },
 			onCycleZoom = { zoom = ZOOMS.firstOrNull { it > zoom + 0.01f } ?: ZOOMS.first() },
 			onScrub = { scrub = it }, onCallOff = { scrub = null }, onSeek = seek)
@@ -426,7 +428,7 @@ private fun BoxedIcon(icon: Icon, label: String, w: Dp, h: Dp, enabled: Boolean,
 
 @Composable
 private fun Landscape(
-	t: Track, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, onSkin: (WaveSkin) -> Unit,
+	t: Track, a: TrackAnalysis, peaks: Peaks?, skin: WaveSkin, onSkin: (WaveSkin) -> Unit, grid: GridShow,
 	position: () -> Double, duration: Double, zoom: Float, tr: Transport,
 	back: () -> Unit, openActions: () -> Unit, onZoom: (Float) -> Unit, onCycleZoom: () -> Unit,
 	onScrub: (Double) -> Unit, onCallOff: () -> Unit, onSeek: (Double) -> Unit,
@@ -448,7 +450,7 @@ private fun Landscape(
 			IconButton(Icon.Menu, "Track actions", tint = C.fg, onClick = openActions)
 		}
 		androidx.compose.foundation.layout.BoxWithConstraints(Modifier.fillMaxWidth().height(192.dp)) {
-			BigWave(peaks, skin, position, duration, a.beats, a.downbeats, span, a.cues, a.phrases,
+			BigWave(peaks, skin, position, duration, a.beats, a.downbeats, span, grid, a.cues, a.phrases,
 				Modifier.fillMaxSize().semantics { contentDescription = "Waveform, ${zoom.toInt()} bars around the playhead. Drag to scrub" },
 				onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek, onZoom = onZoom)
 			// Just right of the centre playhead, over the bar numbers' row.

@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import app.curator.mobile.model.ListView
+import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.WaveSkin
 import kotlinx.coroutines.flow.Flow
@@ -22,14 +23,16 @@ private val Context.viewStore by preferencesDataStore("view-state")
  * device by design (§3, §5): nothing here rides an op. The streaming service
  * too, as the desktop keeps its primary one (app_setting primary_streaming,
  * not an account setting): what a device can play through is its own.
- * Whether it updates itself, whether it sends its log, and its waveform style,
- * too: each phone's choice.
+ * Whether it updates itself, whether it sends its log, its waveform style and
+ * grid, too: each phone's choice.
  */
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
 	private val recentKey = stringPreferencesKey("recent")
 	private val rotatedKey = booleanPreferencesKey("rotated-once")
 	private val skinKey = stringPreferencesKey("waveform-skin")
+	private val gridBeatsKey = booleanPreferencesKey("grid-beats")
+	private val gridBarsKey = booleanPreferencesKey("grid-bars")
 	private val streamingKey = stringPreferencesKey("streaming")
 	private val autoUpdateKey = booleanPreferencesKey("auto-update")
 	private val diagnosticsKey = booleanPreferencesKey("diagnostics")
@@ -81,6 +84,16 @@ class ViewState(private val context: Context) {
 
 	suspend fun setSkin(s: WaveSkin) {
 		context.viewStore.edit { it[skinKey] = s.id }
+	}
+
+	/** The big wave's grid; both on unless turned off. */
+	val grid: Flow<GridShow> = context.viewStore.data.map { GridShow(beats = it[gridBeatsKey] ?: true, bars = it[gridBarsKey] ?: true) }
+
+	suspend fun setGrid(g: GridShow) {
+		context.viewStore.edit {
+			it[gridBeatsKey] = g.beats
+			it[gridBarsKey] = g.bars
+		}
 	}
 
 	/** Install new releases without asking (Updater); on unless turned off. */
