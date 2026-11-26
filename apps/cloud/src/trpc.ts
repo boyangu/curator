@@ -43,7 +43,7 @@ export type AppDeps = {
 	// 'global_catalog' (src/catalog): on or off (config.ts CURATOR_GLOBAL_CATALOG).
 	// Off refuses the catalog.* and feed.* procedures and drops the feature.
 	catalog: boolean;
-	// 'catalog_connect' (src/catalog/connect.ts): the fetch a user's answer is
+	// 'catalog_connect_auto' (src/catalog/connect.ts): the fetch a user's answer is
 	// checked against the store with. Absent: the global one.
 	connectFetch?: FetchLike;
 	// SoundCloud by the app's credentials, for the profiles a user picks

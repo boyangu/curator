@@ -192,6 +192,7 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'catalog:follow-many': async (targets) => svc.catalogFollowMany(targets),
 		'catalog:connect-status': async () => svc.getConnectStatus(),
 		'catalog:connect-queue': async (opts) => svc.getConnectQueue(opts),
+		'catalog:connect-pending': async () => svc.getConnectPending(),
 		'catalog:connect-search': async (subject, provider) => svc.searchConnectCandidates(subject, provider),
 		'catalog:connect-answer': async (answers) => svc.submitConnectAnswers(answers),
 		// Journeys + knowledge base — in-process like the feed (user-paced

@@ -255,6 +255,7 @@ export const entityApi = {
 export const connectApi = {
 	status: () => api()['catalog:connect-status'](),
 	queue: (...args: Parameters<typeof window.api['catalog:connect-queue']>) => api()['catalog:connect-queue'](...args),
+	pending: () => api()['catalog:connect-pending'](),
 	search: (...args: Parameters<typeof window.api['catalog:connect-search']>) => api()['catalog:connect-search'](...args),
 	answer: (...args: Parameters<typeof window.api['catalog:connect-answer']>) => api()['catalog:connect-answer'](...args),
 };

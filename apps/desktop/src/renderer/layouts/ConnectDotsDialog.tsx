@@ -22,13 +22,13 @@
 import { createSignal, For, Show } from 'solid-js';
 import type { Accessor } from 'solid-js';
 import { render } from 'solid-js/web';
-import type { CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectCandidate, CatalogConnectItem, CatalogConnectQueueResult, ConnectSearch, ConnectSubject } from '@curator/core';
+import type { CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectCandidate, CatalogConnectItem, ConnectQueue, ConnectSearch, ConnectSubject } from '@curator/core';
 import { brandIcon } from '../features/brandIcons.js';
 import { providerLabel } from '../features/feedHandles.js';
 import { registerModalOpenSignal } from '../modalGate.js';
 
 export interface ConnectDotsProps {
-	queue: (opts?: { limit?: number; objectIds?: string[] }) => Promise<CatalogConnectQueueResult>;
+	queue: (opts?: { limit?: number; objectIds?: string[]; exclude?: string[] }) => Promise<ConnectQueue>;
 	search: (subject: ConnectSubject, provider: CatalogConnectCandidate['provider']) => Promise<ConnectSearch>;
 	answer: (answers: CatalogConnectAnswer[]) => Promise<CatalogConnectAnswerResult>;
 	openExternal: (url: string) => void;
@@ -165,12 +165,14 @@ export function mountConnectDotsDialog(host: HTMLElement, props: ConnectDotsProp
 		const my = ++seq;
 		setLoading(true);
 		setError(null);
-		props.queue(named ? { objectIds: named } : { limit: PAGE })
+		// The queue's next page leaves out what was skipped this sitting, so a
+		// page of skipped objects does not end the sitting.
+		props.queue(named ? { objectIds: named } : { limit: PAGE, exclude: [...skipped] })
 			.then((r) => {
 				if (my !== seq) return;
 				const list = r.items.filter((i) => !skipped.has(i.object.id));
 				setItems(list);
-				setTotal(Math.max(0, r.total - skipped.size));
+				setTotal(named ? list.length : Math.max(0, r.total - skipped.size));
 				if (!named) props.onRemaining?.(r.total);
 				show(list[0]);
 			})

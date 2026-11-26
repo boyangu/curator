@@ -83,7 +83,7 @@ import { requestRestatement } from '@curator/sync-core/sync-log/restate';
 import { claimLinksOf, claimLinkUrl, dismissClaimLink } from '@curator/sync-core/sync-log/claim-links';
 import { masterDevice, serverReadsTrackMeta, setMasterDevice } from '@curator/sync-core/sync-log/track-meta';
 import { getDeviceId as getSyncDeviceId } from '@curator/sync-core/sync-log/device';
-import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectQueueResult, CatalogProvider, CatalogWatch, DevicePlatform } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogProvider, CatalogWatch, DevicePlatform } from '@curator/protocol';
 import { applyTrackMerge, describeMergeSide, planTrackMerge, suggestKeepId, type TrackMergeSide, type TrackMergePlan, type TrackMergeResult } from '@curator/sync-core/library/merge-tracks';
 
 export type SourceLinkError = {
@@ -190,7 +190,8 @@ import {
 	type CatalogImportReport,
 	type CatalogSearchHit,
 } from './catalog-client/service.js';
-import { createCatalogConnect, type CatalogConnect, type ConnectSearch, type ConnectSubject } from './catalog-client/connect.js';
+import { createCatalogConnect, type CatalogConnect, type ConnectQueue, type ConnectSearch, type ConnectSubject } from './catalog-client/connect.js';
+import { createConnectFinder, type ConnectFinder } from './catalog-client/connect-finder.js';
 import {
 	artistCandidates,
 	genreCandidates,
@@ -1362,13 +1363,17 @@ export interface CoreService {
 	catalogBrowse(objectId: string): Promise<CatalogBrowseResult>;
 	// ─── Help us connect the dots (catalog-client/connect.ts) ───
 	// Whether the feature is there: signed in, and the server offers
-	// 'catalog_connect'.
+	// 'catalog_connect_auto'.
 	getConnectStatus(): Promise<CatalogClientStatus>;
-	// What to ask the user: their follows that lack a store page (most
-	// followed first), or exactly `objectIds` — an artist, a label or an album
-	// the modal was opened on. Each with the stores it lacks and the
-	// candidates the catalogue itself could not choose between.
-	getConnectQueue(opts?: { limit?: number; objectIds?: string[] }): Promise<CatalogConnectQueueResult>;
+	// What to ask the user. With `objectIds`: exactly those — an artist, a
+	// label or an album the modal was opened on — each with every store it
+	// lacks. Without: a page of this device's own queue, the follows whose
+	// store pages its background search could not settle (`exclude`: the ones
+	// skipped this sitting), each with only those stores.
+	getConnectQueue(opts?: { limit?: number; objectIds?: string[]; exclude?: string[] }): Promise<ConnectQueue>;
+	// How many follows are in that queue: the number on the button. Counted
+	// here, from what this device already holds; the cloud is not asked.
+	getConnectPending(): Promise<{ count: number }>;
 	// This device's search of one store for the object's page there.
 	searchConnectCandidates(subject: ConnectSubject, provider: CatalogProvider): Promise<ConnectSearch>;
 	// The user's answers. Each comes back attached, waiting for the catalogue's
@@ -2820,7 +2825,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		? createCatalogConnect({
 			catalog: catalogProcs,
 			status: () => catalogClient.status(),
-			offered: () => (opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? []).includes('catalog_connect'),
+			offered: () => (opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? []).includes('catalog_connect_auto'),
 			deviceId: () => cloudClient.deviceId(),
 			spotifyToken: () => auth.getSpotifyAccessToken(),
 			tidal: async () => {
@@ -2829,6 +2834,21 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			},
 			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
 			onAttached: () => { artistPages.forget(); entityPages.forget(); },
+		})
+		: null;
+	// The follows' store pages, looked for in the background (connect-finder.ts)
+	// by the device that reads for its user this week; started with the worker.
+	const CONNECT_FINDER_KEY = 'catalog.connect_finder';
+	const connectFinder: ConnectFinder | null = catalogConnect && catalogClient
+		? createConnectFinder({
+			connect: catalogConnect,
+			watches: () => catalogClient.watches(),
+			active: () => catalogConnect.status().available && catalogWorker?.status().active === true,
+			load: () => (sqlite.prepare(`SELECT value FROM app_setting WHERE key = ?`).get(CONNECT_FINDER_KEY) as { value: string } | undefined)?.value ?? null,
+			save: (state) => {
+				sqlite.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(CONNECT_FINDER_KEY, state, Date.now());
+			},
+			paused: (provider) => provider === 'spotify' && spotifyBackoffUntil() > Date.now(),
 		})
 		: null;
 	const requireConnect = (): CatalogConnect => {
@@ -5117,6 +5137,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		},
 		startCatalogWorker() {
 			catalogWorker?.start();
+			connectFinder?.start();
 		},
 		async getCatalogWorkerStatus() {
 			return catalogWorker?.status() ?? NO_CATALOG_WORKER;
@@ -5191,13 +5212,20 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			return catalogConnect?.status() ?? { available: false, reason: 'signed_out' };
 		},
 		async getConnectQueue(opts) {
-			return requireConnect().queue(opts);
+			const connect = requireConnect();
+			if (opts?.objectIds?.length) return connect.queue({ objectIds: opts.objectIds });
+			return connectFinder!.queue({ ...(opts?.limit !== undefined ? { limit: opts.limit } : {}), ...(opts?.exclude ? { exclude: opts.exclude } : {}) });
+		},
+		async getConnectPending() {
+			return connectFinder && catalogConnect?.status().available ? connectFinder.pending() : { count: 0 };
 		},
 		async searchConnectCandidates(subject, provider) {
 			return requireConnect().search(subject, provider);
 		},
 		async submitConnectAnswers(answers) {
-			return requireConnect().answer(answers);
+			const r = await requireConnect().answer(answers);
+			connectFinder?.settled(answers, r.results);
+			return r;
 		},
 		async catalogImportSpotifyFollows() {
 			return requireCatalog().importSpotifyFollows();
@@ -6710,6 +6738,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			sourceScheduler.stopAll();
 			albumEnricher.stop();
 			catalogWorker?.stop();
+			connectFinder?.stop();
 			factsUp.stop();
 			audienceUp.stop();
 			feedService.stop(); // stops scheduler + enrichment + closes feed.db

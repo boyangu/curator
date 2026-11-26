@@ -39,7 +39,7 @@ export { extract, parseInline, type ParseResult, type ParseFn } from './ingest/i
 export * from '@curator/sync-core/feed/types';
 export type { CatalogClientStatus, CatalogEnrichReport, CatalogFollowManyReport, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit } from './catalog-client/service.js';
 export type { FollowCandidate, FollowCandidateKind } from './catalog-client/library-candidates.js';
-export type { ConnectSearch, ConnectSubject } from './catalog-client/connect.js';
+export type { ConnectQueue, ConnectSearch, ConnectSubject } from './catalog-client/connect.js';
 export type { CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogConnectCandidate, CatalogConnectItem, CatalogConnectOutcome, CatalogConnectQueueResult, PageKind } from '@curator/protocol';
 export type { CatalogWorkerStatus } from './catalog-worker/service.js';
 export type { CatalogReadCadence, CatalogReadSources, CatalogReadSourcesPatch } from './catalog-worker/settings.js';

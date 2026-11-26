@@ -100,7 +100,7 @@ export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'ca
 		(f) =>
 			(f !== 'catalogue' || deps.catalogue !== null) &&
 			(f !== 'spotify_gateway' || deps.spotify !== null) &&
-			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience') || deps.catalog),
+			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect_auto' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience') || deps.catalog),
 	);
 }
 
@@ -432,7 +432,7 @@ export const appRouter = router({
 			ctx.call.opsIn = input.results.length;
 			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workers.workerReport({ ...d, log: ctx.deps.log }, ctx.user.id, callerOf(ctx), { deviceId: input.deviceId, results: input.results.map((r) => ({ ...r, outcome: parseWorkerOutcome(r.outcome) })) }));
 		}),
-		// 'catalog_connect' (src/catalog/connect.ts): "Help us connect the dots".
+		// 'catalog_connect_auto' (src/catalog/connect.ts): "Help us connect the dots".
 		connectQueue: authedProcedure.input(ZCatalogConnectQueueInput).mutation(({ ctx, input }): Promise<CatalogConnectQueueResult> =>
 			catalogCall(ctx, input.deviceId, 'catalogRead', (d) => connect.connectQueue(d, ctx.user.id, callerOf(ctx), input)),
 		),

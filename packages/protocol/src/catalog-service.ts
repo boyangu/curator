@@ -581,17 +581,20 @@ export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.
 export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional() }).strict();
 export const ZFeedRecentInput = z.object({ deviceId: ZDeviceId, days: z.number().int().min(1).max(FEED_RECENT_MAX_DAYS) }).strict();
 
-// ── connect the dots ('catalog_connect') ────────────────────────────────────
+// ── connect the dots ('catalog_connect_auto') ────────────────────────────────────
 //
-// "Help us connect the dots": a user says which store page is an artist's, a
-// label's or an album's on a store the catalogue has not mapped. The cloud
-// keeps the queue (what the caller follows that lacks a store, and the
-// candidates its own finders could not choose between); the device searches
-// the store for the rest and sends the user's answer. An answer is a vote:
-// the page is attached at once only when the cloud can back it — a trusted
-// account, or the page's own releases overlapping the object's, read by the
-// cloud — and otherwise waits for the operator. What a device says the page
-// lists is evidence for the operator, never the reason to attach.
+// "Help us connect the dots": which store page is an artist's, a label's or an
+// album's on a store the catalogue has not mapped. The device keeps the queue:
+// it knows its user's follows and the pages each has (the Following list), it
+// searches the stores for the rest in the background, and it sends what it
+// found — a clear match on its own ('auto'), anything less once its user
+// picked. The cloud answers for the objects a device names (what it lacks,
+// its release titles, the candidates its own finders could not choose
+// between) and decides what an answer does. An answer is a vote: the page is
+// attached at once only when the cloud can back it — the page's own releases
+// overlapping the object's, read by the cloud; a trusted account's own pick;
+// or a trusted account's device finding two of the object's releases on the
+// page — and otherwise waits for the operator.
 
 // Which stores each kind is asked about.
 export const CATALOG_CONNECT_STORES = {
@@ -599,9 +602,20 @@ export const CATALOG_CONNECT_STORES = {
 	label: ['beatport', 'soundcloud', 'bandcamp'],
 	release: ['beatport', 'spotify', 'deezer', 'tidal'],
 } as const satisfies Record<PageKind, readonly CatalogProvider[]>;
+// The stores a follow is asked about without the user naming it: the ones a
+// tracker reads the object through, so a page found there brings its releases
+// to the feed. The rest (an artist's Beatport or Bandcamp page) are asked only
+// when the user opens that artist.
+export const CATALOG_CONNECT_QUEUE_STORES = {
+	artist: ['spotify', 'deezer'],
+	label: ['beatport', 'bandcamp', 'soundcloud'],
+} as const satisfies Record<'artist' | 'label', readonly CatalogProvider[]>;
 export const isConnectKind = (k: CatalogKind): k is PageKind => (PAGE_KINDS as readonly string[]).includes(k);
 
-export const CATALOG_CONNECT_SOURCES = ['cloud', 'search', 'pasted'] as const;
+// cloud: a candidate the catalogue's finders left open. search: the device's
+// search, picked by its user. pasted: a link the user gave. auto: the device's
+// background search, with nobody picking (a 'not' or a ruling is never auto).
+export const CATALOG_CONNECT_SOURCES = ['cloud', 'search', 'pasted', 'auto'] as const;
 export type CatalogConnectSource = (typeof CATALOG_CONNECT_SOURCES)[number];
 
 // One page offered for one store. `releases`: a few titles the page lists;
@@ -632,10 +646,14 @@ export type CatalogConnectItem = {
 };
 
 export const CATALOG_CONNECT_QUEUE_MAX = 50;
-// `objectIds`: exactly these (the modal opened on one artist, label or
-// album); absent: the caller's follows that lack a store, most followed first.
-export type CatalogConnectQueueInput = { deviceId: string; limit?: number; objectIds?: string[] };
-export type CatalogConnectQueueResult = { items: CatalogConnectItem[]; total: number };
+// How many of an object's release titles an answer is checked against.
+export const CATALOG_CONNECT_TITLES_COMPARED = 200;
+// `objectIds`: the objects to ask about (a page of the device's queue, or the
+// one the modal was opened on). `compare`: each with the titles an answer is
+// checked against, not the few a person is shown — the device's finder
+// compares a store page with them.
+export type CatalogConnectQueueInput = { deviceId: string; objectIds: string[]; compare?: boolean };
+export type CatalogConnectQueueResult = { items: CatalogConnectItem[] };
 
 // 'is': this page is the object's; 'not': this page is not; 'none': no page
 // offered for this store is (asked again after a while).
@@ -649,7 +667,9 @@ export type CatalogConnectAnswer = {
 	url?: string;
 	name?: string;
 	source?: CatalogConnectSource;
-	// What the device read on the page, for the operator.
+	// What the device read on the page: evidence for the operator, and for an
+	// 'auto' answer from a trusted account the titles the cloud looks for among
+	// the object's own.
 	releases?: string[];
 };
 // attached: on the object now. waiting: with the operator. already: the
@@ -672,7 +692,7 @@ export const ZCatalogConnectSearchInput = z
 	.strict();
 
 export const ZCatalogConnectQueueInput = z
-	.object({ deviceId: ZDeviceId, limit: z.number().int().min(1).max(CATALOG_CONNECT_QUEUE_MAX).optional(), objectIds: z.array(ZObjectId).min(1).max(CATALOG_CONNECT_QUEUE_MAX).optional() })
+	.object({ deviceId: ZDeviceId, objectIds: z.array(ZObjectId).min(1).max(CATALOG_CONNECT_QUEUE_MAX), compare: z.boolean().optional() })
 	.strict();
 export const ZCatalogConnectAnswerInput = z
 	.object({

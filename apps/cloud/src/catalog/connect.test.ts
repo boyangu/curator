@@ -44,23 +44,27 @@ describe('connect the dots', () => {
 	it('asks about a followed artist’s unmapped stores, with the candidates the finders left open', async () => {
 		const { app, fan, ivo } = await setup();
 		await withSystemTx(app.db, (tx) => openReview(tx, { kind: 'artist_link', objectId: ivo, candidates: [{ provider: 'deezer', providerId: '111', name: 'Ivo Lark', url: 'https://www.deezer.com/artist/111', releases: ['Drift'] }, { provider: 'deezer', providerId: '222', name: 'Ivo Lark', url: 'https://www.deezer.com/artist/222' }] }));
-		const q = await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId });
-		expect(q.total).toBe(1);
+		const queue = () => fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId, objectIds: [ivo] });
+		const q = await queue();
+		expect(q.items).toHaveLength(1);
 		const [item] = q.items;
 		expect(item!.object.id).toBe(ivo);
 		expect(item!.titles.sort()).toEqual([...TITLES].sort());
 		// Spotify is held; the rest of an artist's stores are asked.
 		expect(item!.missing.map((m) => m.provider)).toEqual(['beatport', 'soundcloud', 'bandcamp', 'deezer', 'tidal']);
 		expect(item!.missing.find((m) => m.provider === 'deezer')!.candidates.map((c) => `${c.providerId}:${c.source}`)).toEqual(['111:cloud', '222:cloud']);
-		// "Not this one" takes a candidate out of this user's list; "none of
-		// these" takes the store out of their queue, until they open the artist.
+		// "Not this one" takes a candidate out of this user's list. "None of
+		// these" is kept as a vote and is the device's to remember: the store is
+		// still the object's to lack.
 		expect((await answer(fan, ivo, 'deezer', 'https://www.deezer.com/artist/222', 'not')).outcome).toBe('noted');
 		expect((await answer(fan, ivo, 'beatport', undefined, 'none')).outcome).toBe('noted');
-		const again = (await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId })).items[0]!;
-		expect(again.missing.map((m) => m.provider)).toEqual(['soundcloud', 'bandcamp', 'deezer', 'tidal']);
+		const again = (await queue()).items[0]!;
+		expect(again.missing.map((m) => m.provider)).toEqual(['beatport', 'soundcloud', 'bandcamp', 'deezer', 'tidal']);
 		expect(again.missing.find((m) => m.provider === 'deezer')!.candidates.map((c) => c.providerId)).toEqual(['111']);
-		const named = (await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId, objectIds: [ivo] })).items[0]!;
-		expect(named.missing.map((m) => m.provider)).toContain('beatport');
+		// Someone else's object, or none: not an item. In the order asked.
+		const other = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: artist('sp-ada', 'Ada Voss'), source: 'manual' });
+		const both = await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId, objectIds: [other.watch.object.id, '00000000-0000-4000-8000-000000000000', ivo] });
+		expect(both.items.map((i) => i.object.name)).toEqual(['Ada Voss', 'Ivo Lark']);
 	});
 
 	it('attaches a page whose own releases the cloud reads and finds shared, with an undo', async () => {
@@ -71,7 +75,7 @@ describe('connect the dots', () => {
 		expect(log).toMatchObject({ actor: 'user', undo: { op: 'unlinkPage', args: { kind: 'artist' } }, evidence: { shared: ['Glass Rivers', 'Northern Line'], trusted: false } });
 		// Asked again, it is already theirs; and Deezer is no longer missing.
 		expect((await answer(fan, ivo, 'deezer', 'https://www.deezer.com/artist/111')).outcome).toBe('already');
-		expect((await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId })).items[0]!.missing.map((m) => m.provider)).not.toContain('deezer');
+		expect((await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId, objectIds: [ivo] })).items[0]!.missing.map((m) => m.provider)).not.toContain('deezer');
 		// The operator's undo takes it off and rules it out.
 		await withSystemTx(app.db, (tx) => decideInbox(tx, log!.id, { action: 'reject', by: 'guy' }));
 		expect(await handles(app, ivo)).toEqual(['spotify:sp-ivo']);
@@ -126,6 +130,35 @@ describe('connect the dots', () => {
 		expect(q.items[0]).toMatchObject({ detail: 'Ivo Lark · 2026-03-01', missing: [{ provider: 'beatport' }, { provider: 'deezer' }, { provider: 'tidal' }] });
 		expect((await answer(fan, album!.object_id, 'deezer', 'https://www.deezer.com/album/5150')).outcome).toBe('attached');
 		expect(await handles(app, album!.object_id)).toEqual(['deezer:5150', 'spotify:sp-r0']);
+	});
+
+	it('takes what a trusted account’s desktop found by itself only on two shared releases; anyone else’s find waits', async () => {
+		const { app, fan, ivo } = await setup();
+		const found = (who: typeof fan, url: string, releases: string[]) =>
+			who.api.catalog.connectAnswer.mutate({ deviceId: who.deviceId, answers: [{ objectId: ivo, provider: 'beatport', verdict: 'is', url, source: 'auto', releases }] }).then((r) => r.results[0]!.outcome);
+		// Not trusted: what its device read is evidence, as ever.
+		expect(await found(fan, 'https://www.beatport.com/artist/ivo-lark/900', TITLES)).toBe('waiting');
+		await app.db.query(`insert into curator.admin_user (user_id) values ($1)`, [fan.userId]);
+		// Trusted, but nobody picked: one shared title (written twice) is a namesake's coincidence.
+		expect(await found(fan, 'https://www.beatport.com/artist/ivo-lark/901', ['Drift', 'DRIFT', 'Elsewhere'])).toBe('waiting');
+		expect(await handles(app, ivo)).toEqual(['spotify:sp-ivo']);
+		expect(await found(fan, 'https://www.beatport.com/artist/ivo-lark/902', ['Drift', 'Glass Rivers', 'Elsewhere'])).toBe('attached');
+		expect(await handles(app, ivo)).toEqual(['beatport:902', 'spotify:sp-ivo']);
+		const [log] = await inbox(app, 'connect.attach');
+		expect(log).toMatchObject({ undo: { op: 'unlinkPage' }, evidence: { source: 'auto', deviceShared: ['Drift', 'Glass Rivers'], trusted: true } });
+		expect(log!.title).toContain('found by a trusted account’s desktop'.replace('’', "'"));
+		// A device never rules a page out, trusted or not.
+		await fan.api.catalog.connectAnswer.mutate({ deviceId: fan.deviceId, answers: [{ objectId: ivo, provider: 'deezer', verdict: 'not', url: 'https://www.deezer.com/artist/222', source: 'auto' }] });
+		await app.db.query(`delete from curator.admin_user`);
+		expect((await answer(fan, ivo, 'deezer', 'https://www.deezer.com/artist/222')).outcome).toBe('waiting');
+	});
+
+	it('hands the device every title an answer is checked against when it asks to compare', async () => {
+		const { app, fan, ivo } = await setup();
+		await withSystemTx(app.db, (tx) => ingestClaims(tx, Array.from({ length: 20 }, (_, i) => release(`sp-more${i}`, `Sketch ${i}`, IVO)), { reason: 'tracker' }));
+		const titles = async (compare: boolean) => (await fan.api.catalog.connectQueue.mutate({ deviceId: fan.deviceId, objectIds: [ivo], compare })).items[0]!.titles.length;
+		expect(await titles(false)).toBe(12);
+		expect(await titles(true)).toBe(23);
 	});
 
 	it('searches SoundCloud for a device with the app’s credentials, and says when it has none', async () => {

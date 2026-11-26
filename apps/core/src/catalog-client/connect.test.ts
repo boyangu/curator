@@ -35,7 +35,7 @@ function setup(over: Partial<ConnectDeps> = {}) {
 	};
 	const connect = createCatalogConnect({
 		catalog: {
-			connectQueue: async (input) => { sent.queue.push(input); return { items: [], total: 0 }; },
+			connectQueue: async (input) => { sent.queue.push(input); return { items: [] }; },
 			connectSearch: async (input) => {
 				calls.push(`cloud:${input.provider}:${input.kind}:${input.name}`);
 				return { searched: true, candidates: [{ provider: 'soundcloud', providerId: '9001', name: 'Ivo Lark', url: 'https://soundcloud.com/ivo-lark', imageUrl: 'https://img.example/sc.jpg', followers: 12_400, detail: 'Leeds', source: 'search' }] };
@@ -90,7 +90,7 @@ describe('connect the dots: candidates', () => {
 	it('says why there is nothing to pick: no search, no connection, the store away', async () => {
 		const { connect } = setup();
 		// A cloud without SoundCloud's credentials cannot search it; an album has no profile search.
-		const bare = setup({ catalog: { connectQueue: async () => ({ items: [], total: 0 }), connectAnswer: async () => ({ results: [] }), connectSearch: async () => ({ candidates: [], searched: false }) } });
+		const bare = setup({ catalog: { connectQueue: async () => ({ items: [] }), connectAnswer: async () => ({ results: [] }), connectSearch: async () => ({ candidates: [], searched: false }) } });
 		expect(await bare.connect.search(IVO, 'soundcloud')).toMatchObject({ candidates: [], note: 'no_search', searchUrl: 'https://soundcloud.com/search/people?q=Ivo%20Lark' });
 		expect((await connect.search(IVO, 'spotify')).note).toBe('not_connected');
 		expect((await connect.search(IVO, 'tidal')).note).toBe('not_connected');
@@ -105,12 +105,12 @@ describe('connect the dots: the cloud', () => {
 	it('is off without the server’s feature, and sends the queue ask and the answers as they are', async () => {
 		const off = setup({ offered: () => false });
 		expect(off.connect.status()).toEqual({ available: false, reason: 'server_off' });
-		await expect(off.connect.queue()).rejects.toThrow(/does not offer/);
+		await expect(off.connect.queue({ objectIds: ['o1'] })).rejects.toThrow(/does not offer/);
 
 		const { connect, sent, attached } = setup();
 		await connect.queue({ objectIds: ['o1'] });
-		await connect.queue({ limit: 5 });
-		expect(sent.queue).toEqual([{ deviceId: 'dev-1', objectIds: ['o1'] }, { deviceId: 'dev-1', limit: 5 }]);
+		await connect.queue({ objectIds: ['o1', 'o2'], compare: true });
+		expect(sent.queue).toEqual([{ deviceId: 'dev-1', objectIds: ['o1'] }, { deviceId: 'dev-1', objectIds: ['o1', 'o2'], compare: true }]);
 		const r = await connect.answer([{ objectId: 'o1', provider: 'deezer', verdict: 'is', url: 'https://www.deezer.com/artist/111' }, { objectId: 'o1', provider: 'beatport', verdict: 'none' }]);
 		expect(r.results.map((x) => x.outcome)).toEqual(['attached', 'noted']);
 		// A page landed: whoever cached the artist's pages is told.

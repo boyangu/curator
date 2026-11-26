@@ -5,8 +5,10 @@
 //
 // The feature exists only signed in to a catalogue server that offers it;
 // `available` is what the surfaces show their entry by. `remaining` is the
-// queue's size, counted by the cloud over everything the user follows — asked
-// when Discover asks and after a sitting, not on a timer.
+// queue's size: the follows whose store pages this desktop's background
+// search could not settle (core catalog-client/connect-finder.ts), counted
+// there from what it already holds — asked when Discover asks and after a
+// sitting, never of the cloud.
 
 import { createSignal } from 'solid-js';
 import type { ConnectDotsHandle } from '../layouts/ConnectDotsDialog.jsx';
@@ -25,7 +27,7 @@ async function refresh(opts: { force?: boolean } = {}): Promise<void> {
 	try {
 		const on = (await connectApi.status()).available;
 		setAvailable(on);
-		setRemaining(on ? (await connectApi.queue({ limit: 1 })).total : null);
+		setRemaining(on ? (await connectApi.pending()).count : null);
 	} catch {
 		// Signed out mid-ask, or the server away: no entry until the next ask.
 		setAvailable(false);

@@ -137,10 +137,13 @@ export type PushInput = {
 //     a desktop may read the catalogue's providers for its user's follows
 //     and report the polls, the cloud applying them as its own
 //     (catalog-service.ts, workers section). With 'global_catalog' only.
-//   - 'catalog_connect': `catalog.connectQueue` / `catalog.connectAnswer`
-//     exist ("Help us connect the dots", catalog-service.ts): a user maps
-//     store pages onto the catalogue's artists, labels and albums. With
-//     'global_catalog' only; a desktop hides the feature without it.
+//   - 'catalog_connect_auto': `catalog.connectQueue` / `catalog.connectAnswer`
+//     exist ("Help us connect the dots", catalog-service.ts): store pages
+//     mapped onto the catalogue's artists, labels and albums. The queue is
+//     the device's own; the cloud answers for the objects it names and takes
+//     a device's background finds ('auto'). With 'global_catalog' only; a
+//     desktop hides the feature without it. (It replaced 'catalog_connect',
+//     whose queue the cloud counted over every follow at each ask.)
 //   - 'catalog_pages': `catalog.tracks` exists and `catalog.browse` answers
 //     the header facts (genres, the caller's watch): what a desktop's artist,
 //     label and album pages read their World side from. With
@@ -165,7 +168,7 @@ export type PushInput = {
 //     `server_outdated`); the settings still apply on the device that set them.
 //   - 'client_logs': `diagnostics.upload` takes a phone's own log records
 //     (diagnostics.ts).
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs'] as const;
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -597,7 +600,7 @@ export interface CloudService {
 		// 'catalog_workers'.
 		workerDue(input: CatalogWorkerDueInput): Promise<CatalogWorkerDueResult>;
 		workerReport(input: CatalogWorkerReportInput): Promise<CatalogWorkerReportResult>;
-		// 'catalog_connect'.
+		// 'catalog_connect_auto'.
 		connectQueue(input: CatalogConnectQueueInput): Promise<CatalogConnectQueueResult>;
 		connectAnswer(input: CatalogConnectAnswerInput): Promise<CatalogConnectAnswerResult>;
 		connectSearch(input: CatalogConnectSearchInput): Promise<CatalogConnectSearchResult>;

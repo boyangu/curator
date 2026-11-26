@@ -1,8 +1,10 @@
-// "Help us connect the dots" on the desktop ('catalog_connect'): the user says
-// which store page is an artist's, a label's or an album's, for the stores the
-// Global Catalog has not mapped. The cloud keeps the queue and decides what an
-// answer does (apps/cloud catalog/connect.ts); this module is the part only a
-// device can do — searching the stores for candidates:
+// "Help us connect the dots" on the desktop ('catalog_connect_auto'): which
+// store page is an artist's, a label's or an album's, for the stores the
+// Global Catalog has not mapped. The cloud decides what an answer does
+// (apps/cloud catalog/connect.ts); this module is the part only a device can
+// do — searching the stores for candidates — and connect-finder.ts runs it
+// for the user's follows without being asked, keeping the queue of what it
+// could not settle:
 //
 //   Beatport    its search pages, over the fetch the desktop gives Beatport
 //               (Electron's: the cloud's own is mostly behind the challenge)
@@ -29,7 +31,7 @@ import {
 	type CatalogConnectAnswer,
 	type CatalogConnectAnswerResult,
 	type CatalogConnectCandidate,
-	type CatalogConnectQueueResult,
+	type CatalogConnectItem,
 	type CatalogProvider,
 	type CloudService,
 	type PageKind,
@@ -53,9 +55,14 @@ export type ConnectSubject = { kind: PageKind; name: string; titles: string[]; d
 // desktop away ('blocked'), or the search failed ('failed').
 export type ConnectSearch = { provider: CatalogProvider; candidates: CatalogConnectCandidate[]; searchUrl: string | null; note: 'no_search' | 'not_connected' | 'blocked' | 'failed' | null };
 
+// What the modal walks: a page of objects, and how many there are in all.
+export type ConnectQueue = { items: CatalogConnectItem[]; total: number };
+
 export interface CatalogConnect {
 	status(): CatalogClientStatus;
-	queue(opts?: { limit?: number; objectIds?: string[] }): Promise<CatalogConnectQueueResult>;
+	// These objects, as the cloud holds them: the stores each lacks, its titles
+	// (`compare`: all an answer is checked against), the candidates left open.
+	queue(opts: { objectIds: string[]; compare?: boolean }): Promise<ConnectQueue>;
 	search(subject: ConnectSubject, provider: CatalogProvider): Promise<ConnectSearch>;
 	answer(answers: CatalogConnectAnswer[]): Promise<CatalogConnectAnswerResult>;
 }
@@ -77,7 +84,8 @@ export type ConnectDeps = {
 };
 
 // A store's namesake tag ("Elif (tr)") is not part of the name.
-const fold = (name: string): string => nameFold(name.replace(/\s*\([A-Za-z]{2,3}\)\s*$/, ''));
+export const connectFold = (name: string): string => nameFold(name.replace(/\s*\([A-Za-z]{2,3}\)\s*$/, ''));
+const fold = connectFold;
 
 // Where a person searches the store by hand.
 export function storeSearchUrl(provider: CatalogProvider, kind: PageKind, q: string): string | null {
@@ -238,9 +246,10 @@ export function createCatalogConnect(deps: ConnectDeps): CatalogConnect {
 	return {
 		status,
 
-		async queue(opts = {}) {
+		async queue(opts) {
 			ready();
-			return deps.catalog.connectQueue({ deviceId: deps.deviceId(), ...(opts.limit !== undefined ? { limit: opts.limit } : {}), ...(opts.objectIds?.length ? { objectIds: opts.objectIds } : {}) });
+			const { items } = await deps.catalog.connectQueue({ deviceId: deps.deviceId(), objectIds: opts.objectIds, ...(opts.compare ? { compare: true } : {}) });
+			return { items, total: items.length };
 		},
 
 		search(subject, provider) {

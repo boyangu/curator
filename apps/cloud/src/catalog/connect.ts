@@ -1,16 +1,22 @@
-// "Help us connect the dots" ('catalog_connect'): users map store pages onto
+// "Help us connect the dots" ('catalog_connect_auto'): store pages mapped onto
 // the catalogue's artists, labels and albums for the stores it has not mapped.
 //
-// connectQueue says what to ask: the caller's follows (or exactly the objects
-// a device names) that lack a store, with the candidates the catalogue's own
-// finders left undecided (open reviews). The device searches the store for the
-// rest and sends back the user's answers.
+// connectQueue answers for the objects a device names: the stores each lacks,
+// its release titles, and the candidates the catalogue's own finders left
+// undecided (open reviews). Which objects to ask about is the device's to
+// know — its user's follows and their pages are in the Following list it
+// holds — so nothing here walks a user's follows: counted here at every ask,
+// that was a read of every followed object's pages for a number on a button
+// (2026-11-25). The device searches the stores and sends back what it found
+// or its user picked.
 //
 // connectAnswer keeps every answer as that user's vote, then decides:
 //
-//   attached  the cloud can back it — a trusted account (admin_user), or the
-//             page's own releases, read here, overlapping the object's by the
-//             finder's rule (two titles). Logged with an undo.
+//   attached  the cloud can back it — the page's own releases, read here,
+//             overlapping the object's by the finder's rule (two titles); a
+//             trusted account's (admin_user) own pick; or a trusted account's
+//             device finding the page itself ('auto') and naming two of the
+//             object's releases on it. Logged with an undo.
 //   waiting   it cannot: an approval in the operator's inbox, one click.
 //             Further users saying the same add to the item; they never
 //             attach on their own.
@@ -18,13 +24,14 @@
 //             notice for the operator (often a twin to merge), nothing moved.
 //
 // What a device says the page lists rides along as evidence for the operator
-// and is never the reason to attach: the client is not trusted. Store pages
+// and is a reason to attach only from a trusted account: no other client is
+// taken at its word. Store pages
 // are read between two transactions, never inside one (PGlite has one
 // connection; a slow store must not hold it).
 
 import {
-	CATALOG_CONNECT_QUEUE_MAX,
 	CATALOG_CONNECT_STORES,
+	CATALOG_CONNECT_TITLES_COMPARED,
 	isConnectKind,
 	pageRef,
 	type CatalogConnectAnswer,
@@ -45,7 +52,7 @@ import { nameFold } from '@curator/library-logic';
 import type { Caller } from '../account/device-gate.js';
 import { withSystemTx, type SystemTx } from '../db/system-tx.js';
 import { num } from '../db/db.js';
-import { objectReleases, ruledNotSame, type ReviewCandidate } from './admin.js';
+import { ruledNotSame, type ReviewCandidate } from './admin.js';
 import { candidateReleases } from './admin-evidence.js';
 import { gated, type CatalogDeps } from './catalog.js';
 import { attachConnected, ruleOutPage, type ConnectPage } from './connect-apply.js';
@@ -57,12 +64,8 @@ import { resolveBandcampBand, resolveSoundcloudUser } from './profile/label-prof
 
 export type ConnectDeps = CatalogDeps & { fetch?: FetchLike };
 
-const QUEUE_DEFAULT = 20;
-// Titles shown with an object, and how many of its releases an answer is checked against.
+// Titles shown with an object.
 const TITLES_SHOWN = 12;
-const TITLES_COMPARED = 200;
-// "None of these" is asked again after this long: stores gain pages.
-const NONE_HIDES_DAYS = 90;
 // The finder's rule (planner.ts confirm): two shared titles make a page the object's.
 const BACKED_MIN_SHARED = 2;
 const READ_TIMEOUT_MS = 8_000;
@@ -73,37 +76,28 @@ const uuids = (ids: string[]): string => `{${[...new Set(ids)].join(',')}}`;
 
 export function connectQueue(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogConnectQueueInput): Promise<CatalogConnectQueueResult> {
 	return gated(deps, userId, caller, input.deviceId, async (tx) => {
-		const explicit = input.objectIds !== undefined;
-		const asked = explicit
-			? await Promise.all(input.objectIds!.map((id) => follow(tx, id)))
-			: (await tx.asUser(userId, (q) => q.query<{ object_id: string }>(`select object_id from curator.catalog_watch where not muted`))).map((r) => r.object_id);
-		if (!asked.length) return { items: [], total: 0 };
+		const asked = [...new Set(await Promise.all(input.objectIds.map((id) => follow(tx, id))))];
 		const list = uuids(asked);
-		// Albums are asked about only when a device names one: there is no
-		// queue of every release a followed label ever put out.
-		const objects = await tx.query<{ id: string; kind: PageKind; name: string }>(
-			`select id, kind, name from curator.catalog_object
-			where id = any($1::uuid[]) and merged_into is null and kind = any($2::text[])
-			order by watch_count desc, name`,
-			[list, explicit ? '{artist,label,release}' : '{artist,label}'],
+		const found = new Map(
+			(await tx.query<{ id: string; kind: PageKind; name: string }>(`select id, kind, name from curator.catalog_object where id = any($1::uuid[]) and merged_into is null and kind = any('{artist,label,release}')`, [list])).map((o) => [o.id, o]),
 		);
 		const held = new Set(
 			(await tx.query<{ k: string }>(`select distinct s.object_id || '|' || s.provider as k from curator.catalog_source_object s where s.object_id = any($1::uuid[]) and not ${WEAK_SQL}`, [list])).map((r) => r.k),
 		);
-		const votes = await tx.query<{ object_id: string; provider: string; provider_id: string; verdict: string; fresh: boolean }>(
-			`select object_id, provider, provider_id, verdict, at > now() - make_interval(days => ${NONE_HIDES_DAYS}) as fresh
-			from curator.catalog_connect_vote where user_id = $1 and object_id = any($2::uuid[])`,
+		const votes = await tx.query<{ object_id: string; provider: string; provider_id: string; verdict: string }>(
+			`select object_id, provider, provider_id, verdict from curator.catalog_connect_vote where user_id = $1 and object_id = any($2::uuid[])`,
 			[userId, list],
 		);
-		// Answered: the user named a page (attached since, or with the operator),
-		// or said lately that none fits. Naming an object asks again past a "none".
-		const answered = new Set(votes.filter((v) => v.verdict === 'is' || (v.verdict === 'none' && v.fresh && !explicit)).map((v) => `${v.object_id}|${v.provider}`));
+		// Answered: the user named a page (attached since, or with the operator).
+		// A "none of these" is the device's to remember; naming the object asks again.
+		const answered = new Set(votes.filter((v) => v.verdict === 'is').map((v) => `${v.object_id}|${v.provider}`));
 		const refused = new Set(votes.filter((v) => v.verdict === 'not').map((v) => `${v.object_id}|${v.provider}|${v.provider_id}`));
-		const queue = objects
+		// In the order asked.
+		const page = asked
+			.flatMap((id) => (found.has(id) ? [found.get(id)!] : []))
 			.map((o) => ({ ...o, missing: CATALOG_CONNECT_STORES[o.kind].filter((p) => !held.has(`${o.id}|${p}`) && !answered.has(`${o.id}|${p}`)) as CatalogProvider[] }))
 			.filter((o) => o.missing.length);
-		const page = queue.slice(0, Math.min(input.limit ?? QUEUE_DEFAULT, CATALOG_CONNECT_QUEUE_MAX));
-		if (!page.length) return { items: [], total: queue.length };
+		if (!page.length) return { items: [] };
 
 		const ids = page.map((o) => o.id);
 		const [objectSummaries, releaseViews, reviews] = await Promise.all([
@@ -132,13 +126,27 @@ export function connectQueue(deps: CatalogDeps, userId: string, caller: Caller, 
 			const view = releaseViews.get(o.id);
 			items.push({
 				object,
-				titles: o.kind === 'release' ? await trackTitles(tx, o.id) : (await objectReleases(tx, o.id, TITLES_SHOWN)).map((r) => r.title),
+				titles: o.kind === 'release' ? await trackTitles(tx, o.id) : await releaseTitles(tx, o.id, input.compare ? CATALOG_CONNECT_TITLES_COMPARED : TITLES_SHOWN),
 				detail: view ? [view.artists?.join(', '), view.date].filter(Boolean).join(' · ') || null : null,
 				missing: o.missing.map((provider) => ({ provider, candidates: offered.get(`${o.id}|${provider}`) ?? [] })),
 			});
 		}
-		return { items, total: queue.length };
+		return { items };
 	});
+}
+
+// An artist's or a label's release titles, newest first: only the names, from
+// the object's own links (admin.ts objectReleases has the rest, for a person).
+async function releaseTitles(tx: SystemTx, objectId: string, limit: number): Promise<string[]> {
+	const rows = await tx.query<{ name: string }>(
+		`select r.name from curator.catalog_object r
+		where r.kind = 'release' and r.merged_into is null and r.id in (
+			select e.dst from curator.catalog_edge e where e.kind = 'artist-release' and e.src = $1
+			union select e.src from curator.catalog_edge e where e.kind = 'release-label' and e.dst = $1)
+		order by r.release_at desc nulls last, r.name limit $2::int`,
+		[objectId, String(limit)],
+	);
+	return rows.map((r) => r.name);
 }
 
 async function trackTitles(tx: SystemTx, releaseId: string): Promise<string[]> {
@@ -220,9 +228,26 @@ async function prepare(tx: SystemTx, answer: CatalogConnectAnswer): Promise<Prep
 	const ref = answer.url ? pageRef(answer.url) : null;
 	if (!ref || ref.provider !== answer.provider) return { ...p, invalid: 'not_a_page_of_that_store' };
 	if (!ref.kinds.includes(target.kind)) return { ...p, invalid: `that_is_a_${ref.kinds[0]}_page` };
-	const known = target.kind === 'release' || answer.verdict !== 'is' ? new Set<string>() : new Set((await objectReleases(tx, target.id, TITLES_COMPARED)).map((r) => nameFold(r.title)));
+	const known = target.kind === 'release' || answer.verdict !== 'is' ? new Set<string>() : new Set((await releaseTitles(tx, target.id, CATALOG_CONNECT_TITLES_COMPARED)).map((t) => nameFold(t)));
 	return { ...p, target, page: { provider: ref.provider, id: ref.id, url: ref.url }, known };
 }
+
+// The object's releases among the titles the device says the page lists, one
+// per title however it is written.
+function deviceShared(p: Prepared): string[] {
+	const seen = new Set<string>();
+	return (p.answer.releases ?? []).filter((t) => {
+		const f = nameFold(t);
+		if (!f || seen.has(f) || !p.known.has(f)) return false;
+		seen.add(f);
+		return true;
+	});
+}
+
+// Whether the account's word backs the answer: a trusted account's own pick,
+// or what its device found by itself when that names two of the object's
+// releases — a search nobody looked at is held to the finder's rule.
+const vouched = (p: Prepared, trusted: boolean): boolean => trusted && (p.answer.source !== 'auto' || deviceShared(p).length >= BACKED_MIN_SHARED);
 
 // The store's own word, read outside any transaction. A failed read leaves
 // the answer unbacked (it waits for the operator); it never fails the call.
@@ -236,7 +261,7 @@ async function readStore(fetchFn: FetchLike, p: Prepared, trusted: boolean): Pro
 			: null;
 	}
 	// A trusted account's word stands; an album has no release list to compare.
-	if (trusted || p.target!.kind === 'release' || !p.known.size) return;
+	if (vouched(p, trusted) || p.target!.kind === 'release' || !p.known.size) return;
 	p.pageTitles = await pageReleases(fetchFn, p.target!.kind, page.provider, p.resolvedId ?? page.id).catch(() => null);
 }
 
@@ -267,14 +292,15 @@ async function apply(tx: SystemTx, userId: string, deviceId: string, trusted: bo
 	const page: ConnectPage = { provider: a.provider, providerId, name: a.name?.trim() || target.name, url: p.page!.url };
 	if (a.verdict === 'not') {
 		// A trusted account's "not this one" is a ruling; anyone else's keeps
-		// the page from being offered to them again.
-		if (trusted) await ruleOutPage(tx, { objectId: target.id, kind: target.kind, page }, `user:${userId}`, 'connect the dots');
+		// the page from being offered to them again. A device rules nothing out.
+		if (trusted && a.source !== 'auto') await ruleOutPage(tx, { objectId: target.id, kind: target.kind, page }, `user:${userId}`, 'connect the dots');
 		await vote(providerId, 'noted');
 		return { outcome: 'noted' };
 	}
 
 	const shared = (p.pageTitles ?? []).filter((t) => p.known.has(nameFold(t)));
-	const evidence = { url: page.url, pageName: a.name ?? null, source: a.source ?? null, deviceRead: (a.releases ?? []).slice(0, 15), cloudRead: p.pageTitles?.slice(0, 25) ?? null, shared, trusted, userId };
+	const found = deviceShared(p);
+	const evidence = { url: page.url, pageName: a.name ?? null, source: a.source ?? null, deviceRead: (a.releases ?? []).slice(0, 15), deviceShared: found, cloudRead: p.pageTitles?.slice(0, 25) ?? null, shared, trusted, userId };
 	const holds = async (id: string) => findRepresentation(tx, { provider: a.provider, kind: target.kind, providerId: id });
 	const owner = (await holds(providerId)) ?? (providerId !== p.page!.id ? await holds(p.page!.id) : null);
 	if (owner === target.id) {
@@ -302,14 +328,15 @@ async function apply(tx: SystemTx, userId: string, deviceId: string, trusted: bo
 	// are two people (the ELIF and Greene buckets, 2026-11-09): the operator's.
 	const sibling = (await tx.query(`select 1 from curator.catalog_source_object s where s.object_id = $1 and s.provider = $2 and s.kind = $3 and not ${WEAK_SQL} limit 1`, [target.id, a.provider, target.kind])).length > 0;
 	const args = { objectId: target.id, kind: target.kind, page };
-	if (!sibling && (trusted || shared.length >= BACKED_MIN_SHARED)) {
+	const word = vouched(p, trusted);
+	if (!sibling && (word || shared.length >= BACKED_MIN_SHARED)) {
 		await attachConnected(tx, args);
 		await vote(providerId, 'attached', evidence);
 		const facts = await objectFacts(tx, [target.id]);
 		await raise(tx, {
 			kind: 'connect.attach',
 			severity: reversiblePolicy(facts.get(target.id)),
-			title: `Connected ${title} to «${target.name}» (${trusted ? 'a trusted account' : `${shared.length} shared releases`})`,
+			title: `Connected ${title} to «${target.name}» (${!word ? `${shared.length} shared releases` : a.source === 'auto' ? `found by a trusted account's desktop: ${found.length} shared releases` : 'a trusted account'})`,
 			subjects: [target.id],
 			evidence,
 			undo: target.kind === 'release' ? null : { op: 'unlinkPage', args: { objectId: target.id, kind: target.kind, page: { provider: a.provider, id: providerId, url: page.url }, note: 'undone: connect the dots' } },
