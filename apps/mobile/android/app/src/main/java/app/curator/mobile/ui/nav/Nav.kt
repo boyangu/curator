@@ -22,6 +22,12 @@ sealed interface ListSource {
 	data class Tag(val id: String) : ListSource { override val key get() = "tag:$id" }
 	/** The artist's tracks in the library (the way to an artist until the phone has artist pages). */
 	data class Artist(val id: String) : ListSource { override val key get() = "artist:$id" }
+	/** The library's tracks on a label (the way to a label until the phone has label pages). */
+	data class Label(val name: String) : ListSource { override val key get() = "label:${name.lowercase()}" }
+	/** A set's tracks as played: one of the track's sets, from the player. */
+	data class Set(val id: String) : ListSource { override val key get() = "set:$id" }
+	/** Find similar, seeded with a track ([title] and [camelot], its key: its own, read when it was opened). */
+	data class Similar(val trackId: String, val title: String, val camelot: String?) : ListSource { override val key get() = "similar" }
 	/** Every track in the library, or those from one source ([filter]: a service id, or [OWNED]). One sort and filter set for all of them. */
 	data class Library(val filter: String?) : ListSource { override val key get() = "library" }
 
@@ -36,11 +42,18 @@ sealed interface Screen {
 	val isPage: Boolean get() = false
 	/** Whether the screen may turn sideways (Track and its actions only). */
 	val rotates: Boolean get() = false
+	/** The player: a sheet that rises from the bottom over the screen below, and is pulled down to close. */
+	val isSheet: Boolean get() = false
 
 	data class TabRoot(val tab: Tab) : Screen
 	data class TrackList(val source: ListSource) : Screen
 	/** [search]: what the list it was opened from was searched for (Next goes on through the same results). */
-	data class Track(val trackId: String, val from: ListSource?, val index: Int, val count: Int, val search: String = "") : Screen { override val rotates get() = true }
+	data class Track(val trackId: String, val from: ListSource?, val index: Int, val count: Int, val search: String = "") : Screen {
+		override val rotates get() = true
+		override val isSheet get() = true
+	}
+	/** The playlists holding a track, or the sets it was played in. */
+	data class TrackUses(val trackId: String, val sets: Boolean) : Screen { override val isPage get() = true }
 	data class ListActions(val source: ListSource) : Screen { override val isPage get() = true }
 	/** [sample]: the list it was opened from; its tracks fill the preview. */
 	data class RowFields(val sample: ListSource?) : Screen { override val isPage get() = true }

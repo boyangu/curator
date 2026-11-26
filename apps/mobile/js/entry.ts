@@ -39,6 +39,7 @@ import { createFetchCloudTransport } from '@curator/sync-core/sync-log/fetch-tra
 import { joinFromReplica } from '@curator/sync-core/sync-log/replica';
 import { createStorageDownload, StorageGoneError } from '@curator/sync-core/sync-log/supabase-storage';
 import { host } from './shim/host.js';
+import { trackPictures } from './track-pictures.js';
 import type Database from 'better-sqlite3';
 
 type BootConfig = {
@@ -375,6 +376,16 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 		return r;
 	},
 	feedArtists: (a) => lib().feed.artistPictures(a['refs'] as FeedArtistRef[]),
+
+	// ── the player ──
+	// A track's artist and label pictures from the Global Catalog; null when
+	// the catalogue can't be asked now (signed out, or a server without it).
+	trackPictures: async (a) => {
+		const { raw, client, transport } = lib();
+		const features = client.serverFeatures();
+		if (transport.session() === null || !features?.includes('global_catalog')) return null;
+		return trackPictures(raw, transport.catalog!, { deviceId: client.deviceId(), brief: features.includes('catalog_pages') }, a['trackId'] as string);
+	},
 };
 
 // A refused sign-in is its code (Kotlin words it); anything else says where.

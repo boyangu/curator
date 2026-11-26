@@ -39,8 +39,7 @@ import { similarLevelsFor, type SimilarityDim } from './features/similarity.js';
 import { setTrackDragPayload } from './dnd.js';
 import { isRemoteRow, remoteMarkSource, remoteRowTitle } from './remoteRows.js';
 import { isCatalogRow } from './catalogRows.js';
-import { fmtReleaseLabel } from './ui/format.js';
-import { PRODUCTION_QUALITY_ENABLED, productionFlags, worstProductionSeverity } from '@curator/library-logic';
+import { fmtReleaseLabel, PRODUCTION_QUALITY_ENABLED, productionFlags, worstProductionSeverity } from '@curator/library-logic';
 import {
 	buildDisplayList, groupHeadInnerHeight, groupIdentity, rowHeight, GROUP_GAP_H, TRACK_ROW_H,
 	type DisplayList, type DisplayRow, type GroupBy, type GroupInfo, type RowLines,

@@ -8,6 +8,7 @@ class LibraryFiles(private val dir: File) {
 	val feedDb = File(dir, "feed.db")
 	val feedWatches = File(dir, "feed-watches.json")
 	val feedArtists = File(dir, "feed-artists.json")
+	val trackPictures = File(dir, "track-pictures.json")
 	val peaks = File(dir, "peaks")
 	val lists = File(dir, "lists.json")
 
@@ -24,7 +25,7 @@ class LibraryFiles(private val dir: File) {
 		installed.delete()
 		// The databases with what SQLite, the replica's install and migrate's
 		// backups keep beside them; the JSON files with their unfinished copies.
-		val own = listOf(db, feedDb, feedWatches, feedArtists, lists).map { it.name }
+		val own = listOf(db, feedDb, feedWatches, feedArtists, trackPictures, lists).map { it.name }
 		dir.listFiles()?.forEach { f -> if (f.isFile && own.any { f.name == it || f.name.startsWith("$it.") || f.name.startsWith("$it-") }) f.delete() }
 		peaks.deleteRecursively()
 	}

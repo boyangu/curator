@@ -2,7 +2,7 @@
 // older or partial dates as "Mon, YYYY" / "YYYY". Pure.
 
 import { describe, expect, it } from 'vitest';
-import { fmtReleaseLabel } from './format.js';
+import { fmtReleaseLabel } from './release-label.js';
 
 const NOW = new Date(2026, 9, 16, 15, 30); // Oct 16 2026, local
 

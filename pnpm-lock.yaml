@@ -304,6 +304,9 @@ importers:
 
   apps/mobile:
     dependencies:
+      '@curator/library-logic':
+        specifier: workspace:*
+        version: link:../../packages/library-logic
       '@curator/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

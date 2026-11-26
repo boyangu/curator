@@ -5,11 +5,22 @@ import app.curator.mobile.model.ListView
 import app.curator.mobile.model.Sort
 import app.curator.mobile.model.searchWords
 
-/** Which tracks a list holds before its view (§5): a playlist's, a tag's, an artist's, or the library's. */
+/** Which tracks a list holds before its view (§5): a playlist's, a tag's, an artist's, a label's, a set's, those like a track, or the library's. */
 sealed interface ListScope {
 	data class Playlist(val id: String) : ListScope
 	data class Tag(val id: String) : ListScope
 	data class Artist(val id: String) : ListScope
+	/** The tracks on a label, by its name as the tracks spell it (the phone has no label rows). */
+	data class Label(val name: String) : ListScope
+	/** A set's tracks, as played. */
+	data class Set(val sessionId: String) : ListScope
+	/**
+	 * Find similar: the tracks near [trackId] as the desktop's similarity
+	 * lights them (features/similarity.ts, its defaults): BPM within 3, a
+	 * related key ([keys]: model relatedKeys), power and brightness within
+	 * 0.5, each where the track has one. Its own order is nearest BPM first.
+	 */
+	data class Similar(val trackId: String, val keys: List<String>) : ListScope
 	/** [remoteSource]: where the recordings live ('local': the Owned files); null: all of them. */
 	data class Library(val remoteSource: String?) : ListScope
 }
@@ -89,7 +100,7 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 	}
 
 	// Whether the order starts with the added date (what track_added_order_idx holds).
-	private val addedFirst = view.sort == Sort.ADDED || (view.sort == Sort.CUSTOM && (scope is ListScope.Library || scope is ListScope.Artist))
+	private val addedFirst = view.sort == Sort.ADDED || (view.sort == Sort.CUSTOM && (scope is ListScope.Library || scope is ListScope.Artist || scope is ListScope.Label))
 
 	/** The scope's size and length, before the view: the list's header ("312 tracks · 21 h"), the "of" in "40 of 312". */
 	fun totals(): Sql {
@@ -116,6 +127,24 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 		is ListScope.Playlist -> { args += scope.id; "playlist_track pt JOIN track t ON t.id = pt.track_id" to "pt.playlist_id = ?" }
 		is ListScope.Tag -> { args += scope.id; "track_tag tt JOIN track t ON t.id = tt.track_id" to "tt.tag_id = ?" }
 		is ListScope.Artist -> { args += scope.id; "track t" to "t.id IN (SELECT track_id FROM track_artist WHERE artist_id = ?)" }
+		is ListScope.Label -> { args += scope.name; "track t" to "${eff("label", "label")} = ? COLLATE NOCASE" }
+		is ListScope.Set -> { args += scope.sessionId; "play_event pe JOIN track t ON t.id = pe.track_id" to "pe.session_id = ?" }
+		is ListScope.Similar -> {
+			// The reference track's values, joined once (its argument comes first: FROM precedes WHERE).
+			args += scope.trackId
+			val bpm = eff("bpm", "bpm")
+			val near = mutableListOf(
+				"t.id != r.id",
+				"(r.bpm IS NULL OR abs($bpm - r.bpm) <= 3)",
+				"(r.power IS NULL OR abs(t.power - r.power) <= 0.5)",
+				"(r.brightness IS NULL OR abs(t.brightness - r.brightness) <= 0.5)",
+			)
+			if (scope.keys.isNotEmpty()) {
+				near += "upper(trim(${eff("key_camelot", "keyCamelot")})) IN (${scope.keys.joinToString(",") { "?" }})"
+				args.addAll(scope.keys)
+			}
+			"track t, (SELECT t.id AS id, $bpm AS bpm, t.power AS power, t.brightness AS brightness FROM track t WHERE t.id = ?) r" to near.joinToString(" AND ")
+		}
 		is ListScope.Library -> scope.remoteSource?.let { args += it; "track t" to "t.remote_source = ?" } ?: ("track t" to "1")
 	}
 
@@ -146,6 +175,8 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 			Sort.CUSTOM -> when (scope) {
 				is ListScope.Playlist -> Triple("pt.order_key", false, null)
 				is ListScope.Tag -> Triple("tt.added_at", true, null)
+				is ListScope.Set -> Triple("pe.played_at", false, null)
+				is ListScope.Similar -> Triple("abs(${eff("bpm", "bpm")} - r.bpm)", false, null)
 				else -> Triple(ADDED, true, null)
 			}
 			Sort.ENERGY -> Triple("t.power", false, "t.power IS NULL")

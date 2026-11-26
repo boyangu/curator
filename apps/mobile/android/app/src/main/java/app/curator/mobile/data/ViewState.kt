@@ -18,8 +18,8 @@ private val Context.viewStore by preferencesDataStore("view-state")
 
 /**
  * This device's view state: which lists were opened lately (Home's Recent),
- * each list's sort and filters, Library's pickers, whether the Track view has been turned
- * sideways yet, the streaming service the library's files play from. Per
+ * each list's sort and filters, Library's pickers, the streaming service
+ * the library's files play from. Per
  * device by design (§3, §5): nothing here rides an op. The streaming service
  * too, as the desktop keeps its primary one (app_setting primary_streaming,
  * not an account setting): what a device can play through is its own.
@@ -29,7 +29,6 @@ private val Context.viewStore by preferencesDataStore("view-state")
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
 	private val recentKey = stringPreferencesKey("recent")
-	private val rotatedKey = booleanPreferencesKey("rotated-once")
 	private val skinKey = stringPreferencesKey("waveform-skin")
 	private val gridBeatsKey = booleanPreferencesKey("grid-beats")
 	private val gridBarsKey = booleanPreferencesKey("grid-bars")
@@ -59,12 +58,6 @@ class ViewState(private val context: Context) {
 
 	suspend fun setListView(list: String, v: ListView) {
 		context.viewStore.edit { it[listKey(list)] = json.encodeToString(v) }
-	}
-
-	val rotatedOnce: Flow<Boolean> = context.viewStore.data.map { it[rotatedKey] ?: false }
-
-	suspend fun rotated() {
-		context.viewStore.edit { it[rotatedKey] = true }
 	}
 
 	/** A remembered choice of a picker (Library's Tracks/Playlists and source): "" when none was made yet. */

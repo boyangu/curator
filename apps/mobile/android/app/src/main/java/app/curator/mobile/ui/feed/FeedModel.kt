@@ -238,9 +238,30 @@ class FeedModel(private val model: AppModel) {
 		}
 	}
 
-	/** The Organize view, when there is one: the track a long-pressed heart just marked. */
-	@Suppress("UNUSED_PARAMETER")
-	private fun onOrganize(trackId: String) = Unit
+	/** Organize, for the track a long-pressed heart just marked. */
+	private fun onOrganize(trackId: String) = model.organizeTrack(trackId)
+
+	// The card the player's track was played from: the mini bar's heart acts on it.
+	private var playedFrom by mutableStateOf<Pair<FeedItem, FeedTrack>?>(null)
+
+	/** Whether the library holds the feed track the player has (the bar's heart is filled). */
+	fun playingHeld(): Boolean = playedFrom?.let { (_, t) -> holdings.of(t)?.takeUnless { it.deleted } != null } == true
+
+	/** The bar's heart on a feed track: Interested, which brings it into the library. */
+	fun heartPlaying() {
+		val (item, t) = playedFrom ?: return
+		heart(item, t, holdings.of(t), on = true)
+	}
+
+	/**
+	 * Organize on the feed track the player has: the library's track when it
+	 * holds it, else marked Interested first (Organize acts on library tracks).
+	 */
+	fun organizePlaying() {
+		val (item, t) = playedFrom ?: return
+		val held = holdings.of(t)?.takeUnless { it.deleted }
+		if (held != null) onOrganize(held.trackId) else heart(item, t, holdings.of(t), on = true, organize = true)
+	}
 
 	fun dismiss(item: FeedItem) = act("feedArchive", "itemId" to JsonPrimitive(item.id))
 
@@ -296,6 +317,7 @@ class FeedModel(private val model: AppModel) {
 		val player = model.player
 		val now = player.state.value
 		lastPlayed = id
+		playedFrom = item to t
 		if (now.track?.trackId == id && now.playing) { player.pause(); return }
 		player.load(
 			PlayerTrack(

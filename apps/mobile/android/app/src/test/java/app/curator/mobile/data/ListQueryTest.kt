@@ -132,4 +132,36 @@ class ListQueryTest {
 		}
 		assertEquals(setOf("p2", "p3", "build", "warm"), names.toSet())
 	}
+
+	@Test fun `a label's tracks, by the name as the tracks spell it, overrides first`() {
+		exec("ALTER TABLE track ADD COLUMN label TEXT")
+		exec("UPDATE track SET label = 'Anjunadeep' WHERE id IN ('a', 'gone')")
+		exec("UPDATE track SET label = 'anjunadeep' WHERE id = 'b'")
+		exec("""UPDATE track SET label = 'Other', overrides = '{"label":"Anjunadeep"}' WHERE id = 'c'""")
+		assertEquals(listOf("a", "c", "b"), ids(ListView(), ListScope.Label("Anjunadeep")))
+	}
+
+	@Test fun `a set's tracks as played`() {
+		exec("CREATE TABLE play_event (session_id TEXT, track_id TEXT, played_at INTEGER)")
+		exec("INSERT INTO play_event VALUES ('s', 'c', 1), ('s', 'a', 2), ('s', 'gone', 3), ('x', 'b', 0)")
+		assertEquals(listOf("c", "a"), ids(ListView(), ListScope.Set("s")))
+	}
+
+	@Test fun `similar is near BPM, a related key, near power and brightness, nearest BPM first`() {
+		exec("ALTER TABLE track ADD COLUMN brightness REAL")
+		exec("UPDATE track SET bpm = 124, power = 0.5 WHERE id = 'c'")
+		exec("UPDATE track SET bpm = 121, power = 0.4, key_camelot = '1B' WHERE id = 'a'")
+		exec("INSERT INTO track (id, title, bpm, key_camelot, power, created_at, remote_source) VALUES ('far', 'Far', 122, '2B', 0.9, 0, 'spotify')")
+		exec("INSERT INTO track (id, title, bpm, key_camelot, power, created_at, remote_source) VALUES ('clash', 'Clash', 122, '6A', 0.2, 0, 'spotify')")
+		// b: 122 BPM, 2B, power 0.2 (no brightness: not compared).
+		val similar = ListScope.Similar("b", app.curator.mobile.model.relatedKeys("2B"))
+		assertEquals(listOf("a", "c"), ids(ListView(), similar))
+		// A brightness on the seed rules out the tracks without one near it.
+		exec("UPDATE track SET brightness = 2.0 WHERE id = 'b'")
+		exec("UPDATE track SET brightness = 2.4 WHERE id = 'c'")
+		assertEquals(listOf("c"), ids(ListView(), similar))
+		// A key that isn't Camelot: no key condition.
+		exec("UPDATE track SET brightness = 2.1 WHERE id = 'clash'")
+		assertEquals(listOf("clash", "c"), ids(ListView(), ListScope.Similar("b", emptyList())))
+	}
 }

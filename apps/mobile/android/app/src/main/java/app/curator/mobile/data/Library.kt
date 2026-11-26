@@ -247,6 +247,21 @@ class Library(private val db: NativeDb) {
 		return StreamingCoverage(owned, by)
 	}
 
+	/** The playlists holding a track, as Home lists them ([TrackUses.playlists]). */
+	fun playlistsOf(trackId: String): List<PlaylistSummary> = TrackUses.playlists(trackId).let { q -> db.query(q.text, *q.args) }.map {
+		PlaylistSummary(it.string("id")!!, it.string("name") ?: "Untitled", it.string("source"), it.string("cover_url"), it.string("parent_folder_id"), 0)
+	}
+
+	/** The sets a track was played in, newest first ([TrackUses.sets]). */
+	fun setsOf(trackId: String): List<SetSummary> = TrackUses.sets(trackId).let { q -> db.query(q.text, *q.args) }.map {
+		SetSummary(it.string("id")!!, it.string("name"), it.long("started_at") ?: 0, it.int("n") ?: 0)
+	}
+
+	/** A set's name, else when it was played (a list's header). */
+	fun setName(id: String): String? = db.query("SELECT name, started_at FROM play_session WHERE id = ?", id).firstOrNull()?.let {
+		it.string("name")?.takeIf { n -> n.isNotBlank() } ?: setDate(it.long("started_at") ?: 0)
+	}
+
 	fun playlistsHolding(trackId: String): Int =
 		db.query("SELECT count(DISTINCT playlist_id) AS n FROM playlist_track WHERE track_id = ?", trackId)[0].int("n") ?: 0
 
@@ -393,3 +408,7 @@ data class Cue(val slot: Int, val positionSec: Double, val color: String?) {
 }
 data class Phrase(val startSec: Double, val endSec: Double, val label: String)
 data class TrackAnalysis(val cues: List<Cue>, val beats: FloatArray, val downbeats: FloatArray, val phrases: List<Phrase>)
+
+/** A set without a name, by its day: "Sat 14 Nov 2026". */
+fun setDate(ms: Long): String =
+	java.time.format.DateTimeFormatter.ofPattern("EEE d MMM yyyy", java.util.Locale.US).format(java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()))

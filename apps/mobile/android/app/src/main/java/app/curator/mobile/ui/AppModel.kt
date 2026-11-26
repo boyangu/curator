@@ -1,25 +1,31 @@
 package app.curator.mobile.ui
 
 import android.os.Build
-import app.curator.mobile.diag.DiagLog
-import app.curator.mobile.diag.Uploader
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import app.curator.mobile.CuratorApp
 import app.curator.mobile.data.Library
 import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Lists
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.ViewState
+import app.curator.mobile.diag.DiagLog
+import app.curator.mobile.diag.Uploader
 import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.HomePin
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.TracklistRows
 import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.player.AppPlayer
-import app.curator.mobile.update.Updater
 import app.curator.mobile.ui.feed.FeedModel
 import app.curator.mobile.ui.list.Metrics
 import app.curator.mobile.ui.list.TrackPager
 import app.curator.mobile.ui.list.playFrom
+import app.curator.mobile.ui.nav.Screen
+import app.curator.mobile.ui.track.Pictures
+import app.curator.mobile.update.Updater
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -30,11 +36,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
-import java.io.File
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+
+/** Organize's track: the line at its top. */
+data class Organize(val title: String, val artist: String, val coverUrl: String?, val seed: String)
 
 /**
  * What every screen shares: the library (once open), a change counter the
@@ -129,6 +137,27 @@ class AppModel(val app: CuratorApp) {
 	val lists: StateFlow<Lists?> = _lists
 	private val listsFile = app.files.lists
 	private val json = Json { ignoreUnknownKeys = true }
+
+	/** The player's artist and label pictures (Global Catalog), kept on the device. */
+	val pictures: Pictures by lazy { Pictures(this) }
+
+	/**
+	 * The player view of what is loaded, as it was last open (the list it
+	 * came from, the row): the mini bar raises that one, so Next and the
+	 * header still know their list.
+	 */
+	var playerScreen: Screen.Track? = null
+
+	/** What Organize is open on (the mini bar's long-pressed heart), else null. */
+	var organize by mutableStateOf<Organize?>(null)
+
+	/** Opens Organize on a library track. */
+	fun organizeTrack(trackId: String) {
+		app.scope.launch(Dispatchers.Main) {
+			val t = withContext(Dispatchers.IO) { library.value?.track(trackId) } ?: return@launch
+			organize = Organize(t.title, t.artist, t.coverUrl, t.id)
+		}
+	}
 
 	/** The Feed tab's list: lives with the process, so a visit elsewhere keeps its place. */
 	val feed: FeedModel by lazy { FeedModel(this) }

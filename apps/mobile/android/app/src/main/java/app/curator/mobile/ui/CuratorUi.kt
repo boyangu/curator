@@ -33,7 +33,7 @@ import app.curator.mobile.data.Track
 import app.curator.mobile.model.accountNotice
 import app.curator.mobile.model.joinNotice
 import app.curator.mobile.ui.chrome.BottomChrome
-import app.curator.mobile.ui.chrome.MiniPlayer
+import app.curator.mobile.ui.chrome.MiniBar
 import app.curator.mobile.ui.feed.FeedModel
 import app.curator.mobile.ui.feed.FeedScreen
 import app.curator.mobile.ui.home.HomeScreen
@@ -53,8 +53,10 @@ import app.curator.mobile.ui.signin.AccountBanner
 import app.curator.mobile.ui.signin.SignInScreen
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
+import app.curator.mobile.ui.track.OrganizeSheet
 import app.curator.mobile.ui.track.TrackActionsPage
 import app.curator.mobile.ui.track.TrackScreen
+import app.curator.mobile.ui.track.TrackUsesPage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -88,37 +90,41 @@ fun CuratorUi(model: AppModel) {
 	}
 
 	val bottom: @Composable () -> Unit = { Bottom(model, nav) }
-	StackHost(nav) { screen ->
-		when (screen) {
-			is Screen.TabRoot -> when (screen.tab) {
-				Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
-				Tab.FEED -> FeedScreen(model, bottom)
-				Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
-				else -> Placeholder(screen.tab.label, bottom)
+	Box(Modifier.fillMaxSize()) {
+		StackHost(nav) { screen ->
+			when (screen) {
+				is Screen.TabRoot -> when (screen.tab) {
+					Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
+					Tab.FEED -> FeedScreen(model, bottom)
+					Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
+					else -> Placeholder(screen.tab.label, bottom)
+				}
+				is Screen.TrackList -> TrackListScreen(model, screen.source, bottom, back = { nav.pop() }, push = nav::push)
+				is Screen.ListActions -> ListActionsPage(model, screen.source, back = { nav.pop() }, openFields = { nav.push(Screen.RowFields(screen.source)) })
+				is Screen.RowFields -> RowFieldsPage(model, screen.sample, back = { nav.pop() })
+				is Screen.Track -> TrackScreen(model, screen, back = { nav.pop() }, push = nav::push, replace = nav::replaceTop)
+				is Screen.TrackActions -> TrackActionsPage(model, screen.trackId, back = { nav.pop() })
+				is Screen.TrackUses -> TrackUsesPage(model, screen, back = { nav.pop() }, push = nav::push)
+				Screen.Settings -> SettingsPage(model, back = { nav.pop() }, signIn = { nav.push(Screen.SignIn) })
+				Screen.SignIn -> SignInScreen(model, back = { nav.pop() })
 			}
-			is Screen.TrackList -> TrackListScreen(model, screen.source, bottom, back = { nav.pop() }, push = nav::push)
-			is Screen.ListActions -> ListActionsPage(model, screen.source, back = { nav.pop() }, openFields = { nav.push(Screen.RowFields(screen.source)) })
-			is Screen.RowFields -> RowFieldsPage(model, screen.sample, back = { nav.pop() })
-			is Screen.Track -> TrackScreen(model, screen, back = { nav.pop() }, push = nav::push, replace = nav::replaceTop)
-			is Screen.TrackActions -> TrackActionsPage(model, screen.trackId, back = { nav.pop() })
-			Screen.Settings -> SettingsPage(model, back = { nav.pop() }, signIn = { nav.push(Screen.SignIn) })
-			Screen.SignIn -> SignInScreen(model, back = { nav.pop() })
 		}
+		model.organize?.let { OrganizeSheet(it) { model.organize = null } }
 	}
 }
 
-// The mini player over the tab bar, with the loaded track's BPM, key and Interested.
+// The mini player over the tab bar: the library's track (its player view), or a feed card's.
 @Composable
 private fun Bottom(model: AppModel, nav: Nav) {
 	val player by model.player.state.collectAsState()
 	val lib by model.library.collectAsState()
 	val version by model.version.collectAsState()
 	val id = player.track?.trackId
-	val facts by produceState<Pair<Track, Boolean>?>(null, id, lib, version) {
+	val held by produceState<Track?>(null, id, lib, version) {
 		val l = lib ?: return@produceState
 		// The track before this one is not what the mini player now plays.
-		if (value?.first?.id != id) value = null
-		value = id?.let { withContext(Dispatchers.IO) { l.track(it)?.let { t -> t to l.hasTag(it, "interested") } } }
+		if (value?.id != id) value = null
+		value = id?.let { withContext(Dispatchers.IO) { l.track(it) } }
 	}
 	val account by model.app.account.collectAsState()
 	val sync by model.app.core.status.collectAsState()
@@ -129,16 +135,16 @@ private fun Bottom(model: AppModel, nav: Nav) {
 	if (notice != null) AccountBanner(notice) { nav.push(if (sync?.needsUpdate == true) Screen.Settings else Screen.SignIn) }
 	BottomChrome(
 		miniPlayer = {
-			val known = facts
-			if (known != null) {
-				val (t, interested) = known
-				MiniPlayer(
-					model.player, t.bpm, t.key, interested,
-					onInterested = { model.setTag(t.id, "interested", !interested) },
-					onOpen = { nav.push(Screen.Track(t.id, null, 0, 1)) },
+			val t = held
+			if (t != null) {
+				MiniBar(
+					// Always filled: a tap opens Organize, so onHeart is never called.
+					model.player, inLibrary = true, onHeart = {},
+					onOrganize = { model.organizeTrack(t.id) },
+					open = { model.playerScreen?.takeIf { it.trackId == t.id } ?: Screen.Track(t.id, null, 0, 1) },
 				)
 			} else if (id != null && FeedModel.isFeedTrack(id)) {
-				MiniPlayer(model.player, null, null, interested = false, onInterested = null, onOpen = null)
+				MiniBar(model.player, inLibrary = model.feed.playingHeld(), onHeart = model.feed::heartPlaying, onOrganize = model.feed::organizePlaying, open = null)
 			}
 		},
 		tab = nav.tab,

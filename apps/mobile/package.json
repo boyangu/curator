@@ -13,6 +13,7 @@
     "device": "node scripts/run.mjs"
   },
   "dependencies": {
+    "@curator/library-logic": "workspace:*",
     "@curator/protocol": "workspace:*",
     "@curator/shared": "workspace:*",
     "@curator/sync-core": "workspace:*"

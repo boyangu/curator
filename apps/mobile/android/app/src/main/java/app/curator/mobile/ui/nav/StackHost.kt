@@ -2,6 +2,7 @@ package app.curator.mobile.ui.nav
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -9,6 +10,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -23,10 +25,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerId
@@ -36,6 +40,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.dp
+import app.curator.mobile.model.SheetDrag
 import app.curator.mobile.ui.theme.C
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -55,9 +60,32 @@ class PageGestures internal constructor(
 
 val LocalPageGestures = staticCompositionLocalOf<PageGestures?> { null }
 
+/**
+ * The player sheet's drag (model SheetDrag decides; this moves it): [open]
+ * with the sheet to raise from a closed bar, [close] for the one on top;
+ * then [drag] to each visible height, and [end] with whether it settles open.
+ */
+class SheetGestures internal constructor(
+	val height: () -> Float,
+	val open: (Screen) -> Unit,
+	val close: () -> Unit,
+	val drag: (Float) -> Unit,
+	val end: (Boolean) -> Unit,
+)
+
+val LocalSheetGestures = staticCompositionLocalOf<SheetGestures?> { null }
+
+/** How far a player sheet is up over this screen, in px (0 when none is): read while drawing, as the mini bar fades out with it. */
+val LocalSheetReveal = staticCompositionLocalOf<() -> Float> { { 0f } }
+
+// The sheet's settle, as the design times it (280 ms, cubic-bezier(.2,.8,.2,1)).
+private val SETTLE = tween<Float>(280, easing = CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f))
+
 // Both edges belong to the system's back gesture (gesture navigation): a
 // swipe that starts there is never ours.
 private val EDGE = 32.dp
+
+private val SHEET_SHAPE = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp)
 
 /**
  * A horizontal swipe left, started away from the edges, that opens [page]
@@ -126,7 +154,9 @@ private suspend fun AwaitPointerEventScope.pageSwipe(
 /**
  * Renders the current tab's stack: the top screen alone once settled (a
  * covered screen leaves the composition and the accessibility tree, its state
- * kept by the holder), the top two while one slides over the other.
+ * kept by the holder), the top two while one slides over the other: from the
+ * right for a screen, up from the bottom for the player sheet ([y], its
+ * visible height), the screen beneath dimmed as it rises.
  */
 @Composable
 fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
@@ -137,7 +167,11 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 
 	BoxWithConstraints(Modifier.fillMaxSize().background(C.bg)) {
 		val width = with(LocalDensity.current) { maxWidth.toPx() }
+		val height = with(LocalDensity.current) { maxHeight.toPx() }
 		val x = remember { Animatable(0f) }
+		val y = remember { Animatable(0f) }
+		// Whether the entry moving is a sheet (vertical) rather than a page.
+		var vertical by remember { mutableStateOf(false) }
 		// The entry sliding (over `under`) and the one beneath it, while one moves.
 		var over by remember { mutableStateOf<Nav.Entry?>(null) }
 		var under by remember { mutableStateOf<Nav.Entry?>(null) }
@@ -147,12 +181,29 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 		// A swipe in progress: opening (a page not yet pushed) or closing.
 		var dragging by remember { mutableStateOf<String?>(null) }
 
-		fun settle() { over = null; under = null; settled = nav.top; settledSize = nav.stack.size }
+		fun settle() { over = null; under = null; vertical = false; settled = nav.top; settledSize = nav.stack.size }
 
 		LaunchedEffect(top.id, nav.tab) {
 			if (nav.tab != settledTab) { settledTab = nav.tab; x.snapTo(0f); settle(); return@LaunchedEffect }
 			if (top === settled) return@LaunchedEffect
-			if (nav.stack.size >= settledSize) {
+			val pushed = nav.stack.size >= settledSize
+			// Next in the player: the track changes in place, the sheet stays up.
+			if (pushed && nav.stack.size == settledSize && top.screen.isSheet && settled.screen.isSheet) { settle(); return@LaunchedEffect }
+			if (pushed && top.screen.isSheet) {
+				if (over !== top) { under = settled; over = top; y.snapTo(0f) }
+				vertical = true
+				y.animateTo(height, SETTLE)
+				settle()
+				return@LaunchedEffect
+			}
+			if (!pushed && settled.screen.isSheet) {
+				if (over !== settled) { over = settled; under = top; y.snapTo(height) }
+				vertical = true
+				y.animateTo(0f, SETTLE)
+				settle()
+				return@LaunchedEffect
+			}
+			if (pushed) {
 				// Pushed (or a swipe committed one): slide the new top in.
 				if (over !== top) { under = settled; over = top; x.snapTo(width) }
 				x.animateTo(0f, tween(240))
@@ -185,6 +236,40 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 						} else {
 							if (x.value > width * 0.33f || velocity > 800f) nav.pop()
 							else { x.animateTo(0f, tween(180)); settle() }
+						}
+					}
+				},
+			)
+		}
+
+		val sheets = remember(nav) {
+			SheetGestures(
+				height = { height },
+				open = { screen ->
+					dragging = "sheet"
+					vertical = true
+					under = nav.top
+					over = Nav.Entry(screen)
+					scope.launch { y.snapTo(0f) }
+				},
+				close = {
+					dragging = "sheet"
+					vertical = true
+					over = nav.top
+					under = nav.stack.getOrNull(nav.stack.size - 2)
+					scope.launch { y.snapTo(height) }
+				},
+				drag = { r -> scope.launch { y.snapTo(r.coerceIn(0f, height)) } },
+				end = { open ->
+					dragging = null
+					scope.launch {
+						val o = over ?: return@launch
+						val pushedYet = nav.top === o
+						when {
+							// Pushed or popped: the effect above settles it from where the finger left it.
+							open && !pushedYet -> nav.pushEntry(o)
+							!open && pushedYet -> nav.pop()
+							else -> { y.animateTo(if (open) height else 0f, SETTLE); settle() }
 						}
 					}
 				},
@@ -250,7 +335,8 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 
 		BackHandler(enabled = stack.size > 1) { nav.pop() }
 
-		CompositionLocalProvider(LocalPageGestures provides gestures) {
+		val reveal = remember { { if (vertical && over != null) y.value else 0f } }
+		CompositionLocalProvider(LocalPageGestures provides gestures, LocalSheetGestures provides sheets, LocalSheetReveal provides reveal) {
 			val o = over
 			val u = under
 			val b = beside?.let { nav.topOf(it) }
@@ -262,17 +348,32 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 			for (e in visible) key(e.id) {
 				val sliding = e === o && b == null
 				val beneath = e === u && o != null && b == null
+				val rising = sliding && vertical
 				Box(
 					Modifier
 						.fillMaxSize()
 						.graphicsLayer {
 							translationX = when {
-								b == null -> if (sliding) x.value else 0f
+								b == null -> if (sliding && !vertical) x.value else 0f
 								e === b -> tx.value + besideDir * width
 								else -> tx.value
 							}
+							translationY = if (rising) height - y.value else 0f
+							// Rounded at the top until it covers the screen.
+							val round = rising && y.value < height
+							shape = if (round) SHEET_SHAPE else RectangleShape
+							clip = round
 						}
 						.drawBehind {
+							if (rising) {
+								// Its shadow over what it rises from (0 -8px 24px rgba(0,0,0,.5)).
+								val h = 24.dp.toPx() + 8.dp.toPx()
+								drawRect(
+									Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f)), startY = -h, endY = 0f),
+									topLeft = Offset(0f, -h), size = Size(size.width, h),
+								)
+								return@drawBehind
+							}
 							// The one shadow the design allows: a page sliding over (-8px 0 24px rgba(0,0,0,.5)).
 							if (!sliding) return@drawBehind
 							val w = 24.dp.toPx() + 8.dp.toPx()
@@ -282,6 +383,8 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 							)
 						}
 						.background(C.bg)
+						// Beneath a rising sheet: dimmed with its reveal.
+						.then(if (beneath && vertical) Modifier.drawWithContent { drawContent(); drawRect(Color.Black, alpha = SheetDrag.dim(y.value, height)) } else Modifier)
 						.then(if (e === top) closeSwipe.then(tabSwipe) else Modifier)
 						// Beneath: seen but not reachable (TalkBack skips it).
 						.then(if (beneath) Modifier.clearAndSetSemantics {} else Modifier),

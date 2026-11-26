@@ -14,6 +14,7 @@ import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.ListScope
 import app.curator.mobile.data.ListTotals
 import app.curator.mobile.data.Track
+import app.curator.mobile.model.relatedKeys
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.nav.ListSource
 import kotlinx.coroutines.CoroutineScope
@@ -128,6 +129,9 @@ fun ListSource.scope(): ListScope = when (this) {
 	is ListSource.Playlist -> ListScope.Playlist(id)
 	is ListSource.Tag -> ListScope.Tag(id)
 	is ListSource.Artist -> ListScope.Artist(id)
+	is ListSource.Label -> ListScope.Label(name)
+	is ListSource.Set -> ListScope.Set(id)
+	is ListSource.Similar -> ListScope.Similar(trackId, relatedKeys(camelot))
 	is ListSource.Library -> ListScope.Library(if (filter == ListSource.OWNED) "local" else filter)
 }
 
