@@ -132,9 +132,12 @@ export async function objectReleases(tx: Queryable, objectId: string, limit = 25
 			(select string_agg(a.name, '|' order by ar.position) from curator.catalog_edge ar join curator.catalog_object a on a.id = ar.src where ar.dst = r.id and ar.kind = 'artist-release') as artists,
 			(select string_agg(distinct so.provider, '|') from curator.catalog_source_object so where so.object_id = r.id) as providers
 		from curator.catalog_object r
-		where r.kind = 'release' and r.merged_into is null and (
-			exists (select 1 from curator.catalog_edge e where e.kind = 'artist-release' and e.src = $1 and e.dst = r.id)
-			or exists (select 1 from curator.catalog_edge e where e.kind = 'release-label' and e.src = r.id and e.dst = $1))
+		-- From its edges, in a union: the two as alternatives (exists … or exists …)
+		-- leave the planner no index and it reads every release there is
+		-- (2026-11-25: 466 MB and 27 s, and everything else waited).
+		where r.kind = 'release' and r.merged_into is null and r.id in (
+			select e.dst from curator.catalog_edge e where e.kind = 'artist-release' and e.src = $1
+			union select e.src from curator.catalog_edge e where e.kind = 'release-label' and e.dst = $1)
 		order by r.release_at desc nulls last, r.name limit $2::int`,
 		[objectId, String(limit)],
 	);
