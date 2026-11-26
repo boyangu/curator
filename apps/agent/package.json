@@ -22,7 +22,7 @@
 		"@curator/agent-core": "workspace:*",
 		"esbuild": "^0.28.2",
 		"@types/node": "^22.10.0",
-		"typescript": "^5.6.3",
+		"typescript": "^7.0.2",
 		"vitest": "^2.1.8"
 	}
 }
