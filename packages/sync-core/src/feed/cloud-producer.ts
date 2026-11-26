@@ -153,6 +153,7 @@ function trackDraft(e: CatalogEvent, card: TrackCard): FeedItemDraft {
 		source: trackId ? 'spotify' : 'catalog',
 		sourceId: trackId ?? e.subjectId,
 		dedupeKey: `catalog:recording:${e.subjectId}`,
+		card: true,
 		aliasKeys: [...(card.isrc ? [`isrc:${card.isrc}`] : []), ...(trackId ? [`spotify:track:${trackId}`] : [])],
 		payload: {
 			title: card.title,
@@ -177,6 +178,17 @@ function trackDraft(e: CatalogEvent, card: TrackCard): FeedItemDraft {
 		publishedAt: card.addedAt ?? e.sourcePublishedAt ?? e.firstSeenAt,
 		suppressKeys: [...(trackId ? ['source:spotify'] : []), ...keys, ...artistIds.map((id) => `artist:${id}`)],
 	};
+}
+
+// A release's genre as the enricher names one for an album (enrichment.ts):
+// what most of its tracks are filed under, the first of them on a tie. The
+// card's own list is alphabetical, and its first entry says nothing.
+function commonest(values: readonly (string | undefined)[]): string | null {
+	const counts = new Map<string, number>();
+	for (const v of values) if (v) counts.set(v, (counts.get(v) ?? 0) + 1);
+	let best: string | null = null;
+	for (const [v, n] of counts) if (best === null || n > counts.get(best)!) best = v;
+	return best;
 }
 
 // `watched`: the catalogue ids the user follows; the origin is the first of
@@ -228,6 +240,7 @@ function releaseDraft(e: CatalogEvent, card: ReleaseCard, watched: ReadonlySet<s
 		source: albumId ? 'spotify' : 'catalog',
 		sourceId: albumId ?? e.subjectId,
 		dedupeKey: `catalog:release:${e.subjectId}`,
+		card: true,
 		aliasKeys: albumId ? [`spotify:album:${albumId}`] : [],
 		payload: {
 			title: card.title,
@@ -244,7 +257,7 @@ function releaseDraft(e: CatalogEvent, card: ReleaseCard, watched: ReadonlySet<s
 			tracks,
 			// The card carries every ISRC the catalogue knows: nothing to fill.
 			isrcResolved: true,
-			genre: card.genres[0] ?? null,
+			genre: commonest(card.tracks.map((t) => t.genres[0])) ?? card.genres[0] ?? null,
 			catalogId: e.subjectId,
 			handles: card.handles,
 			catalogNumber: card.catalogNumber,

@@ -19,7 +19,6 @@ import { num } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { CREDIT_STORES, CREDITS_NEED, shortCreditsSql, type CreditStore } from './credits.js';
-import { reannounceCard } from './events.js';
 import { applyReleaseClaims } from './store-links.js';
 
 // Releases a pass: Spotify's go twenty a call; Beatport's are a page each.
@@ -66,8 +65,6 @@ export async function runCreditFill(deps: CreditFillDeps): Promise<CreditFillRep
 	const apply = (t: Due, store: CreditStore, claims: CatalogClaim[]): Promise<boolean> =>
 		withSystemTx(deps.db, async (tx) => {
 			await applyReleaseClaims(tx, t.id, claims, (c) => `${c.provider} release ${c.providerId} is on the other one; read for this one's track credits`);
-			// A card carries its tracks' credits: devices holding it re-read it.
-			await reannounceCard(tx, t.id);
 			const [row] = await tx.query<{ short: boolean }>(`select ${shortCreditsSql('$1::uuid')} as short`, [t.id]);
 			return row!.short === true;
 		});

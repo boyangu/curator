@@ -10,7 +10,8 @@
 //   - the source's facts, once per (field, source); the object's attributes
 //     take them only while empty for a static object (fold.ts);
 //   - its relationships (credited artists, tracklist, label, genres), each a
-//     canonical edge with this source's evidence beside it;
+//     canonical edge with this source's evidence beside it. A label a store
+//     gives only as text is the label of that name (textLabel below);
 //   - the gaps the planner should fill (catalog_enrich_task).
 // A batch of claims is read and written as one: ingest-batch.ts holds what the
 // claims name and queues what they decide, so a listing costs a handful of
@@ -27,7 +28,7 @@ import {
 	type CatalogKind,
 	type CatalogProvider,
 } from '@curator/protocol';
-import { nameFold, recordingKey } from '@curator/library-logic';
+import { isDistributor, nameFold, recordingKey } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { isCreditStore, queueCredits } from './credits.js';
 import { foldAttrs, releaseAtOf, type FactRow } from './fold.js';
@@ -43,6 +44,19 @@ export type IngestOutcome = { objectId: string; kind: CatalogKind; created: bool
 // Claims resolved together, nested ones counted: several listings' worth. Past
 // it a batch is split, so no statement carries an unbounded parameter.
 export const BATCH_NODES = 2000;
+
+// A label stated as text (Spotify's and Deezer's albums, a device's
+// finding) as a claim: the label of that name, keyed as a library's tag
+// is (`user` / `name:<fold>`), so every way of writing a label down meets
+// on one object and the label's followers get the release whichever store
+// found it. A distributor's name is no label and stays text.
+const textLabel = (text: unknown): CatalogClaim | null => {
+	if (typeof text !== 'string' || isDistributor(text)) return null;
+	return { provider: 'user', kind: 'label', providerId: `name:${nameFold(text)}`, name: text.trim() };
+};
+// A release claim's label: the store's own label object, else its text.
+const labelOf = (c: CatalogClaim): CatalogClaim | null => c.label ?? textLabel(c.facts?.labelText);
+const isNameKey = (c: Pick<CatalogClaim, 'provider' | 'providerId'>): boolean => c.provider === 'user' && c.providerId.startsWith('name:');
 
 export class Ingester {
 	readonly stats = { created: 0, attached: 0 };
@@ -93,7 +107,8 @@ export class Ingester {
 		for (const a of credited) await this.flatten(a, own, out);
 		if (own.kind !== 'release') return;
 		for (const r of own.recordings ?? []) await this.flatten({ ...r, artists: r.artists?.length ? r.artists : own.artists }, own, out);
-		if (own.label) await this.flatten(own.label, own, out);
+		const label = labelOf(own);
+		if (label) await this.flatten(label, own, out);
 	}
 
 	// The object the claim's representation already sits on.
@@ -119,6 +134,7 @@ export class Ingester {
 				const rep = await this.b!.represent(c, objectId);
 				this.attachIdentifiers(c, objectId, rep.id);
 				await this.attachFacts(c, objectId);
+				await this.linkTextLabel(c, objectId, rep.id);
 				if (rep.inserted) this.creditsGap(c, objectId);
 			},
 			[objectId],
@@ -149,18 +165,60 @@ export class Ingester {
 	// created and no relationship written — except the claim's genres when
 	// asked (a device's facts-up: a store's genre is a fact about the
 	// recording, not a tie to another object). Null when it names nothing known.
-	attachIfKnown(c: CatalogClaim, opts: { genres?: boolean } = {}): Promise<IngestOutcome | null> {
-		return this.batch([c], async () => {
-			const objectId = (await this.b!.representation(c)) ?? (await this.candidate(c));
-			if (!objectId) return null;
-			const rep = await this.b!.represent(c, objectId);
-			if (rep.inserted) this.stats.attached++;
-			this.attachIdentifiers(c, objectId, rep.id);
-			await this.attachFacts(c, objectId);
-			if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
-			if (rep.inserted) this.creditsGap(c, objectId);
-			return { objectId, kind: c.kind, created: false };
+	// `about`: the object the sender holds the claim to be about, checked by
+	// the caller against the claim (catalog.ts agrees) and taken only when the
+	// catalogue's own rules name nothing.
+	attachIfKnown(c: CatalogClaim, opts: { genres?: boolean; about?: string | null } = {}): Promise<IngestOutcome | null> {
+		return this.batch(
+			[c],
+			async () => {
+				const objectId = (await this.b!.representation(c)) ?? (await this.candidate(c)) ?? opts.about ?? null;
+				if (!objectId) return null;
+				const rep = await this.b!.represent(c, objectId);
+				if (rep.inserted) this.stats.attached++;
+				this.attachIdentifiers(c, objectId, rep.id);
+				await this.attachFacts(c, objectId);
+				await this.linkTextLabel(c, objectId, rep.id);
+				if (opts.genres && c.genres?.length) await this.attachGenres(c.provider, c.genres, objectId, rep.id);
+				if (rep.inserted) this.creditsGap(c, objectId);
+				return { objectId, kind: c.kind, created: false };
+			},
+			opts.about ? [opts.about] : [],
+		);
+	}
+
+	// A release's label arriving as text on a claim that is attached, not
+	// resolved (a store page found for a release the catalogue holds): tied to
+	// the label of that name like any other text.
+	private async linkTextLabel(c: CatalogClaim, objectId: string, sourceObjectId: string): Promise<void> {
+		const label = c.kind === 'release' && !c.label ? textLabel(c.facts?.labelText) : null;
+		if (!label) return;
+		const l = await this.nested(label);
+		if (l.kind === 'label') this.edge(objectId, 'release-label', l.objectId, sourceObjectId, null, null);
+	}
+
+	// Releases whose label the catalogue holds as text only, tied to the label
+	// of that name: the back catalogue's pass (label-texts.ts) and a label a
+	// device found for a release's track (catalog.ts attachFacts).
+	// `sourceObjectId`: the representation that said so, the link's evidence.
+	// Returns how many named a label (a distributor's name names none).
+	async labelsByText(rows: readonly { releaseId: string; text: string; sourceObjectId: string }[]): Promise<number> {
+		const named = rows.flatMap((r) => {
+			const label = textLabel(r.text);
+			return label ? [{ ...r, label }] : [];
 		});
+		if (!named.length) return 0;
+		await this.batch(
+			named.map((r) => r.label),
+			async () => {
+				for (const r of named) {
+					const label = await this.nested(r.label);
+					if (label.kind === 'label') this.edge(r.releaseId, 'release-label', label.objectId, r.sourceObjectId, null, null);
+				}
+			},
+			named.map((r) => r.releaseId),
+		);
+		return named.length;
 	}
 
 	// Each claim resolved afresh from here on, as by a new ingester: the next
@@ -323,8 +381,11 @@ export class Ingester {
 					releaseAtOf(c.facts?.releaseDate),
 				);
 			case 'artist':
-			case 'label':
 				return parent ? b.corroborated(c.kind, fold, parent, c.provider) : null;
+			case 'label':
+				// On the release it arrives with, else by its name alone: a
+				// label is the label of that name (IngestBatch.labelNamed).
+				return (parent ? await b.corroborated(c.kind, fold, parent, c.provider) : null) ?? b.labelNamed(fold, c);
 			default:
 				return null;
 		}
@@ -357,7 +418,10 @@ export class Ingester {
 		for (const f of facts) this.b!.fact(objectId, f.field, f.source, f.value, live);
 		const o = await this.b!.object(objectId);
 		const next = foldAttrs(o.attrs, facts, { live, liveSource: c.provider });
-		const rename = live && c.name !== o.name;
+		// A name key is someone's spelling of the name (a store's text, a
+		// file's tag, an upload's title), not a store's word on what the object
+		// is called: it names a new object and never renames one.
+		const rename = live && c.name !== o.name && !(isNameKey(c) && !o.fresh);
 		if (JSON.stringify(next) === JSON.stringify(o.attrs) && !rename) return;
 		this.b!.fold(o, next, c, rename);
 	}
@@ -383,8 +447,9 @@ export class Ingester {
 			// other store credited these tracks, the release's Spotify or
 			// Beatport page is read for the rest (credits.ts).
 			if (c.provider === 'deezer' && c.recordings?.length) this.credits.add(objectId);
-			if (c.label) {
-				const label = await this.nested(c.label, self);
+			const stated = labelOf(c);
+			if (stated) {
+				const label = await this.nested(stated, self);
 				if (label.kind === 'label') this.edge(objectId, 'release-label', label.objectId, sourceObjectId, null, null);
 			}
 		}

@@ -51,7 +51,7 @@ import { BandcampTracker, BeatportTracker, DeezerTracker, fetchAlbums, SpotifyTr
 import { gatedFetch, isSpotifyQuotaBackoff, type SpotifySimplifiedTrack } from '@curator/spotify';
 import { searchFold, type EntityHeader, type EntityRef, type EntityRowPatch, type EntityWorkEvent, type EntityWorkStatus, type StreamingService } from '@curator/shared';
 import { nameClaims } from '../catalog-client/facts-up.js';
-import { isDistributor } from '../catalog-client/library-claims.js';
+import { isDistributor } from '@curator/library-logic';
 import type { CatalogClient } from '../catalog-client/service.js';
 import type { Enricher } from '@curator/sync-core/enrich/contract';
 import { enrichOne } from '../enrich/runner.js';

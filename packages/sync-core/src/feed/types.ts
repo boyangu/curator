@@ -245,6 +245,10 @@ export interface FeedItemDraft {
 	// catalogue item's Spotify / ISRC keys, so the local producers' items and
 	// re-announced events land on one row.
 	aliasKeys?: string[];
+	// The catalogue's own card for the item (cloud-producer.ts): what it
+	// states replaces what the row holds (merge.ts), where any other repeat
+	// only fills what the row lacks.
+	card?: true;
 }
 
 export interface FeedItem {

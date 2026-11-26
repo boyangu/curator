@@ -6,8 +6,11 @@
 //     catalogue first saw it) falls within the tracker's window — a first
 //     poll of a newly watched artist must not announce their back catalogue;
 //   - no event exists for it yet: one per release, ever. A second tracker
-//     reaching the same release adds itself as a subject; a provider the
-//     card did not have yet re-announces it (reannounceIfNewProvider).
+//     reaching the same release adds itself as a subject.
+// An event's card is a copy of the release as it stood; refreshEvents
+// keeps it current (and its subjects with it) by moving the event to a
+// fresh seq whenever the card would read differently, for as long as
+// devices still hold it.
 // `recordings_new` counts the release's recordings the catalogue first saw
 // with it; 0 makes the event a reissue (a compilation of known tracks).
 //
@@ -34,6 +37,7 @@ import {
 } from '@curator/protocol';
 import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
+import { WEAK_SQL } from './identity.js';
 
 export const EVENT_SETTLE_SEC = 60;
 // How far ahead of today a release date may be and still announce (a label
@@ -63,6 +67,14 @@ export const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by g.n
 	where ge.src = o.id and ge.kind = 'object-genre') as genres`;
 
 const splitNames = (v: string | null): string[] => (v ? v.split('|') : []);
+
+// A release tied to several labels (its store's own label page, and the name
+// another store writes for it — a sister imprint, a parent) shows the one a
+// store holds a page for: an order term, 0 for such a label and 1 for a name
+// alone. Always the same answer for the same rows, or a rebuilt card would
+// differ from the stored one for no reason (refreshEvents).
+const LABEL_FIRST = (id: string): string =>
+	`(case when exists (select 1 from curator.catalog_source_object s where s.object_id = ${id} and not ${WEAK_SQL}) then 0 else 1 end)`;
 
 // The DJ facts folded onto a recording (fold.ts: Beatport first).
 export function recordingFacts(attrs: Record<string, unknown>, genres: string | null): { bpm: number | null; key: string | null; genres: string[] } {
@@ -106,7 +118,7 @@ export async function releaseCards(tx: Queryable, releaseIds: readonly string[])
 	);
 	const labelRows = await tx.query<{ release: string; id: string; name: string }>(
 		`select distinct on (e.src) e.src as release, o.id, o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst
-		where e.src = any($1::uuid[]) and e.kind = 'release-label' order by e.src, e.at, e.id`,
+		where e.src = any($1::uuid[]) and e.kind = 'release-label' order by e.src, ${LABEL_FIRST('o.id')}, e.at, e.id`,
 		ids,
 	);
 	const trackRows = await tx.query<{ release: string; id: string; name: string; attrs: string; duration_sec: unknown; isrc: string | null; artists: string | null; genres: string | null }>(
@@ -238,18 +250,14 @@ export async function raiseReleaseEvents(tx: Queryable, finds: readonly (Release
 	const cards = await releaseCards(tx, ids);
 	const subjectsFor = (d: Due): string[] => [...new Set([...d.tracked, ...(related.get(d.releaseId) ?? [])])];
 
+	// Announced already: the tracker's object joins the event's subjects. Its
+	// watchers have read past the event, so one that gained a subject is
+	// marked to be sent again (refreshEvents); what the poll changed on the
+	// card is marked by the writes themselves.
 	const announced = [...due.values()].filter((d) => d.seq !== null);
 	if (announced.length) {
-		await insertSubjects(tx, announced.flatMap((d) => subjectsFor(d).map((id) => ({ seq: d.seq!, id }))));
-		for (const d of announced) {
-			// Moved only when a device would see a difference; most are the same
-			// release reported once more.
-			const old = JSON.parse(d.card!) as StoredCard;
-			const known = new Set(old.handles.map((h) => h.provider));
-			const gained = (providers.get(d.releaseId) ?? []).some((p) => !known.has(p as CatalogProvider));
-			if (!gained && (old.kind === 'track' || cardSignature(old) === cardSignature(cards.get(d.releaseId)!))) continue;
-			out[d.at] = await reannounceIfNewProvider(tx, d.releaseId, d.seq!, subjectsFor(d), opts.by);
-		}
+		const gained = new Set(await insertSubjects(tx, announced.flatMap((d) => subjectsFor(d).map((id) => ({ seq: d.seq!, id })))));
+		await markCards(tx, announced.filter((d) => gained.has(d.seq!)).map((d) => d.releaseId), { force: true });
 	}
 
 	const fresh = [...due.values()].filter((d) => d.seq === null);
@@ -289,74 +297,102 @@ export async function raiseReleaseEvents(tx: Queryable, finds: readonly (Release
 	return out;
 }
 
-// A release announced through one provider and later found on another: the
-// event's card is rebuilt with the new handles and the event moves to a fresh
-// seq, so devices that read past it read it again. Still one event per
-// release; a device that already holds the item dedupes it, and one that
-// could not use the first card (Discover plays Spotify only, so a card that
-// had only Deezer was dropped) now gets the release. Once per provider: the
-// rebuilt card carries it.
-async function reannounceIfNewProvider(tx: Queryable, releaseId: string, seq: number, subjects: string[], by?: string): Promise<number | null> {
-	const moved = await reannounce(tx, seq, releaseId, subjects, by);
-	if (moved !== null) return moved;
-	// The release had the provider; a track of it may not have (a second
-	// store's tracklist landing on a release the first announced).
-	const [next] = await reannounceCard(tx, releaseId);
-	return next ?? null;
-}
-
-// The same for any event whose subject gained a provider its card lacks: the
-// resolver (planner.ts) calls it after giving a recording or release its
-// Spotify id. Returns the new seq, or null when the card already had every
-// provider.
-// `by`: the reporter of the poll that brought the new provider; the resolver
-// passes none and the event keeps its first reporter.
-export async function reannounce(tx: Queryable, seq: number, subjectId: string, subjects: string[] = [], by?: string): Promise<number | null> {
-	const [ev] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
-	if (!ev) return null;
-	// A stored card of any version: only the fields v1 and v2 share are read.
-	const old = JSON.parse(ev.card) as StoredCard;
-	const announced = new Set(old.handles.map((h) => h.provider));
-	const providers = await tx.query<{ provider: string }>(`select provider from curator.catalog_source_object where object_id = $1`, [subjectId]);
-	if (providers.every((p) => announced.has(p.provider as CatalogProvider))) return null;
-	return moveEvent(tx, seq, subjectId, old, subjects, by);
-}
-
 type StoredCard = CatalogEventCardV1 | CatalogEventCardV2 | CatalogEventTrackCardV1 | CatalogEventTrackCardV2;
 
-// A release's events re-announced because its card changed in what a
-// device shows or plays: the tracklist (two recordings on one slot merged —
-// release-fill.ts dedupeRelease), a track's providers (its Spotify id found —
-// planner.ts, store-links.ts) or the credits (two "Modd"s merged into one —
-// admin.ts mergeObjects; the card said "Modd, Modd, Modd" until then). The
-// live card is built once and compared with the stored one; nothing moves
-// when they agree. Returns the new seqs.
-export async function reannounceCard(tx: Queryable, releaseId: string): Promise<number[]> {
-	const rows = await tx.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1 order by seq`, [releaseId]);
-	if (!rows.length) return [];
-	const card = await releaseCard(tx, releaseId);
-	const live = cardSignature(card);
+// How long after its release an event's card is kept current: devices drop an
+// untouched feed item after 30 days, and past this nobody is waiting on it.
+export const CARD_REBUILD_DAYS = 60;
+
+// Objects whose cards may have changed, for refreshEvents. The catalogue's
+// tables mark themselves (sql/0037: any write to an object, its store ids,
+// its identifiers or its relationships); this is for the one change no table
+// shows, an event that gained a subject where it stands (`force`).
+export async function markCards(tx: Queryable, objectIds: readonly string[], opts: { force?: boolean } = {}): Promise<void> {
+	if (!objectIds.length) return;
+	await tx.query(`insert into curator.catalog_card_dirty (object_id, force) select unnest($1::uuid[]), $2::boolean`, [`{${[...new Set(objectIds)].join(',')}}`, opts.force === true ? 'true' : 'false']);
+}
+
+// Everything a card states, with the order of its unordered lists (store
+// ids, genres) and of its keys taken out: a stored card comes back from
+// jsonb in jsonb's key order, a built one in the builder's.
+function canon(v: unknown, key?: string): unknown {
+	if (Array.isArray(v)) {
+		const items = v.map((x) => canon(x));
+		return key === 'handles' || key === 'genres' ? items.map((x) => JSON.stringify(x)).sort() : items;
+	}
+	if (v && typeof v === 'object') {
+		const o = v as Record<string, unknown>;
+		return Object.fromEntries(
+			Object.keys(o)
+				.filter((k) => o[k] !== undefined)
+				.sort()
+				.map((k) => [k, canon(o[k], k)]),
+		);
+	}
+	return v;
+}
+const cardKey = (c: unknown): string => JSON.stringify(canon(c));
+
+// The events about these objects brought up to date: each one whose card
+// would read differently today, or whose release concerns an artist or label
+// it did not when announced, moves to a fresh seq with the card rebuilt and
+// the subjects it had plus the ones it gained. Devices past the old seq read
+// it again and lay it on the row they hold; a watcher of a gained subject
+// reads it for the first time. One rule for every writer: a tracker reaching
+// an announced release through another store, the store linker and the
+// resolver giving its tracks their ids, a credit fill, a merge of two
+// "Modd"s, a device's own finding, a label linked afterwards.
+// `touched`: object id → force (move it whatever the card says). Releases,
+// and anything a card reads through: a release's recordings, artists and
+// label, a recording's artists. Only events within CARD_REBUILD_DAYS of
+// their release are looked at. Returns the new seqs.
+export async function refreshEvents(tx: Queryable, touched: ReadonlyMap<string, boolean>): Promise<number[]> {
+	if (!touched.size) return [];
+	const evs = await tx.query<{ seq: unknown; subject_id: string; card: string }>(
+		`select ev.seq, ev.subject_id, ev.card::text as card from curator.catalog_event ev
+		where coalesce(ev.release_at, ev.source_published_at, ev.first_seen_at) > now() - make_interval(days => $2::int)
+			and ev.subject_id = any(array(
+				select unnest($1::uuid[])
+				union select e.src from curator.catalog_edge e where e.kind = 'release-recording' and e.dst = any($1::uuid[])
+				union select e.dst from curator.catalog_edge e where e.kind = 'artist-release' and e.src = any($1::uuid[])
+				union select e.src from curator.catalog_edge e where e.kind = 'release-label' and e.dst = any($1::uuid[])
+				union select e.src from curator.catalog_edge e where e.kind = 'recording-artist' and e.dst = any($1::uuid[])
+				union select rr.src from curator.catalog_edge ra join curator.catalog_edge rr on rr.kind = 'release-recording' and rr.dst = ra.src
+					where ra.kind = 'recording-artist' and ra.dst = any($1::uuid[])))
+		order by ev.seq`,
+		[`{${[...touched.keys()].join(',')}}`, String(CARD_REBUILD_DAYS)],
+	);
+	if (!evs.length) return [];
+	const rows = evs.map((e) => ({ seq: num(e.seq), subjectId: e.subject_id, old: JSON.parse(e.card) as StoredCard }));
+	const releaseIds = [...new Set(rows.filter((r) => r.old.kind !== 'track').map((r) => r.subjectId))];
+	const cards = await releaseCards(tx, releaseIds);
+	const related = releaseIds.length ? await subjectsOf(tx, releaseIds) : new Map<string, string[]>();
+	const kept = new Map<number, Set<string>>();
+	for (const k of await tx.query<{ seq: unknown; object_id: string }>(`select seq, object_id from curator.catalog_event_subject where seq = any($1::bigint[])`, [`{${rows.map((r) => r.seq).join(',')}}`])) {
+		const set = kept.get(num(k.seq)) ?? new Set<string>();
+		set.add(k.object_id);
+		kept.set(num(k.seq), set);
+	}
 	const moved: number[] = [];
 	for (const r of rows) {
-		const old = JSON.parse(r.card) as StoredCard;
-		if (old.kind === 'track') continue;
-		if (cardSignature(old) === live) continue;
-		moved.push(await moveEvent(tx, num(r.seq), releaseId, old, [], undefined, card));
+		const force = touched.get(r.subjectId) === true;
+		if (r.old.kind === 'track') {
+			const live = await trackCard(tx, r.subjectId, r.old.container, r.old.rank, r.old.addedAt);
+			if (force || cardKey(r.old) !== cardKey(live)) moved.push(await moveEvent(tx, r.seq, r.subjectId, r.old, [], undefined, live));
+			continue;
+		}
+		const live = cards.get(r.subjectId);
+		if (!live) continue;
+		const subjects = related.get(r.subjectId) ?? [];
+		const gained = subjects.some((s) => !kept.get(r.seq)?.has(s));
+		if (force || gained || cardKey(r.old) !== cardKey(live)) moved.push(await moveEvent(tx, r.seq, r.subjectId, r.old, subjects, undefined, live));
 	}
 	return moved;
 }
 
-// What a device shows or plays off a release card, order aside: the credits
-// and, per track, the recording, its providers and its credits.
-const cardSignature = (c: CatalogEventCardV1 | CatalogEventCardV2): string =>
-	[
-		c.artists.map((a) => `${a.id}:${a.name}`).sort().join(','),
-		...c.tracks.map((t) => `${t.id}|${[...new Set(t.handles.map((h) => h.provider))].sort().join(',')}|${(t.artists ?? []).join(',')}`).sort(),
-	].join('\n');
-
 // The event rebuilt with the object's current card, at a fresh seq.
-// `live`: the release's card when the caller built it already.
-async function moveEvent(tx: Queryable, seq: number, subjectId: string, old: StoredCard, subjects: string[] = [], by?: string, live?: CatalogEventCardV2): Promise<number> {
+// `live`: the card when the caller built it already.
+async function moveEvent(tx: Queryable, seq: number, subjectId: string, old: StoredCard, subjects: string[] = [], by?: string, live?: CatalogEventCardV2 | CatalogEventTrackCardV2): Promise<number> {
 	const providers = await tx.query<{ provider: string }>(`select provider from curator.catalog_source_object where object_id = $1`, [subjectId]);
 	const card = live ?? (old.kind === 'track' ? await trackCard(tx, subjectId, old.container, old.rank, old.addedAt) : await releaseCard(tx, subjectId));
 	const kept = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_event_subject where seq = $1::bigint`, [String(seq)]);
@@ -384,15 +420,6 @@ async function moveEvent(tx: Queryable, seq: number, subjectId: string, old: Sto
 	const next = num(moved!.seq);
 	await insertSubjects(tx, [...new Set([...kept.map((k) => k.object_id), ...subjects])].map((id) => ({ seq: next, id })));
 	return next;
-}
-
-// Every event about this object (a release's, or a recording's playlist and
-// chart events) re-announced if its card lacks a provider the object now has.
-export async function reannounceFor(tx: Queryable, subjectId: string): Promise<number> {
-	const rows = await tx.query<{ seq: unknown }>(`select seq from curator.catalog_event where subject_id = $1 order by seq`, [subjectId]);
-	let n = 0;
-	for (const r of rows) if ((await reannounce(tx, num(r.seq), subjectId)) !== null) n++;
-	return n;
 }
 
 export type ChartEntry = { genreId: string; recordingId: string; provider: CatalogProvider; rank: number };
@@ -511,14 +538,14 @@ async function trackCard(
 	// the release's bare label string.
 	const [lab] = await tx.query<{ id: string | null; name: string }>(
 		`select id, name from (
-			select l.id, l.name, 0 as pri from curator.catalog_edge rr
+			select l.id, l.name, 0 as pri, ${LABEL_FIRST('l.id')} as paged from curator.catalog_edge rr
 				join curator.catalog_edge rl on rl.src = rr.src and rl.kind = 'release-label'
 				join curator.catalog_object l on l.id = rl.dst
 			where rr.dst = $1 and rr.kind = 'release-recording'
 			union all
-			select null, r.label_text, 1 from curator.catalog_edge rr join curator.catalog_object r on r.id = rr.src
+			select null, r.label_text, 1, 1 from curator.catalog_edge rr join curator.catalog_object r on r.id = rr.src
 			where rr.dst = $1 and rr.kind = 'release-recording' and r.label_text is not null
-		) x order by pri limit 1`,
+		) x order by pri, paged, name, id limit 1`,
 		[recordingId],
 	);
 	const handles = await handlesOf(tx, [recordingId, container.id, ...artists.map((a) => a.id)]);
@@ -543,12 +570,14 @@ async function trackCard(
 	};
 }
 
-async function insertSubjects(tx: Queryable, subjects: readonly { seq: number; id: string }[]): Promise<void> {
-	if (!subjects.length) return;
-	await tx.query(
-		`insert into curator.catalog_event_subject (seq, object_id) select distinct x.seq, x.id from jsonb_to_recordset($1::text::jsonb) as x(seq bigint, id uuid) on conflict do nothing`,
+// Returns the seq of each row that was not there yet.
+async function insertSubjects(tx: Queryable, subjects: readonly { seq: number; id: string }[]): Promise<number[]> {
+	if (!subjects.length) return [];
+	const rows = await tx.query<{ seq: unknown }>(
+		`insert into curator.catalog_event_subject (seq, object_id) select distinct x.seq, x.id from jsonb_to_recordset($1::text::jsonb) as x(seq bigint, id uuid) on conflict do nothing returning seq`,
 		[JSON.stringify(subjects)],
 	);
+	return rows.map((r) => num(r.seq));
 }
 
 type EventRow = {

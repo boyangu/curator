@@ -116,6 +116,11 @@ export class IngestBatch {
 	private readonly nodes = new Set<string>();
 	private readonly folds = new Set<string>();
 	private edgesAdded = false;
+	// name_fold → the live labels of that name (only folds that were asked
+	// for), the ones this batch made, and what ranks them (labelNamed).
+	private readonly labelFolds = new Map<string, Set<string>>();
+	private readonly freshLabels = new Map<string, Set<string>>();
+	private readonly labelInfo = new Map<string, { n: number; strong: Set<string> }>();
 
 	// ── what is queued ─────────────────────────────────────────────────────
 	private readonly fresh: Obj[] = [];
@@ -150,6 +155,12 @@ export class IngestBatch {
 		}
 		const ids = objectIds.filter((id) => !this.objs.has(id));
 		if (reps.size || idents.size || aliases.size || ids.length) await this.readNamed([...reps.values()], [...idents.values()], [...aliases.values()], ids);
+		const labels = new Set<string>();
+		for (const { claim: c } of flat) {
+			const f = c.kind === 'label' && !this.reps.get(repKey(c)) ? nameFold(c.name) : '';
+			if (f && !this.labelFolds.has(f)) labels.add(f);
+		}
+		if (labels.size) await this.readLabels([...labels]);
 		await this.readCandidates(flat);
 		await this.readAround(flat);
 	}
@@ -205,6 +216,28 @@ export class IngestBatch {
 		for (const i of idents) if (!this.idents.has(`${i.n}|${i.v}`)) this.idents.set(`${i.n}|${i.v}`, null);
 		// Undefined: known to be missing. `has` says it was asked.
 		for (const a of aliases) if (!this.aliases.has(`${a.p}|${a.f}`)) this.aliases.set(`${a.p}|${a.f}`, undefined);
+	}
+
+	// The live labels under these names, each with how many releases are on it
+	// and the stores that hold it under an id of their own.
+	private async readLabels(folds: string[]): Promise<void> {
+		const rows = await this.tx.query<{ j: string; n: unknown; i: string | null }>(
+			`select ${OBJ_JSON('o')}::text as j,
+				(select count(*) from curator.catalog_edge e where e.dst = o.id and e.kind = 'release-label') as n,
+				(select jsonb_agg(jsonb_build_array(s.provider, s.provider_id)) from curator.catalog_source_object s where s.object_id = o.id and s.kind = 'label')::text as i
+			from (select distinct value as v from jsonb_array_elements_text($1::text::jsonb)) w
+			join curator.catalog_object o on o.kind = 'label' and o.name_fold = w.v and o.merged_into is null`,
+			[JSON.stringify(folds)],
+		);
+		for (const f of folds) if (!this.labelFolds.has(f)) this.labelFolds.set(f, new Set());
+		for (const r of rows) {
+			const o = this.take(JSON.parse(r.j) as ObjRow);
+			add(this.labelFolds, o.nameFold, o.id);
+			if (!this.labelInfo.has(o.id)) {
+				const ids = (r.i ? JSON.parse(r.i) : []) as [string, string][];
+				this.labelInfo.set(o.id, { n: Number(r.n), strong: new Set(ids.filter(([p, i]) => !isWeakId(p, i)).map(([p]) => p)) });
+			}
+		}
 	}
 
 	private async readCandidates(flat: readonly FlatClaim[]): Promise<void> {
@@ -513,6 +546,25 @@ export class IngestBatch {
 		return hits.length === 1 ? hits[0]! : null;
 	}
 
+	// The label of this name a claim joins when nothing surer names one. A
+	// label is the label of its name: a store's text, a library's tag and a
+	// store's own label page all write the same thing down, and a label's
+	// followers want the release whichever of them found it (2026-11-26). The
+	// one thing that tells two labels of a name apart is a store holding both:
+	// a claim under a store's own id never joins a label that store already
+	// holds under another. Several left: the one more releases are on, then
+	// the older.
+	async labelNamed(fold: string, c: Pick<CatalogClaim, 'provider' | 'providerId'>): Promise<string | null> {
+		if (!fold) return null;
+		if (!this.labelFolds.has(fold)) await this.readLabels([fold]);
+		const weak = isWeakId(c.provider, c.providerId);
+		const hits = [...new Set([...(this.labelFolds.get(fold) ?? []), ...(this.freshLabels.get(fold) ?? [])])]
+			.map((id) => ({ id, at: this.objs.get(id)!.discoveredMs, info: this.labelInfo.get(id) ?? { n: 0, strong: new Set<string>() } }))
+			.filter((l) => weak || !l.info.strong.has(c.provider));
+		hits.sort((x, y) => y.info.n - x.info.n || x.at - y.at || (x.id < y.id ? -1 : 1));
+		return hits[0]?.id ?? null;
+	}
+
 	// Undefined: no alias row (one is queued); null: an unmapped one.
 	async alias(provider: string, fold: string): Promise<string | null> {
 		const key = `${provider}|${fold}`;
@@ -559,6 +611,10 @@ export class IngestBatch {
 			add(this.relFolds, o.nameFold, o.id);
 			this.credits.set(o.id, new Map());
 		}
+		if (o.kind === 'label') {
+			add(this.freshLabels, o.nameFold, o.id);
+			this.labelInfo.set(o.id, { n: 0, strong: new Set() });
+		}
 		return o;
 	}
 
@@ -594,6 +650,7 @@ export class IngestBatch {
 			info.n++;
 			if (c.kind === 'artist' && !isWeakId(c.provider, c.providerId)) info.strong.add(c.provider);
 		}
+		if (c.kind === 'label' && !isWeakId(c.provider, c.providerId)) this.labelInfo.get(objectId)?.strong.add(c.provider);
 		return { id: rep.id, inserted: true };
 	}
 

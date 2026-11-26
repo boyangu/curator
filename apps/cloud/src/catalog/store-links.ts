@@ -20,7 +20,6 @@ import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { openReview } from './admin.js';
-import { reannounceCard } from './events.js';
 import { findRepresentation } from './identity.js';
 import { alone, Ingester } from './ingest.js';
 import { heldTracks, slotMatch } from './slots.js';
@@ -262,12 +261,9 @@ export async function runStoreLinker(deps: LinkerDeps): Promise<LinkerReport> {
 			if (hit) report.linked[p] = (report.linked[p] ?? 0) + 1;
 		}
 		if (found.claims.length) {
-			const applied = await withSystemTx(deps.db, async (tx) => {
-				const a = await applyReleaseClaims(tx, r.id, found.claims, (c) => `${c.provider} release ${c.providerId} is on the other one; the store linker found it for this one by UPC`);
-				// Its tracks gained the stores' ids: devices holding the card re-read it.
-				await reannounceCard(tx, r.id);
-				return a;
-			});
+			const applied = await withSystemTx(deps.db, (tx) =>
+				applyReleaseClaims(tx, r.id, found.claims, (c) => `${c.provider} release ${c.providerId} is on the other one; the store linker found it for this one by UPC`),
+			);
 			for (const c of applied.conflicts) deps.log.warn('store_link_conflict', { release: r.id, ...c });
 		}
 		await sleep(Math.max(...Object.keys(readers).map((p) => BUDGET[p as StoreProvider].gapMs)));

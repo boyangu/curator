@@ -17,3 +17,4 @@ export * from './overrides.js';
 export * from './reorder-moves.js';
 export * from './row-removal.js';
 export * from './production-flags.js';
+export * from './distributor.js';

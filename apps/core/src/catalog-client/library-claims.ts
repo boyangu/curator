@@ -29,51 +29,9 @@
 
 import type Database from 'better-sqlite3';
 import type { CatalogClaim } from '@curator/protocol';
-import { nameFold } from '@curator/library-logic';
+import { isDistributor, nameFold } from '@curator/library-logic';
 
 const OWN = `t.deleted_at is null and t.membership = 'local'`;
-
-// Distribution services, not labels: an artist releasing through one has no
-// label. DistroKid also names imprints "<number> Records DK" (DK2…).
-const DISTRIBUTORS = new Set(
-	[
-		'distrokid',
-		'cd baby',
-		'cdbaby',
-		'tunecore',
-		'believe',
-		'believe digital',
-		'amuse',
-		'amuseio ab',
-		'ditto music',
-		'ditto',
-		'routenote',
-		'symphonic',
-		'symphonic distribution',
-		'label worx',
-		'labelworx',
-		'kudos records',
-		'onerpm',
-		'awal',
-		'united masters',
-		'unitedmasters',
-		'level',
-		'record union',
-		'spinnup',
-		'soundrop',
-		'emubands',
-		'self released',
-		'self-released',
-		'independent',
-		'not on label',
-	].map((n) => nameFold(n)),
-);
-const DISTROKID_IMPRINT = /^\d+ records dk\d*$/;
-
-export function isDistributor(name: string): boolean {
-	const fold = nameFold(name);
-	return !fold || DISTRIBUTORS.has(fold) || DISTROKID_IMPRINT.test(fold);
-}
 
 export type LibraryLabelClaim = { claim: CatalogClaim; fold: string; name: string; tracks: number };
 export type LibraryReleaseClaim = {

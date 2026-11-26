@@ -20,7 +20,6 @@ import { num, numOrNull } from '../db/db.js';
 import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { mergeObjects, openReview, ruledNotSame } from './admin.js';
-import { reannounceFor, reannounceCard } from './events.js';
 import { findRepresentation, storeTagless } from './identity.js';
 import { Ingester } from './ingest.js';
 import { ensureCursors } from './watches.js';
@@ -219,8 +218,8 @@ export async function runPlanner(deps: PlannerDeps): Promise<{ attempted: number
 // within the app's budget); the hit must carry the same ISRC and a length
 // within ten seconds of ours (an ISRC reused across an edit and an extended
 // mix), and its album is read in full for the release too. Every event about
-// the track, and every release holding it, is re-announced with the new
-// handles (events.ts reannounceFor, reannounceCard). Queued by
+// the track, and every release holding it, is sent again with the new
+// handles (the writes mark them; card-rebuild.ts). Queued by
 // ingestion for a tracker's new recordings (ingest.ts recordGaps) and by the
 // sweep for charted ones.
 
@@ -282,11 +281,10 @@ export async function runRecordingResolver(deps: ResolverDeps): Promise<{ attemp
 		return claim;
 	};
 	// The album's tracklist onto the release by the slot rule and the usual
-	// claim (store-links.ts), the release re-announced with its tracks' ids.
+	// claim (store-links.ts).
 	const applyAlbum = (releaseId: string, claim: CatalogClaim) =>
 		withSystemTx(deps.db, async (tx) => {
 			await applyReleaseClaims(tx, releaseId, [claim], (c) => `${c.provider} release ${c.providerId} is on the other one; the resolver found it for this one by a track's ISRC`);
-			await reannounceCard(tx, releaseId);
 		});
 	const done = (recId: string) => deps.db.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = 'spotify'`, [recId]);
 
@@ -350,11 +348,7 @@ export async function runRecordingResolver(deps: ResolverDeps): Promise<{ attemp
 						const albumOwner = await findRepresentation(tx, { provider: 'spotify', kind: 'release', providerId: hit.album.id });
 						if (!albumOwner || albumOwner === rel.id) await ingester.attachTo(rel.id, spotifyReleaseClaim(hit.album));
 					}
-					await reannounceFor(tx, rel.id);
 				}
-				// Every release holding the track: its card now plays this row.
-				for (const e of await tx.query<{ id: string }>(`select src as id from curator.catalog_edge where dst = $1 and kind = 'release-recording'`, [r.id])) await reannounceCard(tx, e.id);
-				await reannounceFor(tx, r.id);
 				await tx.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'representation' and provider = 'spotify'`, [r.id]);
 			});
 			resolved++;
@@ -449,9 +443,7 @@ export async function runIsrcFill(deps: ResolverDeps): Promise<{ attempted: numb
 				// onto the ISRC's holder, which has its ISRC already.
 				await tx.query(`delete from curator.catalog_enrich_task where object_id = $1 and need = 'isrc'`, [r.id]);
 				if (into === r.id) return;
-				const releases = await tx.query<{ id: string }>(`select src as id from curator.catalog_edge where dst = $1 and kind = 'release-recording'`, [r.id]);
 				await mergeObjects(tx, r.id, into, 'worker', 'same ISRC after the Spotify fill', { isrc });
-				for (const rel of releases) await reannounceCard(tx, rel.id);
 				gone.set(r.id, into);
 				merged++;
 			});

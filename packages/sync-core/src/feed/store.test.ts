@@ -636,3 +636,28 @@ describe('SqliteFeedStore catalogue identity (v9 aliases)', () => {
 		}
 	});
 });
+
+describe('SqliteFeedStore: what this device found, for the catalogue', () => {
+	it('lists a Spotify match whose store lookup found nothing, and asks again for a finding the catalogue could not place', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-facts-'));
+		try {
+			const s = new SqliteFeedStore(join(dir, 'feed.db'));
+			await s.upsertItems([draft('album', 'matched', 'catalog:release:r1'), draft('album', 'enriched', 'catalog:release:r2'), draft('album', 'neither', 'catalog:release:r3')]);
+			const [matched, enriched] = await Promise.all(['catalog:release:r1', 'catalog:release:r2'].map(async (k) => (await s.getPage({ limit: 10 })).items.find((i) => i.dedupeKey === k)!));
+			await s.markMatched(matched!.id, 'ok');
+			await s.markEnriched(matched!.id, 'na');
+			await s.markEnriched(enriched!.id, 'ok');
+			expect((await s.listEnrichedSince(0, 10)).map((i) => i.dedupeKey).sort()).toEqual(['catalog:release:r1', 'catalog:release:r2']);
+
+			await s.markFactsSent(['spotify:album:a', 'beatport:1'], new Set(['beatport:1']));
+			expect([...(await s.unsentFactKeys(['spotify:album:a', 'beatport:1', 'beatport:2']))].sort()).toEqual(['beatport:2']);
+			expect([...(await s.unsentFactKeys(['spotify:album:a', 'beatport:1'], { retryUnplacedBefore: Date.now() + 1000 }))]).toEqual(['beatport:1']);
+			// Placed on the second try: not asked again.
+			await s.markFactsSent(['beatport:1']);
+			expect([...(await s.unsentFactKeys(['beatport:1'], { retryUnplacedBefore: Date.now() + 1000 }))]).toEqual([]);
+			s.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});

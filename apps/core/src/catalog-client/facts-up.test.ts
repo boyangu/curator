@@ -128,7 +128,7 @@ describe('createFactsUp', () => {
 		await vi.advanceTimersByTimeAsync(100);
 		expect(batches).toHaveLength(1);
 		expect(batches[0]!.claims.map((c) => factsKey({ source: c.provider, sourceTrackId: c.providerId }))).toEqual(['beatport:bp1']);
-		expect(batches[0]!.key).toMatch(/^enrich-facts:[0-9a-f]{32}$/);
+		expect(batches[0]!.key).toMatch(/^enrich-facts:[0-9a-f]{32}:\d+$/);
 		expect(sent.has('beatport:bp1')).toBe(true);
 
 		// An enrichment landing schedules another sweep; nothing new to send.
@@ -147,5 +147,39 @@ describe('createFactsUp', () => {
 			subscribe: () => () => {},
 		});
 		expect(await up.flush()).toEqual({ sent: 0, attached: 0, unknown: 0 });
+	});
+});
+
+describe('a finding’s object', () => {
+	it('is named only where the server reads it', () => {
+		const item = track({ catalogId: 'rec-1' });
+		expect(claimsFor(item)[0]!.claim.about).toBeUndefined();
+		expect(claimsFor(item, { about: true })[0]!.claim.about).toBe('rec-1');
+	});
+
+	it('a finding the catalogue could not place is sent again after a week, not before', async () => {
+		let now = Date.UTC(2026, 10, 26);
+		const sentAt = new Map<string, { at: number; unplaced: boolean }>();
+		const asked: string[][] = [];
+		const up = createFactsUp({
+			store: {
+				listEnrichedSince: async () => [track()],
+				unsentFactKeys: async (keys, opts) => new Set(keys.filter((k) => { const s = sentAt.get(k); return !s || (s.unplaced && s.at < (opts?.retryUnplacedBefore ?? 0)); })),
+				markFactsSent: async (keys, unplaced) => { for (const k of keys) sentAt.set(k, { at: now, unplaced: unplaced?.has(k) ?? false }); },
+			},
+			ingest: () => async (claims, key) => {
+				asked.push([key]);
+				return { results: claims.map(() => ({ rejected: 'unknown' })) };
+			},
+			subscribe: () => () => {},
+			now: () => now,
+		});
+		expect(await up.flush()).toEqual({ sent: 1, attached: 0, unknown: 1 });
+		now += 3 * 86400_000;
+		expect((await up.flush()).sent).toBe(0);
+		now += 5 * 86400_000;
+		expect((await up.flush()).sent).toBe(1);
+		// A new request each time: the server answers a repeated key with its first answer.
+		expect(new Set(asked.map((a) => a[0])).size).toBe(2);
 	});
 });

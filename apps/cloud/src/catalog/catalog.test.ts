@@ -7,6 +7,7 @@ import { createLogger } from '../log.js';
 import { ingestClaims } from './ingest.js';
 import { nextDueAt, nextDueFor, spreadOf } from './trackers/cadence.js';
 import { runTrackers } from './trackers/sweep.js';
+import { rebuildCards } from './card-rebuild.js';
 import type { TrackerAdapter, TrackerPoll, TrackerTarget } from '@curator/catalog-readers';
 const DAY = 86400_000;
 const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
@@ -477,7 +478,7 @@ describe('trackers and events', () => {
 		void app;
 	});
 
-	it('the same release from a second provider stays one event, re-announced with its new handles', async () => {
+	it('the same release from a second provider stays one event, sent again with its new handles', async () => {
 		const { app, fan, spotify, run } = await setup();
 		const deezer = new FakeTracker('deezer');
 		const sp = release('spotify', 'new', 'New Single', [artist('spotify', 'sa1', 'Northfold')], { upc: '222222222222' });
@@ -505,6 +506,7 @@ describe('trackers and events', () => {
 		spotify.listings.set('sa1', [sp]);
 		await app.pg.query(`update curator.catalog_cursor set next_due_at = now() - interval '1 minute'`);
 		await run();
+		await rebuildCards(app.db);
 		await settle(app.pg);
 		const again = await fan.api.feed.events.query({ deviceId: fan.deviceId, afterSeq: first.nextSeq });
 		expect(again.events.map(handles)).toEqual([['deezer', 'spotify']]);
@@ -515,6 +517,7 @@ describe('trackers and events', () => {
 		await app.pg.query(`update curator.catalog_cursor set next_due_at = now() - interval '1 minute'`);
 		deezer.listings.set('da1', [dz, release('deezer', 'dother', 'Other', [artist('deezer', 'da1', 'Northfold')], { date: iso(Date.now() - 300 * DAY) })]);
 		await runDeezer();
+		await rebuildCards(app.db);
 		await settle(app.pg);
 		expect((await fan.api.feed.events.query({ deviceId: fan.deviceId, afterSeq: again.nextSeq })).events).toEqual([]);
 		expect(await count(app.db, `select count(*) as n from curator.catalog_source_object where kind = 'release'`)).toBe(5);

@@ -89,4 +89,19 @@ describe('mergeFeedPayload', () => {
 		expect(mergeFeedPayload(row, { title: 't', artists: [], url: 'https://open.spotify.com/album/al1' }, { upgrade: true })?.url).toBe('https://open.spotify.com/album/al1');
 		expect(mergeFeedPayload(row, { title: 't', artists: [], url: 'https://open.spotify.com/album/al1' })).toBeNull();
 	});
+	it('the catalogue’s own card replaces what the row holds; what the device found fills only what the card leaves empty', () => {
+		const row: FeedItemPayload = { title: 'Glass Rivers', artists: ['Northfold', 'North Fold'], label: 'Northfold Recs', genre: 'House', bpm: 122, catalogId: 'rel-1', url: 'https://open.spotify.com/album/al1' };
+		const card: FeedItemPayload = { title: 'Glass Rivers', artists: ['Northfold'], label: 'Northfold Records', labelCatalogId: 'lab-1', genre: null, catalogId: 'rel-1', url: 'https://x.bandcamp.com/album/t' };
+		const next = mergeFeedPayload(row, card, { card: true })!;
+		// The corrected label and the merged credit land; the card names no
+		// genre or BPM, so the device's own stay; the playable page stays.
+		expect(next).toMatchObject({ artists: ['Northfold'], label: 'Northfold Records', labelCatalogId: 'lab-1', genre: 'House', bpm: 122, url: 'https://open.spotify.com/album/al1' });
+		expect(mergeFeedPayload(next, card, { card: true })).toBeNull();
+	});
+
+	it('a card of another object, or a repeat that is not a card, still only fills', () => {
+		const row: FeedItemPayload = { title: 't', artists: [], label: 'Kept', catalogId: 'rel-1' };
+		expect(mergeFeedPayload(row, { title: 't', artists: [], label: 'Other', catalogId: 'rel-2' }, { card: true })).toBeNull();
+		expect(mergeFeedPayload(row, { title: 't', artists: [], label: 'Other', catalogId: 'rel-1' })).toBeNull();
+	});
 });

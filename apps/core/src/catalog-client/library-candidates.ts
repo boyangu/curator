@@ -12,7 +12,7 @@
 import type Database from 'better-sqlite3';
 import type { CatalogClaim } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
-import { isDistributor } from './library-claims.js';
+import { isDistributor } from '@curator/library-logic';
 
 export const FOLLOW_CANDIDATE_KINDS = ['artist', 'label', 'genre', 'playlist'] as const;
 export type FollowCandidateKind = (typeof FOLLOW_CANDIDATE_KINDS)[number];

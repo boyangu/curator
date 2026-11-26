@@ -1,7 +1,9 @@
 // Production entry: config from env, Postgres pool, JWKS-backed verifier,
 // the Spotify gateway when its secrets are set, HTTP server, the access-log
 // writer, and the maintenance sweeps on timers: batch upkeep (expire idle batches, finish stalled commits) every 15 min,
-// the access log's prune and the log compaction (src/sync/compact.ts) daily.
+// the access log's prune and the log compaction (src/sync/compact.ts) daily,
+// and, with the Global Catalog on, the event cards kept current every minute
+// (src/catalog/card-rebuild.ts).
 // Nothing starts until the migration gate has confirmed the database holds
 // every migration this image ships (src/db/migration-gate.ts).
 
@@ -9,6 +11,7 @@ import { createServer } from 'node:http';
 import { createFetchHandler } from './app.js';
 import { AuditWriter, PRUNE_EVERY_MS, pruneRequestLog } from './audit.js';
 import { createTokenVerifier, remoteKeys } from './auth/jwt.js';
+import { rebuildCards } from './catalog/card-rebuild.js';
 import { SoundCloudTracker } from '@curator/catalog-readers';
 import { loadConfig, soundcloudCredentials } from './config.js';
 import { createPostgresDb } from './db/db.js';
@@ -31,6 +34,9 @@ const BATCH_SWEEP_MS = 15 * 60 * 1000;
 // second finds nothing below the base).
 const COMPACT_EVERY_MS = 24 * 3600 * 1000;
 const COMPACT_FIRST_MS = 10 * 60 * 1000;
+// Event cards: how long a device waits for a change to a release it holds.
+// One query when nothing was written since.
+const CARD_REBUILD_MS = 60 * 1000;
 
 const log = createLogger();
 const config = loadConfig();
@@ -129,6 +135,22 @@ let compactTimer: ReturnType<typeof setInterval> | ReturnType<typeof setTimeout>
 	compactTimer.unref();
 }, COMPACT_FIRST_MS);
 compactTimer.unref();
+
+let rebuilding = false;
+if (config.catalog) {
+	setInterval(() => {
+		if (rebuilding) return;
+		rebuilding = true;
+		void rebuildCards(db)
+			.then((r) => {
+				if (r.moved) log.info('cards_rebuilt', r);
+			})
+			.catch((e: unknown) => log.error('card_rebuild_failed', { error: e }))
+			.finally(() => {
+				rebuilding = false;
+			});
+	}, CARD_REBUILD_MS).unref();
+}
 
 server.listen(config.port, () => log.info('listening', { port: config.port }));
 

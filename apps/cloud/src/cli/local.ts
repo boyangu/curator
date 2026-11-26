@@ -58,6 +58,7 @@ import { SUPABASE_SHIM_SQL } from '../test/supabase-shim.js';
 
 import { watcherPlaylistToken } from '../catalog/spotify-app-token.js';
 import { readersFromEnv, runPass } from '../worker/pass.js';
+import { rebuildCards } from '../catalog/card-rebuild.js';
 import { fromThisMachinesPages } from './loopback.js';
 const PORT = Number(process.env.CURATOR_LOCAL_CLOUD_PORT ?? 8787);
 const PASS_EVERY_MS = 60_000;
@@ -354,6 +355,17 @@ const freshPass = async (): Promise<void> => {
 	await pass();
 };
 const timer = setInterval(() => void pass(), PASS_EVERY_MS);
+// The API's own timer in production (server.ts): event cards kept current.
+let rebuilding = false;
+setInterval(() => {
+	if (rebuilding) return;
+	rebuilding = true;
+	void rebuildCards(db)
+		.catch((e: unknown) => log.error('card_rebuild_failed', { error: e }))
+		.finally(() => {
+			rebuilding = false;
+		});
+}, 60_000).unref();
 setTimeout(() => void pass(), 5_000);
 // A stop request from `--stop` (see the header).
 setInterval(() => {

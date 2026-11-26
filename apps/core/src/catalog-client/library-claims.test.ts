@@ -10,7 +10,8 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ZCatalogClaim } from '@curator/protocol';
 import { migrate } from '@curator/sync-core/db/migrate';
-import { isDistributor, libraryClaims } from './library-claims.js';
+import { isDistributor } from '@curator/library-logic';
+import { libraryClaims } from './library-claims.js';
 
 let dir: string;
 let db: Database.Database;

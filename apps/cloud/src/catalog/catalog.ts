@@ -28,7 +28,9 @@ import {
 import type { CatalogBrowseInput, CatalogBrowseResult, CatalogEnrichInput, CatalogEnrichResult, CatalogTracksInput, CatalogTracksResult } from '@curator/protocol';
 import { gateDevice, type Caller } from '../account/device-gate.js';
 import type { AuditEmit } from '../audit.js';
+import { creditsShareAct, nameFold } from '@curator/library-logic';
 import type { Db, Queryable } from '../db/db.js';
+import { numOrNull } from '../db/db.js';
 import { queueAudience } from './audience.js';
 import { browseForClient } from './browse.js';
 import { queueCredits } from './credits.js';
@@ -39,6 +41,7 @@ import { findRepresentation } from './identity.js';
 import { ingestClaims, Ingester, type IngestOutcome } from './ingest.js';
 import { detail, resolveRefs, search } from './objects.js';
 import { pageTracks } from './pages.js';
+import { sameTrackTitle } from './slots.js';
 import { addWatch, liveTarget, listWatches, refreshNow, removeWatch, setMuted } from './watches.js';
 import { queueValidation } from './artist-validation.js';
 
@@ -126,9 +129,20 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 // objects the catalogue already holds (by the provider's id, the UPC or ISRC
 // with the length guard, or the title / artist / date rules: identity.ts),
 // so every device's card carries them and none re-searches what another
-// found. Never creates an object, never an event, never a follow-up task; a
-// claim naming nothing known is `unknown` (an undefined outcome) and the
-// device moves on.
+// found. Never creates an object and never raises an event (the cards that
+// show the object are rebuilt from what was written: card-rebuild.ts); a
+// claim naming nothing known is `unknown` (an undefined outcome).
+//
+// A claim the rules cannot place may say which object it is about (`about`:
+// the id on the card the device enriched). That is the device's word, and a
+// device's title matcher is sometimes wrong, so the id is never taken by
+// itself: the claim must agree with the object (agrees below). It is what
+// lets a release with no UPC, or a track with no ISRC, gain the store page
+// a device found for it.
+//
+// A label a device found for a track is its release's: where the track is
+// on one release and that release names no label yet, the release is tied
+// to the label of that name (ingest.ts labelsByText).
 //
 // An artist's picture rides the same way (artistPicture below): the page a
 // desktop opened had none, it looked the artist up at the store, and the
@@ -136,11 +150,16 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
 	const ingester = new Ingester(tx, { reason: 'enrichment' });
 	const outcomes: (IngestOutcome | undefined)[] = [];
+	const about = await aboutObjects(tx, claims);
+	const agreed = (c: CatalogClaim): string | null => (c.about && agrees(c, about.get(c.about)) ? c.about : null);
+	const labelled: { rec: string; label: string; p: string; i: string }[] = [];
 	await ingester.batch(claims, async () => {
-		for (const c of claims) {
+		for (const { about: _hint, ...c } of claims) {
 			let known: IngestOutcome | null = null;
-			if (c.kind === 'recording') known = await ingester.attachIfKnown(c, { genres: true });
-			else if (c.kind === 'release') known = await ingester.attachIfKnown(c);
+			if (c.kind === 'recording') {
+				known = await ingester.attachIfKnown(c, { genres: true, about: agreed({ ...c, about: _hint }) });
+				if (known && typeof c.facts?.labelText === 'string') labelled.push({ rec: known.objectId, label: c.facts.labelText, p: c.provider, i: c.providerId });
+			} else if (c.kind === 'release') known = await ingester.attachIfKnown(c, { about: agreed({ ...c, about: _hint }) });
 			else if (c.kind === 'artist') {
 				// Only onto the artist that store id already names: a picture never
 				// goes by the identity rules, and never makes a representation.
@@ -150,7 +169,64 @@ async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outc
 			outcomes.push(known ?? undefined);
 		}
 	});
+	if (labelled.length) {
+		// The track's one release, where it names no label of its own; the
+		// store's track page is the link's evidence.
+		const rows = await tx.query<{ release: string; label: string; so: string }>(
+			`with one as (
+				select x.label, s.id as so, min(e.src::text)::uuid as release
+				from jsonb_to_recordset($1::text::jsonb) as x(rec uuid, label text, p text, i text)
+				join curator.catalog_source_object s on s.provider = x.p and s.kind = 'recording' and s.provider_id = x.i
+				join curator.catalog_edge e on e.dst = x.rec and e.kind = 'release-recording'
+				join curator.catalog_object r on r.id = e.src and r.merged_into is null
+				group by x.rec, x.label, s.id having count(*) = 1)
+			select distinct on (one.release) one.release, one.label, one.so from one
+			where not exists (select 1 from curator.catalog_edge l where l.src = one.release and l.kind = 'release-label')
+			order by one.release, one.label`,
+			[JSON.stringify(labelled)],
+		);
+		await ingester.labelsByText(rows.map((r) => ({ releaseId: r.release, text: r.label, sourceObjectId: r.so })));
+	}
 	return { outcomes, created: 0, attached: ingester.stats.attached };
+}
+
+type AboutObject = { kind: string; name: string; durationSec: number | null; credits: string[] };
+
+// The live objects the claims say they are about.
+async function aboutObjects(tx: SystemTx, claims: readonly CatalogClaim[]): Promise<Map<string, AboutObject>> {
+	const ids = [...new Set(claims.flatMap((c) => (c.about ? [c.about] : [])))];
+	const out = new Map<string, AboutObject>();
+	if (!ids.length) return out;
+	const rows = await tx.query<{ id: string; kind: string; name: string; duration_sec: unknown; credits: string | null }>(
+		`select o.id, o.kind, o.name, o.duration_sec,
+			(select string_agg(a.name, E'\n') from curator.catalog_edge e join curator.catalog_object a on a.id = e.src where e.dst = o.id and e.kind = 'artist-release') as credits
+		from curator.catalog_object o where o.id = any($1::uuid[]) and o.merged_into is null`,
+		[`{${ids.join(',')}}`],
+	);
+	for (const r of rows) out.set(r.id, { kind: r.kind, name: r.name, durationSec: numOrNull(r.duration_sec), credits: r.credits ? r.credits.split('\n') : [] });
+	return out;
+}
+
+// How far two readings of one track's length may be apart (identity.ts
+// uses the same for a title-and-artists match).
+const ABOUT_LENGTH_SEC = 5;
+
+// Whether a device's claim agrees with the object it says it is about. A
+// track: the same title, mix tags aside (slots.ts), and lengths within five
+// seconds, both known — a title alone says little ("Intro"). A release: the
+// same folded title and a credited act in common, as the release rule asks
+// but without the date, which stores give differently for one release.
+export function agrees(c: CatalogClaim, o: AboutObject | undefined): boolean {
+	if (!o || o.kind !== c.kind) return false;
+	if (c.kind === 'recording') {
+		const length = c.facts?.durationSec;
+		return sameTrackTitle(o.name, c.name) && typeof length === 'number' && o.durationSec !== null && Math.abs(length - o.durationSec) <= ABOUT_LENGTH_SEC;
+	}
+	if (c.kind === 'release') {
+		const names = (c.artists ?? []).map((a) => a.name).filter((n) => !!nameFold(n));
+		return nameFold(o.name) === nameFold(c.name) && names.length > 0 && o.credits.length > 0 && creditsShareAct(names, o.credits);
+	}
+	return false;
 }
 
 // The stores a device may state an artist's picture from, and where each

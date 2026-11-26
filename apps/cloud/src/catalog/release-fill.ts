@@ -25,7 +25,6 @@ import { withSystemTx, type SystemTx } from '../db/system-tx.js';
 import { mergeObjects, openReview, renameObject } from './admin.js';
 import { artistTwinsOn } from './artist-twins.js';
 import { storeRef } from './agent-import.js';
-import { reannounceCard } from './events.js';
 import { findRepresentation } from './identity.js';
 import { Ingester } from './ingest.js';
 import { sameTrackTitle } from './slots.js';
@@ -324,8 +323,8 @@ export type DedupeReport = { dry: boolean; releases: number; merged: DedupeMerge
 // sameTrackTitle), lengths within two seconds and no two ISRCs that
 // disagree; the one with an ISRC, then the one more stores hold, survives.
 // Afterwards the stores' copies of the artists are joined by the twins rule,
-// and the release's event is re-announced with the shorter tracklist so the
-// devices that hold the card shrink it (events.ts reannounceCard).
+// and the release's event is sent again with the shorter tracklist so the
+// devices that hold the card shrink it (the merge marks it; card-rebuild.ts).
 // Callers: the dedupe sweep below, a release twin merge (inbox.ts,
 // admin-ops.ts — merging two releases unions their edges by recording, so
 // both stores' copies of a track survive on the winner).
@@ -396,7 +395,6 @@ export async function dedupeRelease(tx: SystemTx, releaseId: string, by: string,
 		// Two copies of a track made one credit each store's copy of its
 		// artist on one track: the twins rule joins them now.
 		await artistTwinsOn(tx, [releaseId], by);
-		await reannounceCard(tx, releaseId);
 	}
 	return merged;
 }

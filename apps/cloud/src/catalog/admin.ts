@@ -19,7 +19,6 @@ import { nameFold } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { num } from '../db/db.js';
 import type { SystemTx } from '../db/system-tx.js';
-import { reannounceCard } from './events.js';
 import { Ingester } from './ingest.js';
 import { editionsOf } from './insights.js';
 import { plainerLabelName } from './label-names.js';
@@ -233,18 +232,9 @@ export async function mergeObjects(tx: SystemTx, fromId: string, intoId: string,
 		[fromId, intoId],
 	);
 	await tx.query(`update curator.catalog_object set merged_into = $2 where id = $1`, [fromId, intoId]);
-	// Two credits became one on every release the twins were on; the cards
-	// devices hold still read "Modd, Modd" until re-announced.
-	if (from.kind === 'artist') {
-		const releases = await tx.query<{ id: string }>(
-			`select distinct ev.subject_id as id from curator.catalog_event ev where ev.subject_id in (
-				select e.dst from curator.catalog_edge e where e.src = $1 and e.kind = 'artist-release'
-				union select rr.src from curator.catalog_edge ra join curator.catalog_edge rr on rr.dst = ra.src and rr.kind = 'release-recording'
-					where ra.dst = $1 and ra.kind = 'recording-artist')`,
-			[intoId],
-		);
-		for (const r of releases) await reannounceCard(tx, r.id);
-	}
+	// Two credits became one on every release the twins were on: the edges
+	// moved above mark those releases, and the cards devices hold ("Modd,
+	// Modd") are rebuilt from the marks (card-rebuild.ts).
 	// One label under two names keeps the plainer one, whichever side won.
 	if (from.kind === 'label') {
 		const names = await tx.query<{ id: string; name: string }>(`select id, name from curator.catalog_object where id = any($1::uuid[])`, [`{${fromId},${intoId}}`]);

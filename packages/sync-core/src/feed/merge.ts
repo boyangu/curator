@@ -2,17 +2,22 @@
 // item (store.ts upsertItems / accrueSources).
 //
 // The row and the draft can come from different producers — a Spotify
-// playlist track and the catalogue's card for the same recording, or a
-// catalogue release announced again after it gained a Spotify id — so the
-// merge is FILL-ONLY: a value the row already has is kept (the user may have
-// seen it, the enricher may have chosen it), a missing one is taken from the
-// draft. Handles are the exception: they are facts about where the item
-// lives, so the row gains every new one (that is how a re-announced release
-// becomes playable in place).
+// playlist track and the catalogue's card for the same recording — so the
+// merge is FILL-ONLY: a value the row already has is kept (the enricher may
+// have chosen it), a missing one is taken from the draft. Two exceptions.
+// Handles are facts about where the item lives, so the row gains every new
+// one (that is how a release sent again becomes playable in place). And the
+// catalogue's own card for the row's object is the shared record every
+// device and store reading fed, sent again whenever it changes: what it
+// states replaces the row's value (a label corrected, a credit merged), and
+// what this device found only fills what the card leaves empty.
 
 import type { FeedHandle, FeedItemPayload, FeedTrackRef } from './types.js';
 
 const FILL_FIELDS = ['catalogId', 'artistCatalogIds', 'labelCatalogId', 'catalogNumber', 'upc', 'genre', 'label', 'bpm', 'keyCamelot', 'releaseDate', 'albumType', 'trackCount', 'isrc', 'coverUrl', 'albumTitle', 'url'] as const satisfies readonly (keyof FeedItemPayload)[];
+// What a card states about its release or recording. Not the url (the
+// row's is its playable page) and not the tracklist (replaceTracks).
+const CARD_FIELDS = ['title', 'artists', 'artistIds', 'artistCatalogIds', 'labelCatalogId', 'label', 'catalogNumber', 'upc', 'genre', 'bpm', 'keyCamelot', 'releaseDate', 'albumType', 'isrc', 'coverUrl', 'albumTitle'] as const satisfies readonly (keyof FeedItemPayload)[];
 const REF_FILL_FIELDS = ['catalogId', 'artistCatalogIds', 'isrc', 'bpm', 'keyCamelot', 'genre', 'label', 'releaseDate'] as const satisfies readonly (keyof FeedTrackRef)[];
 
 const empty = (v: unknown): boolean => v === undefined || v === null || v === '';
@@ -108,9 +113,19 @@ function replaceTracks(current: readonly FeedTrackRef[], incoming: readonly Feed
 // The row's payload with the draft's facts folded in, or null when nothing
 // changed. `upgrade`: the row moves from 'catalog' to a playable source with
 // this draft, so the draft's url (the Spotify page) replaces the store page.
-export function mergeFeedPayload(current: FeedItemPayload, incoming: FeedItemPayload, opts: { upgrade?: boolean } = {}): FeedItemPayload | null {
+// `card`: the draft is the catalogue's card (FeedItemDraft.card).
+export function mergeFeedPayload(current: FeedItemPayload, incoming: FeedItemPayload, opts: { upgrade?: boolean; card?: boolean } = {}): FeedItemPayload | null {
 	const next: FeedItemPayload = { ...current };
 	let changed = false;
+	// The card of the row's own object, or of a row no card had reached yet.
+	if (opts.card && incoming.catalogId && (!current.catalogId || current.catalogId === incoming.catalogId)) {
+		for (const f of CARD_FIELDS) {
+			const v = incoming[f];
+			if (empty(v) || (Array.isArray(v) && v.length === 0) || JSON.stringify(v) === JSON.stringify(next[f])) continue;
+			(next as unknown as Record<string, unknown>)[f] = v;
+			changed = true;
+		}
+	}
 	for (const f of FILL_FIELDS) {
 		if (empty(next[f]) && !empty(incoming[f])) {
 			(next as unknown as Record<string, unknown>)[f] = incoming[f];

@@ -165,11 +165,16 @@ export interface FeedStore {
 	markMatched(itemId: string, status: MatchStatus): Promise<void>;
 	// Items whose enrichment landed metadata after `sinceMs`, newest first:
 	// the facts-up sweep's worklist (catalog-client/facts-up.ts).
+	// Items this device found something for since then: a store lookup that
+	// answered, or a Spotify match. Newest finding first.
 	listEnrichedSince(sinceMs: number, limit: number): Promise<FeedItem[]>;
 	// Which of these facts-up keys ('beatport:<id>') were never sent, and
 	// marking them sent.
-	unsentFactKeys(keys: string[]): Promise<Set<string>>;
-	markFactsSent(keys: string[]): Promise<void>;
+	// `retryUnplacedBefore`: a key the catalogue could not place, sent
+	// before then, counts as unsent again.
+	unsentFactKeys(keys: string[], opts?: { retryUnplacedBefore?: number }): Promise<Set<string>>;
+	// `unplaced`: the keys among them the catalogue named nothing for.
+	markFactsSent(keys: string[], unplaced?: ReadonlySet<string>): Promise<void>;
 	// Pre-bus filter probes (see pipeline.ts): the subset of `keys` already
 	// stored (feed-dedup filter), and every suppression key for a scope
 	// (artist-dismiss filter).
@@ -313,7 +318,8 @@ CREATE TABLE IF NOT EXISTS feed_unavailable (
 -- and on-view enrichment. Plain CREATE-IF-NOT-EXISTS, no ALTER.
 CREATE TABLE IF NOT EXISTS feed_facts_sent (
 	key TEXT PRIMARY KEY,
-	sent_at INTEGER NOT NULL
+	sent_at INTEGER NOT NULL,
+	unplaced INTEGER NOT NULL DEFAULT 0
 );
 `;
 
@@ -506,6 +512,11 @@ export class SqliteFeedStore implements FeedStore {
 		} catch { /* column exists */ }
 		try {
 			this.db.exec(`ALTER TABLE feed_item_origin ADD COLUMN seen_at INTEGER`);
+		} catch { /* column exists */ }
+		// A finding the catalogue could not place, asked again later
+		// (catalog-client/facts-up.ts). Tolerant ALTER.
+		try {
+			this.db.exec(`ALTER TABLE feed_facts_sent ADD COLUMN unplaced INTEGER NOT NULL DEFAULT 0`);
 		} catch { /* column exists */ }
 		this.db.exec(`CREATE INDEX IF NOT EXISTS idx_feed_item_covered ON feed_item (covered_by)`);
 		// What the live feed shows, for a reader that is not this class: the
@@ -742,7 +753,7 @@ export class SqliteFeedStore implements FeedStore {
 		if (upgrade) this.stmt(`UPDATE feed_item SET source = ?, source_id = ? WHERE id = ?`).run(d.source, d.sourceId, itemId);
 		let current: FeedItemPayload;
 		try { current = JSON.parse(row.payload_json) as FeedItemPayload; } catch { return []; }
-		const next = mergeFeedPayload(current, d.payload, { upgrade });
+		const next = mergeFeedPayload(current, d.payload, { upgrade, card: d.card === true });
 		if (!next) return [];
 		return this.writePayloadSync(itemId, row.type as FeedItem['type'], next);
 	}
@@ -1493,26 +1504,33 @@ export class SqliteFeedStore implements FeedStore {
 
 	async listEnrichedSince(sinceMs: number, limit: number): Promise<FeedItem[]> {
 		const rows = this.db
-			.prepare(`SELECT * FROM feed_item WHERE enrich_status = 'ok' AND enriched_at > ? ORDER BY enriched_at DESC LIMIT ?`)
-			.all(sinceMs, Math.max(1, limit)) as ItemRow[];
+			.prepare(
+				`SELECT * FROM feed_item WHERE (enrich_status = 'ok' AND enriched_at > ?) OR (match_status = 'ok' AND matched_at > ?)
+				ORDER BY max(coalesce(enriched_at, 0), coalesce(matched_at, 0)) DESC LIMIT ?`,
+			)
+			.all(sinceMs, sinceMs, Math.max(1, limit)) as ItemRow[];
 		return rows.map(rowToItem);
 	}
 
-	async unsentFactKeys(keys: string[]): Promise<Set<string>> {
+	async unsentFactKeys(keys: string[], opts: { retryUnplacedBefore?: number } = {}): Promise<Set<string>> {
 		const unsent = new Set(keys);
 		for (let i = 0; i < keys.length; i += 500) {
 			const chunk = keys.slice(i, i + 500);
-			const rows = this.db.prepare(`SELECT key FROM feed_facts_sent WHERE key IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as { key: string }[];
+			const rows = this.db
+				.prepare(`SELECT key FROM feed_facts_sent WHERE key IN (${chunk.map(() => '?').join(',')}) AND NOT (unplaced = 1 AND sent_at < ?)`)
+				.all(...chunk, opts.retryUnplacedBefore ?? 0) as { key: string }[];
 			for (const r of rows) unsent.delete(r.key);
 		}
 		return unsent;
 	}
 
-	async markFactsSent(keys: string[]): Promise<void> {
-		const stmt = this.db.prepare(`INSERT OR IGNORE INTO feed_facts_sent (key, sent_at) VALUES (?, ?)`);
+	async markFactsSent(keys: string[], unplaced: ReadonlySet<string> = new Set()): Promise<void> {
+		const stmt = this.db.prepare(
+			`INSERT INTO feed_facts_sent (key, sent_at, unplaced) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET sent_at = excluded.sent_at, unplaced = excluded.unplaced`,
+		);
 		const at = Date.now();
 		this.db.transaction(() => {
-			for (const k of keys) stmt.run(k, at);
+			for (const k of keys) stmt.run(k, at, unplaced.has(k) ? 1 : 0);
 		})();
 	}
 

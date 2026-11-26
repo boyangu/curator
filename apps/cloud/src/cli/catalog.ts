@@ -24,6 +24,7 @@
 //   pnpm --filter @curator/cloud catalog release link <release id> <store release url>
 //   pnpm --filter @curator/cloud catalog release dedupe <release id…> | --label <q> | --artist <q> | --shared-slots [--since-days N] [--dry]   (two recordings on one slot → one)
 //   pnpm --filter @curator/cloud catalog library import --file claims.json [--dry]   (a library's labels + releases; fills queued)
+//   pnpm --filter @curator/cloud catalog labels link-texts [--dry] [--page 2000]   (releases holding their label as text only, tied to the label of that name; once)
 //   pnpm --filter @curator/cloud catalog repair previews [--label <q>] [--dry]   (SoundCloud 0:30 preview copies → their store recordings)
 //   pnpm --filter @curator/cloud catalog repair dj-sets [--dry] [--limit 500]   (long mixed sessions only SoundCloud holds, and releases of nothing else: removed, not undoable)
 //   pnpm --filter @curator/cloud catalog repair credits [--dry]   (artists the SoundCloud/Bandcamp splitter cut out of a credit → the artists they were cut from)
@@ -151,6 +152,7 @@ async function ops(): Promise<AdminOps> {
 		repairCredits: (a) => call('repairCredits', a),
 		compoundArtists: (a) => call('compoundArtists', a),
 		nameLookup: (a) => call('nameLookup', a),
+		labelTexts: (a) => call('labelTexts', a),
 		repairArtistTwins: (a) => call('repairArtistTwins', a),
 		artistMerge: (a) => call('artistMerge', a),
 		artistUnlink: (a) => call('artistUnlink', a),
@@ -352,6 +354,18 @@ try {
 			for (const c of r.conflicts) console.log(`  conflict: ${c.release} — ${c.store}:${c.id} is on ${c.heldBy} (duplicate review opened)`);
 			for (const u of r.unread.slice(0, 20)) console.log(`  not a store page I can key: ${u.release} — ${u.link}`);
 		}
+	} else if (group === 'labels' && sub === 'link-texts') {
+		const dry = flag('--dry');
+		let after: string | null = null;
+		let scanned = 0;
+		let linked = 0;
+		do {
+			const r = await api.labelTexts({ after, limit: Number(arg('--page') ?? 2000), dry });
+			scanned += r.scanned;
+			linked += r.linked;
+			after = r.next;
+			console.log(`${dry ? '[dry run] ' : ''}${scanned} release(s) read, ${linked} ${dry ? 'would be' : ''} tied to a label`);
+		} while (after);
 	} else if (group === 'label' && sub === 'scanned') {
 		const r = await api.labelScanned({ q, note: arg('--note') ?? null, by: arg('--by') ?? 'claude-code' });
 		console.log(`${r.name}: scanned ${when(r.scannedAt)}`);

@@ -166,8 +166,9 @@ describe('library import', () => {
 		expect(ep.tracks).toMatchObject([{ title: 'Low Tide', position: 1, isrc: 'GBNFR2600001' }]);
 		expect(ep.tracks![0]!.handles.map((h) => h.provider)).toEqual(['deezer', 'spotify']);
 
-		// Another record of the label, merged into it: browsing the old id lands on the winner.
-		const [old] = (await withSystemTx(app.db, (tx) => ingestClaims(tx, [{ provider: 'beatport', kind: 'label', providerId: '804', name: LABEL }], { reason: 'enrichment' }))).outcomes;
+		// Another record of the label, merged into it: browsing the old id lands
+		// on the winner. (Under the label's own name it would join the label.)
+		const [old] = (await withSystemTx(app.db, (tx) => ingestClaims(tx, [{ provider: 'beatport', kind: 'label', providerId: '804', name: `${LABEL} Digital` }], { reason: 'enrichment' }))).outcomes;
 		await withSystemTx(app.db, (tx) => mergeObjects(tx, old!.objectId, labelId, 'test', 'same label'));
 		const moved = await fan.api.catalog.browse.query({ deviceId: fan.deviceId, id: old!.objectId });
 		expect(moved).toMatchObject({ object: { id: labelId }, redirectedFrom: old!.objectId });

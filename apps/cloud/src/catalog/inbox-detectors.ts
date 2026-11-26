@@ -20,6 +20,9 @@
 //                    stores' copies the slot rule did not join at ingest,
 //                    release-fill.ts dedupeRelease): merged outright, logged.
 //   tracker.failing  a tracker failing run after run for another reason.
+//   label.namesake   releases tied to a label by its name share no artist
+//                    with the ones its own store pages list: a namesake's,
+//                    perhaps (label-texts.ts). Told, not undone.
 //
 // With the reasoner on, twins become cases (catalog/agent) instead, and two
 // questions only it answers are queued: cut credits and bucket store ids.
@@ -33,6 +36,7 @@ import { withSystemTx } from '../db/system-tx.js';
 import { enqueueCase } from './agent/cases.js';
 import { artistTwins, PLACEHOLDER } from './artist-twins.js';
 import { WEAK_SQL } from './identity.js';
+import { detectLabelNamesakes } from './label-texts.js';
 import { clearInbox, listInbox, raise, type InboxRow } from './inbox.js';
 import { dedupeTracks } from './release-fill.js';
 
@@ -108,6 +112,7 @@ export async function runInboxDetectors(deps: DetectorDeps): Promise<DetectorRep
 	}
 	const p = await timed('pages', () => detectPages(deps.db));
 	report.pages = p.pages;
+	report.pages += await timed('label namesakes', () => withSystemTx(deps.db, (tx) => detectLabelNamesakes(tx)));
 	report.trackers = p.trackers;
 	report.trackers += await timed('parked', () => withSystemTx(deps.db, (tx) => detectParked(tx)));
 	if (Object.values(report).some((n) => n > 0)) deps.log?.info('inbox_detectors_pass', { ...report });

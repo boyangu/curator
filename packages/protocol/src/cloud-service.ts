@@ -168,7 +168,10 @@ export type PushInput = {
 //     `server_outdated`); the settings still apply on the device that set them.
 //   - 'client_logs': `diagnostics.upload` takes a phone's own log records
 //     (diagnostics.ts).
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs'] as const;
+//   - 'catalog_claim_about': a claim may carry `about` (catalog-service.ts
+//     CatalogClaim). An older server refuses a claim with a field it does
+//     not know, so a device sends it only when this is listed.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs', 'catalog_claim_about'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {

@@ -29,6 +29,7 @@ const SHARED_TABLES = [
 	'admin_user',
 	'catalog_agent_case',
 	'catalog_audio',
+	'catalog_card_dirty',
 	'catalog_chart_entry',
 	'catalog_connect_vote',
 	'catalog_page_check',

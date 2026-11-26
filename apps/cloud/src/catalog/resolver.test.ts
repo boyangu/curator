@@ -7,6 +7,7 @@ import type { CatalogEventCardV1 } from '@curator/protocol';
 import { withSystemTx } from '../db/system-tx.js';
 import { createLogger } from '../log.js';
 import { createTestApp } from '../test/harness.js';
+import { rebuildCards } from './card-rebuild.js';
 import { raiseReleaseEvent } from './events.js';
 import { ingestClaims, Ingester } from './ingest.js';
 import { runIsrcFill, runRecordingResolver } from './planner.js';
@@ -101,7 +102,7 @@ async function seed(app: Awaited<ReturnType<typeof createTestApp>>) {
 const handles = (card: CatalogEventCardV1) => ({ release: card.handles.map((h) => h.provider).sort(), track: card.tracks[0]!.handles.map((h) => h.provider).sort() });
 
 describe('recording resolver', () => {
-	it('gives a track and its release their Spotify ids by ISRC and re-announces the event', async () => {
+	it('gives a track and its release their Spotify ids by ISRC, and the event is sent again', async () => {
 		const app = await createTestApp();
 		const { fan, releaseId, recordingId } = await seed(app);
 		await app.pg.query(`update curator.catalog_event set first_seen_at = first_seen_at - interval '5 minutes'`);
@@ -120,6 +121,7 @@ describe('recording resolver', () => {
 			{ object_id: releaseId, provider_id: 'al1' },
 		]);
 		// The event moved past the device's cursor with both providers on it.
+		await rebuildCards(app.db);
 		await app.pg.query(`update curator.catalog_event set first_seen_at = first_seen_at - interval '5 minutes'`);
 		const after = await fan.api.feed.events.query({ deviceId: fan.deviceId, afterSeq: before.nextSeq });
 		expect(after.events).toHaveLength(1);
@@ -163,6 +165,7 @@ describe('recording resolver', () => {
 		const { fetch, searches, albumReads } = fakeSpotify({}, {}, { al9: { name: 'Low Tide EP', tracks: [{ id: 'st21', name: 'Low Tide', duration_ms: 301_000 }, { id: 'st22', name: 'Undertow (feat. Northern Drift)', duration_ms: 288_400 }] } });
 		const r = await runRecordingResolver({ db: app.db, log: quiet, spotify: new SpotifyTracker({ token: appCredentialsToken({ clientId: 'id', clientSecret: 'secret' }, fetch) }, fetch) });
 		expect(r).toEqual({ attempted: 2, resolved: 2 });
+		await rebuildCards(app.db);
 		expect(searches).toEqual([]);
 		expect(albumReads).toEqual([['al9']]);
 		const reps = await app.db.query<{ object_id: string; provider_id: string }>(`select object_id, provider_id from curator.catalog_source_object where provider = 'spotify' and kind = 'recording' order by provider_id`);

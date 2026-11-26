@@ -154,7 +154,9 @@ describe('label profiler', () => {
 	it('attaches nothing from a list with two namesakes, nor a page another label owns', async () => {
 		const app = await createTestApp();
 		const fan = await app.signIn();
-		const other = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: { provider: 'beatport', kind: 'label', providerId: '804', name: 'Northfold' }, source: 'manual' });
+		// Beatport's 804 is another label's page (under its own name there; one
+		// of the same name would be this label).
+		const other = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: { provider: 'beatport', kind: 'label', providerId: '804', name: 'Northfold Audio' }, source: 'manual' });
 		const w = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: { provider: 'user', kind: 'label', providerId: 'name:northfold', name: 'Northfold' }, source: 'manual' });
 		const { fetch } = fakeWorld({
 			mb: [{ id: 'a0000000-0000-4000-8000-000000000001', name: 'Northfold' }, { id: 'a0000000-0000-4000-8000-000000000002', name: 'Northfold' }],

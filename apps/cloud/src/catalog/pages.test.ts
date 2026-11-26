@@ -191,7 +191,7 @@ describe('catalog.browse header facts', () => {
 });
 
 describe("catalog.browse: an artist's labels", () => {
-	it('counts the releases that only name their label, under the label object of that name or by the name alone', async () => {
+	it('counts the releases that name their label in text under the label of that name, whatever the case', async () => {
 		const app = await createTestApp();
 		const fan = await app.signIn();
 		const a = artist('sa1', 'Northfold');
@@ -218,9 +218,15 @@ describe("catalog.browse: an artist's labels", () => {
 		const [known] = (await fan.api.catalog.resolve.mutate({ deviceId: fan.deviceId, refs: [{ provider: 'spotify', kind: 'artist', providerId: 'sa1' }] })).objects;
 		for (const brief of [true, false]) {
 			const b = await fan.api.catalog.browse.query({ deviceId: fan.deviceId, id: known!.id, brief });
-			// The label the artist is tied to takes the release that names it in another case.
-			expect(b.labels).toEqual([{ id: expect.any(String), name: 'Northfold', releases: 2 }]);
-			expect(b.labelTexts).toEqual([{ name: 'Cobalt Pier', releases: 3 }, { name: 'Harbour Lights', releases: 1 }]);
+			// Text is the label of that name: the label page's object takes the
+			// release that names it in another case, and a name with no page
+			// becomes a label of its own, spelt as first written.
+			expect(b.labels).toEqual([
+				{ id: expect.any(String), name: 'Cobalt Pier', releases: 3 },
+				{ id: expect.any(String), name: 'Northfold', releases: 2 },
+				{ id: expect.any(String), name: 'Harbour Lights', releases: 1 },
+			]);
+			expect(b.labelTexts ?? []).toEqual([]);
 		}
 		// A release has its own label line: no texts beside it.
 		const album = await fan.api.catalog.browse.query({ deviceId: fan.deviceId, id: (await fan.api.catalog.browse.query({ deviceId: fan.deviceId, id: known!.id })).releases![0]!.id });

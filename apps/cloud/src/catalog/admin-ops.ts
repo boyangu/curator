@@ -40,6 +40,7 @@ import { openRelatedPair, queueLabelDedupe, scanRelatedLabels } from './label-re
 import { artistTwins, type ArtistTwinReport } from './artist-twins.js';
 import { compoundArtists, type CompoundReport } from './compound-artists.js';
 import { lookUpNames, type NameLookupReport, type NameSource } from './name-lookup.js';
+import { linkLabelTexts, type LabelTextsReport } from './label-texts.js';
 import { recreditOn, repairCredits, type CreditRepairReport } from './repair-credits.js';
 import { repairPreviews, type PreviewRepairReport } from './repair-previews.js';
 import { removeDjSets, type DjSetReport } from './repair-dj-sets.js';
@@ -183,6 +184,9 @@ export type AdminOps = {
 	// whole name (name-lookup.ts): one call a name not yet answered, kept. A
 	// short batch per call; `stopped` says why it ended early.
 	nameLookup(args: { names: string[]; source: NameSource }): Promise<NameLookupReport>;
+	// Releases holding their label as text only, tied to the label of that
+	// name: one page from `after` (label-texts.ts). The CLI runs every page.
+	labelTexts(args: { after?: string | null; limit?: number; dry?: boolean }): Promise<LabelTextsReport>;
 	// Same-name artists on one release merged, unless one store holds both
 	// (then put to the operator; mergeOnly: not) — artist-twins.ts.
 	repairArtistTwins(args: { dry?: boolean; by?: string; mergeOnly?: boolean }): Promise<ArtistTwinReport>;
@@ -583,6 +587,9 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 		},
 		async nameLookup(args) {
 			return lookUpNames(db, { fetch: evidence.fetch, spotify: evidence.spotify }, args);
+		},
+		async labelTexts(args) {
+			return linkLabelTexts(db, args);
 		},
 		async artistMerge(args) {
 			if (!args.note?.trim()) throw new Error('artist merge needs --note (why they are one)');

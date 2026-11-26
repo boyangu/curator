@@ -13,7 +13,7 @@ import type Database from 'better-sqlite3';
 import type { CatalogObjectSummary, CatalogRef } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { CatalogClient } from './service.js';
-import { isDistributor } from './library-claims.js';
+import { isDistributor } from '@curator/library-logic';
 
 export type CatalogRefKind = 'track' | 'album' | 'artist' | 'label';
 export type CatalogRefObjectKind = 'recording' | 'release' | 'artist' | 'label';

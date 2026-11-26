@@ -2752,6 +2752,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		store: feedStore,
 		ingest: () => (catalogClient?.status().available ? (claims, idempotencyKey) => catalogClient.reportEnrichment(claims, idempotencyKey) : null),
 		subscribe: (cb) => feedService.subscribeEnriched(cb),
+		about: () => (opts.cloud?.transport.catalogFeatures?.() ?? cloudClient?.serverFeatures() ?? []).includes('catalog_claim_about'),
 	});
 	// Library artists up (catalog-client/audience-up.ts): the artists of this
 	// desktop's own files, monthly, for their Reach score.

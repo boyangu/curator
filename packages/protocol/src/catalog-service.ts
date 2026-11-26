@@ -163,6 +163,13 @@ export type CatalogClaim = {
 	// When the provider published it (a channel upload can precede the
 	// release date), epoch ms.
 	publishedAt?: number | null;
+	// The catalogue object the sender holds this claim to be about: a device
+	// found the store's page for a card, and the card carries the object's
+	// id. Read for reason 'enrichment' only ('catalog_claim_about'), and
+	// only as a hint: the catalogue takes it when its own rules name nothing
+	// and the claim agrees with that object (title and length for a track,
+	// title and a credited act for a release). Never an instruction.
+	about?: string;
 };
 
 export const CATALOG_MAX_CLAIMS = 200;
@@ -213,6 +220,7 @@ export const ZCatalogClaim: z.ZodType<CatalogClaim> = z.lazy(() =>
 			label: ZCatalogClaim.nullable().optional(),
 			genres: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
 			publishedAt: z.number().int().nonnegative().nullable().optional(),
+			about: z.string().uuid().optional(),
 		})
 		.strict(),
 );

@@ -8,7 +8,8 @@ import type { CatalogEventCardV2, CatalogEventTrackCardV2 } from '@curator/proto
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
 import { mergeObjects } from './admin.js';
-import { raisePlaylistAdds, raiseReleaseEvent, reannounce, reannounceCard, releaseCard } from './events.js';
+import { rebuildCards } from './card-rebuild.js';
+import { markCards, raisePlaylistAdds, raiseReleaseEvent, releaseCard } from './events.js';
 import { ingestClaims, Ingester } from './ingest.js';
 
 const today = new Date().toISOString().slice(0, 10);
@@ -75,72 +76,84 @@ describe('event cards v2', () => {
 		});
 		expect(card).toMatchObject({ version: 2, kind: 'track', bpm: 122, key: 'A Minor', genres: ['Melodic House & Techno', 'Progressive House'], label: { id: labelId, name: 'Northfold Records' } });
 	});
+});
 
-	it('a release whose tracklist shrank is re-announced with the shorter card, once', async () => {
+// An event's card kept current (card-rebuild.ts): the catalogue's tables mark
+// what was written, and the marks are drained into refreshEvents.
+describe('event cards kept current', () => {
+	type App = Awaited<ReturnType<typeof createTestApp>>;
+	const raise = (app: App, releaseId: string, trackedId: string) =>
+		withSystemTx(app.db, (tx) => raiseReleaseEvent(tx, { releaseId, trackedId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 }));
+	const eventOf = async (app: App, releaseId: string) => {
+		const [ev] = await app.db.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
+		const subjects = await app.db.query<{ object_id: string }>(`select object_id from curator.catalog_event_subject where seq = $1::bigint`, [String(ev!.seq)]);
+		return { seq: Number(ev!.seq), card: JSON.parse(ev!.card) as CatalogEventCardV2, subjects: subjects.map((s) => s.object_id) };
+	};
+	const moved = async (app: App) => (await rebuildCards(app.db)).moved;
+
+	it('a release whose tracklist shrank is sent again with the shorter card, once', async () => {
 		const { app, releaseId, labelId, recordingId } = await seed();
-		const r = await withSystemTx(app.db, async (tx) => {
-			const seq = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
-			expect(await reannounceCard(tx, releaseId)).toEqual([]);
+		const seq = (await raise(app, releaseId, labelId))!;
+		// The ingest that made the release marked it; its card reads the same.
+		expect(await moved(app)).toBe(0);
+		await withSystemTx(app.db, async (tx) => {
 			const [other] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'beatport' and kind = 'recording' and provider_id = '12'`);
 			await mergeObjects(tx, other!.object_id, recordingId, 'test', 'same slot');
-			const moved = await reannounceCard(tx, releaseId);
-			const [gone] = await tx.query(`select 1 from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
-			const [ev] = await tx.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
-			const again = await reannounceCard(tx, releaseId);
-			return { moved, again, gone, oldSeq: seq!, newSeq: Number(ev!.seq), card: JSON.parse(ev!.card) as CatalogEventCardV2 };
 		});
-		expect(r.moved).toEqual([r.newSeq]);
-		expect(r.again).toEqual([]);
-		expect(r.gone).toBeUndefined();
-		expect(r.newSeq).toBeGreaterThan(r.oldSeq);
-		expect(r.card.tracks.map((t) => t.title)).toEqual(['Glass Rivers']);
+		expect(await moved(app)).toBe(1);
+		const ev = await eventOf(app, releaseId);
+		expect(ev.seq).toBeGreaterThan(seq);
+		expect(await app.db.query(`select 1 from curator.catalog_event where seq = $1::bigint`, [String(seq)])).toEqual([]);
+		expect(ev.card.tracks.map((t) => t.title)).toEqual(['Glass Rivers']);
+		expect(await moved(app)).toBe(0);
 	});
 
-	it('a track that gained a provider re-announces its release, through the tracker’s own path too', async () => {
+	it('a track that gained a store sends its release again; the same poll once more moves nothing', async () => {
 		const { app, releaseId, labelId, recordingId } = await seed();
-		const r = await withSystemTx(app.db, async (tx) => {
-			const seq = (await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 }))!;
-			// The release has Spotify already (card rebuilt), then a track gains it.
-			await ingestClaims(tx, [{ provider: 'spotify', kind: 'release', providerId: 'al1', name: 'Glass Rivers', identifiers: [{ namespace: 'upc', value: '0123456789012' }], artists: [] }], { reason: 'enrichment' });
-			const seq2 = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
-			await new Ingester(tx, { reason: 'enrichment' }).attachTo(recordingId, { provider: 'spotify', kind: 'recording', providerId: 'st1', name: 'Glass Rivers' });
-			expect(await reannounceCard(tx, releaseId)).toHaveLength(1);
-			// The same again through the tracker's path: another second tracker
-			// reaching the release moves it only while something changed.
-			const seq3 = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
-			const [ev] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
-			return { seq, seq2, seq3, card: JSON.parse(ev!.card) as CatalogEventCardV2 };
-		});
-		expect(r.seq2).toBeGreaterThan(r.seq);
-		expect(r.seq3).toBeNull();
-		expect(r.card.tracks[0]!.handles.map((h) => h.provider).sort()).toEqual(['beatport', 'spotify']);
+		const seq = (await raise(app, releaseId, labelId))!;
+		// The release gains Spotify, then a track of it does.
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(tx, [{ provider: 'spotify', kind: 'release', providerId: 'al1', name: 'Glass Rivers', identifiers: [{ namespace: 'upc', value: '0123456789012' }], artists: [] }], { reason: 'enrichment' }),
+		);
+		expect(await moved(app)).toBe(1);
+		const second = await eventOf(app, releaseId);
+		expect(second.seq).toBeGreaterThan(seq);
+		expect(second.card.handles.map((h) => h.provider).sort()).toEqual(['beatport', 'spotify']);
+		await withSystemTx(app.db, (tx) => new Ingester(tx, { reason: 'enrichment' }).attachTo(recordingId, { provider: 'spotify', kind: 'recording', providerId: 'st1', name: 'Glass Rivers' }));
+		expect(await moved(app)).toBe(1);
+		// The tracker reaching the announced release again raises nothing and,
+		// with nothing changed, sends nothing.
+		expect(await raise(app, releaseId, labelId)).toBeNull();
+		expect(await moved(app)).toBe(0);
+		expect((await eventOf(app, releaseId)).card.tracks[0]!.handles.map((h) => h.provider).sort()).toEqual(['beatport', 'spotify']);
 	});
 
-	it('a stored v1 card is rebuilt as v2 when the release gains a provider', async () => {
+	it('a stored v1 card is rebuilt as v2 when its release is touched', async () => {
 		const { app, releaseId, labelId } = await seed();
-		const card = await withSystemTx(app.db, async (tx) => {
-			const seq = await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 });
+		const seq = await raise(app, releaseId, labelId);
+		await moved(app);
+		await withSystemTx(app.db, async (tx) => {
 			// As a pre-v2 server stored it: no facts, and no provider yet.
 			const [ev] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where seq = $1::bigint`, [String(seq)]);
 			const { catalogNumber: _c, upc: _u, ...v1 } = JSON.parse(ev!.card) as CatalogEventCardV2;
 			const old = { ...v1, version: 1, handles: [], tracks: v1.tracks.map(({ bpm: _b, key: _k, genres: _g, ...t }) => t) };
 			await tx.query(`update curator.catalog_event set card = $2::text::jsonb where seq = $1::bigint`, [String(seq), JSON.stringify(old)]);
-			const next = await reannounce(tx, seq!, releaseId);
-			const [moved] = await tx.query<{ card: string }>(`select card::text as card from curator.catalog_event where seq = $1::bigint`, [String(next)]);
-			return JSON.parse(moved!.card) as CatalogEventCardV2;
+			await markCards(tx, [releaseId]);
 		});
+		expect(await moved(app)).toBe(1);
+		const { card } = await eventOf(app, releaseId);
 		expect(card.version).toBe(2);
 		expect(card.catalogNumber).toBe('NFR042');
 		expect(card.tracks[0]!.bpm).toBe(122);
 	});
 
-	it('two credits merged into one re-announce the release with one name', async () => {
+	it('two credits merged into one send the release again with one name', async () => {
 		const { app, releaseId, labelId } = await seed();
-		const r = await withSystemTx(app.db, async (tx) => {
-			// A second store credits the artist under another spelling, on the
-			// release and on its first track.
-			const credit = { provider: 'deezer', kind: 'artist', providerId: 'd77', name: 'North Fold' } as const;
-			await ingestClaims(
+		// A second store credits the artist under another spelling, on the
+		// release and on its first track.
+		const credit = { provider: 'deezer', kind: 'artist', providerId: 'd77', name: 'North Fold' } as const;
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(
 				tx,
 				[
 					{
@@ -154,23 +167,78 @@ describe('event cards v2', () => {
 					},
 				],
 				{ reason: 'tracker' },
-			);
-			const seq = (await raiseReleaseEvent(tx, { releaseId, trackedId: labelId, publishedAt: null }, { nowMs: Date.now(), windowDays: 14 }))!;
-			const names = async () => {
-				const [ev] = await tx.query<{ seq: unknown; card: string }>(`select seq, card::text as card from curator.catalog_event where subject_id = $1`, [releaseId]);
-				const c = JSON.parse(ev!.card) as CatalogEventCardV2;
-				return { seq: Number(ev!.seq), artists: c.artists.map((a) => a.name).sort(), track: c.tracks[0]!.artists };
-			};
-			const before = await names();
+			),
+		);
+		await raise(app, releaseId, labelId);
+		await moved(app);
+		const before = await eventOf(app, releaseId);
+		expect(before.card.artists.map((a) => a.name).sort()).toEqual(['North Fold', 'Northfold']);
+		await withSystemTx(app.db, async (tx) => {
 			const [fold] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'deezer' and kind = 'artist' and provider_id = 'd77'`);
 			const [keep] = await tx.query<{ object_id: string }>(`select object_id from curator.catalog_source_object where provider = 'beatport' and kind = 'artist' and provider_id = '77'`);
 			await mergeObjects(tx, fold!.object_id, keep!.object_id, 'test', 'twins');
-			return { seq, before, after: await names() };
 		});
-		expect(r.before.seq).toBe(r.seq);
-		expect(r.before.artists).toEqual(['North Fold', 'Northfold']);
-		expect(r.after.seq).toBeGreaterThan(r.before.seq);
-		expect(r.after.artists).toEqual(['Northfold']);
-		expect(r.after.track).toEqual(['Northfold']);
+		expect(await moved(app)).toBe(1);
+		const after = await eventOf(app, releaseId);
+		expect(after.seq).toBeGreaterThan(before.seq);
+		expect(after.card.artists.map((a) => a.name)).toEqual(['Northfold']);
+		expect(after.card.tracks[0]!.artists).toEqual(['Northfold']);
+	});
+
+	it('a fact the card shows moves the event; a scan stamp marks nothing', async () => {
+		const { app, releaseId, labelId } = await seed();
+		const seq = (await raise(app, releaseId, labelId))!;
+		await moved(app);
+		// What a desktop found at the store for the second track.
+		await withSystemTx(app.db, (tx) =>
+			ingestClaims(tx, [{ provider: 'beatport', kind: 'recording', providerId: '12', name: 'Low Tide', facts: { bpm: 124, key: 'F Minor' } }], { reason: 'enrichment' }),
+		);
+		expect(await moved(app)).toBe(1);
+		const ev = await eventOf(app, releaseId);
+		expect(ev.seq).toBeGreaterThan(seq);
+		expect([ev.card.tracks[1]!.bpm, ev.card.tracks[1]!.key]).toEqual([124, 'F Minor']);
+		await app.db.query(`update curator.catalog_object set scanned_at = now() where id = $1`, [releaseId]);
+		expect(await app.db.query(`select 1 from curator.catalog_card_dirty`)).toEqual([]);
+	});
+
+	it('a label linked afterwards joins the event, and its watchers read it', async () => {
+		const { app, releaseId, labelId } = await seed();
+		const seq = (await raise(app, releaseId, labelId))!;
+		await moved(app);
+		const second = await withSystemTx(app.db, async (tx) => {
+			const r = await ingestClaims(tx, [{ provider: 'bandcamp', kind: 'label', providerId: 'bc9', name: 'Second Home' }], { reason: 'manual_registration' });
+			await tx.query(`insert into curator.catalog_edge (src, kind, dst) values ($1, 'release-label', $2)`, [releaseId, r.outcomes[0]!.objectId]);
+			return r.outcomes[0]!.objectId;
+		});
+		expect(await moved(app)).toBe(1);
+		const ev = await eventOf(app, releaseId);
+		expect(ev.seq).toBeGreaterThan(seq);
+		expect(ev.subjects).toEqual(expect.arrayContaining([labelId, second]));
+	});
+
+	it('a second tracker’s object joins an announced event and the event is sent again, once', async () => {
+		const { app, releaseId, labelId, playlistId } = await seed();
+		const seq = (await raise(app, releaseId, labelId))!;
+		await moved(app);
+		// Any other watched object whose tracker lists the release.
+		expect(await raise(app, releaseId, playlistId)).toBeNull();
+		expect(await moved(app)).toBe(1);
+		const ev = await eventOf(app, releaseId);
+		expect(ev.seq).toBeGreaterThan(seq);
+		expect(ev.subjects).toContain(playlistId);
+		expect(await raise(app, releaseId, playlistId)).toBeNull();
+		expect(await moved(app)).toBe(0);
+	});
+
+	it('an event long past its release is left as it was', async () => {
+		const { app, releaseId, labelId } = await seed();
+		const seq = (await raise(app, releaseId, labelId))!;
+		await moved(app);
+		await withSystemTx(app.db, async (tx) => {
+			await tx.query(`update curator.catalog_event set release_at = now() - interval '90 days' where seq = $1::bigint`, [String(seq)]);
+			await markCards(tx, [releaseId], { force: true });
+		});
+		expect(await moved(app)).toBe(0);
+		expect((await eventOf(app, releaseId)).seq).toBe(seq);
 	});
 });
