@@ -32,9 +32,17 @@ export const CALLS_PER_POLL: Readonly<Record<string, number>> = {
 };
 export const callsPerPoll = (provider: string, kind: CatalogKind): number => CALLS_PER_POLL[`${provider}/${kind}`] ?? CALLS_PER_POLL[provider] ?? 1;
 
+// A store's Retry-After is its word, not ours to trust: a missing, negative or
+// absurd one (Infinity serialises as null and sinks a device's profile) is
+// read as a second to a day, whole seconds.
+const MAX_RETRY_AFTER_SEC = 86_400;
+
 export class TrackerRateLimitedError extends Error {
 	override readonly name = 'TrackerRateLimitedError';
-	constructor(readonly retryAfterSec: number) {
-		super(`rate limited (${retryAfterSec}s)`);
+	readonly retryAfterSec: number;
+	constructor(retryAfterSec: number) {
+		const sec = Number.isFinite(retryAfterSec) ? Math.min(MAX_RETRY_AFTER_SEC, Math.max(1, Math.ceil(retryAfterSec))) : MAX_RETRY_AFTER_SEC;
+		super(`rate limited (${sec}s)`);
+		this.retryAfterSec = sec;
 	}
 }

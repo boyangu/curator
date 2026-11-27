@@ -80,6 +80,8 @@ export interface DeviceFeed {
 	onStatus(): void;
 	setActive(active: boolean): void;
 	refresh(): Promise<FeedRefreshAnswer>;
+	// A follow made on this device: the next pass reads the watch list again.
+	watchesChanged(): void;
 	archive(itemId: string): Promise<void>;
 	// Mutes the artist and takes this item off the feed. An album is exempt
 	// from artist mutes (store VISIBLE_WHERE), so without the dismissal the
@@ -170,6 +172,9 @@ export function createDeviceFeed(o: DeviceFeedOptions): DeviceFeed {
 			flog.warn('the kept watch list is unreadable', undefined, err);
 		}
 		return watches;
+	};
+	const staleWatches = (): void => {
+		if (watches) watches = { ...watches, at: 0 };
 	};
 	const noteOf = (w: CatalogWatch): WatchNote => ({ id: w.object.id, spotifyId: w.object.handles.find((h) => h.provider === 'spotify')?.id ?? null, coverUrl: w.object.coverUrl });
 	const currentWatches = async (): Promise<WatchCache | null> => {
@@ -285,9 +290,10 @@ export function createDeviceFeed(o: DeviceFeedOptions): DeviceFeed {
 		},
 		refresh() {
 			// A follow made on a desktop since shows its name on the card now.
-			if (watches) watches = { ...watches, at: 0 };
+			staleWatches();
 			return pass();
 		},
+		watchesChanged: () => staleWatches(),
 		async archive(itemId) {
 			const item = await itemOf(itemId);
 			if (!item) return;

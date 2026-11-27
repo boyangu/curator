@@ -41,6 +41,21 @@ export class ProviderUnavailableError extends Error {
 	}
 }
 
+// Thrown when a call to the source failed — no network, a timeout, a 5xx —
+// with no block behind it. Not "not found": a lookup that answered nothing
+// because its call failed would be remembered as a miss and never asked
+// again (the feed's runner records a throw as `errored`, asked later).
+export class ProviderFailedError extends Error {
+	constructor(
+		readonly provider: string,
+		readonly status: number,
+		readonly reason: string,
+	) {
+		super(`${provider} lookup failed (${reason}${status ? `, HTTP ${status}` : ''})`);
+		this.name = 'ProviderFailedError';
+	}
+}
+
 export interface HeaderReader {
 	get(name: string): string | null;
 }

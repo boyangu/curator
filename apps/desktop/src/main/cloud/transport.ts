@@ -65,6 +65,8 @@ import {
 	type CatalogBrowseResult,
 	type CatalogTracksInput,
 	type CatalogTracksResult,
+	type CatalogWorkReportInput,
+	type CatalogWorkReportResult,
 	type CatalogImportInput,
 	type CatalogImportResult,
 	type CatalogIngestInput,
@@ -161,6 +163,8 @@ const PROCS = {
 	catalogConnectSearch: { path: 'catalog.connectSearch', type: 'mutation' },
 	// 'catalog_pages'.
 	catalogTracks: { path: 'catalog.tracks', type: 'query' },
+	// 'catalog_device_work'.
+	catalogWorkReport: { path: 'catalog.workReport', type: 'mutation' },
 	feedEvents: { path: 'feed.events', type: 'query' },
 	feedRecent: { path: 'feed.recent', type: 'query' },
 } as const;
@@ -462,6 +466,7 @@ export function createHttpCloudTransport(baseUrl: string, account: CloudAccount)
 			connectQueue: (input: CatalogConnectQueueInput) => call<CatalogConnectQueueResult>(PROCS.catalogConnectQueue, input),
 			connectAnswer: (input: CatalogConnectAnswerInput) => call<CatalogConnectAnswerResult>(PROCS.catalogConnectAnswer, input),
 			connectSearch: (input: CatalogConnectSearchInput) => call<CatalogConnectSearchResult>(PROCS.catalogConnectSearch, input),
+			workReport: (input: CatalogWorkReportInput) => call<CatalogWorkReportResult>(PROCS.catalogWorkReport, input),
 		},
 		feed: {
 			events: (input: FeedEventsInput) => call<FeedEventsResult>(PROCS.feedEvents, input),

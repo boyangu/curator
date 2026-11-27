@@ -80,8 +80,6 @@ fun rememberListInfo(model: AppModel, source: ListSource): ListInfo? {
 private fun info(l: Library, s: ListSource): ListInfo? = when (s) {
 	is ListSource.Playlist -> l.playlist(s.id)?.let { ListInfo(it.name, "Playlist", it.source, HomePin("playlist", s.id)) }
 	is ListSource.Tag -> l.tagName(s.id)?.let { ListInfo(it, "Tag", null, HomePin("tag", s.id)) }
-	is ListSource.Artist -> l.artistName(s.id)?.let { ListInfo(it, "Artist", null, null) }
-	is ListSource.Label -> ListInfo(s.name, "Label", null, null)
 	is ListSource.Set -> l.setName(s.id)?.let { ListInfo(it, "Set", null, null) }
 	is ListSource.Similar -> ListInfo("Similar to ${s.title}", "Find similar", null, null)
 	is ListSource.Library -> ListInfo("Library", "Library", null, null)
@@ -115,7 +113,7 @@ fun TrackListScreen(
 			is ListSource.Playlist -> model.viewState.opened("playlist", source.id)
 			is ListSource.Tag -> model.viewState.opened("tag", source.id)
 			// Recent holds what Home can open from its own lists.
-			is ListSource.Artist, is ListSource.Label, is ListSource.Set, is ListSource.Similar, is ListSource.Library -> {}
+			is ListSource.Set, is ListSource.Similar, is ListSource.Library -> {}
 		}
 	}
 

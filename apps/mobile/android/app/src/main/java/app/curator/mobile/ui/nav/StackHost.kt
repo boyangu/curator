@@ -16,6 +16,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,7 +64,9 @@ val LocalPageGestures = staticCompositionLocalOf<PageGestures?> { null }
 /**
  * The player sheet's drag (model SheetDrag decides; this moves it): [open]
  * with the sheet to raise from a closed bar, [close] for the one on top;
- * then [drag] to each visible height, and [end] with whether it settles open.
+ * then [drag] to each height it is raised by, and [end] with whether it
+ * settles open. [height]: how far it travels, from the bar's top to the
+ * screen's.
  */
 class SheetGestures internal constructor(
 	val height: () -> Float,
@@ -75,8 +78,22 @@ class SheetGestures internal constructor(
 
 val LocalSheetGestures = staticCompositionLocalOf<SheetGestures?> { null }
 
-/** How far a player sheet is up over this screen, in px (0 when none is): read while drawing, as the mini bar fades out with it. */
-val LocalSheetReveal = staticCompositionLocalOf<() -> Float> { { 0f } }
+/**
+ * A player sheet on the move, read while drawing: whether one is [moving],
+ * how far it has been raised ([reveal], px) of how far it goes ([height]),
+ * and whether the bar is part of it ([viaBar]: raised from the bar, its top
+ * starting at the bar's, or lowered to it), so the bar's cover and names can
+ * be carried into the player rather than faded.
+ */
+class SheetMotion internal constructor(val moving: () -> Boolean, val reveal: () -> Float, val height: () -> Float, val viaBar: () -> Boolean) {
+	/** How far the bar has turned into the player (model SheetDrag.morph): 0 with no sheet moving. */
+	fun step(): Float = if (moving()) SheetDrag.morph(reveal(), height()) else 0f
+
+	/** How much of the player shows: all of it unless a sheet is moving. */
+	fun shown(): Float = if (moving()) step() else 1f
+}
+
+val LocalSheetMotion = staticCompositionLocalOf { SheetMotion({ false }, { 0f }, { 0f }, { false }) }
 
 // The sheet's settle, as the design times it (280 ms, cubic-bezier(.2,.8,.2,1)).
 private val SETTLE = tween<Float>(280, easing = CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f))
@@ -159,7 +176,13 @@ private suspend fun AwaitPointerEventScope.pageSwipe(
  * visible height), the screen beneath dimmed as it rises.
  */
 @Composable
-fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
+fun StackHost(
+	nav: Nav,
+	// Where a sheet raised from the bar rests when lowered: the bar's top, if there has been one.
+	barTop: () -> Float? = { null },
+	overlay: @Composable () -> Unit = {},
+	content: @Composable (Screen) -> Unit,
+) {
 	val holder = rememberSaveableStateHolder()
 	val scope = rememberCoroutineScope()
 	val stack = nav.stack
@@ -172,6 +195,11 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 		val y = remember { Animatable(0f) }
 		// Whether the entry moving is a sheet (vertical) rather than a page.
 		var vertical by remember { mutableStateOf(false) }
+		// Whether the sheet moving goes from or to the bar (SheetMotion.viaBar),
+		// and how far it travels: up from the bar's top, or from the screen's foot.
+		var viaBar by remember { mutableStateOf(false) }
+		var travel by remember { mutableFloatStateOf(height) }
+		fun fromBar(): Float = barTop()?.takeIf { it > 0f && it < height } ?: height
 		// The entry sliding (over `under`) and the one beneath it, while one moves.
 		var over by remember { mutableStateOf<Nav.Entry?>(null) }
 		var under by remember { mutableStateOf<Nav.Entry?>(null) }
@@ -190,14 +218,15 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 			// Next in the player: the track changes in place, the sheet stays up.
 			if (pushed && nav.stack.size == settledSize && top.screen.isSheet && settled.screen.isSheet) { settle(); return@LaunchedEffect }
 			if (pushed && top.screen.isSheet) {
-				if (over !== top) { under = settled; over = top; y.snapTo(0f) }
+				// Pushed (a row's tap), not raised from the bar.
+				if (over !== top) { under = settled; over = top; viaBar = false; travel = height; y.snapTo(0f) }
 				vertical = true
-				y.animateTo(height, SETTLE)
+				y.animateTo(travel, SETTLE)
 				settle()
 				return@LaunchedEffect
 			}
 			if (!pushed && settled.screen.isSheet) {
-				if (over !== settled) { over = settled; under = top; y.snapTo(height) }
+				if (over !== settled) { over = settled; under = top; viaBar = true; travel = fromBar(); y.snapTo(travel) }
 				vertical = true
 				y.animateTo(0f, SETTLE)
 				settle()
@@ -244,10 +273,12 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 
 		val sheets = remember(nav) {
 			SheetGestures(
-				height = { height },
+				height = { fromBar() },
 				open = { screen ->
 					dragging = "sheet"
 					vertical = true
+					viaBar = true
+					travel = fromBar()
 					under = nav.top
 					over = Nav.Entry(screen)
 					scope.launch { y.snapTo(0f) }
@@ -255,11 +286,13 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 				close = {
 					dragging = "sheet"
 					vertical = true
+					viaBar = true
+					travel = fromBar()
 					over = nav.top
 					under = nav.stack.getOrNull(nav.stack.size - 2)
-					scope.launch { y.snapTo(height) }
+					scope.launch { y.snapTo(travel) }
 				},
-				drag = { r -> scope.launch { y.snapTo(r.coerceIn(0f, height)) } },
+				drag = { r -> scope.launch { y.snapTo(r.coerceIn(0f, travel)) } },
 				end = { open ->
 					dragging = null
 					scope.launch {
@@ -269,7 +302,7 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 							// Pushed or popped: the effect above settles it from where the finger left it.
 							open && !pushedYet -> nav.pushEntry(o)
 							!open && pushedYet -> nav.pop()
-							else -> { y.animateTo(if (open) height else 0f, SETTLE); settle() }
+							else -> { y.animateTo(if (open) travel else 0f, SETTLE); settle() }
 						}
 					}
 				},
@@ -335,8 +368,8 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 
 		BackHandler(enabled = stack.size > 1) { nav.pop() }
 
-		val reveal = remember { { if (vertical && over != null) y.value else 0f } }
-		CompositionLocalProvider(LocalPageGestures provides gestures, LocalSheetGestures provides sheets, LocalSheetReveal provides reveal) {
+		val motion = remember { SheetMotion(moving = { vertical && over != null }, reveal = { y.value }, height = { travel }, viaBar = { viaBar }) }
+		CompositionLocalProvider(LocalPageGestures provides gestures, LocalSheetGestures provides sheets, LocalSheetMotion provides motion) {
 			val o = over
 			val u = under
 			val b = beside?.let { nav.topOf(it) }
@@ -358,20 +391,23 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 								e === b -> tx.value + besideDir * width
 								else -> tx.value
 							}
-							translationY = if (rising) height - y.value else 0f
+							translationY = if (rising) travel - y.value else 0f
 							// Rounded at the top until it covers the screen.
-							val round = rising && y.value < height
+							val round = rising && y.value < travel
 							shape = if (round) SHEET_SHAPE else RectangleShape
 							clip = round
 						}
 						.drawBehind {
 							if (rising) {
+								// Raised from the bar, it fades in over it with the rest (SheetMotion.shown).
+								val a = motion.shown()
 								// Its shadow over what it rises from (0 -8px 24px rgba(0,0,0,.5)).
 								val h = 24.dp.toPx() + 8.dp.toPx()
 								drawRect(
 									Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f)), startY = -h, endY = 0f),
-									topLeft = Offset(0f, -h), size = Size(size.width, h),
+									topLeft = Offset(0f, -h), size = Size(size.width, h), alpha = a,
 								)
+								drawRect(C.bg, alpha = if (viaBar) a else 1f)
 								return@drawBehind
 							}
 							// The one shadow the design allows: a page sliding over (-8px 0 24px rgba(0,0,0,.5)).
@@ -382,14 +418,15 @@ fun StackHost(nav: Nav, content: @Composable (Screen) -> Unit) {
 								topLeft = Offset(-w, 0f), size = Size(w, size.height),
 							)
 						}
-						.background(C.bg)
+						.then(if (rising) Modifier else Modifier.background(C.bg))
 						// Beneath a rising sheet: dimmed with its reveal.
-						.then(if (beneath && vertical) Modifier.drawWithContent { drawContent(); drawRect(Color.Black, alpha = SheetDrag.dim(y.value, height)) } else Modifier)
+						.then(if (beneath && vertical) Modifier.drawWithContent { drawContent(); drawRect(Color.Black, alpha = SheetDrag.dim(y.value, travel)) } else Modifier)
 						.then(if (e === top) closeSwipe.then(tabSwipe) else Modifier)
 						// Beneath: seen but not reachable (TalkBack skips it).
 						.then(if (beneath) Modifier.clearAndSetSemantics {} else Modifier),
 				) { holder.SaveableStateProvider(e.id) { content(e.screen) } }
 			}
+			overlay()
 		}
 	}
 }

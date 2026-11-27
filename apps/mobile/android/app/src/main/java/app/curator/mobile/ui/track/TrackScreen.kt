@@ -51,6 +51,7 @@ import app.curator.mobile.data.ArtistRef
 import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Track
 import app.curator.mobile.data.TrackAnalysis
+import app.curator.mobile.model.EntityRef
 import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.Peaks
 import app.curator.mobile.model.WaveSkin
@@ -171,8 +172,8 @@ fun TrackScreen(model: AppModel, screen: Screen.Track, back: () -> Unit, push: (
 			from = listName?.name, index = screen.index, count = screen.count,
 			back = back, openActions = open,
 			openUses = { sets -> push(Screen.TrackUses(track.id, sets)) },
-			openArtist = { push(Screen.TrackList(ListSource.Artist(it.id))) },
-			openLabel = { push(Screen.TrackList(ListSource.Label(it))) },
+			openArtist = { push(Screen.Entity(EntityRef("artist", it.name, libraryId = it.id))) },
+			openLabel = { push(Screen.Entity(EntityRef("label", it))) },
 			onScrub = { scrub = it }, onCallOff = { scrub = null }, onSeek = seek,
 			modifier = Modifier.swipeToOpen(gestures) { Screen.TrackActions(track.id) })
 	}

@@ -24,6 +24,7 @@
 // contract for that: claim and event shapes, the procedure inputs, results.
 
 import { z } from 'zod';
+import { ZCatalogDeviceProfile, type CatalogDeviceProfile, type CatalogWork } from './catalog-work.js';
 import { PAGE_KINDS, type PageKind } from './page-ref.js';
 import { ZDeviceId } from './sync-input.js';
 
@@ -370,8 +371,15 @@ export type CatalogIngestResult = {
 	duplicate: boolean;
 };
 
-export type CatalogResolveInput = { deviceId: string; refs: CatalogRef[] };
-export type CatalogResolveResult = { objects: (CatalogObjectSummary | null)[] };
+// `profile`, `hints` and the answer's `work` ('catalog_device_work',
+// catalog-work.ts) on resolve, browse, tracks and feed.events: the device
+// says what it can read, and the catalogue asks for the reads it wants of
+// what was just fetched. `hints`: the store pages the device itself holds
+// the entity by (its own track's artist page) — which of an object's pages
+// the user means, and the page to read for one the catalogue does not hold.
+// A device sends the keys only to a server that lists the feature.
+export type CatalogResolveInput = { deviceId: string; refs: CatalogRef[]; profile?: CatalogDeviceProfile; hints?: CatalogRef[] };
+export type CatalogResolveResult = { objects: (CatalogObjectSummary | null)[]; work?: CatalogWork };
 
 export type CatalogSearchInput = { deviceId: string; q: string; kind?: CatalogKind; limit?: number };
 export type CatalogSearchResult = { objects: CatalogObjectSummary[] };
@@ -383,7 +391,7 @@ export type CatalogSearchResult = { objects: CatalogObjectSummary[] };
 // its facts without the release / track lists — what a page header or a
 // link menu reads. Those lists are the dear part of the answer, and a page
 // gets them from catalog.tracks.
-export type CatalogBrowseInput = { deviceId: string; id: string; brief?: boolean };
+export type CatalogBrowseInput = { deviceId: string; id: string; brief?: boolean; profile?: CatalogDeviceProfile; hints?: CatalogRef[] };
 export type CatalogBrowseRef = { id: string; name: string };
 export type CatalogBrowseRelease = {
 	id: string;
@@ -467,7 +475,7 @@ export const CATALOG_COLLABS_MAX = 50;
 // page lists — its releases newest first, each with its tracklist in order,
 // a page of releases at a time. One call per page instead of a browse per
 // release, which the read bucket would not carry.
-export type CatalogTracksInput = { deviceId: string; id: string; cursor?: string; limit?: number };
+export type CatalogTracksInput = { deviceId: string; id: string; cursor?: string; limit?: number; profile?: CatalogDeviceProfile; hints?: CatalogRef[] };
 export type CatalogPageTrack = {
 	id: string;
 	title: string;
@@ -512,6 +520,7 @@ export type CatalogTracksResult = {
 	nextCursor: string | null;
 	// First page only.
 	releaseCount?: number;
+	work?: CatalogWork;
 };
 // Releases a page; a page of long tracklists is cut short of it (never below
 // one release) so no answer carries more than about CATALOG_TRACKS_BUDGET tracks.
@@ -548,8 +557,8 @@ export type CatalogEnrichNeed = 'profile' | 'audience';
 export type CatalogEnrichInput = { deviceId: string; objectIds: string[]; need?: CatalogEnrichNeed };
 export type CatalogEnrichResult = { queued: number };
 
-export type FeedEventsInput = { deviceId: string; afterSeq: number; limit?: number };
-export type FeedEventsResult = { events: CatalogEvent[]; nextSeq: number };
+export type FeedEventsInput = { deviceId: string; afterSeq: number; limit?: number; profile?: CatalogDeviceProfile };
+export type FeedEventsResult = { events: CatalogEvent[]; nextSeq: number; work?: CatalogWork };
 // "Load more": the caller's watched objects' events of the last `days`,
 // whatever their seq (a device's cursor is past them). Newest first.
 export type FeedRecentInput = { deviceId: string; days: number };
@@ -565,14 +574,16 @@ const ZSeq = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const ZCatalogIngestInput = z
 	.object({ deviceId: ZDeviceId, reason: z.enum(CATALOG_CLIENT_REASONS), idempotencyKey: ZIdempotencyKey, claims: z.array(z.unknown()) })
 	.strict();
-export const ZCatalogResolveInput = z.object({ deviceId: ZDeviceId, refs: z.array(ZCatalogRef).min(1).max(50) }).strict();
+export const ZCatalogHints = z.array(ZCatalogRef).max(10);
+const ZHints = ZCatalogHints;
+export const ZCatalogResolveInput = z.object({ deviceId: ZDeviceId, refs: z.array(ZCatalogRef).min(1).max(50), profile: ZCatalogDeviceProfile.optional(), hints: ZHints.optional() }).strict();
 export const ZCatalogSearchInput = z
 	.object({ deviceId: ZDeviceId, q: z.string().trim().min(1).max(200), kind: ZKind.optional(), limit: z.number().int().min(1).max(25).optional() })
 	.strict();
 export const ZCatalogGetInput = z.object({ deviceId: ZDeviceId, id: ZObjectId }).strict();
-export const ZCatalogBrowseInput = z.object({ deviceId: ZDeviceId, id: ZObjectId, brief: z.boolean().optional() }).strict();
+export const ZCatalogBrowseInput = z.object({ deviceId: ZDeviceId, id: ZObjectId, brief: z.boolean().optional(), profile: ZCatalogDeviceProfile.optional(), hints: ZHints.optional() }).strict();
 export const ZCatalogTracksInput = z
-	.object({ deviceId: ZDeviceId, id: ZObjectId, cursor: z.string().min(1).max(200).optional(), limit: z.number().int().min(1).max(CATALOG_TRACKS_MAX).optional() })
+	.object({ deviceId: ZDeviceId, id: ZObjectId, cursor: z.string().min(1).max(200).optional(), limit: z.number().int().min(1).max(CATALOG_TRACKS_MAX).optional(), profile: ZCatalogDeviceProfile.optional(), hints: ZHints.optional() })
 	.strict();
 export const ZCatalogWatchInput = z
 	.object({ deviceId: ZDeviceId, objectId: ZObjectId.optional(), claim: z.unknown().optional(), source: z.enum(CATALOG_WATCH_SOURCES) })
@@ -586,7 +597,7 @@ export const ZCatalogImportInput = z
 	.strict();
 export const ZCatalogRefreshInput = z.object({ deviceId: ZDeviceId, objectId: ZObjectId }).strict();
 export const ZCatalogEnrichInput = z.object({ deviceId: ZDeviceId, objectIds: z.array(ZObjectId).min(1).max(200), need: z.enum(['profile', 'audience']).optional() }).strict();
-export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional() }).strict();
+export const ZFeedEventsInput = z.object({ deviceId: ZDeviceId, afterSeq: ZSeq, limit: z.number().int().min(1).optional(), profile: ZCatalogDeviceProfile.optional() }).strict();
 export const ZFeedRecentInput = z.object({ deviceId: ZDeviceId, days: z.number().int().min(1).max(FEED_RECENT_MAX_DAYS) }).strict();
 
 // ── connect the dots ('catalog_connect_auto') ────────────────────────────────────
@@ -822,14 +833,16 @@ export type CatalogWorkerDueResult = {
 	check?: CatalogCheckReport;
 };
 export type CatalogWorkerOutcome = { poll: CatalogTrackerPoll } | { error: { message: string; rateLimitedSec: number | null } };
-export type CatalogWorkerReportInput = { deviceId: string; results: { objectId: string; provider: CatalogProvider; outcome: CatalogWorkerOutcome }[] };
+// `profile` ('catalog_device_work'): the answer may then carry work — the new
+// releases this report brought, to complete.
+export type CatalogWorkerReportInput = { deviceId: string; results: { objectId: string; provider: CatalogProvider; outcome: CatalogWorkerOutcome }[]; profile?: CatalogDeviceProfile };
 // `stale`: results whose lease this device no longer held (lapsed, or a
 // resend after a timeout); nothing of theirs was applied.
-export type CatalogWorkerReportResult = { applied: number; stale: number; events: number };
+export type CatalogWorkerReportResult = { applied: number; stale: number; events: number; work?: CatalogWork };
 
 export const CATALOG_WORKER_MAX_RESULTS = 100;
 // A chart carries 100 entries; a first read of a long listing a few hundred.
-const CATALOG_POLL_MAX_CHILDREN = 500;
+export const CATALOG_POLL_MAX_CHILDREN = 500;
 // The cursor is stored as given (`rememberSeen` keeps 300 ids).
 const CATALOG_POLL_MAX_CURSOR_BYTES = 64 * 1024;
 
@@ -876,6 +889,7 @@ export const ZCatalogWorkerReportInput = z
 	.object({
 		deviceId: ZDeviceId,
 		results: z.array(z.object({ objectId: ZObjectId, provider: ZProvider, outcome: ZOutcome }).strict()).max(CATALOG_WORKER_MAX_RESULTS),
+		profile: ZCatalogDeviceProfile.optional(),
 	})
 	.strict();
 
@@ -887,6 +901,7 @@ export const ZCatalogWorkerReportWire = z
 	.object({
 		deviceId: ZDeviceId,
 		results: z.array(z.object({ objectId: ZObjectId, provider: ZProvider, outcome: z.unknown() }).strict()).max(CATALOG_WORKER_MAX_RESULTS),
+		profile: ZCatalogDeviceProfile.optional(),
 	})
 	.strict();
 

@@ -28,16 +28,14 @@
 
 import type Database from 'better-sqlite3';
 import { getTableColumns } from 'drizzle-orm';
-import type { CatalogBrowseResult, CatalogHandle, CatalogTracksResult } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogDeviceProfile, CatalogRef, CatalogTracksResult, CatalogWork } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { searchFold, track, type Track, type AlbumSummary, type ArtistLink, type EntityChip, type EntityHeader, type EntityRef, type EntityRowPatch, type EntityTracksPage, type EntityWorldReason, type ZTrackFilterT } from '@curator/shared';
-import { isDistributor } from '@curator/library-logic';
-import { keyToCamelot } from '@curator/sync-core/enrich/keys';
+import { applyBrowse, GENRES_MAX, mergeLinks, worldPage, worldProbes } from '@curator/sync-core/entity/catalog-page';
 import { findSpotifyAlbum, findSpotifyTrack, type SpotifyMatchClient } from '../feed/spotify-match.js';
 import { log } from '@curator/sync-core/log';
-import { matchLibraryTracks, type OwnershipProbe } from './ownership.js';
+import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
 import { findArtistPicture, type ArtistPicture, type FetchLike } from './artist-picture.js';
-import { artistBadges } from './badges.js';
 import { identifyLocal, identifyRemote, libraryForObject, rememberObject, type EntityCatalog, type EntityIds } from './resolve.js';
 import { normalizeEntityRef, provisionalRelease, streamObjectId, type StreamingCatalog } from './streaming.js';
 
@@ -60,11 +58,6 @@ type Keep = 'whole' | 'partial' | 'none';
 const KEEP_MS: Record<Keep, number> = { whole: 10 * 60_000, partial: 60_000, none: 0 };
 const PAGE_TTL_MS = 10 * 60_000;
 const PAGE_CACHE_MAX = 60;
-const CHIPS_MAX = 12;
-// An artist's labels: every one the header can name (it shows the first few
-// and lists the rest behind "+n more").
-const LABELS_MAX = 50;
-const GENRES_MAX = 6;
 // How long a header waits for an artist's picture lookup at a store. Past it
 // the page opens without one; the lookup finishes for the next ask.
 const PICTURE_WAIT_MS = 2500;
@@ -85,10 +78,14 @@ export type EntityPagesDeps = {
 	albumSummary(id: string): AlbumSummary | null;
 	// A live library artist of this name (library/artists.ts lookupArtistRaw).
 	artistByName(name: string): { id: string; name: string } | null;
-	// The page work's side (entity/work.ts): told of every World page read,
-	// and asked what its lookups found for a recording — laid over a page the
-	// catalogue answered before it had those findings.
-	onPage?(catalogId: string, result: CatalogTracksResult): void;
+	// The page work's side (entity/work.ts): asked what this desktop can read
+	// for a catalogue object's page (null: nothing — the page is not the one
+	// in front, or the server hands out no work); told of each page the
+	// catalogue answered, once, with the work it carried; and asked what the
+	// work found for a recording — laid over a page the catalogue answered
+	// before it had those findings.
+	workProfile?(catalogId: string): CatalogDeviceProfile | null;
+	onRead?(catalogId: string, result: CatalogTracksResult, work: CatalogWork | undefined, hints: CatalogRef[]): void;
 	patchOf?(recordingId: string): EntityRowPatch | undefined;
 	// The user's streaming service read as a catalogue (entity/streaming.ts);
 	// null while none is connected, or while it is resting.
@@ -133,16 +130,6 @@ function blankTrack(): Track {
 	}
 	blank = { ...out, state: 'unsorted' } as Track;
 	return blank;
-}
-
-// A handle a person can open: a store's own page, not a reader's name key.
-const openable = (h: CatalogHandle): boolean => !!h.url && h.provider !== 'user' && !h.id.includes('/');
-const linksOf = (handles: readonly CatalogHandle[]): ArtistLink[] => handles.filter(openable).map((h) => ({ source: h.provider, sourceId: h.id, url: h.url }));
-
-function mergeLinks(local: ArtistLink[], remote: ArtistLink[]): ArtistLink[] {
-	const out = new Map<string, ArtistLink>();
-	for (const l of [...local, ...remote]) if (!out.has(l.source)) out.set(l.source, l);
-	return [...out.values()].sort((a, b) => a.source.localeCompare(b.source));
 }
 
 // The library's id first: it is what a lookup cannot change (a catalogue id
@@ -238,8 +225,6 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 
 	const off = (reason: EntityWorldReason, candidates?: EntityChip[]): EntityHeader['world'] => ({ available: false, reason, releaseCount: null, trackCount: null, ...(candidates ? { candidates } : {}) });
 
-	const chip = (kind: EntityChip['ref']['kind'], c: { id: string; name: string; releases?: number }): EntityChip => ({ ref: { kind, name: c.name, catalogId: c.id }, ...(c.releases !== undefined ? { count: c.releases } : {}) });
-
 	// The catalogue's account of the entity, beside what only the library
 	// knows (which of its own entities this is, the files, its own store ids).
 	function withCatalog(ids: EntityIds, b: CatalogBrowseResult, pagesOffered: boolean): EntityHeader {
@@ -264,32 +249,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 			const filter = ownedFilter(full, [searchFold(b.object.name)]);
 			header.owned = { ...header.owned, filter, count: filter ? deps.countTracks(filter) : 0 };
 		}
-		header.imageUrl = b.object.coverUrl ?? header.imageUrl;
-		if (b.genres?.length) header.genres = b.genres.slice(0, GENRES_MAX).map((g) => ({ name: g.name, ...(g.count !== undefined ? { count: g.count } : {}) }));
-		header.links = mergeLinks(header.links, linksOf(b.object.handles));
-		if (full.kind === 'artist') {
-			// The labels it releases on, most releases first: the catalogue's
-			// label objects, and the ones its releases only name (a store with
-			// no label pages) — by name alone; that label's own page finds the
-			// catalogue's object. A distributor's name is not a label.
-			const named = (b.labelTexts ?? []).filter((l) => !isDistributor(l.name)).map((l): EntityChip => ({ ref: { kind: 'label', name: l.name }, count: l.releases }));
-			header.labels = [...(b.labels ?? []).map((l) => chip('label', l)), ...named].sort((x, y) => (y.count ?? 0) - (x.count ?? 0)).slice(0, LABELS_MAX);
-			header.similar = (b.similar ?? []).slice(0, CHIPS_MAX).map((a) => chip('artist', a));
-			header.collabs = (b.collabs ?? []).map((a): EntityChip => ({ ref: { kind: 'artist', name: a.name, catalogId: a.id }, count: a.tracks }));
-			header.activity = b.activity ?? null;
-			header.badges = artistBadges(header.activity, b.releaseCount ?? null, now());
-			header.reach = b.reach ?? null;
-		} else if (full.kind === 'label') {
-			if (b.artists?.length) header.artists = b.artists.slice(0, CHIPS_MAX).map((a) => chip('artist', a));
-		} else {
-			if (b.artists?.length) header.artists = b.artists.map((a) => chip('artist', { id: a.id, name: a.name }));
-			if (b.labels?.length) header.labels = b.labels.map((l) => chip('label', { id: l.id, name: l.name }));
-			else if (b.release?.labelText && !header.labels.length) header.labels = [{ ref: { kind: 'label', name: b.release.labelText } }];
-			header.facts = { releaseDate: b.release?.date ?? header.facts.releaseDate ?? null, albumType: b.release?.type ?? header.facts.albumType ?? null };
-		}
-		// `watch` absent: a server from before it answered one — no follow state to show.
-		if (full.kind !== 'album' && b.watch !== undefined) header.follow = { following: b.watch !== null, muted: b.watch?.muted ?? false };
-		return header;
+		return applyBrowse(header, b, now());
 	}
 
 	// An artist the catalogue holds no picture of: look one up at a store it
@@ -519,11 +479,24 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 	}
 
 	// ── World tracks ──────────────────────────────────────────────────────
-	const cloudPage = (catalogId: string, cursor: string | undefined): Promise<CatalogTracksResult> => {
+	// The pages the library knows an entity by: the cloud names the store page
+	// it is read at from these (an artist's own Spotify page, among namesakes').
+	const hintsOf = (ids: EntityIds): CatalogRef[] => (ids.kind === 'artist' && ids.spotifyId ? [{ provider: 'spotify', kind: 'artist', providerId: ids.spotifyId }] : []);
+
+	// The work an answer carried is handed on once, as it lands, and not kept
+	// with the page: a page read again from here is not work again.
+	const cloudPage = (catalogId: string, cursor: string | undefined, hints: CatalogRef[]): Promise<CatalogTracksResult> => {
 		const key = `${catalogId}|${cursor ?? ''}`;
 		const hit = pages.get(key);
 		if (hit && now() - hit.at < PAGE_TTL_MS) return hit.page;
-		const page = deps.catalog()!.tracks(catalogId, cursor);
+		const profile = deps.workProfile?.(catalogId) ?? null;
+		const page = deps
+			.catalog()!
+			.tracks(catalogId, cursor, profile ? { profile, hints } : undefined)
+			.then(({ work, ...result }) => {
+				deps.onRead?.(catalogId, result, work, hints);
+				return result;
+			});
 		pages.set(key, { at: now(), page });
 		page.catch(() => { if (pages.get(key)?.page === page) pages.delete(key); });
 		// Oldest out: a Map iterates in insertion order.
@@ -531,60 +504,10 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 		return page;
 	};
 
-	const streamId = (handles: readonly CatalogHandle[], provider: 'spotify' | 'tidal'): string | null => handles.find((h) => h.provider === provider && !h.id.includes('/'))?.id ?? null;
-
 	function toPage(result: CatalogTracksResult): EntityTracksPage {
-		const probes: OwnershipProbe[] = [];
-		for (const r of result.releases) {
-			for (const t of r.tracks) {
-				probes.push({ recordingId: t.id, releaseId: r.id, releaseTitle: r.title, releaseDate: r.date, isrc: t.isrc, spotifyId: streamId(t.handles, 'spotify'), tidalId: streamId(t.handles, 'tidal') });
-			}
-		}
+		const probes = worldProbes(result);
 		// Ownership is read every time: the library changes under a cached page.
-		const matches = matchLibraryTracks(raw, probes);
-		let i = 0;
-		return {
-			albums: result.releases.map((r) => ({
-				id: r.id,
-				title: r.title,
-				date: r.date,
-				type: r.type,
-				coverUrl: r.coverUrl,
-				label: r.labels[0] ? { id: r.labels[0].id, name: r.labels[0].name } : r.labelText ? { id: null, name: r.labelText } : null,
-				artists: r.artists,
-				genres: r.genres,
-				trackCount: r.trackCount,
-				appearance: r.appearance,
-				links: linksOf(r.handles),
-			})),
-			tracks: result.releases.flatMap((r) =>
-				r.tracks.map((t) => {
-					const probe = probes[i]!;
-					const match = matches[i++] ?? null;
-					const patch = deps.patchOf?.(t.id);
-					return {
-						recordingId: t.id,
-						releaseId: r.id,
-						title: t.title,
-						artists: t.artists.length ? t.artists : r.artists,
-						position: t.position,
-						disc: t.disc,
-						durationSec: t.durationSec,
-						isrc: t.isrc,
-						bpm: t.bpm ?? patch?.bpm ?? null,
-						keyCamelot: (t.key ? keyToCamelot(t.key) : null) ?? patch?.keyCamelot ?? null,
-						genre: t.genres[0] ?? patch?.genre ?? r.genres[0] ?? null,
-						label: patch?.label ?? null,
-						links: linksOf(t.handles),
-						streamIds: { ...patch?.streamIds, ...(probe.spotifyId ? { spotify: probe.spotifyId } : {}), ...(probe.tidalId ? { tidal: probe.tidalId } : {}) },
-						libraryTrackId: match?.libraryTrackId ?? null,
-						libraryPrimary: match?.primary ?? false,
-					};
-				}),
-			),
-			nextCursor: result.nextCursor,
-			template: blankTrack(),
-		};
+		return { ...worldPage(result, probes, matchLibraryTracks(raw, probes), deps.patchOf), template: blankTrack() };
 	}
 
 	return {
@@ -635,9 +558,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 			if (client && !down && !streamed) {
 				const found = await identifyRemote(client, ids, ref);
 				if (!('reason' in found)) {
-					const result = await cloudPage(found.catalogId, opts?.cursor);
-					deps.onPage?.(found.catalogId, result);
-					return toPage(result);
+					return toPage(await cloudPage(found.catalogId, opts?.cursor, hintsOf(ids)));
 				}
 				unknown = found.reason === 'unknown';
 			}

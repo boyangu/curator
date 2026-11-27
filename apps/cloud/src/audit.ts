@@ -110,6 +110,11 @@ export const AUDIT_KINDS = [
 	'catalog_refresh_requested',
 	// "Connect the dots" answers ({ answers, attached, waiting, conflicts, invalid }).
 	'catalog_connect_answered',
+	'catalog_work_reported',
+	// A planner or one result of a report that failed ({ read | job, error }):
+	// the read, and the rest of the report, went through without it.
+	'catalog_work_plan_failed',
+	'catalog_work_result_failed',
 ] as const;
 
 export type AuditKind = (typeof AUDIT_KINDS)[number];
@@ -162,6 +167,9 @@ const AUDIT_LEVEL: Record<AuditKind, 'info' | 'warn'> = {
 	catalog_enrich_requested: 'info',
 	catalog_refresh_requested: 'info',
 	catalog_connect_answered: 'info',
+	catalog_work_reported: 'info',
+	catalog_work_plan_failed: 'warn',
+	catalog_work_result_failed: 'warn',
 };
 
 // ── request ids and headers ─────────────────────────────────────────────────

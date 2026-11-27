@@ -133,14 +133,6 @@ class ListQueryTest {
 		assertEquals(setOf("p2", "p3", "build", "warm"), names.toSet())
 	}
 
-	@Test fun `a label's tracks, by the name as the tracks spell it, overrides first`() {
-		exec("ALTER TABLE track ADD COLUMN label TEXT")
-		exec("UPDATE track SET label = 'Anjunadeep' WHERE id IN ('a', 'gone')")
-		exec("UPDATE track SET label = 'anjunadeep' WHERE id = 'b'")
-		exec("""UPDATE track SET label = 'Other', overrides = '{"label":"Anjunadeep"}' WHERE id = 'c'""")
-		assertEquals(listOf("a", "c", "b"), ids(ListView(), ListScope.Label("Anjunadeep")))
-	}
-
 	@Test fun `a set's tracks as played`() {
 		exec("CREATE TABLE play_event (session_id TEXT, track_id TEXT, played_at INTEGER)")
 		exec("INSERT INTO play_event VALUES ('s', 'c', 1), ('s', 'a', 2), ('s', 'gone', 3), ('x', 'b', 0)")

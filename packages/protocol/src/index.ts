@@ -20,6 +20,8 @@ export * from './reduce.js';
 export * from './cloud-service.js';
 export * from './spotify-gateway.js';
 export * from './catalog-service.js';
+export * from './catalog-work.js';
+export * from './catalog-work-report.js';
 export * from './page-ref.js';
 export * from './sync-input.js';
 export * from './snapshot.js';

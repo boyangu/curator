@@ -31,7 +31,7 @@ import { hostname } from 'node:os';
 import { join } from 'node:path';
 import type { CatalogClaim } from '@curator/protocol';
 import { migrate } from '@curator/sync-core/db/migrate';
-import { writeRefs, type CatalogRefRow } from '../catalog-client/catalog-refs.js';
+import { writeRefs, type CatalogRefRow } from '@curator/sync-core/entity/catalog-ref';
 import { libraryClaims } from '../catalog-client/library-claims.js';
 
 const argv = process.argv.slice(2);

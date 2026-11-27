@@ -19,3 +19,4 @@ export * from './row-removal.js';
 export * from './production-flags.js';
 export * from './release-label.js';
 export * from './distributor.js';
+export * from './release-match.js';

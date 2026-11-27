@@ -16,7 +16,7 @@
 // lookup that threw within the hour. One item at a time, through the
 // process-wide Spotify gate the player shares.
 
-import { nameFold } from '@curator/library-logic';
+import { artistsOverlap, closeSec, DURATION_TOLERANCE_SEC, ISRC_DURATION_TOLERANCE_SEC, nameFold, pairTracklists, titleKey, type MatchTrack } from '@curator/library-logic';
 import type { SpotifyAlbum, SpotifySimplifiedTrack, SpotifyTrack } from '@curator/spotify';
 import { log } from '@curator/sync-core/log';
 import type { FeedStore } from '@curator/sync-core/feed/store';
@@ -26,10 +26,6 @@ import { isSpotifyQuotaBackoff } from '@curator/spotify';
 const flog = log.for('feed');
 
 export const MATCH_RETRY_MS: Record<Exclude<MatchStatus, 'ok'>, number> = { none: 3 * 86400_000, err: 3600_000 };
-// Tracklist confirmation: title and length agree for at least this share.
-const CONFIRM_SHARE = 0.5;
-const DURATION_TOLERANCE_SEC = 5;
-const ISRC_DURATION_TOLERANCE_SEC = 10;
 
 export type SpotifyMatchClient = {
 	searchTracks(query: string, limit?: number): Promise<SpotifyTrack[]>;
@@ -61,57 +57,20 @@ export function needsMatch(item: Pick<FeedItem, 'source' | 'matchStatus' | 'matc
 	return (item.matchedAt ?? 0) + MATCH_RETRY_MS[item.matchStatus] <= now;
 }
 
-// Titles across stores differ by their mix tags ("Original Mix", "[LABEL]"):
-// folded without them, with the fold the catalogue uses.
-export function titleKey(title: string): string {
-	return nameFold(
-		title
-			.replace(/\s*[[(]\s*original\s+mix\s*[\])]/gi, '')
-			.replace(/\s+-\s+original\s+mix\s*$/i, '')
-			.replace(/\s*\[[^\]]*\]\s*$/g, ''),
-	);
-}
+// The tracklist comparison is the shared one (library-logic release-match.ts:
+// the cloud repeats it, strictly, before it links what a device found).
+export { titleKey, type MatchTrack };
 
-const closeSec = (a: number | null | undefined, b: number | null | undefined, tol: number): boolean => a == null || b == null || a <= 0 || b <= 0 || Math.abs(a - b) <= tol;
-
-const artistsOverlap = (ours: readonly string[], theirs: readonly { name: string }[]): boolean => {
-	const folds = new Set(ours.map(nameFold).filter(Boolean));
-	if (!folds.size || folds.has(nameFold('Various Artists'))) return true;
-	return theirs.some((a) => folds.has(nameFold(a.name)));
-};
-
-// What the match reads of a track and of a release, whoever asks: a feed
-// card's refs, or a catalogue release on an entity page (entity/work.ts).
-export type MatchTrack = { title: string; durationSec?: number | null; isrc?: string | null };
+// What the match reads of a release, whoever asks: a feed card's refs, or a
+// catalogue release on an entity page (entity/work.ts).
 export type AlbumQuery<R extends MatchTrack> = { title: string; artists: readonly string[]; upc?: string | null; tracks: readonly R[] };
 export type TrackQuery = MatchTrack & { artists: readonly string[] };
 
 // Our refs paired with the album's tracks: by title and length, else by
 // position when the counts agree. Null when the tracklist does not confirm.
 export function pairTracks<R extends MatchTrack>(ours: readonly R[], theirs: readonly SpotifySimplifiedTrack[]): Map<R, SpotifySimplifiedTrack> | null {
-	if (!ours.length || !theirs.length) return null;
-	const pairs = new Map<R, SpotifySimplifiedTrack>();
-	const taken = new Set<string>();
-	for (const r of ours) {
-		const key = titleKey(r.title);
-		const hit = theirs.find((t) => !taken.has(t.id) && titleKey(t.name) === key && closeSec(r.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC));
-		if (hit) {
-			pairs.set(r, hit);
-			taken.add(hit.id);
-		}
-	}
-	if (pairs.size < Math.max(1, Math.ceil(ours.length * CONFIRM_SHARE))) return null;
-	// The rest by position, when the lists are the same length.
-	if (ours.length === theirs.length) {
-		for (const [i, r] of ours.entries()) {
-			const t = theirs[i]!;
-			if (!pairs.has(r) && !taken.has(t.id) && closeSec(r.durationSec, t.duration_ms / 1000, DURATION_TOLERANCE_SEC)) {
-				pairs.set(r, t);
-				taken.add(t.id);
-			}
-		}
-	}
-	return pairs;
+	const pairs = pairTracklists(ours, theirs.map((track) => ({ title: track.name, durationSec: track.duration_ms / 1000, track })));
+	return pairs && new Map([...pairs].map(([r, t]) => [r, t.track]));
 }
 
 const spotifyHandle = (kind: 'album' | 'track', id: string, url?: string): FeedHandle => ({ provider: 'spotify', id, url: url ?? `https://open.spotify.com/${kind}/${id}` });

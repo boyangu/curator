@@ -19,6 +19,8 @@ import app.curator.mobile.model.TracklistRows
 import app.curator.mobile.model.WaveSkin
 import app.curator.mobile.player.AppPlayer
 import app.curator.mobile.ui.feed.FeedModel
+import app.curator.mobile.ui.entity.EntityPageModel
+import app.curator.mobile.model.EntityRef
 import app.curator.mobile.ui.list.Metrics
 import app.curator.mobile.ui.list.TrackPager
 import app.curator.mobile.ui.list.playFrom
@@ -238,6 +240,14 @@ class AppModel(val app: CuratorApp) {
 	private val pagers = object : LinkedHashMap<Any, TrackPager>(8, 0.75f, true) {
 		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Any, TrackPager>) = size > 6
 	}
+
+	// Artist and label pages by their stack entry's key: back finds a page's
+	// scope, filters and loaded releases as it left them.
+	private val entityPages = object : LinkedHashMap<String, EntityPageModel>(8, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, EntityPageModel>) = size > 8
+	}
+
+	fun entityPage(key: String, ref: EntityRef): EntityPageModel = entityPages.getOrPut(key) { EntityPageModel(this, ref) }
 
 	/** The pager reading [query] (main thread: the views ask while composing). */
 	fun pager(query: ListQuery): TrackPager {

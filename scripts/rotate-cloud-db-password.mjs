@@ -3,20 +3,28 @@
 //
 //   pnpm cloud:rotate-db-password
 //
-// 1. mints a new password locally and shows the one SQL line the owner runs in
-//    the Supabase SQL Editor (only the owner can alter a role);
-// 2. waits, then proves the new password logs in as curator_api;
+// 1. mints a new password and sets it on curator_api over the owner's
+//    connection (only the owner can alter a role);
+// 2. proves the new password logs in as curator_api through the pooler;
 // 3. builds DATABASE_URL itself and hands it to Fly through `fly secrets
 //    import` on stdin, never argv, never the screen, never a shell variable;
 // 4. rolls the secret onto the machines and waits for /trpc/health.
 //
-// Hand-typed connection strings kept going wrong (a bare password stored as
-// DATABASE_URL, an address typed into a prompt's question), and each slip
-// leaked the secret somewhere. This makes the only manual step one paste.
+// The password is never shown and never typed: it exists in this process and
+// in Fly's secret. Hand-typed connection strings kept going wrong (a bare
+// password stored as DATABASE_URL, an address typed into a prompt's question),
+// a pasted `alter role` line stayed in the SQL Editor's saved queries, and
+// each slip leaked the secret somewhere.
+//
+// Between steps 1 and 4 the running API still holds the old password, so
+// requests can fail for the minute or two that takes. A run that stops in
+// between leaves the role on a password nobody holds: run it again.
 //
 // Reads from the git-ignored root .env: CURATOR_FLY_TOKEN, CURATOR_FLY_APP,
-// CURATOR_SUPABASE_URL (the project ref is its first host label) and
-// CURATOR_DB_POOLER_HOST (Supabase → Connect → Transaction pooler host).
+// CURATOR_SUPABASE_URL (the project ref is its first host label),
+// CURATOR_DB_POOLER_HOST (Supabase → Connect → Transaction pooler host) and
+// CURATOR_DB_OWNER_URL (the owner connection; asked for with the input hidden
+// when absent).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -24,12 +32,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { loadPostgres } from './cloud-pg.mjs';
+import { loadPostgres, scramVerifier } from './cloud-pg.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const ROLE = 'curator_api';
 const PORT = 6543;
+// The pooler keeps a role's credentials for a while after they change.
+const LOGIN_WAIT_MS = 120_000;
 
 function fail(msg) {
 	console.error(`\nrotate-cloud-db-password: ${msg}`);
@@ -59,7 +70,7 @@ function findFlyctl() {
 	fail('flyctl not found: install it from https://fly.io/docs/flyctl/install/');
 }
 
-function waitForEnter(prompt) {
+function ask(prompt) {
 	return new Promise((resolve) => {
 		const rl = createInterface({ input: process.stdin, output: process.stdout });
 		rl.question(prompt, (answer) => {
@@ -69,14 +80,49 @@ function waitForEnter(prompt) {
 	});
 }
 
+async function askHidden(question) {
+	let muted = false;
+	const output = new Writable({ write(chunk, _e, done) { if (!muted) process.stdout.write(chunk); done(); } });
+	const rl = createInterface({ input: process.stdin, output, terminal: true });
+	const answer = new Promise((resolve) => rl.question(question, resolve));
+	muted = true;
+	const value = await answer;
+	rl.close();
+	process.stdout.write('\n');
+	return value.trim();
+}
+
+// Shape only, never echoing the value (as cloud-db-apply does).
+function checkOwnerUrl(url) {
+	let u;
+	try { u = new URL(url); } catch { fail('the owner connection string is not a URL (value not shown)'); }
+	if (u.protocol !== 'postgres:' && u.protocol !== 'postgresql:') fail('the owner connection string must start with postgresql:// (value not shown)');
+	if (!/^postgres([.]|$)/.test(decodeURIComponent(u.username))) fail('expected the owner user postgres.<ref> (value not shown)');
+}
+
+async function setPassword(postgres, ownerUrl, password) {
+	const sql = postgres(ownerUrl, { prepare: false, max: 1, connect_timeout: 15, onnotice: () => {} });
+	try {
+		const [role] = await sql`select 1 from pg_roles where rolname = ${ROLE}`;
+		if (!role) return `the role ${ROLE} does not exist (apps/cloud/sql/roles.sql creates it)`;
+		// A utility statement takes no parameters; the verifier is base64 and ours.
+		await sql.unsafe(`alter role ${ROLE} with password '${scramVerifier(password)}'`);
+		return null;
+	} catch (e) {
+		// postgres.js errors carry no connection string; the code is enough.
+		return `${e?.code ?? ''} ${String(e?.message ?? e).slice(0, 120)}`.trim();
+	} finally {
+		await sql.end({ timeout: 2 });
+	}
+}
+
 async function canLogin(postgres, url) {
 	const sql = postgres(url, { prepare: false, max: 1, connect_timeout: 15, onnotice: () => {} });
 	try {
 		const [row] = await sql`select current_user as u`;
 		return row.u === ROLE ? null : `logged in as ${row.u}, expected ${ROLE}`;
 	} catch (e) {
-		// postgres.js errors carry no connection string; the code is enough.
-		return e && e.code === '28P01' ? 'password rejected (the alter role line has not run yet, or was mistyped)' : `${e?.code ?? ''} ${String(e?.message ?? e).slice(0, 120)}`;
+		return e && e.code === '28P01' ? 'password rejected' : `${e?.code ?? ''} ${String(e?.message ?? e).slice(0, 120)}`.trim();
 	} finally {
 		await sql.end({ timeout: 2 });
 	}
@@ -107,7 +153,7 @@ async function waitHealthy(app) {
 }
 
 async function main() {
-	if (!process.stdin.isTTY) fail('run this in a terminal: pnpm cloud:rotate-db-password (it waits for you between steps)');
+	if (!process.stdin.isTTY) fail('run this in a terminal: pnpm cloud:rotate-db-password (it asks before it changes anything)');
 	const env = { ...loadDotEnv(join(repoRoot, '.env')), ...process.env };
 	const token = env.CURATOR_FLY_TOKEN?.trim();
 	const app = env.CURATOR_FLY_APP?.trim();
@@ -123,37 +169,47 @@ async function main() {
 	if (!host) fail('CURATOR_DB_POOLER_HOST is not set in .env (Supabase → Connect → Transaction pooler, the host after @)');
 	if (!ref) fail('CURATOR_SUPABASE_URL is not set in .env');
 	const flyctl = findFlyctl();
+	let ownerUrl = env.CURATOR_DB_OWNER_URL?.trim();
+	if (!ownerUrl) ownerUrl = await askHidden('Owner connection string (postgres.<ref>…, input hidden): ');
+	if (!ownerUrl) fail('no owner connection string');
+	checkOwnerUrl(ownerUrl);
 	const postgres = await loadPostgres();
+
+	const answer = await ask(`This replaces the ${ROLE} database password and restarts ${app}; requests can fail for a minute or two. Type yes to go on: `);
+	if (answer !== 'yes') fail('stopped; nothing was changed.');
+	const halfDone = `The ${ROLE} password was changed but ${app} does not have it yet: run this again.`;
 
 	// Hex keeps the password safe inside a URL without escaping.
 	const password = randomBytes(24).toString('hex').toUpperCase();
 	const url = `postgresql://${ROLE}.${ref}:${password}@${host}:${PORT}/postgres`;
 
-	console.log('\nStep 1 of 3. In Supabase, open the SQL Editor, start a new query, paste this line and click Run:\n');
-	console.log(`    alter role ${ROLE} with password '${password}';\n`);
-	console.log('Then delete that query from the SQL Editor\'s saved list (it holds the password).');
-	console.log('Do not paste the line anywhere else.\n');
+	process.stdout.write(`\nStep 1 of 4. Setting the new password on ${ROLE}… `);
+	const refused = await setPassword(postgres, ownerUrl, password);
+	if (refused) fail(`could not set the password: ${refused}`);
+	console.log('done.');
 
+	process.stdout.write('Step 2 of 4. Checking it logs in through the pooler… ');
+	const deadline = Date.now() + LOGIN_WAIT_MS;
 	for (;;) {
-		const answer = await waitForEnter('Press Enter once it says Success (or type q to quit): ');
-		if (answer === 'q') fail('stopped; nothing was changed on Fly. The old password still works unless the line was run.');
-		process.stdout.write('Checking the new password logs in… ');
 		const problem = await canLogin(postgres, url);
-		if (!problem) {
-			console.log('yes.');
-			break;
-		}
-		console.log(`not yet: ${problem}.`);
+		if (!problem) break;
+		if (Date.now() > deadline) fail(`${problem}. ${halfDone}`);
+		await new Promise((r) => setTimeout(r, 3_000));
 	}
+	console.log('yes.');
 
-	console.log('\nStep 2 of 3. Storing DATABASE_URL on Fly (sent over stdin, not shown)…');
-	const flyEnv = { ...process.env, FLY_API_TOKEN: token };
-	await run(flyctl, ['secrets', 'import', '--stage', '--app', app], { env: flyEnv, input: `DATABASE_URL=${url}\n` });
+	try {
+		console.log('\nStep 3 of 4. Storing DATABASE_URL on Fly (sent over stdin, not shown)…');
+		const flyEnv = { ...process.env, FLY_API_TOKEN: token };
+		await run(flyctl, ['secrets', 'import', '--stage', '--app', app], { env: flyEnv, input: `DATABASE_URL=${url}\n` });
 
-	console.log('\nStep 3 of 3. Restarting the server with it…');
-	await run(flyctl, ['secrets', 'deploy', '--app', app], { env: flyEnv });
+		console.log('\nStep 4 of 4. Restarting the server with it…');
+		await run(flyctl, ['secrets', 'deploy', '--app', app], { env: flyEnv });
+	} catch (e) {
+		fail(`${e instanceof Error ? e.message : String(e)}. ${halfDone}`);
+	}
 	await waitHealthy(app);
-	console.log(`\nDone: ${app} is healthy on the new password. Close this terminal tab to clear the screen.`);
+	console.log(`\nDone: ${app} is healthy on the new password.`);
 }
 
 main().catch((e) => fail(e instanceof Error ? e.message : String(e)));

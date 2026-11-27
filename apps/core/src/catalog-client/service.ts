@@ -13,7 +13,7 @@
 
 import { createHash } from 'node:crypto';
 import { CATALOG_MAX_CLAIMS } from '@curator/protocol';
-import type { CatalogBrowseResult, CatalogClaim, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogTracksResult, CatalogWatch, CatalogWatchSource, CloudService } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogClaim, CatalogDeviceProfile, CatalogIngestResult, CatalogKind, CatalogObjectSummary, CatalogRef, CatalogTracksResult, CatalogWatch, CatalogWatchSource, CatalogWorkReportInput, CatalogWorkReportResult, CloudService } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import { SpotifyClient } from '@curator/spotify';
 import { log } from '@curator/sync-core/log';
@@ -94,8 +94,15 @@ export interface CatalogClient {
 	// 'catalog_pages': does the server answer `tracks` and the header facts.
 	offersPages(): boolean;
 	// A page of an artist's, a label's or an album's releases with their
-	// tracklists (entity/service.ts).
-	tracks(objectId: string, cursor?: string): Promise<CatalogTracksResult>;
+	// tracklists (entity/service.ts). With a `profile`, the answer may carry
+	// the store reads the catalogue wants of this desktop for it (`work`:
+	// entity/work.ts); `hints` name the pages the library itself knows the
+	// entity by.
+	tracks(objectId: string, cursor?: string, work?: { profile: CatalogDeviceProfile; hints?: CatalogRef[] }): Promise<CatalogTracksResult>;
+	// 'catalog_device_work': does the server hand out work and take reports.
+	offersWork(): boolean;
+	// What the work read (packages/catalog-work), with this device's id.
+	workReport(input: Omit<CatalogWorkReportInput, 'deviceId'>): Promise<CatalogWorkReportResult>;
 }
 
 // A label followed by name: one shared object per folded name, so everyone
@@ -185,6 +192,7 @@ export function createCatalogClient(deps: CatalogClientDeps): CatalogClient {
 		if (!s.available) throw new CatalogUnavailableError(s.reason === 'signed_out' ? 'Sign in to Curator Cloud to follow artists and labels.' : 'The sync server does not offer Following yet.');
 	};
 	const deviceId = () => deps.deviceId();
+	const offersWork = (): boolean => status().available && (deps.features?.().includes('catalog_device_work') ?? false);
 
 	// The account's watches, held for a minute: thousands of them make a
 	// megabytes-large answer, and the feed's unfollow/mute lookups, the
@@ -395,9 +403,18 @@ export function createCatalogClient(deps: CatalogClientDeps): CatalogClient {
 
 		offersPages: () => status().available && (deps.features?.().includes('catalog_pages') ?? false),
 
-		tracks(objectId, cursor) {
+		tracks(objectId, cursor, work) {
 			ready();
-			return deps.catalog.tracks({ deviceId: deviceId(), id: objectId, ...(cursor ? { cursor } : {}) });
+			// The keys came with 'catalog_device_work': an older server refuses them.
+			const asks = !!work && offersWork();
+			return deps.catalog.tracks({ deviceId: deviceId(), id: objectId, ...(cursor ? { cursor } : {}), ...(asks ? { profile: work.profile, ...(work.hints?.length ? { hints: work.hints } : {}) } : {}) });
+		},
+
+		offersWork,
+
+		workReport(input) {
+			ready();
+			return deps.catalog.workReport({ deviceId: deviceId(), ...input });
 		},
 
 		// The library's labels, registered with the catalogue by name (no

@@ -67,6 +67,17 @@ describe('event cards v2', () => {
 		]);
 	});
 
+	it('lists the genres Beatport states first, so a track’s first genre is Beatport’s', async () => {
+		const { app, releaseId } = await seed();
+		await withSystemTx(app.db, (tx) => ingestClaims(
+			tx,
+			[{ provider: 'traxsource', kind: 'recording', providerId: 't11', name: 'Glass Rivers', identifiers: [{ namespace: 'isrc', value: 'GBAAA2600001' }], facts: { durationSec: 401 }, artists: [{ provider: 'traxsource', kind: 'artist', providerId: 't77', name: 'Northfold' }], genres: ['House'] }],
+			{ reason: 'tracker' },
+		));
+		const card = await withSystemTx(app.db, (tx) => releaseCard(tx, releaseId));
+		expect(card.tracks[0]!.genres).toEqual(['Melodic House & Techno', 'Progressive House', 'House']);
+	});
+
 	it('a playlist addition’s track card carries the recording’s facts and its release’s label', async () => {
 		const { app, playlistId, recordingId, labelId } = await seed();
 		const card = await withSystemTx(app.db, async (tx) => {

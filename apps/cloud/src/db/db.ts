@@ -33,11 +33,68 @@ export interface Queryable {
 	exec(text: string): Promise<void>;
 }
 
+// A transaction's handle. `savepoint` runs `fn` behind a savepoint, on its own
+// handle: when `fn` throws — a statement of its own failed, or it chose to —
+// what it wrote is rolled back, the transaction goes on, and the error comes
+// out of the returned promise for the caller to take or pass on.
+//
+// It is the ONLY way to survive a failed statement inside a transaction. A
+// bare `savepoint` / `rollback to` typed as statements is not: postgres.js
+// notes every rejected query of a transaction's handle, caught or not, and
+// throws the first once the transaction's function returns — the whole
+// transaction rolled back after all (found in review, 2026-11-27: PGlite has
+// no such memory, so a suite on it passed). The savepoint's own handle keeps
+// its own account.
+export interface Tx extends Queryable {
+	savepoint<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
+}
+
 export interface Db extends Queryable {
 	// Runs `fn` in one transaction on one connection; commits when it
 	// resolves, rolls back when it throws.
-	begin<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
+	begin<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
 	close(): Promise<void>;
+}
+
+// A transaction handle over statements alone (PGlite; tests), behaving as
+// postgres.js does: a statement that failed on a handle fails that handle's
+// scope when it ends, whoever caught it — so code that leans on a caught
+// error fails here as it would in production.
+export function scopedTx(q: Queryable): { tx: Tx; settle(): void } {
+	let failed: unknown;
+	let depth = 0;
+	const noting = async <T>(run: () => Promise<T>): Promise<T> => {
+		try {
+			return await run();
+		} catch (e) {
+			failed ??= e;
+			throw e;
+		}
+	};
+	const tx: Tx = {
+		query: (text, params) => noting(() => q.query(text, params)),
+		exec: (text) => noting(() => q.exec(text)),
+		async savepoint<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+			const name = `sp_${depth++}`;
+			await tx.exec(`savepoint ${name}`);
+			const inner = scopedTx(q);
+			try {
+				const out = await fn(inner.tx);
+				inner.settle();
+				await tx.exec(`release savepoint ${name}`);
+				return out;
+			} catch (e) {
+				await tx.exec(`rollback to savepoint ${name}`);
+				throw e;
+			}
+		},
+	};
+	return {
+		tx,
+		settle(): void {
+			if (failed !== undefined) throw failed;
+		},
+	};
 }
 
 export class ConnectionStringError extends Error {
@@ -99,8 +156,10 @@ export function createPostgresDb(url: string, opts: { max?: number; prepare?: bo
 	return {
 		query: base.query,
 		exec: base.exec,
-		async begin<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
-			return (await sql.begin((tx) => fn(wrap(tx)))) as T;
+		async begin<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+			// postgres.js's own savepoint: a nested scope with its own handle.
+			const txOf = (q: postgres.TransactionSql): Tx => ({ ...wrap(q), savepoint: <U>(inner: (tx: Tx) => Promise<U>) => q.savepoint((s) => inner(txOf(s))) as Promise<U> });
+			return (await sql.begin((tx) => fn(txOf(tx)))) as T;
 		},
 		async close(): Promise<void> {
 			await sql.end({ timeout: 5 });

@@ -13,6 +13,7 @@
 import {
 	sharedScorer,
 	ProviderBlockedError,
+	ProviderFailedError,
 	ProviderUnavailableError,
 	Cooldown,
 	cloudflareChallengeReason,
@@ -317,13 +318,13 @@ export class BeatportClient {
 				'Accept-Language': 'en-US,en;q=0.9',
 				'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 			},
-		}).catch((err: unknown) => {
+		}).catch((err: unknown): never => {
 			// Our own route to Beatport is down (FlareSolverr): not a miss, not a block.
 			if (err instanceof ProviderUnavailableError) this._unavailable(err);
 			if (DEBUG) console.warn('[beatport] fetch threw', err instanceof Error ? err.message : err);
-			return null;
+			// No answer is not "no such track": the caller asks again later.
+			throw new ProviderFailedError('beatport', 0, err instanceof Error ? err.message : String(err));
 		});
-		if (!res) return [];
 		if (DEBUG) console.log(`[beatport] response status=${res.status} ct=${res.headers.get('content-type')} redirected=${res.redirected} url=${res.url}`);
 		// A Cloudflare challenge is tagged on the header even before we read the
 		// body — check that first (cheap), then the body on the statuses CF uses
@@ -337,7 +338,8 @@ export class BeatportClient {
 			const reason = cloudflareChallengeReason(res.status, res.headers, body);
 			if (reason) this._blocked(res, reason);
 			if (DEBUG) console.warn(`[beatport] non-OK response (${res.status}), bailing`);
-			return [];
+			// A search that found nothing answers 200 with no rows; anything else failed.
+			throw new ProviderFailedError('beatport', res.status, 'search');
 		}
 		// Got past the wall: the next block starts the backoff from the bottom.
 		this.cooldown.clear();

@@ -30,6 +30,7 @@ const repoRoot = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 //                need an explicit rule above
 //   allowNode  — node:* builtins in non-test source too
 //   testDirs   — files under these repo-relative dirs count as test code
+//   testAllow  — workspace packages tests alone may import
 //   deny       — patterns refused even where another rule would allow them
 //   denyExempt — file → the exact denied specifiers it alone may import
 const RULES = {
@@ -59,6 +60,16 @@ const RULES = {
 		dir: 'packages/catalog-readers/src',
 		allow: ['@curator/protocol', '@curator/library-logic'],
 		allowExact: ['@curator/shared/artist-credit'],
+	},
+	// The reading engine of device work, run by the desktop main process and
+	// by the phone's embedded engine (Hermes): the readers, the matcher and
+	// the store clients, and nothing with a runtime of its own — no node:*,
+	// no app code. The one sync-core file it takes is the key notation map,
+	// which imports nothing (the rest of sync-core is SQLite- and Node-shaped).
+	'catalog-work': {
+		dir: 'packages/catalog-work/src',
+		allow: ['@curator/protocol', '@curator/library-logic', '@curator/catalog-readers', '@curator/beatport', '@curator/traxsource'],
+		allowExact: ['@curator/sync-core/enrich/keys'],
 	},
 	// The device sync client and the library writers it cycles with (op
 	// builders, mutators, migrate), and the Discover feed's store, cloud
@@ -94,6 +105,10 @@ const RULES = {
 		ownDeps: 'apps/cloud/package.json',
 		allowNode: true,
 		testDirs: ['apps/cloud/src/test/', 'apps/cloud/src/cli/local.ts', 'apps/cloud/src/cli/catalog.ts'],
+		// The device-work engine, run against the real report handler in a
+		// contract test (catalog/work/contract.test.ts): the seam where every
+		// defect of the first round sat. Never in the API's own code.
+		testAllow: ['@curator/catalog-work'],
 		deny: [/^@curator\/(core|desktop|mcp|agent)(\/|$)/, /sqlite/i],
 		// The dev-only local server reads the desktop's library read-only
 		// through Node's built-in SQLite. Only src/cli/local.ts loads it (the
@@ -148,6 +163,7 @@ for (const file of walk(srcRoot)) {
 		if (rule.allowNode && spec.startsWith('node:')) continue;
 		const pkg = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
 		if (rule.allow.includes(pkg)) continue;
+		if (isTest && rule.testAllow?.includes(pkg)) continue;
 		if (deps.prod.includes(pkg) || (isTest && deps.dev.includes(pkg))) continue;
 		if (rule.allowExact?.includes(spec)) continue;
 		if (rule.typeOnly?.includes(spec) && /^(?:import|export)\s+type\s/.test(m[0])) continue;

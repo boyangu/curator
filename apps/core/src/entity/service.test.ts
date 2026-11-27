@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CatalogBrowseResult, CatalogObjectSummary, CatalogRef, CatalogTracksResult } from '@curator/protocol';
 import type { ZTrackFilterT } from '@curator/shared';
 import { migrate } from '@curator/sync-core/db/migrate';
-import { matchLibraryTracks } from './ownership.js';
+import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
 import type { EntityCatalog } from './resolve.js';
 import { createEntityPages, OWNED_SOURCES } from './service.js';
 

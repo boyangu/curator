@@ -66,6 +66,8 @@ import {
 	type CatalogSearchResult,
 	type CatalogTracksInput,
 	type CatalogTracksResult,
+	type CatalogWorkReportInput,
+	type CatalogWorkReportResult,
 	type CatalogUnwatchInput,
 	type CatalogWatch,
 	type CatalogWatchInput,
@@ -277,6 +279,7 @@ export function createFetchCloudTransport(deps: FetchTransportDeps): CloudTransp
 			connectAnswer: (input: CatalogConnectAnswerInput) => call<CatalogConnectAnswerResult>('mutation', 'catalog.connectAnswer', input),
 			connectSearch: (input: CatalogConnectSearchInput) => call<CatalogConnectSearchResult>('mutation', 'catalog.connectSearch', input),
 			tracks: (input: CatalogTracksInput) => call<CatalogTracksResult>('query', 'catalog.tracks', input),
+			workReport: (input: CatalogWorkReportInput) => call<CatalogWorkReportResult>('mutation', 'catalog.workReport', input),
 		},
 		feed: {
 			events: (input: FeedEventsInput) => call<FeedEventsResult>('query', 'feed.events', input),

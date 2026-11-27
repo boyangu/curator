@@ -44,6 +44,7 @@ import { pageTracks } from './pages.js';
 import { sameTrackTitle } from './slots.js';
 import { addWatch, liveTarget, listWatches, refreshNow, removeWatch, setMuted } from './watches.js';
 import { queueValidation } from './artist-validation.js';
+import { planPage, planRead, planUnknown, unknownPages } from './work/plan.js';
 
 export type CatalogDeps = { db: Db; audit: AuditEmit };
 
@@ -147,7 +148,7 @@ export async function recordBatch(tx: SystemTx, producer: string, key: string, r
 // An artist's picture rides the same way (artistPicture below): the page a
 // desktop opened had none, it looked the artist up at the store, and the
 // next device's page has it.
-async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
+export async function attachFacts(tx: SystemTx, claims: CatalogClaim[]): Promise<{ outcomes: (IngestOutcome | undefined)[]; created: number; attached: number }> {
 	const ingester = new Ingester(tx, { reason: 'enrichment' });
 	const outcomes: (IngestOutcome | undefined)[] = [];
 	const about = await aboutObjects(tx, claims);
@@ -277,8 +278,19 @@ export async function ingest(deps: CatalogDeps, userId: string, caller: Caller, 
 	});
 }
 
+// A planner that failed costs the read its work, never its answer (work/plan.ts planRead).
+const planFailed = (deps: CatalogDeps, read: string) => (e: unknown): void => deps.audit('catalog_work_plan_failed', { read, error: e instanceof Error ? e.message.slice(0, 300) : String(e).slice(0, 300) });
+
 export function resolve(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogResolveInput): Promise<CatalogResolveResult> {
-	return gated(deps, userId, caller, input.deviceId, async (tx) => ({ objects: await resolveRefs(tx, input.refs) }));
+	return gated(deps, userId, caller, input.deviceId, async (tx) => {
+		const objects = await resolveRefs(tx, input.refs);
+		// An artist's or a label's own page the catalogue does not hold, asked
+		// about by a device that can read it: read it (work/plan.ts).
+		const work = input.profile && unknownPages(input.refs, objects).length
+			? await planRead(tx, { userId, profile: input.profile }, planFailed(deps, 'resolve'), (fenced, scope) => planUnknown(fenced, { userId, profile: input.profile, refs: input.refs, objects, nowMs: tx.nowMs, scope }))
+			: undefined;
+		return { objects, ...(work ? { work } : {}) };
+	});
 }
 
 export function searchObjects(deps: CatalogDeps, userId: string, caller: Caller, input: CatalogSearchInput): Promise<CatalogSearchResult> {
@@ -319,7 +331,14 @@ export function tracks(deps: CatalogDeps, userId: string, caller: Caller, input:
 		// Someone is looking at this artist: a Deezer page of theirs nobody
 		// checked yet is checked by the next pass (artist-validation.ts).
 		if (page.object.kind === 'artist' && !input.cursor) await queueValidation(tx, page.object.id);
-		return page;
+		// What the catalogue wants read of this page, by a device that said
+		// what it can read (work/plan.ts).
+		const work = input.profile
+			? await planRead(tx, { userId, profile: input.profile }, planFailed(deps, 'tracks'), (fenced, scope) =>
+					planPage(fenced, { userId, profile: input.profile, hints: input.hints, object: page.object, releases: page.releases, first: !input.cursor, nowMs: tx.nowMs, scope }),
+				)
+			: undefined;
+		return work ? { ...page, work } : page;
 	});
 }
 

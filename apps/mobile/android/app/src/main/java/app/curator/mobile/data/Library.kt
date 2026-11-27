@@ -1,6 +1,8 @@
 package app.curator.mobile.data
 
 import app.curator.mobile.model.HomePin
+import app.curator.mobile.model.OwnedFilter
+import app.curator.mobile.model.OwnedTrack
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.TracklistRows
 import kotlinx.serialization.Serializable
@@ -178,9 +180,6 @@ class Library(private val db: NativeDb) {
 		db.query("SELECT EXISTS (SELECT 1 FROM track WHERE remote_source = ? AND deleted_at IS NULL) AS e", it).first().int("e") == 1
 	}.toSet()
 
-	fun artistName(artistId: String): String? =
-		db.query("SELECT name FROM artist WHERE id = ?", artistId).takeIf { it.size > 0 }?.get(0)?.string("name")
-
 	/** A track's credited artists in credit order, each with its artist row (track_artist, derived from track.artists). */
 	fun trackArtists(trackId: String): List<ArtistRef> = db.query(
 		"""
@@ -188,6 +187,54 @@ class Library(private val db: NativeDb) {
 		WHERE ta.track_id = ? ORDER BY ta.position
 		""".trimIndent(), trackId,
 	).map { ArtistRef(it.string("id")!!, it.string("name") ?: "", it.string("role")) }
+
+	/**
+	 * An artist's or a label's page in My Library: the account's own files
+	 * (remote_source 'local') of the library artist, or on a label that folds
+	 * alike ([OwnedFilter], as the desktop's `labelFolds` reads label_ascii).
+	 * One query; the credits come as a list, split on a separator no name holds.
+	 */
+	fun ownedOf(f: OwnedFilter): List<OwnedTrack> {
+		val conds = mutableListOf<String>()
+		val args = mutableListOf<Any?>()
+		if (f.artistIds.isNotEmpty()) {
+			conds += "t.id IN (SELECT track_id FROM track_artist WHERE artist_id IN (${f.artistIds.joinToString(",") { "?" }}))"
+			args.addAll(f.artistIds)
+		}
+		if (f.labelFolds.isNotEmpty()) {
+			conds += "t.label_ascii IN (${f.labelFolds.joinToString(",") { "?" }})"
+			args.addAll(f.labelFolds)
+		}
+		if (conds.isEmpty()) return emptyList()
+		return db.query(
+			"""
+			SELECT t.id, t.album_id,
+				${eff("title", "title")} AS title,
+				(SELECT group_concat(json_extract(j.value, '$.name'), char(31)) FROM json_each(
+					CASE WHEN json_valid(coalesce(json_extract(t.overrides, '$.artists'), t.artists)) THEN coalesce(json_extract(t.overrides, '$.artists'), t.artists) END
+				) j) AS artists,
+				${eff("album_title", "albumTitle")} AS album,
+				${eff("label", "label")} AS label,
+				${eff("genre", "genre")} AS genre,
+				${eff("release_date", "releaseDate")} AS released,
+				${eff("bpm", "bpm")} AS bpm,
+				${eff("key_camelot", "keyCamelot")} AS key,
+				t.duration, t.cover_url
+			FROM track t
+			WHERE t.deleted_at IS NULL AND t.remote_source = 'local' AND (${conds.joinToString(" OR ")})
+			""".trimIndent(),
+			*args.toTypedArray(),
+		).map { r ->
+			val (title, version) = splitVersion(r.string("title") ?: "")
+			OwnedTrack(
+				id = r.string("id")!!, title = title, version = version,
+				artists = r.string("artists")?.split('\u001f')?.filter { it.isNotBlank() } ?: emptyList(),
+				album = r.string("album"), albumKey = r.string("album_id"),
+				label = r.string("label"), genre = r.string("genre"), released = r.string("released"),
+				durationSec = r.int("duration"), bpm = r.double("bpm"), key = r.string("key"), coverUrl = r.string("cover_url"),
+			)
+		}
+	}
 
 	fun track(id: String): Track? {
 		val rows = db.query("SELECT $trackColumns FROM track t WHERE t.id = ?", id)

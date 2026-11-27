@@ -28,7 +28,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { createFetchHandler, type FetchHandler } from '../app.js';
 import { AuditWriter } from '../audit.js';
 import { createTokenVerifier } from '../auth/jwt.js';
-import type { Db, Param, Queryable, Row } from '../db/db.js';
+import { scopedTx, type Db, type Param, type Queryable, type Row, type Tx } from '../db/db.js';
 import { findSqlDir, migrate } from '../db/migrate.js';
 import { createLogger, type Logger } from '../log.js';
 import { TokenBucketLimiter, type RateLimits } from '../rate-limit.js';
@@ -62,7 +62,13 @@ export function pgliteDb(pg: PGlite): Db {
 	return {
 		query: base.query,
 		exec: base.exec,
-		begin: (fn) => pg.transaction((tx) => fn(wrap(tx))),
+		begin: (fn) =>
+			pg.transaction(async (tx) => {
+				const scope = scopedTx(wrap(tx));
+				const out = await fn(scope.tx);
+				scope.settle();
+				return out;
+			}),
 		close: () => pg.close(),
 	};
 }
@@ -81,10 +87,13 @@ export function roleDb(pg: PGlite, role: 'curator_api' | 'curator_worker'): Db {
 			exec: q.exec,
 		};
 	};
-	const begin = <T>(fn: (tx: Queryable) => Promise<T>): Promise<T> =>
+	const begin = <T>(fn: (tx: Tx) => Promise<T>): Promise<T> =>
 		pg.transaction(async (tx) => {
 			await tx.query(`select set_config('role', $1, true)`, [role]);
-			return fn(under(tx));
+			const scope = scopedTx(under(tx));
+			const out = await fn(scope.tx);
+			scope.settle();
+			return out;
 		}) as Promise<T>;
 	return {
 		query: (text, params) => begin((tx) => tx.query(text, params)),

@@ -10,7 +10,7 @@ import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
 import { HANDLE_AGG, REF_AGG, handlesOf, refs } from './browse.js';
 import { deezerOnlySql } from './credits.js';
-import { recordingFacts, RECORDING_GENRES_SQL } from './events.js';
+import { GENRE_ORDER, recordingFacts, RECORDING_GENRES_SQL } from './events.js';
 import { follow } from './identity.js';
 
 // The sort key of a release: its date as epoch seconds, undated last. Numeric
@@ -141,7 +141,7 @@ export async function pageTracks(tx: Queryable, id: string, opts: { cursor?: str
 		`select r.id, r.name, to_char(r.release_at, 'YYYY-MM-DD') as date, r.release_type, r.label_text, r.attrs->>'coverUrl' as cover,
 			(select ${REF_AGG('a', 'e.position')} from curator.catalog_edge e join curator.catalog_object a on a.id = e.src where e.dst = r.id and e.kind = 'artist-release') as artists,
 			(select ${REF_AGG('l', 'l.name')} from curator.catalog_edge e join curator.catalog_object l on l.id = e.dst where e.src = r.id and e.kind = 'release-label') as labels,
-			(select string_agg(g.name, '|' order by g.name) from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = r.id and e.kind = 'object-genre') as genres,
+			(select string_agg(g.name, '|' order by ${GENRE_ORDER('e', 'g')}) from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = r.id and e.kind = 'object-genre') as genres,
 			${HANDLE_AGG('r.id')} as handles
 		from curator.catalog_object r where r.id = any($1::uuid[])`,
 		[list(ids)],

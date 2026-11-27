@@ -8,6 +8,7 @@ import { CATALOG_BROWSE_MAX, CATALOG_COLLABS_MAX, type CatalogBrowseResult, type
 import { nameFold } from '@curator/library-logic';
 import type { Queryable } from '../db/db.js';
 import { num, numOrNull } from '../db/db.js';
+import { GENRE_ORDER } from './events.js';
 import { editionsOf, insightsOf, type Insight } from './insights.js';
 import { summaries } from './objects.js';
 
@@ -394,14 +395,14 @@ export async function browseObject(tx: Queryable, id: string, opts: { library?: 
 				DETAIL_LIMIT,
 			);
 		view.trackCount = await count(`select count(*) as n from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null where e.src = $1 and e.kind = 'release-recording'`);
-		view.genres = await refList(`select g.id, g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = $1 and e.kind = 'object-genre' order by g.name`);
+		view.genres = await refList(`select g.id, g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = $1 and e.kind = 'object-genre' order by ${GENRE_ORDER('e', 'g')}`);
 	} else if (o.kind === 'recording') {
 		view.durationSec = numOrNull(o.duration_sec);
 		view.artists = (
 			await tx.query<Ref & { role: string | null }>(`select a.id, a.name, e.role from curator.catalog_edge e join curator.catalog_object a on a.id = e.dst where e.src = $1 and e.kind = 'recording-artist' order by e.position`, [live])
 		).map((a) => ({ id: a.id, name: a.name, role: a.role }));
 		view.releases = await releases(tx, `exists (select 1 from curator.catalog_edge e where e.kind = 'release-recording' and e.src = r.id and e.dst = $1)`, [live], DETAIL_LIMIT);
-		view.genres = await refList(`select g.id, g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = $1 and e.kind = 'object-genre' order by g.name`);
+		view.genres = await refList(`select g.id, g.name from curator.catalog_edge e join curator.catalog_object g on g.id = e.dst where e.src = $1 and e.kind = 'object-genre' order by ${GENRE_ORDER('e', 'g')}`);
 		view.charts = (
 			await tx.query<{ genre_id: string; genre: string; provider: string; rank: unknown; best_rank: unknown; last_ms: unknown }>(
 				`select c.genre_id, g.name as genre, c.provider, c.rank, c.best_rank, extract(epoch from c.last_seen_at) * 1000 as last_ms

@@ -32,19 +32,21 @@ Read from the environment only; `.env.example` lists them with placeholders. Nev
 
 Once, in this order. Before you start, delete the spike's objects from `public` (`library_op`, `push_ops`, `pull_ops`, `library_op_wake`, the "owner receives own wakeups" policy on `realtime.messages`) and the spike user.
 
-1. **Migrations**, with the owner connection (Project Settings → Database → connection string, user `postgres`), from your machine:
+1. **Migrations**, with the owner connection (Project Settings → Database → connection string, user `postgres`, session pooler), from your machine:
 
    ```
-   DATABASE_URL='postgres://postgres.<ref>:<owner password>@<pooler host>:5432/postgres' pnpm --filter @curator/cloud db:migrate
+   pnpm cloud:db-apply
    ```
 
-   It creates the `curator` schema and records each applied file in `curator.schema_migration` with a checksum. `0010_spotify_grant.sql` adds the Spotify gateway's one table (`curator.spotify_grant`, see "Spotify gateway"); it needs nothing from `roles.sql` or `storage.sql`. Re-running is a no-op; editing an applied file is refused. A fix goes in the next numbered file (`sql/0005_*.sql`). `0004_catalogue.sql` adds the catalogue (`catalogue_item`, `catalogue_account`, the `catalogue_rev` sequence, `catalogue_entitled()`). The SQL files are plain SQL, so pasting one into the SQL editor works too, but then the runner does not know it ran.
+   It takes the connection from `CURATOR_DB_OWNER_URL` in the git-ignored root `.env`, or asks for it with the input hidden, so the owner's password is never on a command line or in shell history. It runs the migrations, then `sql/roles.sql` and `sql/storage.sql` (steps 2 and 4), then checks the result (`--check` only checks). The migration runner creates the `curator` schema and records each applied file in `curator.schema_migration` with a checksum. `0010_spotify_grant.sql` adds the Spotify gateway's one table (`curator.spotify_grant`, see "Spotify gateway"); it needs nothing from `roles.sql` or `storage.sql`. Re-running is a no-op; editing an applied file is refused. A fix goes in the next numbered file (`sql/0005_*.sql`). `0004_catalogue.sql` adds the catalogue (`catalogue_item`, `catalogue_account`, the `catalogue_rev` sequence, `catalogue_entitled()`). The SQL files are plain SQL, so pasting one into the SQL editor works too, but then the runner does not know it ran.
 
-2. **The API role**: paste `sql/roles.sql` into the SQL editor and run it (as `postgres`). Then, separately and never in a file:
+2. **The API role**: `sql/roles.sql` creates it (step 1 ran it; by hand, paste it into the SQL editor and run it as `postgres`). Then, separately and never in a file:
 
    ```sql
    alter role curator_api with password '<generate 32+ random chars>';
    ```
+
+   That is for the first setup only, and the line stays in the SQL editor's history until you delete it there. Once the API is deployed, `pnpm cloud:rotate-db-password` replaces the password without showing it: it sets the role over the owner connection, stores the new `DATABASE_URL` on Fly and restarts the server.
 
    `curator_api` can log in and do nothing as itself. Each request switches to `authenticated` in its transaction with the caller's JWT claims, so RLS decides every row. If `grant authenticated to curator_api` is refused, the project's `postgres` lacks admin option on `authenticated`; ask Supabase support or run that one line from a session that has it.
 
@@ -111,9 +113,11 @@ The token reaches flyctl through its environment only; it is never printed or wr
 
 **Migrations come before the release**, in this order:
 
-1. The owner runs the new migrations from their machine (Database setup, step 1): `DATABASE_URL='<owner connection>' pnpm --filter @curator/cloud db:migrate`.
-2. The owner re-runs `sql/roles.sql` (step 2), always: it is idempotent, and a migration that adds a function the API calls (`0002_audit.sql`, `0003_migration_check.sql`) needs its grant.
-3. When `sql/storage.sql` changed (or on the catalogue's first release), the owner runs it too (step 4), always after the migrations. It changed with `0006_device_session.sql` (its policies call `curator.session_revoked()`) and with `0008_snapshot_storage.sql` (the `snapshots` bucket).
+`pnpm cloud:db-apply` (Database setup, step 1) does the first three from the owner's machine, then checks them:
+
+1. The new migrations.
+2. `sql/roles.sql` (step 2), always: it is idempotent, and a migration that adds a function the API calls (`0002_audit.sql`, `0003_migration_check.sql`) needs its grant.
+3. `sql/storage.sql` (step 4), always after the migrations. It changed with `0006_device_session.sql` (its policies call `curator.session_revoked()`) and with `0008_snapshot_storage.sql` (the `snapshots` bucket).
 4. Then release.
 
 The server enforces the order. At boot it compares the migration files it ships (`sql/NNNN_*.sql`, not `roles.sql`) with `curator.applied_migrations()` (0003, executable by `curator_api` only, which has no read on `curator.schema_migration` itself) and, if any is missing, logs `schema_behind` with the missing files and a hint, and exits. The new machine never passes the health check, the deploy fails, and the previous release keeps serving. A database *ahead* of the image (a rollback onto a newer schema) starts with a `schema_ahead` warning, since migrations are additive.

@@ -40,6 +40,7 @@ import { joinFromReplica } from '@curator/sync-core/sync-log/replica';
 import { createStorageDownload, StorageGoneError } from '@curator/sync-core/sync-log/supabase-storage';
 import { host } from './shim/host.js';
 import { trackPictures } from './track-pictures.js';
+import { entityFollow, entityPage, entityTracks, type EntityDeps, type PageAsk } from './entity.js';
 import type Database from 'better-sqlite3';
 
 type BootConfig = {
@@ -386,7 +387,29 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 		if (transport.session() === null || !features?.includes('global_catalog')) return null;
 		return trackPictures(raw, transport.catalog!, { deviceId: client.deviceId(), brief: features.includes('catalog_pages') }, a['trackId'] as string);
 	},
+
+	// ── artist and label pages (js/entity.ts) ──
+	entityPage: (a) => entityPage(entityDeps(), a as unknown as PageAsk),
+	entityTracks: (a) => entityTracks(entityDeps(), a as unknown as Parameters<typeof entityTracks>[1]),
+	// The account's watch list only: never a follow at Spotify (2026-11-26).
+	entityFollow: async (a) => {
+		const r = await entityFollow(entityDeps(), a as unknown as Parameters<typeof entityFollow>[1]);
+		lib().feed.watchesChanged();
+		return r;
+	},
 };
+
+// What an entity page may ask the catalogue, and why not when it may not.
+function entityDeps(): EntityDeps {
+	const { raw, client, transport } = lib();
+	const features = client.serverFeatures();
+	const catalog: EntityDeps['catalog'] =
+		transport.session() === null ? { reason: 'signed_out' }
+			: features === null ? { reason: 'server_off' }
+				: !features.includes('global_catalog') || !transport.catalog ? { reason: 'old_server' }
+					: { client: transport.catalog, deviceId: client.deviceId(), pages: features.includes('catalog_pages') };
+	return { raw, catalog, now: Date.now() };
+}
 
 // A refused sign-in is its code (Kotlin words it); anything else says where.
 const failure = (e: unknown): string => (e instanceof AuthError ? e.code : e instanceof Error ? `${e.message}\n${e.stack ?? ''}` : String(e));

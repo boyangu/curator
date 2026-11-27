@@ -31,6 +31,7 @@ import type {
 import { recordingKeysFor } from './recording.js';
 import { mergeFeedPayload } from './merge.js';
 import { keyToCamelot } from '../enrich/keys.js';
+import { preferBeatportGenres } from '../enrich/beatport-genre.js';
 import { itemArtists } from './lenses.js';
 
 // Ranking lift per EXTRA source (beyond the first) that surfaced an item —
@@ -183,7 +184,7 @@ export interface FeedStore {
 	close(): void;
 }
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS feed_meta (
@@ -712,6 +713,20 @@ export class SqliteFeedStore implements FeedStore {
 					// The album's genre came from these tracks: re-derived once they settle.
 					if (payload.genre && reopened.some((t) => t.genre === payload.genre && t.enrichProvisional?.includes('genre'))) payload.enrichProvisional = ['genre'];
 					reopen.run(JSON.stringify(payload), r.id);
+				}
+			})();
+		}
+		// v13 → v14: Beatport's genre wins (enrich/beatport-genre.ts). Cards
+		// enriched before carry the catalogue's — "House" where Beatport says
+		// "Progressive House" — and enrichment never visits a settled card
+		// again: correct them from the Beatport links they already hold.
+		if (priorVersion < 14) {
+			this.db.transaction(() => {
+				const set = this.db.prepare(`UPDATE feed_item SET payload_json = ? WHERE id = ?`);
+				const rows = this.db.prepare(`SELECT id, type, payload_json FROM feed_item WHERE payload_json LIKE '%"beatport"%'`).all() as { id: string; type: string; payload_json: string }[];
+				for (const r of rows) {
+					const payload = JSON.parse(r.payload_json) as FeedItemPayload;
+					if (preferBeatportGenres(payload, r.type === 'album').changed) set.run(JSON.stringify(payload), r.id);
 				}
 			})();
 		}

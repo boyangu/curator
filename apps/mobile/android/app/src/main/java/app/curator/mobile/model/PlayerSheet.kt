@@ -57,8 +57,23 @@ class SheetDrag(private val tapSlop: Float, private val step: Float) {
 		/** The dim over what is behind: up to 60% black, with the reveal. */
 		fun dim(reveal: Float, height: Float): Float = if (height <= 0f) 0f else min(0.6f, reveal / height * 0.8f)
 
-		/** The bar's opacity: gone once the sheet is [fade] up. */
-		fun barAlpha(reveal: Float, fade: Float): Float = max(0f, 1f - reveal / fade)
+		/**
+		 * How far the bar has turned into the player, 0 to 1: all the way once
+		 * the sheet is [MORPH_AT] of the way up. The cover and the names reach
+		 * their places on the player by then, and the rest has faded in.
+		 */
+		fun morph(reveal: Float, height: Float): Float = if (height <= 0f) 1f else (reveal / (height * MORPH_AT)).coerceIn(0f, 1f)
+
+		const val MORPH_AT = 0.2f
+
+		/**
+		 * How far the player's title and artists have moved up into its header,
+		 * 0 to 1, as its content is scrolled: the title rides up with the
+		 * content until it meets its row there, [distance] up, so this is the
+		 * scroll over that distance. Follows the finger; nothing animates.
+		 */
+		fun dock(scroll: Float, distance: Float): Float =
+			if (distance <= 0f) (if (scroll > 0f) 1f else 0f) else (scroll / distance).coerceIn(0f, 1f)
 	}
 }
 

@@ -15,7 +15,7 @@
 
 import type Database from 'better-sqlite3';
 import { log } from '@curator/sync-core/log';
-import { writeRefs } from './catalog-refs.js';
+import { writeRefs } from '@curator/sync-core/entity/catalog-ref';
 import type { CatalogArtistRef, CatalogClient } from './service.js';
 
 const alog = log.for('catalog');

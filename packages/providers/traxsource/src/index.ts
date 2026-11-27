@@ -18,6 +18,7 @@
 import {
 	sharedScorer,
 	ProviderBlockedError,
+	ProviderFailedError,
 	Cooldown,
 	cloudflareChallengeReason,
 	retryAfterMs,
@@ -169,11 +170,11 @@ export class TraxsourceClient {
 		if (this.cooldown.active) throw new ProviderBlockedError('traxsource', 0, 'cooldown');
 		const url = `https://www.traxsource.com/search?term=${encodeURIComponent(query)}`;
 		if (DEBUG) console.log(`[traxsource] GET ${url}`);
-		const res = await this.fetchImpl(url, { credentials: 'omit', headers: HEADERS }).catch((err: unknown) => {
+		const res = await this.fetchImpl(url, { credentials: 'omit', headers: HEADERS }).catch((err: unknown): never => {
 			if (DEBUG) console.warn('[traxsource] fetch threw', err instanceof Error ? err.message : err);
-			return null;
+			// No answer is not "no such track": the caller asks again later.
+			throw new ProviderFailedError('traxsource', 0, err instanceof Error ? err.message : String(err));
 		});
-		if (!res) return [];
 		const cfHeader = cloudflareChallengeReason(res.status, res.headers, null);
 		if (cfHeader) this._blocked(res, cfHeader);
 		if (!res.ok) {
@@ -181,7 +182,8 @@ export class TraxsourceClient {
 			const reason = cloudflareChallengeReason(res.status, res.headers, body);
 			if (reason) this._blocked(res, reason);
 			if (DEBUG) console.warn(`[traxsource] non-OK response (${res.status}), bailing`);
-			return [];
+			// A search that found nothing answers 200 with no rows; anything else failed.
+			throw new ProviderFailedError('traxsource', res.status, 'search');
 		}
 		this.cooldown.clear();
 		const html = await res.text();

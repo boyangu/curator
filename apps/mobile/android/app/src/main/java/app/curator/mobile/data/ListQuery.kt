@@ -5,13 +5,10 @@ import app.curator.mobile.model.ListView
 import app.curator.mobile.model.Sort
 import app.curator.mobile.model.searchWords
 
-/** Which tracks a list holds before its view (§5): a playlist's, a tag's, an artist's, a label's, a set's, those like a track, or the library's. */
+/** Which tracks a list holds before its view (§5): a playlist's, a tag's, a set's, those like a track, or the library's. */
 sealed interface ListScope {
 	data class Playlist(val id: String) : ListScope
 	data class Tag(val id: String) : ListScope
-	data class Artist(val id: String) : ListScope
-	/** The tracks on a label, by its name as the tracks spell it (the phone has no label rows). */
-	data class Label(val name: String) : ListScope
 	/** A set's tracks, as played. */
 	data class Set(val sessionId: String) : ListScope
 	/**
@@ -100,7 +97,7 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 	}
 
 	// Whether the order starts with the added date (what track_added_order_idx holds).
-	private val addedFirst = view.sort == Sort.ADDED || (view.sort == Sort.CUSTOM && (scope is ListScope.Library || scope is ListScope.Artist || scope is ListScope.Label))
+	private val addedFirst = view.sort == Sort.ADDED || (view.sort == Sort.CUSTOM && scope is ListScope.Library)
 
 	/** The scope's size and length, before the view: the list's header ("312 tracks · 21 h"), the "of" in "40 of 312". */
 	fun totals(): Sql {
@@ -126,8 +123,6 @@ class ListQuery(val scope: ListScope, val view: ListView, val search: String = "
 	private fun scoped(args: MutableList<Any?>): Pair<String, String> = when (scope) {
 		is ListScope.Playlist -> { args += scope.id; "playlist_track pt JOIN track t ON t.id = pt.track_id" to "pt.playlist_id = ?" }
 		is ListScope.Tag -> { args += scope.id; "track_tag tt JOIN track t ON t.id = tt.track_id" to "tt.tag_id = ?" }
-		is ListScope.Artist -> { args += scope.id; "track t" to "t.id IN (SELECT track_id FROM track_artist WHERE artist_id = ?)" }
-		is ListScope.Label -> { args += scope.name; "track t" to "${eff("label", "label")} = ? COLLATE NOCASE" }
 		is ListScope.Set -> { args += scope.sessionId; "play_event pe JOIN track t ON t.id = pe.track_id" to "pe.session_id = ?" }
 		is ListScope.Similar -> {
 			// The reference track's values, joined once (its argument comes first: FROM precedes WHERE).

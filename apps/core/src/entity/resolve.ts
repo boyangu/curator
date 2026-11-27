@@ -18,7 +18,7 @@ import type { CatalogBrowseResult, CatalogObjectSummary } from '@curator/protoco
 import { nameFold } from '@curator/library-logic';
 import type { EntityChip, EntityKind, EntityRef, EntityWorldReason } from '@curator/shared';
 import type { CatalogClient } from '../catalog-client/service.js';
-import { writeRefs, type CatalogRefKind, type CatalogRefObjectKind } from '../catalog-client/catalog-refs.js';
+import { writeRefs, type CatalogRefKind, type CatalogRefObjectKind } from '@curator/sync-core/entity/catalog-ref';
 
 type Raw = Database.Database;
 export type EntityCatalog = Pick<CatalogClient, 'status' | 'resolve' | 'browse' | 'find' | 'offersPages' | 'tracks' | 'reportEnrichment'>;

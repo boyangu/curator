@@ -72,9 +72,11 @@ import { DEVICE_PLATFORMS, listDevices, registerDevice, revokeDevice } from './a
 import * as catalog from './catalog/catalog.js';
 import * as connect from './catalog/connect.js';
 import * as workers from './catalog/workers.js';
+import { workReport } from './catalog/work/report.js';
 import { ZCatalogConnectAnswerInput, ZCatalogConnectQueueInput, ZCatalogConnectSearchInput, type CatalogConnectAnswerResult, type CatalogConnectQueueResult, type CatalogConnectSearchResult } from '@curator/protocol';
 import { parseWorkerOutcome, ZCatalogWorkerDueInput, ZCatalogWorkerReportWire, type CatalogWorkerDueResult, type CatalogWorkerReportResult } from '@curator/protocol';
 import { ZCatalogTracksInput, type CatalogTracksResult } from '@curator/protocol';
+import { ZCatalogWorkReportWire, type CatalogWorkReportResult } from '@curator/protocol';
 import { ZDiagnosticsUploadInput, type DiagnosticsUploadResult } from '@curator/protocol';
 import { inventory, lookup, put } from './catalogue/catalogue.js';
 import { storeClientLog } from './diagnostics.js';
@@ -100,7 +102,7 @@ export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'ca
 		(f) =>
 			(f !== 'catalogue' || deps.catalogue !== null) &&
 			(f !== 'spotify_gateway' || deps.spotify !== null) &&
-			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect_auto' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience' && f !== 'catalog_claim_about') || deps.catalog),
+			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect_auto' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience' && f !== 'catalog_claim_about' && f !== 'catalog_device_work') || deps.catalog),
 	);
 }
 
@@ -449,6 +451,12 @@ export const appRouter = router({
 			const r = await catalogCall(ctx, input.deviceId, 'catalogRead', (d) => catalog.tracks(d, ctx.user.id, callerOf(ctx), input));
 			ctx.call.opsOut = r.releases.length;
 			return r;
+		}),
+		// 'catalog_device_work' (src/catalog/work/report.ts): what a device read
+		// for the work a read handed it. Results are judged one by one.
+		workReport: authedProcedure.input(ZCatalogWorkReportWire).mutation(({ ctx, input }): Promise<CatalogWorkReportResult> => {
+			ctx.call.opsIn = input.results.length;
+			return catalogCall(ctx, input.deviceId, 'catalogWrite', (d) => workReport(d, ctx.user.id, callerOf(ctx), input));
 		}),
 	}),
 

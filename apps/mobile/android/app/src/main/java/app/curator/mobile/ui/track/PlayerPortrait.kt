@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -32,6 +33,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +42,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
@@ -52,6 +55,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -61,6 +65,8 @@ import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
@@ -79,6 +85,8 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -102,6 +110,7 @@ import app.curator.mobile.ui.common.SourceDot
 import app.curator.mobile.ui.common.TagPill
 import app.curator.mobile.ui.common.formatTime
 import app.curator.mobile.ui.nav.LocalSheetGestures
+import app.curator.mobile.ui.nav.LocalSheetMotion
 import app.curator.mobile.ui.nav.SheetGestures
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
@@ -131,99 +140,222 @@ internal fun Portrait(
 	onScrub: (Double) -> Unit, onCallOff: () -> Unit, onSeek: (Double) -> Unit, modifier: Modifier,
 ) {
 	val sheet = LocalSheetGestures.current
-	Column(
+	val motion = LocalSheetMotion.current
+	val morph = LocalPlayerMorph.current
+	val face = Face(t, bands)
+	SideEffect { morph?.face = face }
+	val dock = remember { Dock() }
+	val scroll = rememberScrollState()
+	// The cover's title and artists: hidden while the bar's are carried to it (PlayerMorph), faded in when not.
+	val names = { if (morph?.carrying(motion) == true) 0f else motion.shown() }
+	Box(
 		modifier
 			.fillMaxSize()
-			.background(C.bg)
-			.windowInsetsPadding(WindowInsets.statusBars)
+			.onGloballyPositioned { morph?.sheet = it; dock.root = it }
+			// No background of its own: the host draws the sheet's, faded in as it is raised from the bar.
 			.semantics { customActions = listOf(CustomAccessibilityAction("Collapse player") { back(); true }) },
 	) {
-		Box(Modifier.fillMaxWidth().height(56.dp)) {
-			Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(48.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-				IconButton(Icon.Back, if (from != null) "Back to $from" else "Back", onClick = back)
-				BasicText(
-					buildAnnotatedString {
-						if (from != null) {
-							append("From ")
-							withStyle(SpanStyle(color = C.fg)) { append(from) }
-							append(" · ${index + 1} of $count")
-						}
-					},
-					Modifier.weight(1f), style = T.of(13.sp, color = C.fg2).copy(textAlign = TextAlign.Center), maxLines = 1, overflow = TextOverflow.Ellipsis,
-				)
-				IconButton(Icon.Menu, "Track actions", tint = C.fg, onClick = openActions)
-			}
-			// The grip, its target kept clear of Back and the menu.
-			Box(
-				Modifier
-					.align(Alignment.TopCenter)
-					.padding(horizontal = 96.dp)
-					.fillMaxWidth()
-					.height(44.dp)
-					.then(if (sheet != null) Modifier.gripDrag(sheet, back) else Modifier)
-					.semantics { contentDescription = "Collapse player"; role = Role.Button; onClick { back(); true } },
-			) { Box(Modifier.align(Alignment.TopCenter).padding(top = 4.dp).size(40.dp, 5.dp).background(C.fg3, RoundedCornerShape(3.dp))) }
-		}
-		val scroll = rememberScrollState()
-		Column(
-			Modifier
-				.weight(1f)
-				.then(if (sheet != null) Modifier.pullToClose(sheet, scroll) else Modifier)
-				.verticalScroll(scroll)
-				.windowInsetsPadding(WindowInsets.navigationBars)
-				.padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 40.dp),
-			verticalArrangement = Arrangement.spacedBy(18.dp),
-		) {
-			BandedCover(t, bands)
-			Column {
-				Ticking({ formatTime(position()) }) { now ->
-					BasicText(
-						buildAnnotatedString {
-							withStyle(SpanStyle(color = C.fg)) { append(now) }
-							append(" / ${formatTime(duration)}")
+		Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
+			// All but the cover's pieces fade in as the sheet rises (SheetMotion.shown).
+			Box(Modifier.fillMaxWidth().height(56.dp).onGloballyPositioned { dock.header = it }.graphicsLayer { alpha = motion.shown() }) {
+				Row(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(48.dp).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+					IconButton(Icon.Back, if (from != null) "Back to $from" else "Back", onClick = back)
+					// Scrolled away with the content, gone by the time the names are halfway to its place (DockedNames).
+					Box(Modifier.weight(1f).fillMaxHeight().clipToBounds(), contentAlignment = Alignment.Center) {
+						BasicText(
+							buildAnnotatedString {
+								if (from != null) {
+									append("From ")
+									withStyle(SpanStyle(color = C.fg)) { append(from) }
+									append(" · ${index + 1} of $count")
+								}
+							},
+							Modifier.graphicsLayer {
+							translationY = -scroll.value.toFloat()
+							alpha = 1f - 2f * (dock.places(scroll.value.toFloat(), 1.dp.toPx())?.q ?: 0f).coerceAtMost(0.5f)
 						},
-						Modifier.background(C.lineSoft).padding(horizontal = 8.dp, vertical = 3.dp).semantics { contentDescription = "$now of ${formatTime(duration)}" },
-						style = T.mono(12.sp, C.fg2),
-					)
+							style = T.of(13.sp, color = C.fg2).copy(textAlign = TextAlign.Center), maxLines = 1, overflow = TextOverflow.Ellipsis,
+						)
+					}
+					IconButton(Icon.Menu, "Track actions", tint = C.fg, onClick = openActions)
 				}
-				OverviewMap(peaks, skin, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek)
-				Spacer(Modifier.height(4.dp))
-				PhraseLane(a.phrases, skin, duration, Modifier.fillMaxWidth().height(5.dp))
+				// The grip, its target kept clear of Back and the menu.
+				Box(
+					Modifier
+						.align(Alignment.TopCenter)
+						.padding(horizontal = 96.dp)
+						.fillMaxWidth()
+						.height(44.dp)
+						.then(if (sheet != null) Modifier.gripDrag(sheet, back) else Modifier)
+						.semantics { contentDescription = "Collapse player"; role = Role.Button; onClick { back(); true } },
+				) { Box(Modifier.align(Alignment.TopCenter).padding(top = 4.dp).size(40.dp, 5.dp).background(C.fg3, RoundedCornerShape(3.dp))) }
 			}
-			Column(Modifier.padding(top = 0.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-				Controls(tr)
-				tr.caption?.let { BasicText(it, Modifier.fillMaxWidth(), style = T.of(12.5.sp, color = C.fg2).copy(textAlign = TextAlign.Center)) }
-			}
-			if (scores.isNotEmpty()) Analysis(scores)
-			Section("Tags") {
-				FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-					for (tag in t.tags) TagPill(tag, height = 28.dp)
-					AddTag(openActions)
+			Column(
+				Modifier
+					.weight(1f)
+					.then(if (sheet != null) Modifier.pullToClose(sheet, scroll) else Modifier)
+					.onGloballyPositioned { dock.viewport = it }
+					.verticalScroll(scroll)
+					.onGloballyPositioned { dock.content = it }
+					.windowInsetsPadding(WindowInsets.navigationBars)
+					.padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 40.dp),
+				verticalArrangement = Arrangement.spacedBy(18.dp),
+			) {
+				// Its title and artists are drawn by DockedNames, over it and the header.
+				BandedCover(t, bands, modifier = Modifier.graphicsLayer { alpha = names() }, leads = false) { piece, at ->
+					when (piece) {
+						Piece.COVER -> morph?.cover = at
+						Piece.TITLE -> { morph?.title = at; dock.title = at }
+						Piece.ARTISTS -> { morph?.artist = at; dock.artists = at }
+					}
 				}
-			}
-			Column {
-				val playlists = uses?.playlists?.size ?: 0
-				val sets = uses?.sets?.size ?: 0
-				if (playlists > 0 || sets > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(C.lineSoft))
-				if (playlists > 0) UseRow(Icon.Playlists, "In", playlists, if (playlists == 1) "playlist" else "playlists") { openUses(false) }
-				if (sets > 0) UseRow(Icon.Set, "Played in", sets, if (sets == 1) "set" else "sets") { openUses(true) }
-				playingFrom?.let { src ->
-					Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-						SourceDot(src)
-						BasicText("Playing from ${sourceName(src)}", style = T.of(12.sp, color = C.fg2))
+				Column(Modifier.graphicsLayer { alpha = motion.shown() }, verticalArrangement = Arrangement.spacedBy(18.dp)) {
+					Column {
+						Ticking({ formatTime(position()) }) { now ->
+							BasicText(
+								buildAnnotatedString {
+									withStyle(SpanStyle(color = C.fg)) { append(now) }
+									append(" / ${formatTime(duration)}")
+								},
+								Modifier.background(C.lineSoft).padding(horizontal = 8.dp, vertical = 3.dp).semantics { contentDescription = "$now of ${formatTime(duration)}" },
+								style = T.mono(12.sp, C.fg2),
+							)
+						}
+						OverviewMap(peaks, skin, duration, position, a.cues, Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Track overview. Tap or drag to seek" }, onScrub = onScrub, onCallOff = onCallOff, onSeek = onSeek)
+						Spacer(Modifier.height(4.dp))
+						PhraseLane(a.phrases, skin, duration, Modifier.fillMaxWidth().height(5.dp))
+					}
+					Column(Modifier.padding(top = 0.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+						Controls(tr)
+						tr.caption?.let { BasicText(it, Modifier.fillMaxWidth(), style = T.of(12.5.sp, color = C.fg2).copy(textAlign = TextAlign.Center)) }
+					}
+					if (scores.isNotEmpty()) Analysis(scores)
+					Section("Tags") {
+						FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+							for (tag in t.tags) TagPill(tag, height = 28.dp)
+							AddTag(openActions)
+						}
+					}
+					Column {
+						val playlists = uses?.playlists?.size ?: 0
+						val sets = uses?.sets?.size ?: 0
+						if (playlists > 0 || sets > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(C.lineSoft))
+						if (playlists > 0) UseRow(Icon.Playlists, "In", playlists, if (playlists == 1) "playlist" else "playlists") { openUses(false) }
+						if (sets > 0) UseRow(Icon.Set, "Played in", sets, if (sets == 1) "set" else "sets") { openUses(true) }
+						playingFrom?.let { src ->
+							Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+								SourceDot(src)
+								BasicText("Playing from ${sourceName(src)}", style = T.of(12.sp, color = C.fg2))
+							}
+						}
+					}
+					if (people.artists.isNotEmpty()) Section("Artists", gap = 10.dp) {
+						FlowRow(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+							for (artist in people.artists) Person(artist.name, people.artistPicture(artist.name), "Open artist ${artist.name}", ring = false) { openArtist(artist) }
+						}
+					}
+					people.label?.let { label ->
+						Section("Label", gap = 10.dp) { Person(label, people.labelPicture(label), "Open label $label", ring = true) { openLabel(label) } }
 					}
 				}
 			}
-			if (people.artists.isNotEmpty()) Section("Artists", gap = 10.dp) {
-				FlowRow(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-					for (artist in people.artists) Person(artist.name, people.artistPicture(artist.name), "Open artist ${artist.name}", ring = false) { openArtist(artist) }
-				}
-			}
-			people.label?.let { label ->
-				Section("Label", gap = 10.dp) { Person(label, people.labelPicture(label), "Open label $label", ring = true) { openLabel(label) } }
-			}
 		}
+		DockedNames(bands, dock, scroll, names)
 	}
+}
+
+// ── the names, cover → header ───────────────────────────────────────────────
+
+// Where the pieces docking needs are (state: placed a frame after the
+// player is, and read while drawing, which must then redo).
+private class Dock {
+	var root by mutableStateOf<LayoutCoordinates?>(null)
+	var header by mutableStateOf<LayoutCoordinates?>(null)
+	var viewport by mutableStateOf<LayoutCoordinates?>(null)
+	var content by mutableStateOf<LayoutCoordinates?>(null)
+	var title by mutableStateOf<LayoutCoordinates?>(null)
+	var artists by mutableStateOf<LayoutCoordinates?>(null)
+}
+
+// A name's band this frame: its layout's corner and scale, and how much of
+// its padding (in its own px) its band has given up.
+private class Placed(val x: Float, val y: Float, val scale: Float, val inset: Float)
+
+// How far the names have docked (model SheetDrag.dock), and where each is.
+private class Docked(val q: Float, val names: List<Placed>)
+
+/**
+ * The title and artists' bands at this scroll: from their place on the
+ * cover (as at the scroll's top) to two rows in the header's middle, between
+ * Back and the menu, each 1sp smaller, its band 1dp less tall each way and
+ * the rows 2dp closer. The title rides up with the content until it meets
+ * its row (model SheetDrag.dock), and every change follows it there.
+ */
+private fun Dock.places(scroll: Float, dp: Float): Docked? {
+	val root = root
+	val header = header
+	val viewport = viewport
+	val content = content
+	val title = title
+	if (root == null || header == null || viewport == null || content == null || title == null) return null
+	if (!(root.isAttached && header.isAttached && viewport.isAttached && content.isAttached && title.isAttached)) return null
+	val artists = artists?.takeIf { it.isAttached }
+	// On the cover at the scroll's top: the content's place, not where it is scrolled to.
+	val view = root.localBoundingBoxOf(viewport, clipBounds = false)
+	fun atTop(c: LayoutCoordinates) = content.localBoundingBoxOf(c, clipBounds = false).translate(view.left, view.top)
+	val t = atTop(title)
+	val a = artists?.let(::atTop)
+	val ts = (TITLE.fontSize.value - 1f) / TITLE.fontSize.value
+	val asc = (ARTISTS.fontSize.value - 1f) / ARTISTS.fontSize.value
+	// Docked: each band 1dp shorter top and bottom, the rows 1dp apart (3 on the cover), centred in the 48dp row.
+	val th = t.height * ts - 2 * dp
+	val ah = a?.let { it.height * asc - 2 * dp }
+	val group = th + (ah?.let { dp + it } ?: 0f)
+	val row = root.localBoundingBoxOf(header, clipBounds = false).bottom - 48 * dp
+	val top = row + (48 * dp - group) / 2
+	val width = root.size.width.toFloat()
+	val q = SheetDrag.dock(scroll, t.top - top)
+	fun place(from: Rect, x: Float, y: Float, scale: Float): Placed {
+		val s = 1f + (scale - 1f) * q
+		// The band shows q dp in from its layout's top: that is what goes to y.
+		return Placed(from.left + (x - from.left) * q, from.top + (y - from.top) * q - q * dp, s, q * dp / s)
+	}
+	return Docked(q, listOfNotNull(
+		place(t, (width - t.width * ts) / 2, top, ts),
+		a?.let { place(it, (width - it.width * asc) / 2, top + th + dp, asc) },
+	))
+}
+
+/** The cover's title and artists, drawn over the cover and the header so they can move from one to the other. */
+@Composable
+private fun DockedNames(b: CoverBands, dock: Dock, scroll: ScrollState, alpha: () -> Float) {
+	val density = LocalDensity.current
+	fun sized(c: LayoutCoordinates?) = c?.size?.let { with(density) { Modifier.size(DpSize(it.width.toDp(), it.height.toDp())) } }
+	b.title?.let { title -> sized(dock.title)?.let { DockedName(title, TITLE, it, 0, dock, scroll, alpha) } }
+	b.artists?.let { artists -> sized(dock.artists)?.let { DockedName(artists, ARTISTS, it, 1, dock, scroll, alpha) } }
+}
+
+@Composable
+private fun DockedName(text: String, style: TextStyle, size: Modifier, i: Int, dock: Dock, scroll: ScrollState, alpha: () -> Float) {
+	val dp = with(LocalDensity.current) { 1.dp.toPx() }
+	Band(
+		text, style,
+		size.clearAndSetSemantics {}.graphicsLayer {
+			val p = dock.places(scroll.value.toFloat(), dp)?.names?.getOrNull(i)
+			if (p == null) {
+				this.alpha = 0f
+				return@graphicsLayer
+			}
+			this.alpha = alpha()
+			transformOrigin = TransformOrigin(0f, 0f)
+			scaleX = p.scale
+			scaleY = p.scale
+			translationX = p.x
+			translationY = p.y
+		},
+		// Its own read of the scroll, so the band redraws as it tightens.
+		inset = { dock.places(scroll.value.toFloat(), dp)?.names?.getOrNull(i)?.inset ?: 0f },
+	)
 }
 
 /** The transport and what goes with it. */
@@ -252,8 +384,19 @@ internal class Transport(
  * its corner (opaque to 40%, gone at 100%), each sized to what it carries.
  */
 @Composable
-private fun BandedCover(t: Track, b: CoverBands) {
-	BoxWithConstraints(Modifier.fillMaxWidth().aspectRatio(1f).clearAndSetSemantics { contentDescription = b.spoken(); role = Role.Image }) {
+internal fun BandedCover(
+	t: Track, b: CoverBands, modifier: Modifier = Modifier,
+	// The glass and the other bands faded by [fade]; the title and artists drawn by someone else ([leads] false: laid out, not seen).
+	fade: () -> Float = { 1f }, leads: Boolean = true,
+	// Where it and its title and artists are.
+	placed: ((Piece, LayoutCoordinates) -> Unit)? = null,
+) {
+	fun Modifier.at(piece: Piece) = if (placed != null) onGloballyPositioned { placed(piece, it) } else this
+	val faded = Modifier.graphicsLayer { alpha = fade() }
+	val lead = if (leads) Modifier else Modifier.graphicsLayer { alpha = 0f }
+	BoxWithConstraints(
+		Modifier.at(Piece.COVER).then(modifier).fillMaxWidth().aspectRatio(1f).clearAndSetSemantics { contentDescription = b.spoken(); role = Role.Image },
+	) {
 		val wide = maxWidth
 		// Each corner group's size, read while drawing the glass.
 		var tl by remember { mutableStateOf(IntSize.Zero) }
@@ -265,7 +408,7 @@ private fun BandedCover(t: Track, b: CoverBands) {
 			t.coverUrl, t.id,
 			Modifier
 				.fillMaxSize()
-				.graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+				.graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen; alpha = fade() }
 				.drawWithContent {
 					drawContent()
 					drawRect(Color.Black.copy(alpha = 0.22f))
@@ -280,12 +423,12 @@ private fun BandedCover(t: Track, b: CoverBands) {
 			pad.align(Alignment.TopStart).widthIn(max = wide * 0.7f).onSizeChanged { tl = it },
 			verticalArrangement = Arrangement.spacedBy(3.dp),
 		) {
-			b.title?.let { Band(it, T.of(15.5.sp, 600, C.fg)) }
-			b.artists?.let { Band(it, T.of(13.sp, color = C.fg1)) }
-			b.album?.let { Band(it, T.of(12.5.sp, color = C.fg2)) }
+			b.title?.let { Band(it, TITLE, lead.at(Piece.TITLE)) }
+			b.artists?.let { Band(it, ARTISTS, lead.at(Piece.ARTISTS)) }
+			b.album?.let { Band(it, T.of(12.5.sp, color = C.fg2), faded) }
 		}
 		if (b.hasTopRight) Column(
-			pad.align(Alignment.TopEnd).onSizeChanged { tr = it },
+			pad.align(Alignment.TopEnd).onSizeChanged { tr = it }.then(faded),
 			horizontalAlignment = Alignment.End,
 			verticalArrangement = Arrangement.spacedBy(3.dp),
 		) {
@@ -294,21 +437,38 @@ private fun BandedCover(t: Track, b: CoverBands) {
 		}
 		val lower = b.bottomLeft
 		if (lower.isNotEmpty()) Column(
-			pad.align(Alignment.BottomStart).widthIn(max = wide * 0.64f).onSizeChanged { bl = it },
+			pad.align(Alignment.BottomStart).widthIn(max = wide * 0.64f).onSizeChanged { bl = it }.then(faded),
 			verticalArrangement = Arrangement.spacedBy(3.dp),
 		) {
 			b.label?.let { Band(it, T.of(13.sp, color = C.fg)) }
 			b.genre?.let { Band(it, T.of(12.5.sp, color = C.fg1)) }
 		}
-		b.released?.let { Band(it, T.of(12.5.sp, color = C.fg1), pad.align(Alignment.BottomEnd).onSizeChanged { s -> br = s }) }
+		b.released?.let { Band(it, T.of(12.5.sp, color = C.fg1), pad.align(Alignment.BottomEnd).onSizeChanged { s -> br = s }.then(faded)) }
 	}
 }
 
 private val BAND = Color.Black.copy(alpha = 0.78f)
+internal val BAND_PAD_X = 7.dp
+internal val BAND_PAD_Y = 3.dp
+internal val TITLE = T.of(15.5.sp, 600, C.fg)
+internal val ARTISTS = T.of(13.sp, color = C.fg1)
 
+internal enum class Piece { COVER, TITLE, ARTISTS }
+
+/**
+ * A line on the cover over its black band; [bg]: how much of the band shows
+ * (a carried name gains it); [inset]: px the band is short of the padding,
+ * top and bottom (a docked name's is tighter).
+ */
 @Composable
-private fun Band(text: String, style: TextStyle, modifier: Modifier = Modifier) {
-	BasicText(text, modifier.background(BAND).padding(horizontal = 7.dp, vertical = 3.dp), style = style, maxLines = 1, overflow = TextOverflow.Ellipsis)
+internal fun Band(text: String, style: TextStyle, modifier: Modifier = Modifier, bg: () -> Float = { 1f }, inset: () -> Float = { 0f }) {
+	BasicText(
+		text,
+		modifier
+			.drawBehind { val i = inset(); drawRect(BAND, Offset(0f, i), Size(size.width, size.height - 2 * i), alpha = bg()) }
+			.padding(horizontal = BAND_PAD_X, vertical = BAND_PAD_Y),
+		style = style, maxLines = 1, overflow = TextOverflow.Ellipsis,
+	)
 }
 
 /** A corner group's size, and which corner (0 or 1 across, 0 or 1 down). */
@@ -383,15 +543,12 @@ private fun Section(title: String, gap: androidx.compose.ui.unit.Dp = 8.dp, cont
 	}
 }
 
-/** Power, Brightness, Density: two to a row (the last on its own), each a meter with its name and value over the bar. */
+/** Power, Brightness, Density: one row, an equal share each, each a meter with its name and value over the bar. */
 @Composable
 private fun Analysis(scores: List<Score>) {
 	Section("Analysis") {
-		Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-			for (pair in scores.chunked(2)) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-				for (s in pair) Meter(s, Modifier.weight(1f))
-				if (pair.size == 1) Spacer(Modifier.weight(1f))
-			}
+		Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+			for (s in scores) Meter(s, Modifier.weight(1f))
 		}
 	}
 }
@@ -416,7 +573,7 @@ private fun Meter(s: Score, modifier: Modifier) {
 			.padding(horizontal = 10.dp),
 	) {
 		Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
-			BasicText(s.label, Modifier.weight(1f), style = T.of(13.sp, color = C.fg), maxLines = 1)
+			BasicText(s.label, Modifier.weight(1f), style = T.of(13.sp, color = C.fg), maxLines = 1, overflow = TextOverflow.Ellipsis)
 			BasicText(s.value.toString(), style = T.mono(13.sp, C.fg))
 		}
 	}

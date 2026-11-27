@@ -128,8 +128,6 @@ class TrackPager internal constructor(private val lib: Library, val query: ListQ
 fun ListSource.scope(): ListScope = when (this) {
 	is ListSource.Playlist -> ListScope.Playlist(id)
 	is ListSource.Tag -> ListScope.Tag(id)
-	is ListSource.Artist -> ListScope.Artist(id)
-	is ListSource.Label -> ListScope.Label(name)
 	is ListSource.Set -> ListScope.Set(id)
 	is ListSource.Similar -> ListScope.Similar(trackId, relatedKeys(camelot))
 	is ListSource.Library -> ListScope.Library(if (filter == ListSource.OWNED) "local" else filter)

@@ -391,3 +391,48 @@ describe('FeedEnrichmentQueue — catalogue first, enrichment fills gaps', () =>
 		expect(out?.payload).toMatchObject({ genre: 'Progressive House', label: 'Cat' });
 	});
 });
+
+// Beatport as the real enricher reports it: its genre on the link's payload.
+function beatport(genre: string): Enricher {
+	return {
+		id: 'beatport',
+		produces: 'metadata',
+		applicableTo: (t: EnrichmentTarget) => !!t.query.title,
+		async enrich(): Promise<EnricherOutput | null> {
+			return { kind: 'metadata', patch: { ...FULL, genre }, sourceLink: { source: 'beatport', sourceTrackId: '1', payload: { genre } } };
+		},
+	};
+}
+
+describe("FeedEnrichmentQueue — Beatport's genre wins", () => {
+	it('replaces the card’s genre on a track item', async () => {
+		const store = new FakeStore();
+		store.add(trackItem('t1', 'hit', { payload: { title: 'hit', artists: ['A'], genre: 'House', label: 'Cat' } }));
+		const out = await queue(store, beatport('Progressive House')).enrichItem('t1');
+		expect(out?.payload).toMatchObject({ genre: 'Progressive House', label: 'Cat', bpm: 120 });
+	});
+
+	it('replaces it on the album’s rows and on the album', async () => {
+		const store = new FakeStore();
+		const al = albumItem('al', [{ sourceTrackId: 's1', title: 'one' }, { sourceTrackId: 's2', title: 'two' }]);
+		al.payload.genre = 'House';
+		al.payload.tracks = al.payload.tracks!.map((t) => ({ ...t, catalogId: t.sourceTrackId, genre: 'House' }));
+		store.add(al);
+		const out = await queue(store, beatport('Progressive House')).enrichItem('al');
+		expect(out?.payload.tracks?.map((t) => t.genre)).toEqual(['Progressive House', 'Progressive House']);
+		expect(out?.payload.genre).toBe('Progressive House');
+	});
+
+	it('corrects an item settled before it won, from the links it holds, with no lookup', async () => {
+		const store = new FakeStore();
+		const al = albumItem('al', [{ sourceTrackId: 's1', title: 'one' }]);
+		al.enrichStatus = 'ok';
+		al.payload.genre = 'House';
+		al.payload.tracks![0] = { ...al.payload.tracks![0]!, genre: 'House', enrichStatus: 'ok', sourceLinks: [{ source: 'beatport', sourceTrackId: '1', payload: { genre: 'Progressive House' } }] };
+		const t1 = trackItem('t1', 'hit', { enrichStatus: 'ok', payload: { title: 'hit', artists: ['A'], genre: 'House', sourceLinks: [{ source: 'beatport', sourceTrackId: '2', payload: { genre: 'Progressive House' } }] } });
+		store.add(al, t1);
+		const q = queue(store, enricher('beatport', () => 'throw'));
+		expect((await q.enrichItem('al'))?.payload).toMatchObject({ genre: 'Progressive House', tracks: [{ genre: 'Progressive House' }] });
+		expect((await q.enrichItem('t1'))?.payload.genre).toBe('Progressive House');
+	});
+});

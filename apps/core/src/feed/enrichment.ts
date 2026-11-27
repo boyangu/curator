@@ -10,6 +10,7 @@
 // can't block the feed from populating behind Beatport's 1.5s/track pace.
 
 import type { DjMetadataPatch, Enricher, EnrichmentResult, SourceLinkDraft, TrackQuery } from '@curator/sync-core/enrich/contract';
+import { preferBeatportGenre, preferBeatportGenres } from '@curator/sync-core/enrich/beatport-genre';
 import { enrichOne } from '../enrich/runner.js';
 import type { EnrichStatus, FeedEnrichReport, FeedItem, FeedItemActivity, FeedItemPayload, FeedTrackRef } from '@curator/sync-core/feed/types';
 import type { FeedStore } from '@curator/sync-core/feed/store';
@@ -42,8 +43,8 @@ function hasDjFacts(r: Pick<FeedTrackRef, 'bpm' | 'keyCamelot' | 'genre'>): bool
 
 // Catalogue first, enrichment fills gaps (2026-11-04): a lookup only sets
 // what is still empty, so the catalogue's facts — and anything the user
-// already saw on the card — are never replaced by a scrape. Returns the
-// fields it set.
+// already saw on the card — are never replaced by a scrape. Beatport's genre
+// is the one exception (enrich/beatport-genre.ts). Returns the fields it set.
 function fillOnly<T extends object>(target: T, patch: DjMetadataPatch): string[] {
 	const set: string[] = [];
 	for (const [k, v] of Object.entries(patch)) {
@@ -152,10 +153,11 @@ export class FeedEnrichmentQueue {
 		// on-view / promote paths retry an item the background drain failed on.
 		if (item.enrichStatus === 'ok' || item.enrichStatus === 'na') {
 			// Already settled — but rows enriched before album-level genre/label
-			// existed have only per-track values. Backfill the album-level fields
-			// from the existing track refs (pure derivation, no Beatport calls) so
-			// old albums light up their card chips without a re-scrape.
-			if (item.type === 'album' && this.applyAlbumGenreLabel(item)) {
+			// existed have only per-track values, and rows enriched before
+			// Beatport's genre won still carry the card's. Correct both from what
+			// the item holds (pure derivation, no Beatport calls) so old cards
+			// light up their chips without a re-scrape.
+			if (item.type === 'album' ? this.applyAlbumGenreLabel(item) : preferBeatportGenre(item.payload)) {
 				await this.store.setPayload(item.id, item.payload);
 			}
 			return item;
@@ -252,6 +254,7 @@ export class FeedEnrichmentQueue {
 		}
 		if (res.patch) payload.sourceLinks = mergeLinks(item.payload.sourceLinks, res.sourceLinks);
 		applyLookup(payload, res);
+		preferBeatportGenre(payload);
 		carryAsked(payload, res);
 		// On a retry, what an earlier attempt's fallback found still counts.
 		const found = !!res.patch || (payload.sourceLinks?.length ?? 0) > 0;
@@ -305,16 +308,21 @@ export class FeedEnrichmentQueue {
 
 	// Set the album-level genre/label from the track refs' modal values (a
 	// release carries one label and one (sub)genre) when the album has none —
-	// a catalogue card's own genre/label stand. One derived from provisional
-	// track values is provisional too, and re-derived once Beatport has
-	// answered for the tracks. Pure, no network. Returns true when it changed
-	// the payload.
+	// a catalogue card's own genre/label stand, but for Beatport's genre: each
+	// ref Beatport matched takes it, and the release takes the commonest of
+	// those. One derived from provisional track values is provisional too, and
+	// re-derived once Beatport has answered for the tracks. Pure, no network.
+	// Returns true when it changed the payload.
 	private applyAlbumGenreLabel(item: FeedItem): boolean {
 		const p = item.payload;
 		const tracks = p.tracks ?? [];
 		const prov = new Set(p.enrichProvisional ?? []);
 		let changed = false;
+		const { genre: bp, changed: bpChanged } = preferBeatportGenres(p, true);
+		if (bpChanged) changed = true;
+		if (bp && prov.delete('genre')) changed = true;
 		for (const f of ['genre', 'label'] as const) {
+			if (f === 'genre' && bp) continue;
 			if (p[f] && !prov.has(f)) continue;
 			const v = modeOf(tracks.map((t) => t[f]));
 			if (!v) continue;

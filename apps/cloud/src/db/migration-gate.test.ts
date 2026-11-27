@@ -37,10 +37,14 @@ function capture(): { log: Logger; lines: { level: string; msg: string; [k: stri
 // keeps the latter past the transaction (and past RESET), which would leave
 // the rest of the file running as curator_api. The privilege checks here go
 // by current_user, so the switch is the same test.
+// The gate runs on the pool, not in a transaction: a statement it catches
+// (no function, no grant) is an answer there. Here it needs the login role,
+// so it runs in PGlite's own transaction, which keeps no account of caught
+// failures — the pool's behaviour, not postgres.js's transaction's (db.ts Tx).
 const asApi = <T>(t: TestDb, fn: (q: Queryable) => Promise<T>) =>
-	t.db.begin(async (tx) => {
+	t.pg.transaction(async (tx) => {
 		await tx.query(`select set_config('role', 'curator_api', true)`);
-		return fn(tx);
+		return fn({ query: async (text, params) => (await tx.query(text, params as string[])).rows as never, exec: async (text) => void (await tx.exec(text)) });
 	});
 
 describe('migration gate', () => {

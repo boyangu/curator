@@ -140,6 +140,45 @@ describe('SqliteFeedStore v12 → v13: Traxsource-only facts sent back to Beatpo
 	});
 });
 
+describe("SqliteFeedStore v13 → v14: Beatport's genre wins", () => {
+	it('corrects settled cards from the Beatport links they hold, and leaves the rest', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'feed-v14-'));
+		const path = join(dir, 'feed.db');
+		const bp = (genre: string) => ({ source: 'beatport', sourceTrackId: '7', payload: { genre } });
+		try {
+			const s = new SqliteFeedStore(path);
+			await s.upsertItems([
+				draft('album', 'al', 'catalog:release:al', { genre: 'House', tracks: [
+					{ sourceTrackId: 'r1', title: 'one', artists: ['A'], durationSec: 1, genre: 'House', bpm: 124, enrichStatus: 'ok', sourceLinks: [bp('Progressive House')] },
+					{ sourceTrackId: 'r2', title: 'two', artists: ['A'], durationSec: 1, genre: 'House', enrichStatus: 'ok', sourceLinks: [bp('Progressive House')] },
+					{ sourceTrackId: 'r3', title: 'three', artists: ['A'], durationSec: 1, genre: 'House', enrichStatus: 'ok' },
+				] }),
+				draft('track', 'tr', 'spotify:track:tr', { genre: 'House', bpm: 122, sourceLinks: [bp('Melodic House & Techno')] }),
+				draft('track', 'plain', 'spotify:track:plain', { genre: 'Techno' }),
+			]);
+			s.close();
+			const raw = new Database(path);
+			raw.prepare(`UPDATE feed_item SET enrich_status = 'ok', enriched_at = 1`).run();
+			raw.exec(`UPDATE feed_meta SET value = '13' WHERE key = 'schema_version'`);
+			raw.close();
+
+			const s2 = new SqliteFeedStore(path);
+			const byId = new Map((await s2.getPage({ limit: 50 })).items.map((i) => [i.sourceId, i]));
+			const al = byId.get('al')!;
+			expect(al.payload.genre).toBe('Progressive House');
+			expect(al.payload.tracks!.map((t) => t.genre)).toEqual(['Progressive House', 'Progressive House', 'House']);
+			expect(al.payload.tracks![0]!.bpm).toBe(124);
+			expect(byId.get('tr')!.payload).toMatchObject({ genre: 'Melodic House & Techno', bpm: 122 });
+			expect(byId.get('plain')!.payload.genre).toBe('Techno');
+			// Settled cards stay settled: no Beatport calls.
+			expect(await s2.listUnenriched(50)).toEqual([]);
+			s2.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe('SqliteFeedStore filter probes', () => {
 	it('existingDedupeKeys returns only stored keys', async () => {
 		const s = new SqliteFeedStore(':memory:');

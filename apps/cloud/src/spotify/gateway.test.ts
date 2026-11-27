@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { SPOTIFY_GATEWAY_SCOPES, SYNC_FEATURES } from '@curator/protocol';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { Db, Queryable } from '../db/db.js';
+import type { Db, Tx } from '../db/db.js';
 import { TokenBucketLimiter } from '../rate-limit.js';
 import { FakeSpotify, randomTokenKey } from '../test/fake-spotify.js';
 import { asUser, createTestApp, errorReason, type TestApp } from '../test/harness.js';
@@ -194,7 +194,8 @@ describe('spotify.token', () => {
 		const crypto = app.deps.spotify!.crypto;
 		const realDb = app.deps.db;
 		let fired = false;
-		const intercept = (tx: Queryable): Queryable => ({
+		const intercept = (tx: Tx): Tx => ({
+			savepoint: (fn) => tx.savepoint(fn),
 			exec: (t) => tx.exec(t),
 			async query(text, params) {
 				const rows = await tx.query(text, params);

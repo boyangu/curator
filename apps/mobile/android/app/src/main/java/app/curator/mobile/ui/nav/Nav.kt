@@ -1,6 +1,8 @@
 package app.curator.mobile.ui.nav
 
 import androidx.compose.runtime.Stable
+import app.curator.mobile.model.EntityChip
+import app.curator.mobile.model.EntityRef
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -20,10 +22,6 @@ sealed interface ListSource {
 	val key: String
 	data class Playlist(val id: String) : ListSource { override val key get() = "playlist:$id" }
 	data class Tag(val id: String) : ListSource { override val key get() = "tag:$id" }
-	/** The artist's tracks in the library (the way to an artist until the phone has artist pages). */
-	data class Artist(val id: String) : ListSource { override val key get() = "artist:$id" }
-	/** The library's tracks on a label (the way to a label until the phone has label pages). */
-	data class Label(val name: String) : ListSource { override val key get() = "label:${name.lowercase()}" }
 	/** A set's tracks as played: one of the track's sets, from the player. */
 	data class Set(val id: String) : ListSource { override val key get() = "set:$id" }
 	/** Find similar, seeded with a track ([title] and [camelot], its key: its own, read when it was opened). */
@@ -47,6 +45,10 @@ sealed interface Screen {
 
 	data class TabRoot(val tab: Tab) : Screen
 	data class TrackList(val source: ListSource) : Screen
+	/** An artist's or a label's page (ui/entity/): what the surface that opened it knows of it. */
+	data class Entity(val ref: EntityRef) : Screen
+	/** Artists like one, from its page's menu: the catalogue's similar artists, each opening its page. */
+	data class SimilarArtists(val of: String, val artists: List<EntityChip>) : Screen { override val isPage get() = true }
 	/** [search]: what the list it was opened from was searched for (Next goes on through the same results). */
 	data class Track(val trackId: String, val from: ListSource?, val index: Int, val count: Int, val search: String = "") : Screen {
 		override val rotates get() = true

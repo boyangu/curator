@@ -12,8 +12,12 @@ import { createFetchHandler } from './app.js';
 import { AuditWriter, PRUNE_EVERY_MS, pruneRequestLog } from './audit.js';
 import { createTokenVerifier, remoteKeys } from './auth/jwt.js';
 import { rebuildCards } from './catalog/card-rebuild.js';
+import { AppleLookup } from './catalog/trackers/apple.js';
+import { TidalApp } from './catalog/trackers/tidal-app.js';
+import { drainFollowUps } from './catalog/work/followup.js';
+import { pruneWork } from './catalog/work/retention.js';
 import { SoundCloudTracker } from '@curator/catalog-readers';
-import { loadConfig, soundcloudCredentials } from './config.js';
+import { loadConfig, soundcloudCredentials, tidalCredentials } from './config.js';
 import { createPostgresDb } from './db/db.js';
 import { pruneClientLog } from './diagnostics.js';
 import { migrationGate } from './db/migration-gate.js';
@@ -37,6 +41,13 @@ const COMPACT_FIRST_MS = 10 * 60 * 1000;
 // Event cards: how long a device waits for a change to a release it holds.
 // One query when nothing was written since.
 const CARD_REBUILD_MS = 60 * 1000;
+// Releases devices just completed, looked up at Tidal and Apple
+// (catalog/work/followup.ts): about as soon as the device's page shows them.
+const FOLLOW_UP_MS = 30 * 1000;
+// What device work stops keeping (catalog/work/retention.ts): once a day, and
+// a quarter of an hour after boot. One instance at a time, by its own lock.
+const WORK_PRUNE_EVERY_MS = 24 * 3600 * 1000;
+const WORK_PRUNE_FIRST_MS = 15 * 60 * 1000;
 
 const log = createLogger();
 const config = loadConfig();
@@ -150,6 +161,41 @@ if (config.catalog) {
 				rebuilding = false;
 			});
 	}, CARD_REBUILD_MS).unref();
+}
+
+// The stores only Curator's own keys open, for what devices completed:
+// Tidal with the app's credentials (unset: not asked), Apple's public lookup
+// unless switched off (CURATOR_FEED_APPLE=0, as the upkeep reads it).
+const tidalCreds = tidalCredentials(process.env);
+const followUpReaders = { tidal: tidalCreds ? new TidalApp(tidalCreds) : null, apple: process.env.CURATOR_FEED_APPLE?.trim() !== '0' ? new AppleLookup() : null };
+let following = false;
+if (config.catalog && (followUpReaders.tidal || followUpReaders.apple)) {
+	setInterval(() => {
+		if (following) return;
+		following = true;
+		void drainFollowUps({ db, log, readers: followUpReaders })
+			.then((r) => {
+				if (r.linked || r.releases > r.requeued) log.info('work_followed_up', r);
+			})
+			.catch((e: unknown) => log.error('work_followup_failed', { error: e }))
+			.finally(() => {
+				following = false;
+			});
+	}, FOLLOW_UP_MS).unref();
+}
+
+if (config.catalog) {
+	const prune = (): void => {
+		void pruneWork(db)
+			.then((r) => {
+				if (r.answers || r.state) log.info('work_pruned', r);
+			})
+			.catch((e: unknown) => log.error('work_prune_failed', { error: e }));
+	};
+	setTimeout(() => {
+		prune();
+		setInterval(prune, WORK_PRUNE_EVERY_MS).unref();
+	}, WORK_PRUNE_FIRST_MS).unref();
 }
 
 server.listen(config.port, () => log.info('listening', { port: config.port }));

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -29,10 +30,12 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -53,12 +56,14 @@ import app.curator.mobile.ui.common.IconButton
 import app.curator.mobile.ui.common.IconGlyph
 import app.curator.mobile.ui.common.Line
 import app.curator.mobile.ui.nav.LocalSheetGestures
-import app.curator.mobile.ui.nav.LocalSheetReveal
+import app.curator.mobile.ui.nav.LocalSheetMotion
 import app.curator.mobile.ui.nav.Screen
 import app.curator.mobile.ui.nav.SheetGestures
 import app.curator.mobile.ui.nav.Tab
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
+import app.curator.mobile.ui.track.LocalPlayerMorph
+import app.curator.mobile.ui.track.PlayerMorph
 
 private val TAB_ICONS = mapOf(Tab.HOME to Icon.Home, Tab.FEED to Icon.Feed, Tab.LIBRARY to Icon.Library, Tab.EXPLORE to Icon.Explore, Tab.SEARCH to Icon.Search)
 
@@ -118,9 +123,12 @@ fun MiniBar(
 	// Read only while drawing the border, so the bar itself never recomposes as it plays.
 	val position = player.position.collectAsState()
 	val sheet = LocalSheetGestures.current
-	val reveal = LocalSheetReveal.current
-	val density = LocalDensity.current
-	val fade = with(density) { 160.dp.toPx() }
+	val motion = LocalSheetMotion.current
+	// Its cover and names are carried into the player as it rises (PlayerMorph); hidden here meanwhile.
+	val morph = LocalPlayerMorph.current
+	SideEffect { morph?.barTrack = t.trackId }
+	val carried = Modifier.graphicsLayer { alpha = if (morph?.carrying(motion) == true) 0f else 1f }
+	fun Modifier.at(put: PlayerMorph.(LayoutCoordinates) -> Unit) = if (morph != null) onGloballyPositioned { morph.put(it) } else this
 	val haptics = LocalHapticFeedback.current
 	val raise: (() -> Unit)? = if (open != null && sheet != null) { { sheet.open(open()); sheet.end(true) } } else null
 	val label = "Open player: ${t.title}" + (if (t.artist.isNotEmpty()) " by ${t.artist}" else "") + ". Swipe up to open"
@@ -128,7 +136,8 @@ fun MiniBar(
 		Modifier
 			.fillMaxWidth()
 			.height(72.dp)
-			.graphicsLayer { alpha = SheetDrag.barAlpha(reveal(), fade) }
+			.at { barTop = it.positionInRoot().y }
+			.graphicsLayer { alpha = 1f - motion.step() }
 			.background(C.bg2)
 			.drawBehind {
 				// The top border is the progress: the played part filled in.
@@ -156,10 +165,10 @@ fun MiniBar(
 			verticalAlignment = Alignment.CenterVertically,
 			horizontalArrangement = Arrangement.spacedBy(12.dp),
 		) {
-			Cover(t.coverUrl, t.trackId, 44.dp)
+			Cover(t.coverUrl, t.trackId, 44.dp, Modifier.at { barCover = it }.then(carried))
 			Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-				Line(t.title, T.of(14.5.sp, color = C.fg))
-				if (t.artist.isNotEmpty()) Line(t.artist, T.of(12.5.sp, color = C.fg2))
+				Line(t.title, T.of(14.5.sp, color = C.fg), Modifier.at { barTitle = it }.then(carried))
+				if (t.artist.isNotEmpty()) Line(t.artist, T.of(12.5.sp, color = C.fg2), Modifier.at { barArtist = it }.then(carried))
 			}
 		}
 		if (onHeart != null) {

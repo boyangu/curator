@@ -14,10 +14,8 @@ import type { CatalogObjectSummary, CatalogRef } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { CatalogClient } from './service.js';
 import { isDistributor } from '@curator/library-logic';
+import { writeRefs, type CatalogRefKind, type CatalogRefObjectKind, type CatalogRefRow } from '@curator/sync-core/entity/catalog-ref';
 
-export type CatalogRefKind = 'track' | 'album' | 'artist' | 'label';
-export type CatalogRefObjectKind = 'recording' | 'release' | 'artist' | 'label';
-export type CatalogRefRow = { entityKind: CatalogRefKind; entityId: string; objectId: string; objectKind: CatalogRefObjectKind; provider: string | null; providerId: string | null };
 export type CatalogObjectRef = { objectId: string; name: string; provider: string | null; providerId: string | null };
 export type TrackCatalogRefs = {
 	recording: CatalogObjectRef | null;
@@ -28,17 +26,6 @@ export type TrackCatalogRefs = {
 
 // A row older than this is resolved again (the object may have merged).
 const STALE_MS = 7 * 86400_000;
-
-export function writeRefs(raw: Database.Database, rows: CatalogRefRow[], now = Date.now()): void {
-	const put = raw.prepare(
-		`insert into catalog_ref (entity_kind, entity_id, object_id, object_kind, provider, provider_id, resolved_at) values (?, ?, ?, ?, ?, ?, ?)
-		on conflict (entity_kind, entity_id) do update set object_id = excluded.object_id, object_kind = excluded.object_kind,
-			provider = excluded.provider, provider_id = excluded.provider_id, resolved_at = excluded.resolved_at`,
-	);
-	raw.transaction(() => {
-		for (const r of rows) put.run(r.entityKind, r.entityId, r.objectId, r.objectKind, r.provider, r.providerId, now);
-	})();
-}
 
 type Wanted = { entityKind: CatalogRefKind; entityId: string; objectKind: CatalogRefObjectKind; ref: CatalogRef; artistId?: string };
 

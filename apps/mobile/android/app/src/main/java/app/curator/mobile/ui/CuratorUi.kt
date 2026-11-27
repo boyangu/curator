@@ -16,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -34,6 +35,9 @@ import app.curator.mobile.model.accountNotice
 import app.curator.mobile.model.joinNotice
 import app.curator.mobile.ui.chrome.BottomChrome
 import app.curator.mobile.ui.chrome.MiniBar
+import app.curator.mobile.ui.entity.EntityPageModel
+import app.curator.mobile.ui.entity.EntityScreen
+import app.curator.mobile.ui.entity.SimilarArtistsPage
 import app.curator.mobile.ui.feed.FeedModel
 import app.curator.mobile.ui.feed.FeedScreen
 import app.curator.mobile.ui.home.HomeScreen
@@ -53,7 +57,10 @@ import app.curator.mobile.ui.signin.AccountBanner
 import app.curator.mobile.ui.signin.SignInScreen
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
+import app.curator.mobile.ui.track.LocalPlayerMorph
+import app.curator.mobile.ui.track.MorphOverlay
 import app.curator.mobile.ui.track.OrganizeSheet
+import app.curator.mobile.ui.track.PlayerMorph
 import app.curator.mobile.ui.track.TrackActionsPage
 import app.curator.mobile.ui.track.TrackScreen
 import app.curator.mobile.ui.track.TrackUsesPage
@@ -90,23 +97,28 @@ fun CuratorUi(model: AppModel) {
 	}
 
 	val bottom: @Composable () -> Unit = { Bottom(model, nav) }
+	val morph = remember { PlayerMorph() }
 	Box(Modifier.fillMaxSize()) {
-		StackHost(nav) { screen ->
-			when (screen) {
-				is Screen.TabRoot -> when (screen.tab) {
-					Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
-					Tab.FEED -> FeedScreen(model, bottom)
-					Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
-					else -> Placeholder(screen.tab.label, bottom)
+		CompositionLocalProvider(LocalPlayerMorph provides morph) {
+			StackHost(nav, barTop = { morph.barTop }, overlay = { MorphOverlay(morph) }) { screen ->
+				when (screen) {
+					is Screen.TabRoot -> when (screen.tab) {
+						Tab.HOME -> HomeScreen(model, bottom, openSettings = { nav.push(Screen.Settings) }) { nav.push(Screen.TrackList(it)) }
+						Tab.FEED -> FeedScreen(model, bottom)
+						Tab.LIBRARY -> LibraryScreen(model, bottom, push = nav::push)
+						else -> Placeholder(screen.tab.label, bottom)
+					}
+					is Screen.TrackList -> TrackListScreen(model, screen.source, bottom, back = { nav.pop() }, push = nav::push)
+					is Screen.Entity -> EntityScreen(model, screen.ref, bottom, back = { nav.pop() }, push = nav::push)
+					is Screen.SimilarArtists -> SimilarArtistsPage(screen.of, screen.artists, back = { nav.pop() }, push = nav::push)
+					is Screen.ListActions -> ListActionsPage(model, screen.source, back = { nav.pop() }, openFields = { nav.push(Screen.RowFields(screen.source)) })
+					is Screen.RowFields -> RowFieldsPage(model, screen.sample, back = { nav.pop() })
+					is Screen.Track -> TrackScreen(model, screen, back = { nav.pop() }, push = nav::push, replace = nav::replaceTop)
+					is Screen.TrackActions -> TrackActionsPage(model, screen.trackId, back = { nav.pop() })
+					is Screen.TrackUses -> TrackUsesPage(model, screen, back = { nav.pop() }, push = nav::push)
+					Screen.Settings -> SettingsPage(model, back = { nav.pop() }, signIn = { nav.push(Screen.SignIn) })
+					Screen.SignIn -> SignInScreen(model, back = { nav.pop() })
 				}
-				is Screen.TrackList -> TrackListScreen(model, screen.source, bottom, back = { nav.pop() }, push = nav::push)
-				is Screen.ListActions -> ListActionsPage(model, screen.source, back = { nav.pop() }, openFields = { nav.push(Screen.RowFields(screen.source)) })
-				is Screen.RowFields -> RowFieldsPage(model, screen.sample, back = { nav.pop() })
-				is Screen.Track -> TrackScreen(model, screen, back = { nav.pop() }, push = nav::push, replace = nav::replaceTop)
-				is Screen.TrackActions -> TrackActionsPage(model, screen.trackId, back = { nav.pop() })
-				is Screen.TrackUses -> TrackUsesPage(model, screen, back = { nav.pop() }, push = nav::push)
-				Screen.Settings -> SettingsPage(model, back = { nav.pop() }, signIn = { nav.push(Screen.SignIn) })
-				Screen.SignIn -> SignInScreen(model, back = { nav.pop() })
 			}
 		}
 		model.organize?.let { OrganizeSheet(it) { model.organize = null } }
@@ -145,6 +157,9 @@ private fun Bottom(model: AppModel, nav: Nav) {
 				)
 			} else if (id != null && FeedModel.isFeedTrack(id)) {
 				MiniBar(model.player, inLibrary = model.feed.playingHeld(), onHeart = model.feed::heartPlaying, onOrganize = model.feed::organizePlaying, open = null)
+			} else if (id != null && EntityPageModel.isCatalogTrack(id)) {
+				// A catalogue row from an artist or label page: no heart, no player view (no library track).
+				MiniBar(model.player, inLibrary = false, onHeart = null, onOrganize = {}, open = null)
 			}
 		},
 		tab = nav.tab,

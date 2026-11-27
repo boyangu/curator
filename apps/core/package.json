@@ -22,6 +22,7 @@
     "@curator/agent-core": "workspace:*",
     "@curator/beatport": "workspace:*",
     "@curator/catalog-readers": "workspace:*",
+    "@curator/catalog-work": "workspace:*",
     "@curator/google-drive": "workspace:*",
     "@curator/library-logic": "workspace:*",
     "@curator/matcher": "workspace:*",

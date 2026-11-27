@@ -61,9 +61,19 @@ async function handlesOf(tx: Queryable, ids: string[]): Promise<Map<string, Cata
 	return out;
 }
 
+// The order an object's genres are listed in: the one Beatport stated first,
+// then by name. Clients take the first as the genre (feed/cloud-producer.ts,
+// entity/catalog-page.ts), and Curator prefers Beatport's — it files a track
+// at the depth a DJ sorts by ("Progressive House") where other stores state
+// the family ("House"), which name order would put first. `edge` and `genre`
+// are the object-genre edge's and the genre object's aliases.
+export const GENRE_ORDER = (edge: string, genre: string): string =>
+	`exists (select 1 from curator.catalog_edge_evidence gv join curator.catalog_source_object gs on gs.id = gv.source_object_id
+		where gv.edge_id = ${edge}.id and gs.provider = 'beatport') desc, ${genre}.name`;
+
 // A recording's canonical genre names (its object-genre edges), '|'-joined
 // in one scalar subquery per row: the card's per-track genres.
-export const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by g.name) from curator.catalog_edge ge join curator.catalog_object g on g.id = ge.dst
+export const RECORDING_GENRES_SQL = `(select string_agg(g.name, '|' order by ${GENRE_ORDER('ge', 'g')}) from curator.catalog_edge ge join curator.catalog_object g on g.id = ge.dst
 	where ge.src = o.id and ge.kind = 'object-genre') as genres`;
 
 const splitNames = (v: string | null): string[] => (v ? v.split('|') : []);
@@ -132,7 +142,7 @@ export async function releaseCards(tx: Queryable, releaseIds: readonly string[])
 		ids,
 	);
 	const genreRows = await tx.query<{ release: string; name: string }>(
-		`select e.src as release, o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst where e.src = any($1::uuid[]) and e.kind = 'object-genre' order by o.name`,
+		`select e.src as release, o.name from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst where e.src = any($1::uuid[]) and e.kind = 'object-genre' order by ${GENRE_ORDER('e', 'o')}`,
 		ids,
 	);
 	const handles = await handlesOf(tx, [...new Set([...releaseIds, ...artistRows.map((a) => a.id), ...trackRows.map((t) => t.id)])]);

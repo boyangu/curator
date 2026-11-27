@@ -73,6 +73,7 @@ type DzList<T> = { data?: T[]; total?: number; error?: { code: number; message: 
 
 // Deezer answers 200 with { error } for its quota (code 4) and for missing
 // objects (800).
+export const DZ_NOT_FOUND = 800;
 function unwrap<T extends { error?: { code: number } }>(j: T): T {
 	if (j.error?.code === 4) throw new TrackerRateLimitedError(10);
 	return j;
@@ -162,7 +163,13 @@ export class DeezerTracker implements TrackerAdapter {
 	async fetchRelease(ref: { id: string } | { upc: string }, signal: AbortSignal): Promise<CatalogClaim | null> {
 		const key = 'id' in ref ? ref.id : `upc:${ref.upc}`;
 		const album = await this.get<DzAlbum & { error?: { code: number } }>(`/album/${encodeURIComponent(key)}`, signal);
-		if (album.error || !album.id) return null;
+		// Only 800 says the album is not there; any other error is Deezer
+		// failing, and "gone" would be remembered of a page that is not.
+		if (album.error) {
+			if (album.error.code === DZ_NOT_FOUND) return null;
+			throw new Error(`deezer error ${album.error.code}`);
+		}
+		if (!album.id) return null;
 		const tracks = await this.get<DzList<DzTrack>>(`/album/${album.id}/tracks?limit=200`, signal);
 		return this.releaseClaim(album, tracks.data ?? []);
 	}

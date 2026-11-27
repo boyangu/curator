@@ -44,6 +44,7 @@ import type { SpotifyAdoptInput, SpotifyConnectInput, SpotifyDisconnectInput, Sp
 import type { CatalogWorkerDueInput, CatalogWorkerDueResult, CatalogWorkerReportInput, CatalogWorkerReportResult } from './catalog-service.js';
 import type { CatalogConnectAnswerInput, CatalogConnectAnswerResult, CatalogConnectQueueInput, CatalogConnectQueueResult, CatalogConnectSearchInput, CatalogConnectSearchResult } from './catalog-service.js';
 import type { CatalogTracksInput, CatalogTracksResult } from './catalog-service.js';
+import type { CatalogWorkReportInput, CatalogWorkReportResult } from './catalog-work-report.js';
 
 // An op as the server stored it. `seq` is the per-user total order and the
 // pull cursor; `user_id` comes from the JWT, never from the client;
@@ -171,7 +172,14 @@ export type PushInput = {
 //   - 'catalog_claim_about': a claim may carry `about` (catalog-service.ts
 //     CatalogClaim). An older server refuses a claim with a field it does
 //     not know, so a device sends it only when this is listed.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs', 'catalog_claim_about'] as const;
+//   - 'catalog_device_work': the cloud plans, the device reads
+//     (catalog-work.ts). `catalog.resolve`, `browse`, `tracks`,
+//     `feed.events` and `catalog.workerReport` take the device's `profile`
+//     (and `hints`) and may answer `work`; `catalog.workReport` takes what the
+//     device read. Before it a device sends neither key (an older server
+//     refuses them) and reads the stores on its own, as it did. With
+//     'catalog_pages' only.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs', 'catalog_claim_about', 'catalog_device_work'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {
@@ -609,6 +617,8 @@ export interface CloudService {
 		connectSearch(input: CatalogConnectSearchInput): Promise<CatalogConnectSearchResult>;
 		// 'catalog_pages'.
 		tracks(input: CatalogTracksInput): Promise<CatalogTracksResult>;
+		// 'catalog_device_work'.
+		workReport(input: CatalogWorkReportInput): Promise<CatalogWorkReportResult>;
 	};
 	feed: {
 		events(input: FeedEventsInput): Promise<FeedEventsResult>;

@@ -60,13 +60,29 @@ class PlayerSheetTest {
 	}
 
 	@Test
-	fun `the dim and the bar follow the reveal`() {
+	fun `the dim follows the reveal`() {
 		assertEquals(0f, SheetDrag.dim(0f, h))
 		assertEquals(0.4f, SheetDrag.dim(400f, h), 1e-6f)
 		assertEquals(0.6f, SheetDrag.dim(h, h))
-		assertEquals(1f, SheetDrag.barAlpha(0f, 160f))
-		assertEquals(0.5f, SheetDrag.barAlpha(80f, 160f))
-		assertEquals(0f, SheetDrag.barAlpha(400f, 160f))
+	}
+
+	@Test
+	fun `the names dock in the header as the content scrolls to their row`() {
+		assertEquals(0f, SheetDrag.dock(0f, 160f))
+		assertEquals(0.25f, SheetDrag.dock(40f, 160f))
+		assertEquals(1f, SheetDrag.dock(160f, 160f))
+		assertEquals(1f, SheetDrag.dock(900f, 160f))
+		// Already at their row: docked as soon as it scrolls.
+		assertEquals(0f, SheetDrag.dock(0f, 0f))
+		assertEquals(1f, SheetDrag.dock(1f, 0f))
+	}
+
+	@Test
+	fun `the bar has turned into the player a fifth of the way up`() {
+		assertEquals(0f, SheetDrag.morph(0f, h))
+		assertEquals(0.5f, SheetDrag.morph(h * 0.1f, h), 1e-6f)
+		assertEquals(1f, SheetDrag.morph(h * 0.2f, h))
+		assertEquals(1f, SheetDrag.morph(h, h))
 	}
 
 	@Test

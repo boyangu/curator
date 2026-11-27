@@ -44,6 +44,7 @@
 
 import { log } from '@curator/sync-core/log';
 import { CATALOG_CONNECT_QUEUE_STORES, type CatalogConnectAnswer, type CatalogConnectAnswerResult, type CatalogConnectCandidate, type CatalogConnectItem, type CatalogProvider, type CatalogWatch } from '@curator/protocol';
+import { clearMatch as clearMatchBy } from '@curator/library-logic';
 import { connectFold, type CatalogConnect, type ConnectQueue, type ConnectSearch } from './connect.js';
 
 const flog = log.for('catalog');
@@ -65,7 +66,6 @@ const PARK_MS: Record<NonNullable<ConnectSearch['note']>, number> = { blocked: 6
 const AGAIN_MS = 90 * 86_400_000;
 // An object's titles and candidates are kept this long between its stores.
 const ITEM_TTL_MS = 10 * 60_000;
-const CLEAR_MIN_SHARED = 2;
 // With this many of its releases known, an object's page would share one: a
 // namesake's list that shares none is someone else's.
 const WELL_KNOWN_TITLES = 5;
@@ -96,13 +96,7 @@ export function connectSlots(watches: readonly CatalogWatch[]): Slot[] {
 // under the object's name, the one sharing two releases with it and at least
 // twice as many as any other. Null when none stands out.
 export function clearMatch(name: string, candidates: readonly CatalogConnectCandidate[]): CatalogConnectCandidate | null {
-	const want = connectFold(name);
-	const ranked = candidates
-		.filter((c) => connectFold(c.name) === want && (c.shared?.length ?? 0) > 0)
-		.sort((a, b) => b.shared!.length - a.shared!.length);
-	const [top, next] = ranked;
-	if (!top || top.shared!.length < CLEAR_MIN_SHARED) return null;
-	return next && top.shared!.length < 2 * next.shared!.length ? null : top;
+	return clearMatchBy(name, candidates, connectFold);
 }
 
 // Whether a person could tell more than the search did: a page of the

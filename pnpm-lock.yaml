@@ -69,6 +69,9 @@ importers:
       '@curator/catalog-readers':
         specifier: workspace:*
         version: link:../../packages/catalog-readers
+      '@curator/catalog-work':
+        specifier: workspace:*
+        version: link:../../packages/catalog-work
       '@curator/library-logic':
         specifier: workspace:*
         version: link:../../packages/library-logic
@@ -114,6 +117,9 @@ importers:
       '@curator/catalog-readers':
         specifier: workspace:*
         version: link:../../packages/catalog-readers
+      '@curator/catalog-work':
+        specifier: workspace:*
+        version: link:../../packages/catalog-work
       '@curator/google-drive':
         specifier: workspace:*
         version: link:../../packages/providers/google-drive
@@ -415,6 +421,37 @@ importers:
       typescript:
         specifier: ^5.6.3
         version: 5.9.3
+
+  packages/catalog-work:
+    dependencies:
+      '@curator/beatport':
+        specifier: workspace:*
+        version: link:../providers/beatport
+      '@curator/catalog-readers':
+        specifier: workspace:*
+        version: link:../catalog-readers
+      '@curator/library-logic':
+        specifier: workspace:*
+        version: link:../library-logic
+      '@curator/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@curator/sync-core':
+        specifier: workspace:*
+        version: link:../sync-core
+      '@curator/traxsource':
+        specifier: workspace:*
+        version: link:../providers/traxsource
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.19.19
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.6
+        version: 2.1.9(@types/node@22.19.19)(jsdom@28.1.0)
 
   packages/library-logic:
     dependencies:

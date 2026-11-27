@@ -8,22 +8,27 @@
 // and back afterwards: one transaction, so a watch and the object it names
 // commit together or not at all.
 
-import { num, type Db, type Queryable } from './db.js';
+import { num, type Db, type Queryable, type Tx } from './db.js';
 
 export type SystemTx = Queryable & {
 	nowMs: number;
 	// Runs `fn` as `userId` (role `authenticated`, RLS on), then returns the
 	// transaction to curator_api.
 	asUser<T>(userId: string, fn: (tx: Queryable) => Promise<T>): Promise<T>;
+	// `fn` behind a savepoint, on its own handle (db.ts Tx): its failure costs
+	// what it wrote and nothing else.
+	savepoint<T>(fn: (tx: SystemTx) => Promise<T>): Promise<T>;
 };
 
 export async function withSystemTx<T>(db: Db, fn: (tx: SystemTx) => Promise<T>): Promise<T> {
-	return db.begin(async (tx) => {
-		const [row] = await tx.query<{ now_ms: unknown }>(`select floor(extract(epoch from now()) * 1000)::float8 as now_ms`);
-		const sys: SystemTx = {
+	return db.begin(async (root) => {
+		const [row] = await root.query<{ now_ms: unknown }>(`select floor(extract(epoch from now()) * 1000)::float8 as now_ms`);
+		const nowMs = num(row!.now_ms);
+		const over = (tx: Tx): SystemTx => ({
 			query: tx.query.bind(tx),
 			exec: tx.exec.bind(tx),
-			nowMs: num(row!.now_ms),
+			nowMs,
+			savepoint: (inner) => tx.savepoint((s) => inner(over(s))),
 			async asUser<U>(userId: string, inner: (q: Queryable) => Promise<U>): Promise<U> {
 				await tx.query(`select set_config('role', 'authenticated', true), set_config('request.jwt.claims', $1, true)`, [
 					JSON.stringify({ sub: userId, role: 'authenticated' }),
@@ -36,7 +41,7 @@ export async function withSystemTx<T>(db: Db, fn: (tx: SystemTx) => Promise<T>):
 					await tx.query(`select set_config('role', 'none', true), set_config('request.jwt.claims', '', true)`);
 				}
 			},
-		};
-		return fn(sys);
+		});
+		return fn(over(root));
 	});
 }
