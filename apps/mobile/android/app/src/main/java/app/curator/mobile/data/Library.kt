@@ -267,6 +267,39 @@ class Library(private val db: NativeDb) {
 		return out
 	}
 
+	/**
+	 * Up to [n] tracks with a title and an artist, picked at random by [random]
+	 * (seeded: a run can be picked again), electronic genres first — the ones
+	 * Beatport is likely to carry. The beatport-probe spike's searches.
+	 *
+	 * By rowid, one indexed seek a pick: a scan with the JSON joins over a
+	 * 38k-track library's track table would take seconds.
+	 */
+	fun lookupSample(n: Int, random: kotlin.random.Random): List<LookupTrack> {
+		val max = db.query("SELECT max(rowid) AS m FROM track")[0].long("m") ?: return emptyList()
+		val likely = LinkedHashMap<String, LookupTrack>()
+		val other = LinkedHashMap<String, LookupTrack>()
+		var tries = 0
+		while (likely.size < n && tries++ < n * 20) {
+			val r = db.query(
+				"""
+				SELECT t.id, ${eff("title", "title")} AS title, ${eff("genre", "genre")} AS genre,
+					(SELECT group_concat(json_extract(j.value, '$.name'), ' ') FROM json_each(
+						CASE WHEN json_valid(coalesce(json_extract(t.overrides, '$.artists'), t.artists)) THEN coalesce(json_extract(t.overrides, '$.artists'), t.artists) END
+					) j) AS artists
+				FROM track t WHERE t.rowid >= ? AND t.deleted_at IS NULL LIMIT 1
+				""".trimIndent(),
+				random.nextLong(max) + 1,
+			).firstOrNull() ?: continue
+			val title = splitVersion(r.string("title")?.trim() ?: "").first
+			val artists = r.string("artists")?.trim() ?: ""
+			if (title.isEmpty() || artists.isEmpty()) continue
+			val t = LookupTrack(r.string("id")!!, artists, title, r.string("genre"))
+			if (r.string("genre")?.let { LIKELY_GENRE.containsMatchIn(it) } == true) likely[t.id] = t else other[t.id] = t
+		}
+		return (likely.values + other.values).take(n)
+	}
+
 	/** Whether the track carries a tag (Interested, Basket). */
 	fun hasTag(trackId: String, tagId: String): Boolean =
 		db.query("SELECT 1 FROM track_tag WHERE track_id = ? AND tag_id = ? LIMIT 1", trackId, tagId).size > 0
@@ -362,6 +395,12 @@ class Library(private val db: NativeDb) {
 		.takeIf { it.size > 0 }?.get(0)?.string("value")?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() }
 
 	companion object {
+		// Beatport's own genres, loosely: what makes a track worth looking for there.
+		private val LIKELY_GENRE = Regex(
+			"""house|techno|trance|drum|bass|dubstep|break|garage|electro|disco|downtempo|progressive|melodic|afro|minimal|organic|dance|edm|electronic|hardstyle|ambient""",
+			RegexOption.IGNORE_CASE,
+		)
+
 		// "Hyperfall (Original Mix)" → ("Hyperfall", "Original Mix"): the
 		// version is the last bracketed part, as the desktop's matcher reads
 		// it; or Spotify's " - Extended Mix" form, when what follows the dash
@@ -446,6 +485,9 @@ data class TagSummary(val id: String, val name: String, val system: Boolean, val
 data class Lists(val playlists: List<PlaylistSummary>, val folders: List<Folder>, val tags: List<TagSummary>)
 
 data class ArtistRef(val id: String, val name: String, val role: String?)
+
+/** A track as a store search reads it: its artists (space-joined) and its title without the version. */
+data class LookupTrack(val id: String, val artists: String, val title: String, val genre: String?)
 
 /** [owned]: the library's own files; [by]: per source, how many of them it has a claim for. */
 data class StreamingCoverage(val owned: Int, val by: Map<String, Int>)

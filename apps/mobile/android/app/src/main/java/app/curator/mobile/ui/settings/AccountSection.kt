@@ -1,5 +1,6 @@
 package app.curator.mobile.ui.settings
 
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import androidx.compose.foundation.background
@@ -19,6 +20,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,7 +36,11 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import app.curator.mobile.MainActivity
+import app.curator.mobile.core.BeatportProbe
+import app.curator.mobile.core.BeatportWebView
 import app.curator.mobile.diag.DiagLog
 import app.curator.mobile.diag.Uploader
 import app.curator.mobile.model.accountNotice
@@ -46,10 +52,13 @@ import app.curator.mobile.ui.common.formatWhen
 import app.curator.mobile.ui.list.topLine
 import app.curator.mobile.ui.theme.C
 import app.curator.mobile.ui.theme.T
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.random.Random
 
 /** Who this phone is signed in as, whether it syncs, and signing out. */
 @Composable
@@ -129,6 +138,76 @@ fun Diagnostics(model: AppModel) {
 			}
 		}
 	}
+	BeatportProbeRow(model)
+}
+
+/**
+ * The beatport-probe spike's button: reads 30 Beatport pages in a hidden
+ * WebView and logs how it went (core/BeatportProbe). It runs while this
+ * screen is on the phone's screen only: leaving it, or the app, ends it, and
+ * the WebView with it.
+ */
+@Composable
+private fun BeatportProbeRow(model: AppModel) {
+	val activity = LocalContext.current as Activity
+	val scope = rememberCoroutineScope()
+	var job by remember { mutableStateOf<Job?>(null) }
+	var line by remember { mutableStateOf<String?>(null) }
+	LifecycleEventEffect(Lifecycle.Event.ON_STOP) { job?.cancel() }
+
+	Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+		BasicText("Beatport probe", Modifier.semantics { heading() }, style = T.label)
+		BasicText("Reads 30 Beatport pages in a hidden browser and logs how long each took. Nothing in your library changes.", style = T.secondary)
+		line?.let { BasicText(it, Modifier.semantics { liveRegion = LiveRegionMode.Polite }, style = T.mono(12.5.sp, C.fg2)) }
+	}
+	Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+		Action(if (job != null) "Running…" else "Run Beatport probe", enabled = job == null) {
+			val lib = model.library.value
+			if (lib == null) {
+				// Diagnostics shows on the sign-in screen too, before there are tracks to search for.
+				line = "Open your library first: the searches are its tracks"
+				return@Action
+			}
+			job = scope.launch {
+				val reader = BeatportWebView(activity)
+				try {
+					line = "Picking tracks…"
+					val seed = System.currentTimeMillis()
+					val tracks = withContext(Dispatchers.IO) { lib.lookupSample(BeatportProbe.SEARCHES, Random(seed)) }
+					if (tracks.isEmpty()) {
+						line = "No tracks with a title and an artist to search for"
+						return@launch
+					}
+					line = "0/${BeatportProbe.PLANNED} · loading the first page…"
+					val s =BeatportProbe.run(activity, reader, tracks, seed) { p ->
+						line = "${p.done}/${p.planned} · ${p.parsed} parsed" + (p.medianMs?.let { " · median ${seconds(it)}" } ?: "")
+					}
+					line = "${s.parsed}/${s.total} parsed · median ${s.medianMs?.let(::seconds) ?: "–"} · p90 ${s.p90Ms?.let(::seconds) ?: "–"} · " +
+						"${s.challenged} challenged · ${networkLabel(s.network)}"
+					// Up now rather than at the quarter hour, where the owner lets the log go up at all.
+					if (model.diagnostics.value && model.app.account.value?.tokens != null) model.logs.sendNow()
+				} catch (e: CancellationException) {
+					line = "Stopped"
+					throw e
+				} catch (e: Exception) {
+					DiagLog.e("beatport-probe", "the probe failed", e)
+					line = "The probe failed: ${e.message}"
+				} finally {
+					reader.close()
+					job = null
+				}
+			}
+		}
+	}
+}
+
+private fun seconds(ms: Long) = "%.1f s".format(ms / 1000.0)
+
+private fun networkLabel(kind: String) = when (kind) {
+	"wifi" -> "Wi-Fi"
+	"cellular" -> "mobile data"
+	"mixed" -> "network changed during the run"
+	else -> "other network"
 }
 
 @Composable

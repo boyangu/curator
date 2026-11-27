@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
 	<uses-permission android:name="android.permission.INTERNET" />
+	<!-- Which network a measurement ran on (core/BeatportProbe.kt: Wi-Fi or
+	     mobile data); granted at install, no prompt. -->
+	<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 	<!-- The app installs its own updates (update/Updater.kt); the user grants
 	     it once, as "Install unknown apps". -->
 	<uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
