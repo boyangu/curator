@@ -18,7 +18,7 @@ nativeloader = "0.10.5"
 junit = "4.13.2"
 sqliteJdbc = "3.49.1.0"
 gson = "2.11.0"
-spotifyAuth = "2.1.0"
+spotifyAuth = "5.0.0"
 
 [libraries]
 compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
