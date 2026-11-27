@@ -81,6 +81,7 @@ async function removeObject(tx: SystemTx, id: string): Promise<number> {
 		`delete from curator.catalog_page_check where object_id = $1`,
 		`delete from curator.catalog_work_state where object_id = $1`,
 		`delete from curator.catalog_work_followup where release_id = $1`,
+		`delete from curator.catalog_work_queue where object_id = $1`,
 		`delete from curator.catalog_source_object where object_id = $1`,
 		`delete from curator.catalog_object where id = $1`,
 	])

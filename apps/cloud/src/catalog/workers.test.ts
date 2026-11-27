@@ -6,7 +6,9 @@
 import { describe, expect, it } from 'vitest';
 import { CATALOG_TRACKERS, trackerKey, type CatalogClaim, type CatalogTrackerPoll, type CatalogWorkerDueInput } from '@curator/protocol';
 import type { TrackerAdapter, TrackerPoll, TrackerTarget } from '@curator/catalog-readers';
+import { CLOUD_CONFIG_DEFAULTS } from '@curator/protocol';
 import { createLogger } from '../log.js';
+import { configSet } from './admin-config.js';
 import { createTestApp, errorReason, type TestApp } from '../test/harness.js';
 import { providerPauses } from './tracking.js';
 import { nextDueAt, nextDueFor, spreadOf } from './trackers/cadence.js';
@@ -309,15 +311,17 @@ describe('workerReport', () => {
 	});
 });
 
-// Settings → Discover: how often a kind is read, sent with every ask.
+// How often a kind is read: the operator's one value for everyone
+// (settings/registry.ts read.cadence.<kind>), set in the back office.
 describe('read cadence', () => {
 	// The seeded artist/spotify tracker (sql/0012).
 	const ARTIST_SPOTIFY = { everyMin: 1440, friday: { fromUtc: '00:00', toUtc: '12:00', everyMin: 120 } };
 	const dueAt = async (app: TestApp, objectId: string) =>
 		Number((await app.db.query<{ ms: unknown }>(`select extract(epoch from next_due_at) * 1000 as ms from curator.catalog_cursor where object_id = $1 and provider = 'spotify'`, [objectId]))[0]!.ms);
 	const near = (got: number, want: number) => expect(Math.abs(got - want)).toBeLessThan(60_000);
+	const OPERATOR = 'guy-pc/guy';
 
-	it('times a read by its followers’ choice: weekly unless said, the most frequent of several', async () => {
+	it("times a read by the operator's cadence for its kind — weekly until set — and never by a desktop's own word", async () => {
 		const { app, fan, objectId, due } = await setup();
 		const read = async (over: Partial<CatalogWorkerDueInput> = {}) => {
 			await app.pg.query(`update curator.catalog_cursor set next_due_at = now()`);
@@ -325,27 +329,48 @@ describe('read cadence', () => {
 			await fan.api.catalog.workerReport.mutate({ deviceId: fan.deviceId, results: [{ objectId, provider: 'spotify', outcome: { poll: pollOf([]) } }] });
 			return dueAt(app, objectId);
 		};
-		// A desktop from before the choice says nothing: once, in the Friday window.
 		near(await read(), nextDueFor(Date.now(), ARTIST_SPOTIFY, 'weekly', spreadOf(objectId)));
-		near(await read({ cadence: { artist: 'daily', playlist: 'weekly' } }), Date.now() + DAY);
-		near(await read({ cadence: { artist: 'source' } }), nextDueAt(Date.now(), ARTIST_SPOTIFY, spreadOf(objectId)));
-		// A second follower who never said (weekly) does not slow the first's daily read.
-		const other = await app.signIn('desk-9');
-		await other.api.catalog.watch.mutate({ deviceId: other.deviceId, objectId, source: 'manual' });
-		near(await read({ cadence: { artist: 'daily' } }), Date.now() + DAY);
+		// A desktop from before 'cloud_config' still says what its user chose: not read.
+		near(await read({ cadence: { artist: 'daily' } }), nextDueFor(Date.now(), ARTIST_SPOTIFY, 'weekly', spreadOf(objectId)));
+		await configSet(app.db, { key: 'read.cadence.artist', value: 'daily', by: OPERATOR });
+		near(await read(), Date.now() + DAY);
+		await configSet(app.db, { key: 'read.cadence.artist', value: 'source', by: OPERATOR });
+		near(await read({ cadence: { artist: 'weekly' } }), nextDueAt(Date.now(), ARTIST_SPOTIFY, spreadOf(objectId)));
 	});
 
-	it('pulls the user’s cursors forward when a kind is to be read more often, and leaves a backoff where it is', async () => {
+	it("pulls everyone's cursors of a kind forward when the operator has it read more often, and leaves a backoff where it is", async () => {
 		const { app, fan, objectId, due } = await setup();
 		const failing = await fan.api.catalog.watch.mutate({ deviceId: fan.deviceId, claim: artist('sa2', 'Amber Tide'), source: 'manual' });
-		// Both read two days ago and parked for most of a week; one of them failing.
+		// Another account's follow: the operator's value is everyone's.
+		const other = await app.signIn('desk-9');
+		const theirs = await other.api.catalog.watch.mutate({ deviceId: other.deviceId, claim: artist('sa3', 'Low Sun'), source: 'manual' });
+		// All read two days ago and parked for most of a week; one of them failing.
 		await app.pg.query(`update curator.catalog_cursor set last_run_at = now() - interval '2 days', next_due_at = now() + interval '6 days'`);
 		await app.pg.query(`update curator.catalog_cursor set last_error = 'HTTP 500', fail_count = 1 where object_id = $1`, [failing.watch.object.id]);
-		// Weekly said outright is what it was by default: nothing moves.
-		expect((await due(undefined, undefined, { cadence: { artist: 'weekly' } })).tasks).toEqual([]);
-		// Daily: the healthy cursor was due a day ago, and the same call hands it out.
-		const r = await due(undefined, undefined, { cadence: { artist: 'daily' } });
-		expect(r.tasks.map((t) => t.objectId)).toEqual([objectId]);
+		// Weekly set outright is what it was by default: nothing moves.
+		expect((await configSet(app.db, { key: 'read.cadence.artist', value: 'weekly', by: OPERATOR })).retimed).toBe(0);
+		expect((await due()).tasks).toEqual([]);
+		// Daily: the healthy cursors were due a day ago — both accounts' — and the next ask hands this one's out.
+		expect((await configSet(app.db, { key: 'read.cadence.artist', value: 'daily', by: OPERATOR })).retimed).toBe(2);
+		expect((await due()).tasks.map((t) => t.objectId)).toEqual([objectId]);
+		expect(Number((await cursorOf(app, theirs.watch.object.id)).due_in_s)).toBeLessThan(0);
 		expect(Number((await cursorOf(app, failing.watch.object.id)).due_in_s)).toBeGreaterThan(5 * 86400);
 	});
 });
+
+// The operator's scheduling values, carried down on the ask ('cloud_config').
+describe('cloud config on workerDue', () => {
+	it('answers the config only to a desktop whose copy is behind, and never to one that does not ask', async () => {
+		const { app, due } = await setup();
+		// Nothing set yet: the defaults, version 0 — a desktop holding 0 is current.
+		expect((await due()).config).toBeUndefined();
+		expect((await due(undefined, undefined, { configVersion: 0 })).config).toBeUndefined();
+		const set = await configSet(app.db, { key: 'worker.tick_sec', value: 120, by: 'guy-pc/guy' });
+		const behind = await due(undefined, undefined, { configVersion: 0 });
+		expect(behind.config).toEqual({ version: set.version, values: { ...CLOUD_CONFIG_DEFAULTS, workerTickSec: 120 } });
+		expect((await due(undefined, undefined, { configVersion: set.version })).config).toBeUndefined();
+		// A desktop from before the feature sends no version and is told nothing.
+		expect((await due()).config).toBeUndefined();
+	});
+});
+

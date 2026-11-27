@@ -11,24 +11,27 @@
 //     (catalog_work_state) once it is older than every age it is read
 //     against: the planner treats such a row and no row alike — due. Not a
 //     listing's row (job 'find'): it carries the reader's cursor, and the
-//     word that a probe did not agree.
+//     word that a probe did not agree;
+//   - a background release no main desktop came for in a month, and a
+//     background lease lapsed a day ago (background.ts).
 //
 // Run by the API once a day (server.ts), one instance at a time.
 
 import type { Db } from '../../db/db.js';
 import { withSystemTx } from '../../db/system-tx.js';
+import { QUEUE_KEEP_DAYS } from './background.js';
 import { loadWorkSettings } from './settings.js';
 
 const ANSWER_KEEP_HOURS = 24;
 // Past the longest age (the 90-day confirmation), with room to spare.
 const STATE_KEEP_DAYS = 100;
 
-export type PruneReport = { answers: number; state: number };
+export type PruneReport = { answers: number; state: number; queue: number; leases: number };
 
 export async function pruneWork(db: Db): Promise<PruneReport> {
 	return withSystemTx(db, async (tx) => {
 		const [lock] = await tx.query<{ ok: boolean }>(`select pg_try_advisory_xact_lock(hashtext('curator.catalog_work_prune')) as ok`);
-		if (!lock?.ok) return { answers: 0, state: 0 };
+		if (!lock?.ok) return { answers: 0, state: 0, queue: 0, leases: 0 };
 		// Never younger than an age someone set longer than the default.
 		const s = await loadWorkSettings(tx, '*');
 		const days = Math.max(STATE_KEEP_DAYS, Math.ceil(s.checkDays) + 10, Math.ceil(s.retryDays) + 10);
@@ -43,6 +46,12 @@ export async function pruneWork(db: Db): Promise<PruneReport> {
 			select count(*)::int as n from gone`,
 			[String(days)],
 		);
-		return { answers: answers?.n ?? 0, state: state?.n ?? 0 };
+		// Background work (background.ts): a release no main desktop came for
+		// in a month, and leases long lapsed.
+		const [queue] = await tx.query<{ n: number }>(
+			`with gone as (delete from curator.catalog_work_queue where queued_at < now() - make_interval(days => ${QUEUE_KEEP_DAYS}) returning 1) select count(*)::int as n from gone`,
+		);
+		const [leases] = await tx.query<{ n: number }>(`with gone as (delete from curator.catalog_work_lease where until < now() - interval '1 day' returning 1) select count(*)::int as n from gone`);
+		return { answers: answers?.n ?? 0, state: state?.n ?? 0, queue: queue?.n ?? 0, leases: leases?.n ?? 0 };
 	});
 }

@@ -143,6 +143,21 @@ a.btn:hover { text-decoration: none; background: var(--accent-soft); }
 .chip.now { background: var(--accent); color: var(--panel); }
 a.warn, span.warn { color: var(--warn); }
 nav a .badge { background: var(--warn); color: #fff; border-radius: 999px; padding: 0 6px; font-size: 11px; margin-left: 6px; font-weight: 600; }
+/* Settings: the operator's values for everyone (settings/registry.ts). */
+.cfg td { vertical-align: middle; }
+.cfg .help { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.cfg input[type=number] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; width: 7em; }
+.cfg .parts { display: flex; gap: 8px; flex-wrap: wrap; }
+.cfg .parts label { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); }
+.cfg .unit { color: var(--muted); font-size: 12px; margin-left: 4px; }
+.cfg .acts { white-space: nowrap; }
+.cfg .acts .err { display: inline-block; padding: 2px 6px; margin-left: 6px; }
+.cfg .acts .err[hidden] { display: none; }
+.cfg .said { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.cfg tr.over td { font-size: 13px; padding-top: 4px; padding-bottom: 4px; }
+.cfg tr.over td:first-child { padding-left: 28px; }
+.cfg input[type=text] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; width: 18em; }
+.cfg .changed { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 @media (max-width: 640px) { .hide-sm { display: none; } .head img { width: 64px; height: 64px; } }
 </style>
 </head>
@@ -205,6 +220,7 @@ function renderNav(active) {
 	const waiting = inboxCounts ? inboxCounts.approval + inboxCounts.notice : null;
 	nav.innerHTML = `<a href="#/inbox" class="${active === 'inbox' ? 'on' : ''}">Inbox${waiting ? `<span class="badge">${fmtN(waiting)}</span>` : ''}</a>`
 		+ `<a href="#/tracking" class="${active === 'tracking' ? 'on' : ''}">Tracking</a>`
+		+ `<a href="#/settings" class="${active === 'settings' ? 'on' : ''}">Settings</a>`
 		+ KINDS.map((k) => {
 			const n = libraryOn() ? stats.library.objects[k.kind] : stats[k.kind];
 			return `<a href="#/${k.path}" class="${k.kind === active ? 'on' : ''}">${k.title}<span class="n">${n != null ? fmtN(n) : ''}</span></a>`;
@@ -805,10 +821,8 @@ function workersLine(workers) {
 		}
 		return [...byKind].map(([kind, providers]) => `${esc(kindTitle(kind).toLowerCase())} on ${providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')}`).join(', ') || '<span class="warn">nothing (every source unchecked)</span>';
 	};
-	// How often its user wants each kind read (Settings → Discover): 'source'
-	// is the tracker's own cadence; null, a desktop from before the choice.
-	const often = (w) => (w.cadence ? Object.entries(w.cadence).map(([kind, c]) => `${esc(kindTitle(kind).toLowerCase())} ${esc(c === 'source' ? 'as often as the source allows' : c)}`).join(', ') : 'weekly (never said)');
-	return workers.map((w) => `<div class="tr-sub">${w.live ? '<span class="chip now">reading</span>' : '<span class="chip">silent</span>'} <b>${esc(w.name)}</b> can read ${w.providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')} · its user checked ${chosen(w)} · read ${often(w)} · checked in ${ago(w.checkedInAt)} · week of ${esc(w.weekOf)}</div>`).join('');
+	// How often each kind is read is the operator's, for everyone (Settings).
+	return workers.map((w) => `<div class="tr-sub">${w.live ? '<span class="chip now">reading</span>' : '<span class="chip">silent</span>'} <b>${esc(w.name)}</b> can read ${w.providers.map((p) => `<span class="chip">${esc(p)}</span>`).join(' ')} · its user checked ${chosen(w)} · checked in ${ago(w.checkedInAt)} · week of ${esc(w.weekOf)}</div>`).join('');
 }
 const workerReads = (w, kind, provider) => w.live && w.providers.includes(provider) && (w.trackers === null || w.trackers.includes(`${kind}/${provider}`));
 const readBy = (workers, kind, provider) => (workers ?? []).filter((w) => workerReads(w, kind, provider)).map((w) => w.name);
@@ -1098,12 +1112,148 @@ async function fillObjectTracking(o) {
 	await fill();
 }
 
+// ---- settings ----
+// The operator's values for everyone (settings/registry.ts, admin-config.ts):
+// one per key, an account's own where the key allows it. Written through the
+// host's /admin, which stamps who (this machine) on every write; the page
+// never says who it is. Scheduling values reach the desktops on their next
+// check (protocol cloud-config.ts).
+
+const CADENCES = ['source', 'daily', 'weekly'];
+const CADENCE_WORDS = { source: 'as often as the source allows', daily: 'daily', weekly: 'weekly (Friday window)' };
+
+// What a value reads as, by its type.
+function cfgText(t, v) {
+	if (v === undefined || v === null) return '<span class="dim">—</span>';
+	if (t.kind === 'bool') return v ? 'on' : 'off';
+	if (t.kind === 'int') return `${fmtN(v)}${t.unit ? `<span class="unit">${esc(t.unit)}</span>` : ''}`;
+	if (t.kind === 'enum') return esc(CADENCE_WORDS[v] ?? v);
+	return t.parts.filter((p) => v[p] !== undefined).map((p) => `${esc(p)} ${fmtN(v[p])}`).join(' · ') || '<span class="dim">none</span>';
+}
+
+// The editor for one value; `name` keys its inputs in the row.
+function cfgEditor(t, v, disabled) {
+	const off = disabled ? 'disabled' : '';
+	if (t.kind === 'bool') return `<select data-v ${off}><option value="true" ${v ? 'selected' : ''}>on</option><option value="false" ${v ? '' : 'selected'}>off</option></select>`;
+	if (t.kind === 'int') return `<input type="number" data-v min="${t.min}" max="${t.max}" step="1" value="${esc(v)}" ${off}>${t.unit ? `<span class="unit">${esc(t.unit)}</span>` : ''}`;
+	if (t.kind === 'enum') return `<select data-v ${off}>${t.values.map((x) => `<option value="${esc(x)}" ${x === v ? 'selected' : ''}>${esc(CADENCE_WORDS[x] ?? x)}</option>`).join('')}</select>`;
+	return `<div class="parts">${t.parts.map((p) => `<label>${esc(p)}<input type="number" data-part="${esc(p)}" min="${t.min}" max="${t.max}" step="1" value="${v?.[p] ?? ''}" placeholder="${t.optional ? 'no cap' : ''}" ${off}></label>`).join('')}</div>`;
+}
+
+// The value in a row's editor, as its type takes it (null: not a value).
+function cfgRead(t, el) {
+	if (t.kind === 'bool') return el.querySelector('[data-v]').value === 'true';
+	if (t.kind === 'enum') return el.querySelector('[data-v]').value;
+	if (t.kind === 'int') {
+		const raw = el.querySelector('[data-v]').value.trim();
+		return raw === '' ? null : Number(raw);
+	}
+	const out = {};
+	for (const input of el.querySelectorAll('[data-part]')) {
+		const raw = input.value.trim();
+		if (raw !== '') out[input.dataset.part] = Number(raw);
+	}
+	return out;
+}
+
+const said = (at, by) => (at ? `<span class="said" title="${esc(new Date(at).toISOString().slice(0, 16).replace('T', ' '))} UTC">${ago(at)}${by ? ` · ${esc(by)}` : ''}</span>` : '<span class="said">never set</span>');
+
+function cfgRows(rows) {
+	return rows.map((r) => {
+		const main = `<tr data-key="${esc(r.key)}">
+			<td><b>${esc(r.label)}</b><div class="help">${esc(r.help)}</div><div class="help mono">${esc(r.key)}</div></td>
+			<td>${cfgEditor(r.type, r.value, !writable)}</td>
+			<td class="dim">${cfgText(r.type, r.default)}</td>
+			<td>${said(r.updatedAt, r.updatedBy)}${r.atDefault ? '' : ' <span class="chip">changed</span>'}</td>
+			<td class="acts">${writable ? `<button class="ok" data-act="save">Save</button> <button data-act="reset" ${r.atDefault && r.updatedAt === null ? 'disabled' : ''}>Reset</button>` : ''}<span class="err" hidden></span></td>
+		</tr>`;
+		if (!r.perAccount) return main;
+		const overs = r.overrides.map((o) => `<tr class="over" data-key="${esc(r.key)}" data-account="${esc(o.userId)}">
+			<td>${esc(o.email ?? o.userId)}</td>
+			<td>${cfgText(r.type, o.value)}</td>
+			<td></td>
+			<td>${said(o.updatedAt, o.updatedBy)}</td>
+			<td class="acts">${writable ? '<button data-act="unset">Remove</button>' : ''}<span class="err" hidden></span></td>
+		</tr>`).join('');
+		const add = writable ? `<tr class="over" data-key="${esc(r.key)}" data-add>
+			<td><input type="text" data-account placeholder="An account's email or id" autocomplete="off"></td>
+			<td>${cfgEditor(r.type, r.value, false)}</td>
+			<td></td><td class="said">for that account only</td>
+			<td class="acts"><button data-act="add">Set for account</button><span class="err" hidden></span></td>
+		</tr>` : '';
+		return main + overs + add;
+	}).join('');
+}
+
+async function renderSettings() {
+	renderNav('settings');
+	document.title = 'Settings · Catalogue';
+	await ensureWritable();
+	let list;
+	try {
+		list = await admin('configList', {});
+	} catch (e) {
+		app.innerHTML = `<div class="err">${esc(/read-only|404|not served/.test(e.message) ? 'Settings are read from the host’s /admin, which this back office does not serve. Restart it from this checkout.' : e.message)}</div>`;
+		return;
+	}
+	const groups = [...new Set(list.rows.map((r) => r.group))];
+	app.innerHTML = `<div data-settings>
+		<div class="tr-line">One value for every account. Scheduling reaches the desktops on their next check (config version <span class="mono">${list.version ? esc(new Date(list.version).toISOString().slice(0, 19).replace('T', ' ')) : 'defaults'}</span>).${writable ? '' : ' <span class="warn">Read-only here.</span>'}</div>
+		${groups.map((g) => section(esc(g), `<div class="card scroll"><table class="cfg">
+			<thead><tr><th>Setting</th><th>Value</th><th>Default</th><th>Last change</th><th></th></tr></thead>
+			<tbody>${cfgRows(list.rows.filter((r) => r.group === g))}</tbody>
+		</table></div>`)).join('')}
+	</div>`;
+	const rowOf = (key) => list.rows.find((r) => r.key === key);
+	app.querySelector('[data-settings]').addEventListener('click', async (e) => {
+		const btn = e.target.closest('button[data-act]');
+		if (!btn) return;
+		const tr = btn.closest('tr');
+		const r = rowOf(tr.dataset.key);
+		const err = tr.querySelector('.err');
+		err.hidden = true;
+		const fail = (m) => { err.textContent = m; err.hidden = false; };
+		const act = btn.dataset.act;
+		try {
+			if (act === 'save' || act === 'add') {
+				const value = cfgRead(r.type, tr);
+				if (value === null) return fail('Give a value.');
+				const account = act === 'add' ? tr.querySelector('[data-account]').value.trim() : undefined;
+				if (act === 'add' && !account) return fail('Name the account.');
+				// A kind read more often from now on pulls everyone's reads of it forward.
+				if (act === 'save' && r.type.kind === 'enum' && CADENCES.indexOf(value) < CADENCES.indexOf(r.value)
+					&& !confirm(`${r.label}: ${CADENCE_WORDS[value]} from now on.\n\nEvery followed one is re-timed now, so reads due later this week may start within minutes. Go on?`)) return;
+				btn.disabled = true;
+				const out = await admin('configSet', { key: r.key, value, ...(account ? { account } : {}) });
+				if (out.retimed) alert(`${fmtN(out.retimed)} reads brought forward.`);
+			} else if (act === 'reset') {
+				if (!confirm(`${r.label}: back to ${r.type.kind === 'counts' ? 'its default' : cfgText(r.type, r.default).replace(/<[^>]+>/g, '')} for everyone?`)) return;
+				btn.disabled = true;
+				await admin('configReset', { key: r.key });
+			} else if (act === 'unset') {
+				btn.disabled = true;
+				await admin('configReset', { key: r.key, account: tr.dataset.account });
+			}
+			await renderSettings();
+		} catch (x) {
+			btn.disabled = false;
+			fail(x.message);
+		}
+	});
+	// An edited value shows as unsaved until it is.
+	app.querySelector('[data-settings]').addEventListener('input', (e) => {
+		const tr = e.target.closest('tr[data-key]:not(.over)');
+		if (tr) tr.querySelectorAll('[data-v], [data-part]').forEach((x) => x.classList.add('changed'));
+	});
+}
+
 // ---- routing ----
 
 function route() {
 	const { parts, params } = parseHash();
 	clearInterval(trackingTimer);
 	if (parts[0] === 'tracking') return void renderTracking();
+	if (parts[0] === 'settings') return void renderSettings();
 	if (parts[0] === 'o' && parts[1]) return void renderObject(parts[1]);
 	if (parts[0] === 'inbox') return void renderInbox(params);
 	const kindDef = KINDS.find((k) => k.path === parts[0]);

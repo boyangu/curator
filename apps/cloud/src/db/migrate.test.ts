@@ -35,6 +35,8 @@ const SHARED_TABLES = [
 	'catalog_work_report',
 	'catalog_work_item',
 	'catalog_work_followup',
+	'catalog_work_queue',
+	'catalog_work_lease',
 	'catalog_chart_entry',
 	'catalog_connect_vote',
 	'catalog_page_check',

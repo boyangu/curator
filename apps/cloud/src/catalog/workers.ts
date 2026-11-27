@@ -11,12 +11,13 @@
 //   workerDue    — every minute: the device offers its providers (never the
 //                  cloud's keyed ones) and its user's checked trackers (the
 //                  Refresh menu; cloud-only ones included, so the master
-//                  knows whether anyone wants them) and how often the user
-//                  wants each kind read (the cursors are timed by it:
-//                  tracking.ts readCadencesOf), takes or keeps the week, runs
-//                  the check a Refresh asked for, and is handed its due
+//                  knows whether anyone wants them), takes or keeps the week,
+//                  runs the check a Refresh asked for, and is handed its due
 //                  cursors of the checked trackers under a ten-minute lease
-//                  with the poll's calls reserved.
+//                  with the poll's calls reserved — and the operator's
+//                  scheduling values when its copy is behind (the cursors are
+//                  timed by the read cadence there: tracking.ts
+//                  readCadencesOf).
 //   workerReport — the polls, or the errors the readers met. A result whose
 //                  lease the device no longer holds (lapsed, a resend after a
 //                  timeout) is `stale`: nothing of it is applied, so a resend
@@ -28,16 +29,24 @@
 // (tracking.ts providerPauses by holder): its IP and login are not the
 // cloud's.
 
-import { CATALOG_TRACKERS, type CatalogCheckReport, type CatalogProvider, type CatalogReadCadenceChoices, type CatalogWorkerDueInput, type CatalogWorkerDueResult, type CatalogWorkerReportInput, type CatalogWorkerReportResult, type CatalogWorkerTask } from '@curator/protocol';
+import { CATALOG_TRACKERS, type CatalogCheckReport, type CatalogProvider, type CatalogWork, type CatalogWorkerDueInput, type CatalogWorkerDueResult, type CatalogWorkerReportInput, type CatalogWorkerReportResult, type CatalogWorkerTask } from '@curator/protocol';
 import { callsPerPoll } from '@curator/catalog-readers';
 import type { Caller } from '../account/device-gate.js';
 import { num } from '../db/db.js';
 import type { Logger } from '../log.js';
 import { gated, type CatalogDeps } from './catalog.js';
-import { checkNow, providerPauses, retimeCursors } from './tracking.js';
+import { withSystemTx } from '../db/system-tx.js';
+import { loadCloudConfig } from '../settings/cloud-config.js';
+import { readMaster } from '../sync/master.js';
+import { planBackground, queueBackground } from './work/background.js';
+import { loadPlanInputs, loadWorkSettings } from './work/settings.js';
+import { checkNow, providerPauses } from './tracking.js';
 import { applyPolls, deviceHolder, leaseDue, loadTargets, loadTrackers, releaseLeases, reserveCalls, WORKER_LIVE_WINDOW, type LeasedCursor, type PollToApply, type TrackerRow } from './trackers/sweep.js';
 
 export type WorkerDeps = CatalogDeps & { log: Logger };
+
+// How long a background plan waits on a row a report is writing.
+const BACKGROUND_LOCK_WAIT = '2s';
 
 // Cursors handed out per tracker per call: a tick's work, well inside the
 // lease; the next call brings the rest.
@@ -62,26 +71,34 @@ export function weekEndsAt(nowMs: number): number {
 export async function workerDue(deps: WorkerDeps, userId: string, caller: Caller, input: CatalogWorkerDueInput): Promise<CatalogWorkerDueResult> {
 	const holder = deviceHolder(input.deviceId);
 	const providers = input.providers.filter((p) => !CLOUD_ONLY.has(p));
-	// Take the week, keep it, or find it held: one upsert. The holder's row is
-	// touched every call; another device's only once it is stale or last week's.
+	// Take the week, keep it, or find it held: one upsert. The account's main
+	// desktop (the `library.master_device` setting, sync/master.ts) always
+	// takes it and no other device ever does (Guy, 2026-11-27): it is the
+	// machine that is on, and off it the reads wait for it. An account that
+	// never named one keeps the old rule — the holder's row is touched every
+	// call; another device's only once it is stale or last week's.
 	// The check runs in the same transaction, whoever holds the week: what it
 	// makes due is leased below by the holder, or read by the cloud.
-	const { active, check } = await gated(deps, userId, caller, input.deviceId, async (tx) => {
-		// The choices on record, to see below whether this call changes them.
-		const [prev] = input.cadence ? await tx.query<{ cadence: string | null }>(`select cadence::text as cadence from curator.catalog_worker where user_id = $1`, [userId]) : [];
-		const rows = await tx.query<{ device_id: string }>(
-			`insert into curator.catalog_worker as k (user_id, device_id, providers, trackers, cadence, week_of, checked_in_at)
-			values ($1, $2, $3::text[], $4::text[], $5::text::jsonb, (date_trunc('week', now() at time zone 'utc'))::date, now())
-			on conflict (user_id) do update set device_id = excluded.device_id, providers = excluded.providers, trackers = excluded.trackers, cadence = excluded.cadence, week_of = excluded.week_of, checked_in_at = now()
-				where k.device_id = excluded.device_id or k.week_of < excluded.week_of or k.checked_in_at < now() - ${WORKER_LIVE_WINDOW}
-			returning device_id`,
-			[userId, input.deviceId, `{${providers.join(',')}}`, `{${input.trackers.join(',')}}`, input.cadence ? JSON.stringify(input.cadence) : null],
-		);
-		// The holder's choices are the ones that count, like its trackers.
-		if (rows.length && input.cadence) {
-			const moved = await retimeCursors(tx, userId, prev?.cadence ? (JSON.parse(prev.cadence) as CatalogReadCadenceChoices) : null, input.cadence);
-			if (moved) deps.log.info('worker_cadence_retimed', { by: holder, moved, cadence: input.cadence });
-		}
+	const { active, check, config, main } = await gated(deps, userId, caller, input.deviceId, async (tx) => {
+		const master = await tx.asUser(userId, (q) => readMaster(q));
+		const main = master === input.deviceId;
+		// The read cadence is the operator's (settings/registry.ts), one for
+		// everyone: a desktop's own `cadence`, from before 'cloud_config', is
+		// not read.
+		const rows =
+			master !== null && !main
+				? []
+				: await tx.query<{ device_id: string }>(
+						`insert into curator.catalog_worker as k (user_id, device_id, providers, trackers, week_of, checked_in_at)
+						values ($1, $2, $3::text[], $4::text[], (date_trunc('week', now() at time zone 'utc'))::date, now())
+						on conflict (user_id) do update set device_id = excluded.device_id, providers = excluded.providers, trackers = excluded.trackers, week_of = excluded.week_of, checked_in_at = now()
+							where $5::boolean or k.device_id = excluded.device_id or k.week_of < excluded.week_of or k.checked_in_at < now() - ${WORKER_LIVE_WINDOW}
+						returning device_id`,
+						[userId, input.deviceId, `{${providers.join(',')}}`, `{${input.trackers.join(',')}}`, String(main)],
+					);
+		// The cloud's scheduling values, to a desktop whose copy is behind.
+		const cfg = input.configVersion === undefined ? null : await loadCloudConfig(tx);
+		const config = cfg && cfg.version > input.configVersion! ? cfg : undefined;
 		let check: CatalogCheckReport | undefined;
 		if (input.check) {
 			const r = await checkNow(tx, { ...(input.check.kind ? { kind: input.check.kind } : { all: true }), userId, trackers: input.trackers });
@@ -91,10 +108,10 @@ export async function workerDue(deps: WorkerDeps, userId: string, caller: Caller
 				pauses: r.pauses.map((p) => ({ provider: p.provider as CatalogProvider, until: p.until })),
 			};
 		}
-		return { active: rows.length > 0, check };
+		return { active: rows.length > 0, check, config, main };
 	});
 	const ends = weekEndsAt(Date.now());
-	const withCheck = <T extends CatalogWorkerDueResult>(r: T): T => (check ? { ...r, check } : r);
+	const withCheck = <T extends CatalogWorkerDueResult>(r: T): T => ({ ...r, ...(check ? { check } : {}), ...(config ? { config } : {}) });
 	if (!active) return withCheck({ active: false, weekEndsAt: ends, tasks: [], pauses: [] });
 	const pauses = await providerPauses(deps.db, { holder });
 	const paused = new Set<string>([...pauses.map((p) => p.provider), ...(input.paused ?? []).filter((p) => p.until > Date.now()).map((p) => p.provider)]);
@@ -113,7 +130,18 @@ export async function workerDue(deps: WorkerDeps, userId: string, caller: Caller
 			tasks.push({ objectId: c.objectId, provider: t.provider as CatalogProvider, kind: t.kind, target: targets.get(c.objectId)!.target, minGapMs: t.budget.minGapMs, timeoutMs: POLL_TIMEOUT_MS });
 		}
 	}
-	return withCheck({ active: true, weekEndsAt: ends, tasks, pauses: pauses.map((p) => ({ provider: p.provider as CatalogProvider, until: p.until })) });
+	// The main desktop, with nothing of its own in hand (it sends its profile
+	// only then): what its weekly reads created, to complete. A plan that
+	// fails costs this check its background work, not its reads.
+	let work: CatalogWork | undefined;
+	if (main && input.profile) {
+		try {
+			work = await withSystemTx(deps.db, async (tx) => planBackground(tx, { userId, deviceId: input.deviceId, profile: input.profile!, inputs: await loadPlanInputs(tx, userId, BACKGROUND_LOCK_WAIT), nowMs: tx.nowMs }));
+		} catch (e) {
+			deps.log.warn('background_plan_failed', { by: holder, error: e instanceof Error ? e.message.slice(0, 300) : String(e).slice(0, 300) });
+		}
+	}
+	return withCheck({ active: true, weekEndsAt: ends, tasks, pauses: pauses.map((p) => ({ provider: p.provider as CatalogProvider, until: p.until })), ...(work ? { work } : {}) });
 }
 
 export async function workerReport(deps: WorkerDeps, userId: string, caller: Caller, input: CatalogWorkerReportInput): Promise<CatalogWorkerReportResult> {
@@ -160,7 +188,8 @@ export async function workerReport(deps: WorkerDeps, userId: string, caller: Cal
 	const polls = [...results.keys()].flatMap((k) => applying.get(k) ?? []);
 	out.stale = input.results.length - polls.length;
 	const extra = new Map<string, { t: TrackerRow; calls: number }>();
-	for (const [i, a] of (await applyPolls(deps, polls, { holder, nowMs })).entries()) {
+	const applied = await applyPolls(deps, polls, { holder, nowMs });
+	for (const [i, a] of applied.entries()) {
 		const { t, outcome } = polls[i]!;
 		out.applied++;
 		out.events += a.events;
@@ -181,6 +210,13 @@ export async function workerReport(deps: WorkerDeps, userId: string, caller: Cal
 		runs.set(key, run);
 	}
 	for (const { t, calls } of extra.values()) await reserveCalls(deps.db, t.provider, calls, t.budget.perDay);
+	// What these reads brought in, for the account's main desktop to complete
+	// on its next checks — while background work is on for the account.
+	const created = [...new Set(applied.flatMap((a) => a.created))];
+	if (created.length && (await loadWorkSettings(deps.db, userId)).background.enabled) {
+		const queued = await queueBackground(deps.db, userId, created);
+		if (queued) deps.log.info('background_queued', { by: holder, queued });
+	}
 	if (runs.size) {
 		await deps.db.query(
 			`insert into curator.tracker_run (kind, provider, worker, finished_at, claimed, calls, events, failed, errors)

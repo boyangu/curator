@@ -190,7 +190,9 @@ export async function loadTargets(db: Pick<Db, 'query'>, t: TrackerRow, cursors:
 // What a poll came to: the reader's result, or the error it met (a rate
 // limit says how long the provider asked to wait).
 export type PollOutcome = { poll: TrackerPoll } | { error: { message: string; rateLimitedSec: number | null } };
-export type ApplyResult = { polled: boolean; unchanged: boolean; calls: number; events: number; failed: boolean; limited: boolean; error: string | null };
+// `created`: the releases the poll brought into the catalogue (a main
+// desktop completes them: catalog/work/background.ts).
+export type ApplyResult = { polled: boolean; unchanged: boolean; calls: number; events: number; failed: boolean; limited: boolean; error: string | null; created: string[] };
 
 export type PollToApply = { t: TrackerRow; c: Pick<LeasedCursor, 'objectId' | 'cursor' | 'failCount'>; rep: Representation | null; outcome: PollOutcome };
 
@@ -206,7 +208,7 @@ const errorOf = (e: unknown): { message: string; rateLimitedSec: number | null }
 // share their transactions; where one fails, each is applied on its own, so
 // it fails alone.
 export async function applyPolls(deps: { db: Db; log: Logger }, polls: readonly PollToApply[], opts: { holder: string; nowMs: number }): Promise<ApplyResult[]> {
-	const results: ApplyResult[] = polls.map(() => ({ polled: false, unchanged: false, calls: 0, events: 0, failed: false, limited: false, error: null }));
+	const results: ApplyResult[] = polls.map(() => ({ polled: false, unchanged: false, calls: 0, events: 0, failed: false, limited: false, error: null, created: [] }));
 	const errors = new Map<number, { message: string; rateLimitedSec: number | null }>();
 	const changed: Found[] = [];
 	for (const [i, { t, c, rep, outcome }] of polls.entries()) {
@@ -247,6 +249,7 @@ export async function applyPolls(deps: { db: Db; log: Logger }, polls: readonly 
 	};
 	const ingested = await each(changed, (f) => ingestFound(deps.db, f));
 	const outcomes = new Map(ingested.map(([f, o]) => [f.i, o]));
+	for (const [f, o] of ingested) results[f.i]!.created = o.filter((x) => x.kind === 'release' && x.created).map((x) => x.objectId);
 	for (const [f, n] of await each(ingested.map(([f]) => f), (found) => raiseFound(deps.db, found.map((f) => ({ ...f, outcomes: outcomes.get(f.i)! })), opts.nowMs, opts.holder))) results[f.i]!.events = n;
 
 	const done = polls.map((p, i) => ({ ...p, i })).filter((p): p is typeof p & { outcome: { poll: TrackerPoll } } => 'poll' in p.outcome && !errors.has(p.i));

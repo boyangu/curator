@@ -102,7 +102,8 @@ begin
 		'catalog_chart_entry', 'catalog_review', 'catalog_inbox', 'catalog_insight',
 		'catalog_agent_case', 'catalog_credit_rule', 'catalog_source_block', 'catalog_worker',
 		'catalog_connect_vote', 'catalog_page_check', 'catalog_name_lookup', 'catalog_card_dirty',
-		'catalog_setting', 'catalog_work_state', 'catalog_work_report', 'catalog_work_item', 'catalog_work_followup'
+		'catalog_setting', 'catalog_work_state', 'catalog_work_report', 'catalog_work_item', 'catalog_work_followup',
+		'catalog_work_queue', 'catalog_work_lease'
 	] loop
 		if to_regclass('curator.' || t) is not null then
 			execute format('grant select, insert, update, delete on curator.%I to curator_api, curator_worker', t);

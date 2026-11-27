@@ -22,17 +22,31 @@ export type WorkSettings = {
 	minReader: number;
 	releases: Record<CatalogDeviceForm, number>;
 	perDay: Partial<Record<CatalogWorkStore, number>>;
+	// What an account's main desktop completes on its checks (background.ts):
+	// the switch (per account, to roll out), the releases planned a check, the
+	// share of each store's day it may use, and how long a handed job is held.
+	background: { enabled: boolean; releases: number; sharePct: number; leaseMin: number };
 };
 
 // What a database without the rows (a test's, a half-applied migration's)
 // reads as: off.
-export const WORK_DEFAULTS: WorkSettings = { enabled: false, findDays: 7, checkDays: 90, retryDays: 7, rounds: 3, minReader: 1, releases: { phone: 20, desktop: 100 }, perDay: {} };
+export const WORK_DEFAULTS: WorkSettings = {
+	enabled: false,
+	findDays: 7,
+	checkDays: 90,
+	retryDays: 7,
+	rounds: 3,
+	minReader: 1,
+	releases: { phone: 20, desktop: 100 },
+	perDay: {},
+	background: { enabled: false, releases: 10, sharePct: 50, leaseMin: 15 },
+};
 
 const count = (v: unknown, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback);
 
 // `rows`: everyone's row before the user's, so the user's is the one kept.
 function settingsOf(rows: readonly { key: string; value: string }[]): WorkSettings {
-	const s: WorkSettings = { ...WORK_DEFAULTS, releases: { ...WORK_DEFAULTS.releases }, perDay: {} };
+	const s: WorkSettings = { ...WORK_DEFAULTS, releases: { ...WORK_DEFAULTS.releases }, perDay: {}, background: { ...WORK_DEFAULTS.background } };
 	for (const r of rows) {
 		const v: unknown = JSON.parse(r.value);
 		switch (r.key) {
@@ -48,6 +62,10 @@ function settingsOf(rows: readonly { key: string; value: string }[]): WorkSettin
 					s.releases = { phone: count(o['phone'], s.releases.phone), desktop: count(o['desktop'], s.releases.desktop) };
 				}
 				break;
+			case 'work.background.enabled': s.background.enabled = v === true; break;
+			case 'work.background.releases': s.background.releases = count(v, s.background.releases); break;
+			case 'work.background.share_pct': s.background.sharePct = Math.min(100, count(v, s.background.sharePct)); break;
+			case 'work.background.lease_min': s.background.leaseMin = count(v, s.background.leaseMin); break;
 			case 'work.per_day':
 				if (v && typeof v === 'object') {
 					s.perDay = {};

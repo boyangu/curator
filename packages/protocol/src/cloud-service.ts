@@ -179,7 +179,15 @@ export type PushInput = {
 //     device read. Before it a device sends neither key (an older server
 //     refuses them) and reads the stores on its own, as it did. With
 //     'catalog_pages' only.
-export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs', 'catalog_claim_about', 'catalog_device_work'] as const;
+//   - 'cloud_config': `catalog.workerDue` takes the `configVersion` a desktop
+//     holds and answers `config` when the cloud's scheduling values moved
+//     since (cloud-config.ts); the read cadence is the cloud's, one for
+//     everyone, and a desktop's own `cadence` is no longer read.
+//   - 'catalog_background_work': `catalog.workerDue` takes the device's
+//     `profile`; the account's main desktop (the `library.master_device`
+//     setting) alone holds the week's reads and is answered `work` — the
+//     releases its weekly reads created, to complete — leased to it.
+export const SYNC_FEATURES = ['pull_skip_own', 'catalogue', 'device_reads', 'track_meta', 'zero_loss_v4', 'batches', 'snapshot_storage', 'analysis_v5', 'spotify_gateway', 'global_catalog', 'feed_lenses_v6', 'catalog_workers', 'catalog_connect_auto', 'catalog_pages', 'catalog_read_cadence', 'catalog_audience', 'replica_storage', 'mobile_settings_v7', 'client_logs', 'catalog_claim_about', 'catalog_device_work', 'cloud_config', 'catalog_background_work'] as const;
 export type SyncFeature = (typeof SYNC_FEATURES)[number];
 
 export type PushResult = {

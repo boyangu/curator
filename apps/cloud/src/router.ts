@@ -102,7 +102,7 @@ export function serverFeatures(deps: Pick<AppDeps, 'catalogue' | 'spotify' | 'ca
 		(f) =>
 			(f !== 'catalogue' || deps.catalogue !== null) &&
 			(f !== 'spotify_gateway' || deps.spotify !== null) &&
-			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect_auto' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience' && f !== 'catalog_claim_about' && f !== 'catalog_device_work') || deps.catalog),
+			((f !== 'global_catalog' && f !== 'catalog_workers' && f !== 'catalog_connect_auto' && f !== 'catalog_pages' && f !== 'catalog_read_cadence' && f !== 'catalog_audience' && f !== 'catalog_claim_about' && f !== 'catalog_device_work' && f !== 'cloud_config' && f !== 'catalog_background_work') || deps.catalog),
 	);
 }
 

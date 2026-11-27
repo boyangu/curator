@@ -38,6 +38,7 @@ import { createServer as createNetServer } from 'node:net';
 import { PGlite } from '@electric-sql/pglite';
 import { createFetchHandler } from '../app.js';
 import { createBackofficeHandler, type WorkerStatus } from '../backoffice/handler.js';
+import { stamped } from '../backoffice/operator.js';
 import { AuditWriter } from '../audit.js';
 import { createTokenVerifier, remoteKeys } from '../auth/jwt.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
@@ -198,7 +199,7 @@ const adminHandler = async (req: Request): Promise<Response> => {
 	try {
 		const { op, args } = (await req.json()) as { op: keyof AdminOps; args: never };
 		if (!Object.hasOwn(admin, op)) return Response.json({ ok: false, error: `unknown op ${String(op)}` }, { status: 400 });
-		return Response.json({ ok: true, result: await admin[op](args) });
+		return Response.json({ ok: true, result: await admin[op](stamped(op, args) as never) });
 	} catch (e) {
 		return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
 	}

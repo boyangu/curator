@@ -188,7 +188,7 @@ if (config.catalog) {
 	const prune = (): void => {
 		void pruneWork(db)
 			.then((r) => {
-				if (r.answers || r.state) log.info('work_pruned', r);
+				if (r.answers || r.state || r.queue || r.leases) log.info('work_pruned', r);
 			})
 			.catch((e: unknown) => log.error('work_prune_failed', { error: e }));
 	};

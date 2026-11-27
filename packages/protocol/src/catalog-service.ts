@@ -24,6 +24,7 @@
 // contract for that: claim and event shapes, the procedure inputs, results.
 
 import { z } from 'zod';
+import type { CloudConfigEnvelope } from './cloud-config.js';
 import { ZCatalogDeviceProfile, type CatalogDeviceProfile, type CatalogWork } from './catalog-work.js';
 import { PAGE_KINDS, type PageKind } from './page-ref.js';
 import { ZDeviceId } from './sync-input.js';
@@ -806,6 +807,12 @@ export type CatalogWorkerDueInput = {
 	paused?: CatalogProviderPause[];
 	check?: { kind?: CatalogTrackingKind };
 	cadence?: CatalogReadCadenceChoices;
+	// 'cloud_config': the version of the cloud's config this device holds.
+	configVersion?: number;
+	// 'catalog_background_work': what this device can read now, sent while
+	// it has no background work in hand — the account's main desktop is then
+	// answered `work`.
+	profile?: CatalogDeviceProfile;
 };
 // Per provider, what became of the cursors a check named: due now (queued),
 // due anyway, read within the hour, being read, or on a provider that asked
@@ -831,6 +838,11 @@ export type CatalogWorkerDueResult = {
 	pauses: CatalogProviderPause[];
 	// What the call's `check` did, when it carried one.
 	check?: CatalogCheckReport;
+	// 'cloud_config': the cloud's config, when it moved since `configVersion`.
+	config?: CloudConfigEnvelope;
+	// 'catalog_background_work': releases to complete, leased to this device
+	// (catalog-work.ts jobs, reported through catalog.workReport).
+	work?: CatalogWork;
 };
 export type CatalogWorkerOutcome = { poll: CatalogTrackerPoll } | { error: { message: string; rateLimitedSec: number | null } };
 // `profile` ('catalog_device_work'): the answer may then carry work — the new
@@ -879,6 +891,8 @@ export const ZCatalogWorkerDueInput = z
 		paused: z.array(ZPause).max(CATALOG_PROVIDERS.length).optional(),
 		check: z.object({ kind: z.enum(CATALOG_TRACKING_KINDS).optional() }).strict().optional(),
 		cadence: z.record(z.enum(CATALOG_TRACKING_KINDS), z.enum(CATALOG_READ_CADENCES)).optional(),
+		configVersion: z.number().nonnegative().optional(),
+		profile: ZCatalogDeviceProfile.optional(),
 	})
 	.strict();
 const ZOutcome: z.ZodType<CatalogWorkerOutcome> = z.union([

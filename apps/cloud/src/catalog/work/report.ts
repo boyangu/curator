@@ -70,6 +70,7 @@ import { ingestClaims } from '../ingest.js';
 import { pageTracks } from '../pages.js';
 import { applyReleaseClaims } from '../store-links.js';
 import { deviceHolder } from '../trackers/sweep.js';
+import { releaseLeases } from './background.js';
 import { forgetPages, labelTitlesByStore, namedPages, ownId, pageKey, WORK_ACTOR } from './naming.js';
 import { FIND_STORES, NEW_PAGES, parseJobId, planPage, planSafely, scopeOf, type JobRef } from './plan.js';
 import { loadPlanInputs, type PlanInputs } from './settings.js';
@@ -592,6 +593,9 @@ export async function workReport(deps: CatalogDeps, userId: string, caller: Call
 			results[v.at] = out;
 		}
 		for (const w of waiting) results[w.at] = await apply(w.r, w.ref);
+		// Background jobs this device was holding (background.ts): reported,
+		// whatever became of them.
+		await releaseLeases(tx, userId, input.deviceId, valid.map((v) => v.r.jobId));
 
 		if (c.items.length) {
 			await tx.query(

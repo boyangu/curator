@@ -107,7 +107,7 @@ describe('what device work stops keeping', () => {
 				($2, 'find', 'spotify', 'sa1', 'ok', now() - interval '400 days')`,
 			[rel!.id, art!.id],
 		);
-		expect(await pruneWork(db)).toEqual({ answers: 1, state: 1 });
+		expect(await pruneWork(db)).toEqual({ answers: 1, state: 1, queue: 0, leases: 0 });
 		expect(await db.query(`select idempotency_key, result is null as dropped from curator.catalog_work_report order by idempotency_key`)).toEqual([
 			{ idempotency_key: 'new-00001', dropped: false },
 			{ idempotency_key: 'old-00001', dropped: true },
@@ -115,6 +115,6 @@ describe('what device work stops keeping', () => {
 		expect(await db.query(`select count(*)::int as n from curator.catalog_work_item`)).toEqual([{ n: 1 }]);
 		expect(await db.query(`select job from curator.catalog_work_state order by job`)).toEqual([{ job: 'check' }, { job: 'find' }]);
 		// Nothing left to drop.
-		expect(await pruneWork(db)).toEqual({ answers: 0, state: 0 });
+		expect(await pruneWork(db)).toEqual({ answers: 0, state: 0, queue: 0, leases: 0 });
 	});
 });

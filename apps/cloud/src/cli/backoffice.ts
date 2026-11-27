@@ -9,6 +9,7 @@
 
 import { createServer } from 'node:http';
 import { createBackofficeHandler } from '../backoffice/handler.js';
+import { stamped } from '../backoffice/operator.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
 import { fromThisMachinesPages } from './loopback.js';
@@ -28,7 +29,9 @@ const backoffice = createBackofficeHandler(db);
 // a check. Only those ops reach the cloud from here; the rest of the back
 // office stays the CLI's. A check only makes cursors due: the desktops
 // and the upkeep (cli/cloud-worker.ts) read them, under their own budgets.
-const PAGE_OPS: readonly (keyof AdminOps)[] = ['inboxList', 'inboxCounts', 'inboxGet', 'inboxDecide', 'inboxSnooze', 'trackingCheck'];
+// The operator's settings too: one value for everyone, changed only from a
+// machine that holds this credential, each write stamped with that machine.
+const PAGE_OPS: readonly (keyof AdminOps)[] = ['inboxList', 'inboxCounts', 'inboxGet', 'inboxDecide', 'inboxSnooze', 'trackingCheck', 'configList', 'configSet', 'configReset'];
 const admin = adminOps(db, {});
 const handler = async (req: Request): Promise<Response> => {
 	const res = await backoffice(req);
@@ -37,7 +40,7 @@ const handler = async (req: Request): Promise<Response> => {
 		try {
 			const { op, args } = (await req.json()) as { op: keyof AdminOps; args: never };
 			if (!PAGE_OPS.includes(op)) return Response.json({ ok: false, error: `${String(op)} is not served here: use the catalog CLI` }, { status: 403 });
-			return Response.json({ ok: true, result: await admin[op](args) });
+			return Response.json({ ok: true, result: await admin[op](stamped(op, args) as never) });
 		} catch (e) {
 			return Response.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
 		}

@@ -26,6 +26,7 @@ import type { EvidencePack } from './agent/pack.js';
 import type { ModelCall } from './agent/model.js';
 import { reasonCase, runAgentReasoner, type ReasonerReport } from './agent/reasoner.js';
 import { checkNow, trackingOverview, type CheckReport, type CheckScope, type TrackingOverview } from './tracking.js';
+import { configList, configReset, configSet, type ConfigList, type ConfigWrite } from './admin-config.js';
 
 export type AgentAdvice = { inbox: number; kind: string; title: string; pairs: { i: number; keep: string; fold: string; verdict: string | null }[]; confidence: number | null; rationale: string | null; citations: string[]; searches: number; error: string | null };
 import { findRepresentation } from './identity.js';
@@ -151,6 +152,12 @@ export type AdminOps = {
 	// made due for the worker; what a provider's limits rule out is reported,
 	// not forced. `started`: this host began a pass for it at once.
 	trackingCheck(args: CheckScope): Promise<CheckReport>;
+	// The operator's settings (settings/registry.ts, admin-config.ts): one
+	// value for everyone, or an account's own where the key allows it. `by`
+	// is the host's (the CLI stamps its machine and user), never the page's.
+	configList(args: Record<string, never>): Promise<ConfigList>;
+	configSet(args: { key: string; value: unknown; account?: string; by: string }): Promise<ConfigWrite>;
+	configReset(args: { key: string; account?: string; by: string }): Promise<ConfigWrite>;
 	// Releases holding fewer tracks than their providers said, in a label's or
 	// an artist's catalogue (or everywhere), with the store ids a fill reads.
 	releaseStubs(args: { label?: string; artist?: string; limit?: number }): Promise<{ total: number; rows: ReleaseStub[] }>;
@@ -1104,5 +1111,8 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			if (report.queued > 0) hooks.kick?.();
 			return { ...report, started: report.queued > 0 && !!hooks.kick };
 		},
+		configList: () => configList(db),
+		configSet: (args) => configSet(db, args),
+		configReset: (args) => configReset(db, args),
 	};
 }
