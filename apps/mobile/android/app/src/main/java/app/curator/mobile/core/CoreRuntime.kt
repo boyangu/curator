@@ -7,6 +7,8 @@ import app.curator.mobile.diag.DiagLog
 import app.curator.mobile.model.WorkEvent
 import app.curator.mobile.model.parseWork
 import androidx.annotation.Keep
+import com.facebook.soloader.nativeloader.NativeLoader
+import com.facebook.soloader.nativeloader.SystemDelegate
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -224,6 +226,11 @@ class CoreRuntime(private val context: Context, private val onSession: (Account?
 		private const val SLICE_MS = 8
 
 		init {
+			// fbjni's own Java side loads its library through SoLoader's
+			// NativeLoader, which refuses until it is told how. Hermes reaches
+			// that side for Intl (the first `localeCompare`), and the refusal
+			// comes back as a C++ exception nothing catches: the process aborts.
+			NativeLoader.initIfUninitialized(SystemDelegate())
 			// fbjni first: its JNI_OnLoad keeps the VM, which Hermes needs for
 			// Unicode work and its finalizer thread.
 			for (lib in listOf("fbjni", "jsi", "hermesvm", "curator")) System.loadLibrary(lib)

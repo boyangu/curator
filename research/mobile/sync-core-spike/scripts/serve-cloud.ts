@@ -7,7 +7,7 @@
 //
 //   cd apps/cloud && npx tsx ../../research/mobile/sync-core-spike/scripts/serve-cloud.ts
 //       [--port 8799] [--name main] [--work c:/tmp/curator-mobile-spike] [--ops <ops.json>] [--feed <feed.json>]
-//       [--token-ttl 120]
+//       [--token-ttl 120] [--device-work] [--deezer <object id>=<Deezer id>] [--local-artists <object id>] [--spotify-grant]
 //
 // (Run from apps/cloud so tsx and the server's dependencies resolve there.)
 //
@@ -191,6 +191,24 @@ if (feed) {
 	// Oldest first, as a stream raises them.
 	for (const e of [...feed.events].sort((a, b) => b.ago - a.ago)) await raise(e);
 }
+// --device-work: the catalogue hands out store reading with its pages
+// ('catalog_device_work', off as shipped). --deezer <object id>=<Deezer id>
+// gives a watched artist a Deezer page beside its Spotify one.
+if (args.includes('--device-work')) await app.pg.query(`update curator.catalog_setting set value = 'true' where key = 'work.enabled' and scope = '*'`);
+const localArtists = arg('local-artists');
+// --spotify-grant: the account is connected to (the harness's fake) Spotify,
+// as its desktop would have left it, so a phone is handed a token and reads
+// Spotify with it. The token is the fake's: the real Spotify refuses it.
+if (args.includes('--spotify-grant')) {
+	const verifier = 'pkce-verifier-'.padEnd(64, 'x'), redirectUri = 'http://127.0.0.1:43821/spotify/callback';
+	await api.spotify.connect.mutate({ deviceId: master, code: app.spotify!.authorize(verifier, redirectUri), codeVerifier: verifier, redirectUri });
+}
+if (arg('deezer')) {
+	const [objectId, deezerId] = arg('deezer')!.split('=');
+	// Both pages with an address, as the readers leave them: the artist's header has two links to show.
+	await app.pg.query(`update curator.catalog_source_object set url = 'https://open.spotify.com/artist/' || provider_id where object_id = $1 and provider = 'spotify' and url is null`, [objectId]);
+	await app.pg.query(`insert into curator.catalog_source_object (object_id, provider, kind, provider_id, url) values ($1, 'deezer', 'artist', $2, $3) on conflict do nothing`, [objectId, deezerId, `https://www.deezer.com/artist/${deezerId}`]);
+}
 async function raiseLater(): Promise<{ raised: string | null; left: number }> {
 	const e = feed?.later.shift();
 	if (e) await raise(e);
@@ -259,6 +277,14 @@ const server = createServer((req, res) => {
 				// The API's node listener inflates a gzipped body (apps/cloud http.ts).
 				const sent = Buffer.concat(chunks);
 				const body = req.headers['content-encoding'] === 'gzip' ? gunzipSync(sent) : sent;
+				// --local-artists <object id>: every library artist a phone asks about
+				// is that catalogue artist (as a desktop's library import would have
+				// registered it), so any artist page opened there has a World side.
+				if (localArtists && url.includes('catalog.resolve')) {
+					for (const m of body.toString('utf8').matchAll(/"local:([0-9a-f-]{36})"/g)) {
+						await app.pg.query(`insert into curator.catalog_source_object (object_id, provider, kind, provider_id, url) values ($1, 'user', 'artist', $2, null) on conflict do nothing`, [localArtists, `local:${m[1]}`]);
+					}
+				}
 				const answer = await app.handler(new Request(`http://127.0.0.1:${port}${url}`, { method: req.method, headers, ...(req.method === 'POST' ? { body } : {}) }));
 				send(answer.status, Buffer.from(await answer.arrayBuffer()), answer.headers.get('content-type') ?? 'application/json', answer.headers.get('content-encoding'));
 			} catch (err) {

@@ -12,6 +12,9 @@ serialization = "1.9.0"
 # version Hermes's own Android build names.
 hermes = "260318099.0.8"
 fbjni = "0.7.0"
+# fbjni's own loader, named so the app can initialise it (core/CoreRuntime.kt):
+# the version fbjni brings at run time.
+nativeloader = "0.10.5"
 junit = "4.13.2"
 sqliteJdbc = "3.49.1.0"
 gson = "2.11.0"
@@ -31,6 +34,7 @@ coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-androi
 serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 hermes-android = { module = "com.facebook.hermes:hermes-android", version.ref = "hermes" }
 fbjni = { module = "com.facebook.fbjni:fbjni", version.ref = "fbjni" }
+nativeloader = { module = "com.facebook.soloader:nativeloader", version.ref = "nativeloader" }
 junit = { module = "junit:junit", version.ref = "junit" }
 # The list queries run against a real SQLite in unit tests (ListQueryTest).
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }

@@ -151,6 +151,7 @@ dependencies {
 		attributes { attribute(com.android.build.api.attributes.BuildTypeAttr.ATTRIBUTE, objects.named(com.android.build.api.attributes.BuildTypeAttr::class.java, "release")) }
 	}
 	implementation(libs.fbjni)
+	implementation(libs.nativeloader)
 	implementation(files(vendorDir.resolve("spotify/spotify-app-remote-release-0.8.0.aar")))
 	// App Remote maps its protocol with Gson.
 	implementation(libs.gson)
