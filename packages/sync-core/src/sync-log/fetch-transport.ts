@@ -23,8 +23,10 @@
 // Covered: sync and account, which is what a device needs to hold the
 // library, and the analysis catalogue's procedures (a phone reads waveform
 // peaks through `catalogue.lookup`; catalogue/peaks.ts), the Global Catalog
-// and its event stream (feed/device-feed.ts). The Spotify gateway is an
-// optional member of CloudTransport and is not here yet.
+// and its event stream (feed/device-feed.ts), and the Spotify gateway — a
+// phone holds no Spotify grant of its own for the Web API: it asks the cloud
+// for the account's token (`spotify.token`) when it reads Spotify for the
+// catalogue (apps/mobile js/work.ts).
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -96,6 +98,12 @@ import {
 	type PushInput,
 	type PushResult,
 	type RegisterDeviceInput,
+	type SpotifyAdoptInput,
+	type SpotifyConnectInput,
+	type SpotifyDisconnectInput,
+	type SpotifyGrantStatus,
+	type SpotifyTokenInput,
+	type SpotifyTokenResult,
 } from '@curator/protocol';
 import { CloudTransportError, type CloudSession, type CloudTransport } from './client.js';
 import type { SnapshotText } from './snapshot.js';
@@ -280,6 +288,14 @@ export function createFetchCloudTransport(deps: FetchTransportDeps): CloudTransp
 			connectSearch: (input: CatalogConnectSearchInput) => call<CatalogConnectSearchResult>('mutation', 'catalog.connectSearch', input),
 			tracks: (input: CatalogTracksInput) => call<CatalogTracksResult>('query', 'catalog.tracks', input),
 			workReport: (input: CatalogWorkReportInput) => call<CatalogWorkReportResult>('mutation', 'catalog.workReport', input),
+		},
+		// 'spotify_gateway'. `token` is a mutation: it may refresh the grant.
+		spotify: {
+			connect: (input: SpotifyConnectInput) => call<SpotifyGrantStatus>('mutation', 'spotify.connect', input),
+			adopt: (input: SpotifyAdoptInput) => call<SpotifyGrantStatus>('mutation', 'spotify.adopt', input),
+			status: () => call<SpotifyGrantStatus>('query', 'spotify.status'),
+			token: (input: SpotifyTokenInput) => call<SpotifyTokenResult>('mutation', 'spotify.token', input),
+			disconnect: (input: SpotifyDisconnectInput) => call<SpotifyGrantStatus>('mutation', 'spotify.disconnect', input),
 		},
 		feed: {
 			events: (input: FeedEventsInput) => call<FeedEventsResult>('query', 'feed.events', input),

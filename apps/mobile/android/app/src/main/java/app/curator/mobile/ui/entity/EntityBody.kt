@@ -70,9 +70,11 @@ import app.curator.mobile.model.releaseLabel
 import app.curator.mobile.model.sectionItems
 import app.curator.mobile.model.shownCount
 import app.curator.mobile.model.tabCounts
+import app.curator.mobile.model.workLine
 import app.curator.mobile.model.worldOffText
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.common.Cover
+import app.curator.mobile.ui.common.brandName
 import app.curator.mobile.ui.common.Icon
 import app.curator.mobile.ui.common.IconGlyph
 import app.curator.mobile.ui.common.KeyChip
@@ -305,6 +307,8 @@ private fun Status(page: EntityPageModel, h: EntityHeader, push: (Screen) -> Uni
 	} else {
 		val loaded = page.worldReleases
 		coverageText(loaded.sumOf { it.tracks.size }, loaded.size, h.world.releaseCount, page.hasMore)?.let { lines += it }
+		// Where the store reading for this page is, while there is one.
+		workLine(page.work, ::brandName)?.let { lines += it }
 	}
 	val candidates = if (page.scope == Scope.WORLD && h.world.reason == "ambiguous") h.world.candidates else emptyList()
 	if (lines.isEmpty() && !page.failed) return

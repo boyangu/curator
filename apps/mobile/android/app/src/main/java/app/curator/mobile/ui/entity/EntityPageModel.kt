@@ -2,7 +2,6 @@ package app.curator.mobile.ui.entity
 
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import app.curator.mobile.diag.DiagLog
@@ -14,18 +13,23 @@ import app.curator.mobile.model.Filters
 import app.curator.mobile.model.OwnedFilter
 import app.curator.mobile.model.OwnedTrack
 import app.curator.mobile.model.Pick
+import app.curator.mobile.model.RowPatch
 import app.curator.mobile.model.Scope
 import app.curator.mobile.model.EntitySection
 import app.curator.mobile.model.StreamingService
+import app.curator.mobile.model.WorkEvent
+import app.curator.mobile.model.WorkStatus
 import app.curator.mobile.model.WorldPage
 import app.curator.mobile.model.chartOff
 import app.curator.mobile.model.scopedReleases
 import app.curator.mobile.model.ownedReleases
 import app.curator.mobile.model.toggled
+import app.curator.mobile.model.merged
 import app.curator.mobile.model.worldReleases
 import app.curator.mobile.player.PlayerTrack
 import app.curator.mobile.ui.AppModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -49,6 +53,13 @@ sealed interface EntitySheet {
  * as long as its stack entry may come back, so back returns to the scope,
  * filters and pages it left. The header and World pages come from the core
  * (js/entity.ts); My Library from the library file (Library.ownedOf).
+ *
+ * While the page is on the screen the core reads the stores for it
+ * (js/work.ts: a release's missing tracklist, a track's BPM and key): the
+ * page says when it is in front ([shown], [hidden]), shows where the reading
+ * is ([work]), fills its rows with what was found, and reads its World pages
+ * again when the catalogue kept something. Everything here runs on the main
+ * thread.
  */
 @Stable
 class EntityPageModel(private val model: AppModel, private val asked: EntityRef) {
@@ -58,13 +69,31 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 	var failed by mutableStateOf(false)
 		private set
 
-	val pages = mutableStateListOf<WorldPage>()
+	/** The World pages read so far. One value, so a reload swaps every page in one go. */
+	var pages by mutableStateOf<List<WorldPage>>(emptyList())
+		private set
 	var loadingMore by mutableStateOf(false)
 		private set
 	var worldError by mutableStateOf<String?>(null)
 		private set
 	private var cursor: String? = null
-	private var worldDone = false
+	private var worldDone by mutableStateOf(false)
+	private var moreJob: Job? = null
+
+	/** Where the store reading for this page is, while it is in front; null when nothing is being read. */
+	var work by mutableStateOf<WorkStatus?>(null)
+		private set
+	// What the reading found for rows the page shows, by recording.
+	private var patches by mutableStateOf<Map<String, RowPatch>>(emptyMap())
+	private var showing = false
+	// This showing's number at the core (AppModel.watch); 0 while not watched.
+	private var watch = 0
+	private var watching: Job? = null
+	// The page was left with stores still being read for it: the reading ended there.
+	private var cutOff = false
+	private var reloading = false
+	private var reloadQueued = false
+	private var moreAfterReload = false
 
 	var owned by mutableStateOf<List<OwnedTrack>?>(null)
 		private set
@@ -110,6 +139,9 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 		}.onFailure { DiagLog.w("ui", "entity page failed", it) }.getOrNull()
 		if (h == null) { failed = true; return@launch }
 		header = h
+		// Before the first World page is asked for: a read of a page the core
+		// was not told is in front comes back with nothing to read at the stores.
+		watchNow()
 		loadOwned()
 		if (h.world.available && h.ref.catalogId != null) more()
 	}
@@ -125,39 +157,135 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 		val h = header ?: return
 		val id = h.ref.catalogId ?: return
 		if (loadingMore || worldDone) return
+		// The pages are being read again: the next one is asked for after the swap, from its cursor.
+		if (reloading) { moreAfterReload = true; return }
 		loadingMore = true
-		model.app.scope.launch(Dispatchers.Main) {
-			val r = runCatching {
-				model.ask(
-					"entityTracks",
-					"kind" to JsonPrimitive(h.ref.kind), "catalogId" to JsonPrimitive(id),
-					"cursor" to cursor.json(), "libraryId" to h.ref.libraryId.json(),
-				)?.let { json.decodeFromJsonElement<WorldPage>(it) }
-			}.onFailure { DiagLog.w("ui", "entity tracks failed", it) }.getOrNull()
+		moreJob = model.app.scope.launch(Dispatchers.Main) {
+			watching?.join()
+			val r = worldPage(h, id, cursor)
 			loadingMore = false
 			if (r == null) { worldError = "The catalogue did not answer."; return@launch }
 			worldError = null
-			pages += r
+			pages = pages + r
 			cursor = r.nextCursor
 			worldDone = r.nextCursor == null
-			// The page found the library artist the header could not: My Library has its files now.
-			val lib = r.libraryId
-			val cur = header
-			if (lib != null && cur != null && cur.ref.libraryId == null) {
-				header = cur.copy(ref = cur.ref.copy(libraryId = lib), owned = cur.owned.copy(filter = OwnedFilter(artistIds = listOf(lib))))
-				loadOwned()
+			adopt(r)
+		}
+	}
+
+	private suspend fun worldPage(h: EntityHeader, id: String, cursor: String?): WorldPage? = runCatching {
+		model.ask(
+			"entityTracks",
+			"kind" to JsonPrimitive(h.ref.kind), "catalogId" to JsonPrimitive(id),
+			"cursor" to cursor.json(), "libraryId" to h.ref.libraryId.json(),
+		)?.let { json.decodeFromJsonElement<WorldPage>(it) }
+	}.onFailure { DiagLog.w("ui", "entity tracks failed", it) }.getOrNull()
+
+	// The page found the library artist the header could not: My Library has its files now.
+	private suspend fun adopt(r: WorldPage) {
+		val lib = r.libraryId ?: return
+		val cur = header ?: return
+		if (cur.ref.libraryId != null) return
+		header = cur.copy(ref = cur.ref.copy(libraryId = lib), owned = cur.owned.copy(filter = OwnedFilter(artistIds = listOf(lib))))
+		loadOwned()
+	}
+
+	/**
+	 * Reads the World pages again, in place: as many as are loaded, from the
+	 * start, then all of them swapped in at once. The list is never emptied
+	 * and its rows keep their keys, so it stays where it is scrolled to while
+	 * rows change under it. While one reload runs, one more at most waits:
+	 * it reads everything the ones it stands for would have.
+	 */
+	private fun reload() {
+		if (reloading) { reloadQueued = true; return }
+		val h = header ?: return
+		val id = h.ref.catalogId ?: return
+		reloading = true
+		model.app.scope.launch(Dispatchers.Main) {
+			// A page on its way lands first: it is one of the pages to read again.
+			moreJob?.join()
+			watching?.join()
+			val want = pages.size
+			val fresh = ArrayList<WorldPage>(want)
+			var next: String? = null
+			var ok = want > 0
+			while (ok && fresh.size < want) {
+				val r = worldPage(h, id, next)
+				if (r == null) { ok = false; break }
+				fresh += r
+				next = r.nextCursor
+				if (next == null) break
+			}
+			// A reload that failed leaves the list as it was: the next change tries again.
+			if (ok) {
+				pages = fresh
+				cursor = next
+				worldDone = next == null
+				worldError = null
+				fresh.firstOrNull { it.libraryId != null }?.let { adopt(it) }
+			}
+			reloading = false
+			if (reloadQueued) {
+				reloadQueued = false
+				reload()
+			} else if (moreAfterReload) {
+				moreAfterReload = false
+				more()
 			}
 		}
+	}
+
+	// ── in front: the core reads the stores for this page ───────────────────
+
+	/** The page is on the screen (again): its first showing, back from a page over it, or the app back in front. */
+	fun shown() {
+		showing = true
+		watchNow()
+		// The reading the page's leaving ended starts again with a read of the
+		// page: only an answer to the page in front carries work.
+		if (cutOff && watch != 0) {
+			cutOff = false
+			reload()
+		}
+	}
+
+	/** The page left the screen, or the app did: the core stops reading for it. */
+	fun hidden() {
+		showing = false
+		if (watch == 0) return
+		cutOff = cutOff || work != null
+		watch = 0
+		work = null
+		model.unwatch(this)
+	}
+
+	// Tells the core this page is in front, under a new number, once there is
+	// a catalogue object to name; the page's reads wait on it ([watching]).
+	private fun watchNow() {
+		if (!showing || watch != 0) return
+		val id = header?.ref?.catalogId ?: return
+		val (n, told) = model.watch(this, id)
+		watch = n
+		watching = told
+	}
+
+	/** A `work` event of the core's: this showing's only (an earlier one's may still be on its way). */
+	fun onWork(e: WorkEvent) {
+		if (e.watch != watch) return
+		work = e.status.takeIf { it.phase != null }
+		patches = patches.merged(e.rows)
+		if (e.changed) reload()
 	}
 
 	val hasMore: Boolean get() = !worldDone && header?.world?.available == true
 
 	// ── what the list shows ─────────────────────────────────────────────────
 
-	val worldReleases: List<EntityRelease> get() = worldReleases(pages)
+	val worldReleases: List<EntityRelease> get() = worldReleases(pages, patches)
 	val ownedReleases: List<EntityRelease> get() = ownedReleases(owned ?: emptyList())
 
-	fun releases(): List<EntityRelease> = scopedReleases(scope, pages, owned, filters)
+	fun releases(): List<EntityRelease> = scopedReleases(scope, pages, owned, filters, patches)
 
 	fun tracks(releases: List<EntityRelease>): List<EntityRow> = releases.flatMap { it.tracks }
 

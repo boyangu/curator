@@ -310,6 +310,9 @@ importers:
 
   apps/mobile:
     dependencies:
+      '@curator/catalog-work':
+        specifier: workspace:*
+        version: link:../../packages/catalog-work
       '@curator/library-logic':
         specifier: workspace:*
         version: link:../../packages/library-logic
@@ -335,6 +338,9 @@ importers:
       typescript:
         specifier: ^5.6.3
         version: 5.9.3
+      vitest:
+        specifier: ^2.1.6
+        version: 2.1.9(@types/node@22.19.19)(jsdom@28.1.0)
 
   apps/spotify-player:
     devDependencies:

@@ -23,8 +23,8 @@ private val Context.viewStore by preferencesDataStore("view-state")
  * device by design (§3, §5): nothing here rides an op. The streaming service
  * too, as the desktop keeps its primary one (app_setting primary_streaming,
  * not an account setting): what a device can play through is its own.
- * Whether it updates itself, whether it sends its log, its waveform style and
- * grid, too: each phone's choice.
+ * Whether it updates itself, whether it sends its log, whether it reads the
+ * stores for a page, its waveform style and grid, too: each phone's choice.
  */
 class ViewState(private val context: Context) {
 	private val json = Json { ignoreUnknownKeys = true }
@@ -35,6 +35,7 @@ class ViewState(private val context: Context) {
 	private val streamingKey = stringPreferencesKey("streaming")
 	private val autoUpdateKey = booleanPreferencesKey("auto-update")
 	private val diagnosticsKey = booleanPreferencesKey("diagnostics")
+	private val readStoresKey = booleanPreferencesKey("read-stores")
 	private fun listKey(list: String) = stringPreferencesKey("list:$list")
 
 	@Serializable
@@ -101,6 +102,13 @@ class ViewState(private val context: Context) {
 
 	suspend fun setDiagnostics(on: Boolean) {
 		context.viewStore.edit { it[diagnosticsKey] = on }
+	}
+
+	/** Read the stores for the artist or label page in front (js/work.ts); on unless turned off. */
+	val readStores: Flow<Boolean> = context.viewStore.data.map { it[readStoresKey] ?: true }
+
+	suspend fun setReadStores(on: Boolean) {
+		context.viewStore.edit { it[readStoresKey] = on }
 	}
 
 	/** What was seen of a library that is gone from this phone; the phone's own choices stay. */

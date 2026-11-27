@@ -69,8 +69,8 @@ import kotlinx.coroutines.withContext
 /**
  * This phone's settings: the account, the streaming service the library's own
  * files play from, each service shown with how many of those files it has
- * (their recordings' claims there), how waveforms look, how the app updates
- * itself, and whether it sends its log.
+ * (their recordings' claims there), whether it reads the stores for a page,
+ * how waveforms look, how the app updates itself, and whether it sends its log.
  */
 @Composable
 fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
@@ -105,11 +105,23 @@ fun SettingsPage(model: AppModel, back: () -> Unit, signIn: () -> Unit) {
 		Column(Modifier.fillMaxWidth().selectableGroup().padding(vertical = 4.dp)) {
 			for (s in StreamingService.entries) ServiceRow(s, s == picked, coverage) { model.setStreaming(s) }
 		}
+		Catalogue(model)
 		Waveform(model)
 		Updates(model)
 		Diagnostics(model)
 		Spacer(Modifier.height(24.dp))
 	}
+}
+
+/** Whether this phone reads the stores for the artist or label page in front (js/work.ts). */
+@Composable
+private fun Catalogue(model: AppModel) {
+	val on by model.readStores.collectAsState()
+	Column(Modifier.fillMaxWidth().topLine().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+		BasicText("Catalogue", Modifier.semantics { heading() }, style = T.label)
+		BasicText("Fills in missing tracklists, BPM and key while you look at an artist or label", style = T.secondary)
+	}
+	SwitchRow("Read stores for pages", on, Modifier.fillMaxWidth().heightIn(min = 52.dp)) { model.setReadStores(!on) }
 }
 
 /** How every waveform on this phone looks: the desktop's styles, and the big wave's grid. */

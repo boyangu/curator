@@ -1,10 +1,12 @@
 package app.curator.mobile.ui
 
 import android.os.Build
+import android.webkit.WebView
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import app.curator.mobile.CuratorApp
+import app.curator.mobile.Stage
 import app.curator.mobile.data.Library
 import app.curator.mobile.data.ListQuery
 import app.curator.mobile.data.Lists
@@ -29,10 +31,13 @@ import app.curator.mobile.ui.track.Pictures
 import app.curator.mobile.update.Updater
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -109,6 +114,13 @@ class AppModel(val app: CuratorApp) {
 		app.scope.launch { viewState.setDiagnostics(on) }
 	}
 
+	/** Whether this phone reads the stores for the artist or label page in front (js/work.ts). */
+	val readStores: StateFlow<Boolean> = viewState.readStores.stateIn(app.scope, SharingStarted.Eagerly, true)
+
+	fun setReadStores(on: Boolean) {
+		app.scope.launch { viewState.setReadStores(on) }
+	}
+
 	/** Sends this phone's log while its owner allows it. */
 	val logs = Uploader(
 		app.scope,
@@ -173,6 +185,18 @@ class AppModel(val app: CuratorApp) {
 			val kept = runCatching { json.decodeFromString<Lists>(listsFile.readText()) }.getOrNull()
 			_lists.compareAndSet(null, kept)
 		}
+		// The core reads stores as this phone's switch says, once it is up and
+		// at each change; Beatport only where there is a WebView to read it in.
+		app.scope.launch {
+			app.stage.first { it != Stage.Starting }
+			viewState.readStores.distinctUntilChanged().collect { on ->
+				val beatport = runCatching { WebView.getCurrentWebViewPackage() != null }.getOrDefault(false)
+				runCatching { ask("workSettings", "enabled" to JsonPrimitive(on), "beatport" to JsonPrimitive(beatport)) }
+					.onSuccess { DiagLog.d("ui", "workSettings enabled=$on beatport=$beatport") }
+					.onFailure { DiagLog.w("ui", "workSettings failed", it) }
+			}
+		}
+		app.scope.launch(Dispatchers.Main) { app.core.work.collect { e -> front?.onWork(e) } }
 		app.scope.launch {
 			app.db.collectLatest { db ->
 				if (db == null) return@collectLatest
@@ -190,6 +214,38 @@ class AppModel(val app: CuratorApp) {
 				}
 			}
 		}
+	}
+
+	// ── the page in front ──
+	// The core reads the stores for one artist or label page at a time: the
+	// one it was last told is in front (`entityWatch`), under a number of that
+	// showing which its `work` events carry back. All of it on the main
+	// thread, and every call from there in turn: a page's leaving must never
+	// reach the core after the next page's arrival.
+	private var front: EntityPageModel? = null
+	private var watches = 0
+
+	/** [page] is on the screen: the core is told. Answers the showing's number and the call, to wait on before the page's first read. */
+	fun watch(page: EntityPageModel, catalogId: String): Pair<Int, Job> {
+		front = page
+		val n = ++watches
+		return n to app.scope.launch(Dispatchers.Main) {
+			runCatching { ask("entityWatch", "catalogId" to JsonPrimitive(catalogId), "watch" to JsonPrimitive(n)) }
+				.onSuccess { DiagLog.d("ui", "entityWatch $n: in front") }
+				.onFailure { DiagLog.w("ui", "entityWatch failed", it) }
+		}
+	}
+
+	/** [page] left the screen. Nothing to say when another page took its place meanwhile (a page pushed over it is shown before it goes). */
+	fun unwatch(page: EntityPageModel) {
+		if (front !== page) return
+		front = null
+		app.scope.launch(Dispatchers.Main) {
+			runCatching { ask("entityWatch", "catalogId" to JsonNull, "watch" to JsonPrimitive(0)) }
+				.onSuccess { DiagLog.d("ui", "entityWatch: no page in front") }
+				.onFailure { DiagLog.w("ui", "entityWatch failed", it) }
+		}
+		app.core.stores.release()
 	}
 
 	// Setting writes still on their way to the core: while one is, a reload

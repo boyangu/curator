@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
+import app.curator.mobile.core.FrontWindow
 import app.curator.mobile.ui.CuratorUi
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonPrimitive
@@ -34,9 +35,28 @@ class MainActivity : ComponentActivity() {
 		(application as CuratorApp).model.logs.onForeground()
 	}
 
+	// The window the hidden Beatport reader works in (core/StoreFetch.kt) is
+	// this one's, while it is in front.
+	override fun onResume() {
+		super.onResume()
+		FrontWindow.resumed(this)
+	}
+
+	override fun onPause() {
+		FrontWindow.gone(this)
+		super.onPause()
+	}
+
+	override fun onDestroy() {
+		FrontWindow.gone(this)
+		super.onDestroy()
+	}
+
 	override fun onStop() {
 		super.onStop()
 		setActive(false)
+		// Off the screen: the reader's WebView goes with it.
+		(application as CuratorApp).core.stores.release()
 		(application as CuratorApp).model.player.attach(null, null)
 		(application as CuratorApp).model.updater.onBackground()
 		(application as CuratorApp).model.logs.onBackground()

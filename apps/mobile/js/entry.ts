@@ -41,6 +41,8 @@ import { createStorageDownload, StorageGoneError } from '@curator/sync-core/sync
 import { host } from './shim/host.js';
 import { trackPictures } from './track-pictures.js';
 import { entityFollow, entityPage, entityTracks, type EntityDeps, type PageAsk } from './entity.js';
+import { createStoreFetch, type StoreAnswer } from './shim/store-fetch.js';
+import { createPhoneWork, type PhoneWork } from './work.js';
 import type Database from 'better-sqlite3';
 
 type BootConfig = {
@@ -391,6 +393,13 @@ const CALLS: Record<string, (arg: Record<string, unknown>) => unknown> = {
 	// ── artist and label pages (js/entity.ts) ──
 	entityPage: (a) => entityPage(entityDeps(), a as unknown as PageAsk),
 	entityTracks: (a) => entityTracks(entityDeps(), a as unknown as Parameters<typeof entityTracks>[1]),
+	// ── store reading for the page in front (js/work.ts) ──
+	// The page shown (catalogId null: none — left, or the app in the background).
+	entityWatch: (a) => phoneWork().watch((a['catalogId'] as string | null) ?? null, (a['watch'] as number) ?? 0),
+	// The user's switch, and whether Kotlin's hidden WebView can read Beatport.
+	workSettings: (a) => phoneWork().settings({ enabled: a['enabled'] === true, beatport: a['beatport'] === true }),
+	// Kotlin's answer to a `fetch` event (core/StoreFetch.kt).
+	fetchDone: (a) => storeFetch.done(a as unknown as StoreAnswer),
 	// The account's watch list only: never a follow at Spotify (2026-11-26).
 	entityFollow: async (a) => {
 		const r = await entityFollow(entityDeps(), a as unknown as Parameters<typeof entityFollow>[1]);
@@ -408,7 +417,46 @@ function entityDeps(): EntityDeps {
 			: features === null ? { reason: 'server_off' }
 				: !features.includes('global_catalog') || !transport.catalog ? { reason: 'old_server' }
 					: { client: transport.catalog, deviceId: client.deviceId(), pages: features.includes('catalog_pages') };
-	return { raw, catalog, now: Date.now() };
+	return { raw, catalog, work: phoneWork(), now: Date.now() };
+}
+
+// ── store reading for the page in front ──────────────────────────────────────
+
+const storeFetch = createStoreFetch(emit);
+
+// The account's Spotify token from the cloud's gateway, kept until a minute
+// before it ends. Null: the account has no grant to read with.
+let spotifyToken: { value: string; until: number } | null = null;
+async function gatewayToken(): Promise<string | null> {
+	if (spotifyToken && spotifyToken.until > Date.now()) return spotifyToken.value;
+	const { client, transport } = lib();
+	if (transport.session() === null || !transport.spotify || !client.serverFeatures()?.includes('spotify_gateway')) return null;
+	try {
+		const t = await transport.spotify.token({ deviceId: client.deviceId() });
+		spotifyToken = { value: t.accessToken, until: t.expiresAt - 60_000 };
+		return t.accessToken;
+	} catch (e) {
+		if (e instanceof CloudTransportError && (e.kind === 'spotify_not_connected' || e.kind === 'spotify_reconnect_required')) return null;
+		throw e;
+	}
+}
+
+let work: PhoneWork | null = null;
+function phoneWork(): PhoneWork {
+	work ??= createPhoneWork({
+		emit: (e) => emit(e),
+		offered: () => {
+			const { client, transport } = lib();
+			return transport.session() !== null && !!transport.catalog && (client.serverFeatures()?.includes('catalog_device_work') ?? false);
+		},
+		report: (input) => {
+			const { client, transport } = lib();
+			return transport.catalog!.workReport({ deviceId: client.deviceId(), ...input });
+		},
+		spotifyToken: gatewayToken,
+		fetch: (via) => storeFetch.via(via),
+	});
+	return work;
 }
 
 // A refused sign-in is its code (Kotlin words it); anything else says where.

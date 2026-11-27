@@ -19,6 +19,7 @@ function run(cmd, args) {
 }
 
 run('pnpm', ['exec', 'tsc', '--noEmit']);
+run('pnpm', ['exec', 'vitest', 'run', '--dir', 'js']);
 run(process.execPath, [join(root, 'scripts', 'fetch-vendor.mjs')]);
 run(process.execPath, [join(root, 'scripts', 'bundle.mjs')]);
 run(process.execPath, [join(root, 'scripts', 'gradle.mjs'), 'testDebugUnitTest', 'assembleRelease', ...process.argv.slice(2)]);

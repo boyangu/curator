@@ -10,9 +10,11 @@
     "test": "node scripts/gradle.mjs testDebugUnitTest",
     "check": "node scripts/check.mjs",
     "typecheck": "tsc --noEmit",
+    "test:js": "vitest run --dir js",
     "device": "node scripts/run.mjs"
   },
   "dependencies": {
+    "@curator/catalog-work": "workspace:*",
     "@curator/library-logic": "workspace:*",
     "@curator/protocol": "workspace:*",
     "@curator/shared": "workspace:*",
@@ -22,6 +24,7 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "esbuild": "^0.28.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.6"
   }
 }

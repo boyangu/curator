@@ -86,14 +86,14 @@ class BeatportWebView(private val activity: Activity) {
 			page = when {
 				gone -> {
 					dispose()
-					Page(false, ms, 0, challenged, status, title, "the page's renderer went away", null)
+					Page(false, ms, 0, challenged, status, title, RENDERER_GONE, null)
 				}
 				failed != null -> Page(false, ms, 0, challenged, status, title, failed, null)
 				// Before asking the page anything: a page that stops answering
 				// must not hold the run past its time.
 				ms >= timeoutMs -> {
 					web.stopLoading()
-					Page(false, ms, 0, challenged, status, title, if (challenged) "challenge not passed" else "no page data in time", null)
+					Page(false, ms, 0, challenged, status, title, if (challenged) NOT_PASSED else NO_DATA, null)
 				}
 				else -> {
 					val state = runCatching { Json.parseToJsonElement(eval(web, STATE_JS) ?: "null").jsonObject }.getOrNull()
@@ -114,7 +114,7 @@ class BeatportWebView(private val activity: Activity) {
 						text != null -> Page(true, SystemClock.elapsedRealtime() - t0, text.encodeToByteArray().size, challenged, status, title, null, text)
 						ms >= timeoutMs -> {
 							web.stopLoading()
-							Page(false, ms, 0, challenged, status, title, if (challenged) "challenge not passed" else "no page data in time", null)
+							Page(false, ms, 0, challenged, status, title, if (challenged) NOT_PASSED else NO_DATA, null)
 						}
 						else -> null
 					}
@@ -122,6 +122,19 @@ class BeatportWebView(private val activity: Activity) {
 			}
 		}
 		page
+	}
+
+	/**
+	 * Gives up on the page loading now (main thread). What it brought so far
+	 * is marked as read: the next [read] would otherwise find this page's data
+	 * still in the document, before its own page replaced it, and take it.
+	 */
+	fun stop() {
+		val web = view ?: return
+		runCatching {
+			web.stopLoading()
+			web.evaluateJavascript("window.__curatorRead = 1", null)
+		}
 	}
 
 	/** Takes the WebView off the window and ends it; [read] makes a new one after. */
@@ -222,6 +235,11 @@ class BeatportWebView(private val activity: Activity) {
 		// taking the data copies a megabyte or so of escaped JSON out of it.
 		private const val EVAL_WAIT_MS = 3_000L
 		private const val TEXT_WAIT_MS = 10_000L
+
+		// Why a page gave no data ([Page.error]), for who answers by it (core/StoreFetch).
+		const val RENDERER_GONE = "the page's renderer went away"
+		const val NOT_PASSED = "challenge not passed"
+		const val NO_DATA = "no page data in time"
 
 		/** Whether a main-frame navigation may go to this address: Beatport's own, over TLS. */
 		fun isBeatport(scheme: String?, host: String?): Boolean =

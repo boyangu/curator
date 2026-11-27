@@ -81,6 +81,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import app.curator.mobile.model.EntityHeader
 import app.curator.mobile.model.EntityRef
 import app.curator.mobile.model.EntityWorld
@@ -118,6 +119,12 @@ fun EntityScreen(model: AppModel, ref: EntityRef, bottom: @Composable () -> Unit
 	val key = rememberSaveable { UUID.randomUUID().toString() }
 	val page = remember(key) { model.entityPage(key, ref) }
 	LaunchedEffect(page) { page.start() }
+	// In front while this entry is composed and the app is on the screen: the
+	// core reads the stores for the page meanwhile, and stops when either ends.
+	LifecycleStartEffect(page) {
+		page.shown()
+		onStopOrDispose { page.hidden() }
+	}
 	val header = page.header ?: EntityHeader(ref = ref, world = EntityWorld(available = false, reason = if (page.failed) "" else "pending"))
 
 	val list = rememberLazyListState()

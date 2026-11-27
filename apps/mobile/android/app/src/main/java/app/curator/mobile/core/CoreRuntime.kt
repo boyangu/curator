@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import app.curator.mobile.diag.DiagLog
+import app.curator.mobile.model.WorkEvent
+import app.curator.mobile.model.parseWork
 import androidx.annotation.Keep
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.BufferOverflow
@@ -19,6 +21,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayOutputStream
@@ -38,7 +41,9 @@ import java.util.concurrent.Executors
  * or an HTTP answer never waits behind a long pull for more than a slice.
  *
  * HTTP is the platform's (TLS, transparent gzip) on a small pool; answers go
- * back to the core's thread.
+ * back to the core's thread. The catalogue readers' HTTP to the stores is its
+ * own seam ([StoreFetch]): headers back, calls that can be cut, Beatport
+ * through a WebView.
  */
 class CoreRuntime(private val context: Context, private val onSession: (Account?) -> Unit) {
 	private val thread = HandlerThread("curator-core").apply { start() }
@@ -61,6 +66,13 @@ class CoreRuntime(private val context: Context, private val onSession: (Account?
 	private val _feed = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 	/** feed.db changed: the feed reloads. */
 	val feed: SharedFlow<Unit> = _feed
+
+	private val _work = MutableSharedFlow<WorkEvent>(extraBufferCapacity = 256)
+	/** The store reading for the artist or label page in front: where it is and what it found (js/work.ts). */
+	val work: SharedFlow<WorkEvent> = _work
+
+	/** The stores' side of that reading: the HTTP the core's readers ask for (js/shim/store-fetch.ts). */
+	val stores = StoreFetch { tell("fetchDone", it) }
 
 	private val runner = Runnable { runLoop() }
 
@@ -85,6 +97,14 @@ class CoreRuntime(private val context: Context, private val onSession: (Account?
 			runLoop()
 		}
 		return answer.await()
+	}
+
+	// A call nobody waits on: its `result` finds no one and is dropped (onEmit).
+	private fun tell(name: String, arg: JsonObject) {
+		handler.post {
+			nativeDispatch(name, arg.toString(), nextCall++)
+			runLoop()
+		}
 	}
 
 	private fun runLoop() {
@@ -122,6 +142,9 @@ class CoreRuntime(private val context: Context, private val onSession: (Account?
 			"log" -> (e["record"] as? JsonObject)?.let(DiagLog::record)
 			"feed" -> _feed.tryEmit(Unit)
 			"applied" -> _applied.tryEmit(Applied(tracks = e["tracks"]?.jsonPrimitive?.int ?: 0, playlists = e["playlists"]?.jsonPrimitive?.int ?: 0))
+			"fetch" -> stores.fetch(e)
+			"fetchAbort" -> stores.abort((e["id"] as? JsonPrimitive)?.intOrNull ?: return)
+			"work" -> parseWork(e)?.let(_work::tryEmit)
 		}
 	}
 

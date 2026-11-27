@@ -24,6 +24,7 @@ import { searchFold, type EntityChip, type EntityHeader, type EntityKind, type E
 import { applyBrowse, worldPage, worldProbes } from '@curator/sync-core/entity/catalog-page';
 import { writeRefs } from '@curator/sync-core/entity/catalog-ref';
 import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
+import type { PhoneWork } from './work.js';
 
 export type EntityCatalog = Pick<CloudService['catalog'], 'resolve' | 'search' | 'browse' | 'tracks' | 'watch' | 'unwatch'>;
 
@@ -31,6 +32,9 @@ export type EntityDeps = {
 	raw: Database.Database;
 	// Null: no catalogue to ask (signed out, or a server without one), with why.
 	catalog: { client: EntityCatalog; deviceId: string; pages: boolean } | { reason: EntityWorldReason };
+	// The phone's store reading for the page in front (js/work.ts): asked what
+	// to say with a page read, and handed the work the answer carried.
+	work?: Pick<PhoneWork, 'ready' | 'profile' | 'read' | 'patchOf'>;
 	now: number;
 };
 
@@ -188,9 +192,18 @@ export type EntityTracksAnswer = Omit<EntityTracksPage, 'template'> & {
 export async function entityTracks(d: EntityDeps, ask: { kind: PageKind; catalogId: string; cursor?: string | null; libraryId?: string | null }): Promise<EntityTracksAnswer> {
 	if ('reason' in d.catalog) throw new Error(d.catalog.reason);
 	const c = d.catalog;
-	const result = await c.client.tracks({ deviceId: c.deviceId, id: ask.catalogId, ...(ask.cursor ? { cursor: ask.cursor } : {}) });
+	await d.work?.ready();
+	// What this phone can read now goes with the read, when it is the page in
+	// front; the answer's work is the engine's, not the page's.
+	const profile = d.work?.profile(ask.catalogId) ?? null;
+	const { work, ...result } = await c.client.tracks({ deviceId: c.deviceId, id: ask.catalogId, ...(ask.cursor ? { cursor: ask.cursor } : {}), ...(profile ? { profile } : {}) });
+	d.work?.read(result.object.id, result, work);
 	const probes = worldProbes(result);
-	const page = worldPage(result, probes, matchLibraryTracks(d.raw, probes));
+	// A row the work already found facts for shows them before the catalogue does.
+	const page = worldPage(result, probes, matchLibraryTracks(d.raw, probes), (id) => {
+		const p = d.work?.patchOf(id);
+		return p ? { recordingId: p.recordingId, ...(p.bpm ? { bpm: p.bpm } : {}), ...(p.keyCamelot ? { keyCamelot: p.keyCamelot } : {}), ...(p.genre ? { genre: p.genre } : {}), ...(p.label ? { label: p.label } : {}), ...(p.spotifyId ? { streamIds: { spotify: p.spotifyId } } : {}) } : undefined;
+	});
 	let libraryId: string | null = null;
 	if (ask.kind === 'artist' && !ask.libraryId) {
 		libraryId = artistAmongOwned(d.raw, page, result.object.id);

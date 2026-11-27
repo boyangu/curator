@@ -166,9 +166,13 @@ data class EntityRelease(
 
 enum class Scope { OWNED, WORLD }
 
-/** The catalogue's releases with their tracklists, in the order the pages came. */
-fun worldReleases(pages: List<WorldPage>): List<EntityRelease> {
-	val tracksOf = pages.flatMap { it.tracks }.groupBy { it.releaseId }
+/**
+ * The catalogue's releases with their tracklists, in the order the pages came.
+ * [patches]: what the page's store reading found since, by recording
+ * (model PageWork): shown at once, before the catalogue says it too.
+ */
+fun worldReleases(pages: List<WorldPage>, patches: Map<String, RowPatch> = emptyMap()): List<EntityRelease> {
+	val tracksOf = pages.flatMap { it.tracks }.map { it.filled(patches[it.recordingId]) }.groupBy { it.releaseId }
 	return pages.flatMap { it.albums }.distinctBy { it.id }.map { a ->
 		EntityRelease(
 			id = a.id, title = a.title, artists = a.artists, date = a.date, label = a.label,
@@ -220,8 +224,8 @@ fun ownedReleases(tracks: List<OwnedTrack>): List<EntityRelease> =
 	}.sortedByDescending { it.date ?: "" }
 
 /** What the list holds in a scope, the filters applied: the catalogue's releases, or those holding an owned track. */
-fun scopedReleases(scope: Scope, pages: List<WorldPage>, owned: List<OwnedTrack>?, filters: Filters): List<EntityRelease> =
-	(if (scope == Scope.WORLD) worldReleases(pages) else ownedReleases(owned ?: emptyList())).filter { it.matches(filters) }
+fun scopedReleases(scope: Scope, pages: List<WorldPage>, owned: List<OwnedTrack>?, filters: Filters, patches: Map<String, RowPatch> = emptyMap()): List<EntityRelease> =
+	(if (scope == Scope.WORLD) worldReleases(pages, patches) else ownedReleases(owned ?: emptyList())).filter { it.matches(filters) }
 
 /** The Releases and Tracks tabs' counts: the catalogue's in World, the library's own in My Library (null until read). */
 fun tabCounts(scope: Scope, world: EntityWorld, owned: List<OwnedTrack>?): Pair<Int?, Int?> =
