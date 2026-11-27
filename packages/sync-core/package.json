@@ -16,7 +16,7 @@
     "@curator/protocol": "workspace:*",
     "@curator/shared": "workspace:*",
     "better-sqlite3": "^12.10.0",
-    "drizzle-orm": "^0.36.4"
+    "drizzle-orm": "^0.45.4"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
