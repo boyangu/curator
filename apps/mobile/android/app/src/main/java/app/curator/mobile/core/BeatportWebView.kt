@@ -22,6 +22,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
@@ -88,15 +89,21 @@ class BeatportWebView(private val activity: Activity) {
 					Page(false, ms, 0, challenged, status, title, "the page's renderer went away", null)
 				}
 				failed != null -> Page(false, ms, 0, challenged, status, title, failed, null)
+				// Before asking the page anything: a page that stops answering
+				// must not hold the run past its time.
+				ms >= timeoutMs -> {
+					web.stopLoading()
+					Page(false, ms, 0, challenged, status, title, if (challenged) "challenge not passed" else "no page data in time", null)
+				}
 				else -> {
-					val state = runCatching { Json.parseToJsonElement(eval(web, STATE_JS)).jsonObject }.getOrNull()
+					val state = runCatching { Json.parseToJsonElement(eval(web, STATE_JS) ?: "null").jsonObject }.getOrNull()
 					var text: String? = null
 					if (state != null && !state["seen"]!!.jsonPrimitive.boolean) {
 						title = state["title"]!!.jsonPrimitive.content
 						if (state["cf"]!!.jsonPrimitive.boolean) challenged = true
 						// Parsed whole: until then the script's text may still be arriving.
 						if (state["next"]!!.jsonPrimitive.int >= 0 && state["ready"]!!.jsonPrimitive.content != "loading") {
-							val raw = eval(web, TEXT_JS)
+							val raw = eval(web, TEXT_JS, TEXT_WAIT_MS) ?: "null"
 							// Off the main thread: a page's data is a megabyte or so of escaped JSON.
 							text = withContext(Dispatchers.Default) {
 								runCatching { (Json.parseToJsonElement(raw) as? JsonPrimitive)?.takeIf { it.isString }?.content }.getOrNull()
@@ -178,8 +185,13 @@ class BeatportWebView(private val activity: Activity) {
 		runCatching { web.destroy() }
 	}
 
-	private suspend fun eval(web: WebView, js: String): String = suspendCancellableCoroutine { cont ->
-		web.evaluateJavascript(js) { if (cont.isActive) cont.resume(it ?: "null") }
+	// One question to the page, given up after [waitMs]: a renderer busy with a
+	// heavy page (or hung) may never call back, and the read's own deadline is
+	// only looked at between questions. Null: no answer in time.
+	private suspend fun eval(web: WebView, js: String, waitMs: Long = EVAL_WAIT_MS): String? = withTimeoutOrNull(waitMs) {
+		suspendCancellableCoroutine { cont ->
+			web.evaluateJavascript(js) { if (cont.isActive) cont.resume(it ?: "null") }
+		}
 	}
 
 	private inner class Client : WebViewClient() {
@@ -206,6 +218,11 @@ class BeatportWebView(private val activity: Activity) {
 	}
 
 	companion object {
+		// How long one question to the page may take: the state check is tiny;
+		// taking the data copies a megabyte or so of escaped JSON out of it.
+		private const val EVAL_WAIT_MS = 3_000L
+		private const val TEXT_WAIT_MS = 10_000L
+
 		/** Whether a main-frame navigation may go to this address: Beatport's own, over TLS. */
 		fun isBeatport(scheme: String?, host: String?): Boolean =
 			scheme == "https" && host != null && (host == "beatport.com" || host.endsWith(".beatport.com"))
