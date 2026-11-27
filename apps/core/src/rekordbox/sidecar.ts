@@ -232,6 +232,24 @@ export type CreateOp =
 		name: string;
 	};
 
+// A MyTag group folder (DjmdMyTag, Attribute=1): Genre / Components / ….
+export interface RekordboxMyTagGroup {
+	id: string;
+	name: string;
+}
+
+// Find or create the DjmdMyTag for a Curator-made tag (mytag-phase.ts): a live
+// same-name tag is reused, a tombstoned one revived, else a new row goes into
+// group_id (or the group called group_name). Its own write session ahead of
+// the update push, so the tags pass references a committed id.
+export interface MyTagEnsureOp {
+	kind: 'mytag_ensure';
+	curator_tag_id: string;
+	name: string;
+	group_id: string | null;
+	group_name: string;
+}
+
 // What verify reads back for a create op — built from the write results
 // (the ids only exist after the writer ran).
 export type CreatedVerifyOp =
@@ -240,10 +258,12 @@ export type CreatedVerifyOp =
 
 // Per-op result shape from writer.apply_batch.
 export interface WriteOpResult {
-	kind: WriteOp['kind'] | CreateOp['kind'];
-	// content_create / playlist_create results.
+	kind: WriteOp['kind'] | CreateOp['kind'] | MyTagEnsureOp['kind'];
+	// content_create / playlist_create / mytag_ensure results.
 	curator_track_id?: string;
 	curator_playlist_id?: string;
+	curator_tag_id?: string;
+	rb_tag_id?: string;
 	created?: boolean;
 	revived?: boolean;
 	anlz_copied?: boolean;
@@ -295,7 +315,7 @@ export interface WriteOpResult {
 // attribution so the failure toast can say WHICH track — the original
 // lone-surrogate incident surfaced only as an opaque whole-sync rollback.
 export interface WriteFailure {
-	kind: WriteOp['kind'] | CreateOp['kind'];
+	kind: WriteOp['kind'] | CreateOp['kind'] | MyTagEnsureOp['kind'];
 	// rb_content_id | rb_playlist_id, whichever the op targeted.
 	target: string;
 	// Curator-side track title / playlist name, when the target could be
@@ -312,7 +332,7 @@ export interface CommitResult {
 }
 
 export interface VerifyFailure {
-	kind: WriteOp['kind'] | CreateOp['kind'];
+	kind: WriteOp['kind'] | CreateOp['kind'] | MyTagEnsureOp['kind'];
 	target: string | null;
 	// Human-facing label for the target (e.g. a playlist's name). Null for
 	// track-scoped ops; the UI falls back to `target`.
@@ -703,7 +723,7 @@ export class RekordboxSidecar extends EventEmitter {
 		return this.sendRequest('open_for_write', params as unknown as Record<string, unknown>);
 	}
 
-	applyWriteBatch(ops: ReadonlyArray<WriteOp | CreateOp>, onProgress?: WriteProgress): Promise<{ results: WriteOpResult[] }> {
+	applyWriteBatch(ops: ReadonlyArray<WriteOp | CreateOp | MyTagEnsureOp>, onProgress?: WriteProgress): Promise<{ results: WriteOpResult[] }> {
 		return this.sendRequest('apply_write_batch', { ops }, onProgress);
 	}
 
@@ -742,6 +762,12 @@ export class RekordboxSidecar extends EventEmitter {
 	// writer can actually re-point (see sweepStaleRelations).
 	listStaleRelations(dbPath: string, key: string | undefined): Promise<{ stale: StaleRelation[] }> {
 		return this.sendRequest('list_stale_relations', { dbPath, key });
+	}
+
+	// Read-only: the live MyTag group folders in rekordbox's order — Settings'
+	// choice of where the push creates Curator-made tags (mytag-phase.ts).
+	listMyTagGroups(dbPath: string, key: string | undefined): Promise<{ groups: RekordboxMyTagGroup[] }> {
+		return this.sendRequest('list_mytag_groups', { dbPath, key });
 	}
 
 	async shutdown(): Promise<void> {

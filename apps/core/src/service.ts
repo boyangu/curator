@@ -204,7 +204,7 @@ import { applyPendingFeedDecisionsAsync, backfillFeedDecisionsAsync, createFeedD
 import type { LibraryMembershipLookup } from '@curator/sync-core/feed/filters';
 import type { FeedAction, FeedActionResult, FeedItem, FeedItemActivity, FeedItemDetail, FeedMembershipTier, LibraryTier, FeedPage, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, EnrichmentResult } from '@curator/sync-core/feed/types';
 import { createCatalogWorker, type CatalogWorker, type CatalogWorkerStatus } from './catalog-worker/service.js';
-import { checkedTrackers, readCadence, readReadSources, writeReadCadence, writeReadSources, type CatalogReadCadence, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
+import { checkedTrackers, readCloudConfig, readReadSources, writeCloudConfig, writeReadSources, type CatalogReadSources, type CatalogReadSourcesPatch } from './catalog-worker/settings.js';
 import { createFactsUp } from './catalog-client/facts-up.js';
 import { createAudienceUp } from './catalog-client/audience-up.js';
 
@@ -301,8 +301,9 @@ import { RekordboxSidecar } from './rekordbox/sidecar.js';
 import { RekordboxImporter, type RekordboxFlags, type RekordboxImportEvent, type ImportTotals } from './rekordbox/importer.js';
 import { RekordboxExporter, type ExportFlags, type ExportResult, type RekordboxExportEvent, rekordboxDirOf } from './rekordbox/exporter.js';
 import { planCreateForTracks, planCreatePhase } from './rekordbox/create-phase.js';
+import { DEFAULT_MYTAG_GROUP_NAME, pickMyTagGroup, type MyTagGroupChoice } from './rekordbox/mytag-phase.js';
 import { listOpenConflicts, applyConflictResolutions } from './rekordbox/sync-pipeline.js';
-import type { BackupSummary, ClearBackupsResult, CuePaletteEntry } from './rekordbox/sidecar.js';
+import type { BackupSummary, ClearBackupsResult, CuePaletteEntry, RekordboxMyTagGroup } from './rekordbox/sidecar.js';
 import { defaultRekordboxDbPath, defaultRekordboxSettingsDir } from './rekordbox/paths.js';
 import { createBackupService } from './backup/service.js';
 import { createInlineBackupHost } from './backup/host.js';
@@ -1243,6 +1244,13 @@ export interface CoreService {
 	}): Promise<ExportResult>;
 	subscribeRekordboxExportEvents(cb: (e: RekordboxExportEvent) => void): () => void;
 	listRekordboxBackups(dbPathOverride?: string): Promise<BackupSummary[]>;
+	// Settings → Rekordbox: the live MyTag groups in master.db, and the one
+	// the push creates Curator-made tags in (`selectedId` — resolved the way
+	// the writer resolves it: the stored id, else the stored name, else the
+	// first group; null when there are no groups or no sidecar).
+	getRekordboxMyTagGroups(dbPathOverride?: string, key?: string): Promise<{ groups: RekordboxMyTagGroup[]; selectedId: string | null }>;
+	// null restores the default ("attributes"). Device-local.
+	setRekordboxMyTagGroup(group: RekordboxMyTagGroup | null): Promise<void>;
 	clearRekordboxBackups(dbPathOverride?: string): Promise<ClearBackupsResult>;
 	// Restore is callable only from the verify-failed modal — the renderer
 	// presents the choice; we trust the path it hands back. The dbPath
@@ -1332,9 +1340,6 @@ export interface CoreService {
 	// nobody reads it. Device-local; applied at the worker's next ask.
 	getCatalogReadSources(): Promise<CatalogReadSources>;
 	setCatalogReadSources(patch: CatalogReadSourcesPatch | null): Promise<CatalogReadSources>;
-	// How often one kind of follow is read: 'weekly' (the default, in the
-	// Friday window), 'daily', or 'source' (as often as the source allows).
-	setCatalogReadCadence(kind: CatalogReadSources[number]['kind'], cadence: CatalogReadCadence): Promise<CatalogReadSources>;
 	// ─── Following (Global Catalog watches; catalog-client/service.ts) ───
 	// Whether this device can follow artists and labels: signed in to the
 	// cloud, and the server offers 'global_catalog'.
@@ -1710,6 +1715,18 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	};
 	let creditFormat: ArtistCreditFormat = loadCreditFormat().format;
 	let creditFormatStored = loadCreditFormat().stored;
+	// Settings → Rekordbox: the MyTag group Curator-made tags are created in
+	// (mytag-phase.ts). Device-local — not an account key: group ids belong to
+	// this machine's master.db. The name rides along as the fallback when the
+	// id is gone (a rebuilt library re-mints group ids). Unset → "attributes".
+	const MYTAG_GROUP_KEY = 'rekordbox.mytag_group';
+	const loadMyTagGroup = (): MyTagGroupChoice => {
+		const row = db.select({ value: appSetting.value }).from(appSetting).where(eq(appSetting.key, MYTAG_GROUP_KEY)).get();
+		const v = (row?.value && typeof row.value === 'object' ? row.value : {}) as Partial<MyTagGroupChoice>;
+		return typeof v.id === 'string' && v.id
+			? { id: v.id, name: typeof v.name === 'string' ? v.name : DEFAULT_MYTAG_GROUP_NAME }
+			: { id: null, name: DEFAULT_MYTAG_GROUP_NAME };
+	};
 	// Can the connected user mutate this playlist upstream? `/me/playlists`
 	// includes FOLLOWED playlists owned by other users; Spotify (and Tidal)
 	// answer 403 to a DELETE/POST on a playlist you neither own nor
@@ -2526,7 +2543,7 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		// concurrent read+write sessions safe (one mode at a time, last
 		// open() wins). Caller-side: importer and exporter serialize via
 		// their own `running` flags so we never have both in flight.
-		rekordboxExporter = new RekordboxExporter(db, rekordboxSidecar, opts.writeAudit, () => creditFormat);
+		rekordboxExporter = new RekordboxExporter(db, rekordboxSidecar, opts.writeAudit, () => creditFormat, loadMyTagGroup);
 	}
 
 	// Forward-ref into the constructed `service`, assigned at the end of
@@ -2717,9 +2734,17 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			},
 			spotifyToken: () => auth.getSpotifyAccessToken(),
 			trackers: () => checkedTrackers(sqlite),
-			cadence: () => {
-				const features = opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? [];
-				return features.includes('catalog_read_cadence') ? readCadence(sqlite) : null;
+			// The page work's engine (entity/work.ts), built further down: one set
+			// of store lanes for the pages and the background.
+			background: {
+				offered: () => (opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? []).includes('catalog_background_work'),
+				profile: () => entityWork?.backgroundProfile() ?? null,
+				run: (work) => entityWork?.runBackground(work) ?? Promise.resolve(),
+			},
+			config: {
+				offered: () => (opts.cloud!.transport.catalogFeatures?.() ?? cloudClient.serverFeatures() ?? []).includes('cloud_config'),
+				read: () => readCloudConfig(sqlite),
+				write: (config) => writeCloudConfig(sqlite, config),
 			},
 			...(opts.beatportFetch ? { beatportFetch: opts.beatportFetch } : {}),
 		})
@@ -2815,7 +2840,6 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 	entityWork = createEntityWork({
 		catalog: () => catalogClient,
 		pages: entityPages,
-		trackers: () => checkedTrackers(sqlite),
 		spotifyToken: () => auth.getSpotifyAccessToken().catch(() => null),
 		spotifyBackoffUntil: () => spotifyBackoffUntil(),
 		streaming: () => streamingCatalog(),
@@ -5152,9 +5176,6 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		async setCatalogReadSources(patch) {
 			return writeReadSources(sqlite, patch);
 		},
-		async setCatalogReadCadence(kind, cadence) {
-			return writeReadCadence(sqlite, kind, cadence);
-		},
 
 		// ─── Following ──────────────────────────────────────────────────────
 		async getCatalogStatus() {
@@ -6539,6 +6560,15 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 			if (!dbPath) return [];
 			const { backups } = await rekordboxSidecar.listBackups(rekordboxDirOf(dbPath));
 			return backups;
+		},
+		async getRekordboxMyTagGroups(dbPathOverride, key) {
+			const dbPath = dbPathOverride ?? defaultRekordboxDbPath();
+			if (!rekordboxSidecar || !dbPath) return { groups: [], selectedId: null };
+			const { groups } = await rekordboxSidecar.listMyTagGroups(dbPath, key);
+			return { groups, selectedId: pickMyTagGroup(groups, loadMyTagGroup())?.id ?? null };
+		},
+		async setRekordboxMyTagGroup(group) {
+			mut.setSetting(db, MYTAG_GROUP_KEY, group ? { id: group.id, name: group.name } : null);
 		},
 		async clearRekordboxBackups(dbPathOverride) {
 			if (!rekordboxSidecar) return { deleted: 0, freedBytes: 0 };

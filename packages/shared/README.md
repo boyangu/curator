@@ -26,7 +26,7 @@ entities:
 - **`token`** — OAuth credentials.
 - **Queues & observability** — `sync_job`, `analysis_job`,
   `sync_conflict` / `playlist_conflict`.
-- **Rekordbox state** — `rekordbox_link`, `rekordbox_membership_baseline`,
+- **Rekordbox state** — `rekordbox_link`, `rekordbox_tag_link`, `rekordbox_membership_baseline`,
   `rekordbox_sync_watermark`, `rekordbox_deleted_content`.
 
 `TrackState` ∈ `unsorted | feed | backlog | progress | purchased`.

@@ -416,10 +416,9 @@ def apply_tags(db: Any, op: dict[str, Any]) -> dict[str, Any]:
     Input:
         {"rb_content_id": "12345", "rb_tag_ids": ["100", "200"]}
 
-    The MyTag rows themselves (DjmdMyTag) are not created here — the
-    exporter only includes rb_tag_ids that were originally read FROM rb
-    (i.e., they correspond to existing DjmdMyTag rows). Curator-only
-    tags don't have an rb-side identity and are out of scope for v1.
+    The MyTag rows themselves (DjmdMyTag) are not created here — every
+    rb_tag_id is an existing DjmdMyTag row: read FROM rb, or minted for a
+    Curator-made tag by `apply_mytag_ensure` in an earlier write session.
 
     Returns `{"rb_content_id", "deleted", "inserted", "revived"}` — `revived`
     counts tombstoned DjmdMyTag rows un-deleted because this track references
@@ -477,6 +476,91 @@ def apply_tags(db: Any, op: dict[str, Any]) -> dict[str, Any]:
         "revived": revived,
         "skipped": False,
     }
+
+
+def apply_mytag_ensure(db: Any, op: dict[str, Any]) -> dict[str, Any]:
+    """Give a Curator-made tag a DjmdMyTag row: find it by name, or create it.
+
+    Input:
+        {"curator_tag_id": "...", "name": "bluerama",
+         "group_id": "4" | null, "group_name": "attributes"}
+
+    In order:
+      1. a live tag with the same name (case-insensitive, like the importer's
+         dead-tag reconcile) is reused — the user made it in rekordbox too, or
+         an earlier push created it and Curator lost the link;
+      2. a tombstoned same-name tag is revived — apply_tags' rule: Curator
+         still curates with it, and ids must stay stable on both sides;
+      3. otherwise a new row, filled the way rekordbox fills its own (checked
+         against tags made in rekordbox 7, 2026-11-27): a random unused ID
+         over the full 32-bit range, a fresh UUID, Attribute 0, the next Seq
+         in its group, every status column 0, usn NULL. rb_local_usn comes
+         from the registry on commit, like every row `db.add` stages.
+
+    The group: `group_id` when it is a live group, else the live group named
+    `group_name`, else the first live group by Seq.
+
+    Idempotent by name — a retry after a failed commit finds the row again.
+    Returns {"curator_tag_id", "rb_tag_id", "created", "revived"}.
+    """
+    from pyrekordbox.db6.tables import DjmdMyTag  # type: ignore
+
+    name = str(op.get("name") or "").strip()
+    if not name:
+        raise ValueError("mytag_ensure: empty tag name")
+    out: dict[str, Any] = {"curator_tag_id": op.get("curator_tag_id"), "created": False, "revived": False}
+
+    # A library holds a few hundred MyTag rows at most — one scan serves the
+    # name match, the group lookup and the Seq.
+    rows = list(db.session.query(DjmdMyTag).all())
+    norm = lambda s: str(s or "").strip().lower()  # noqa: E731
+    is_group = lambda r: int(getattr(r, "Attribute", 0) or 0) == 1  # noqa: E731
+    by_age = lambda r: (str(getattr(r, "created_at", "") or ""), str(r.ID))  # noqa: E731
+
+    same_name = sorted((r for r in rows if not is_group(r) and norm(r.Name) == norm(name)), key=by_age)
+    live = [r for r in same_name if _is_live(r)]
+    if live:
+        return {**out, "rb_tag_id": str(live[0].ID)}
+    if same_name:
+        dead = same_name[-1]
+        dead.rb_local_deleted = 0
+        return {**out, "rb_tag_id": str(dead.ID), "revived": True}
+
+    groups = sorted(
+        (r for r in rows if is_group(r) and _is_live(r)),
+        key=lambda r: (int(getattr(r, "Seq", 0) or 0), str(r.ID)),
+    )
+    group_id = op.get("group_id")
+    parent = (
+        next((g for g in groups if group_id and str(g.ID) == str(group_id)), None)
+        or next((g for g in groups if norm(g.Name) == norm(op.get("group_name"))), None)
+        or (groups[0] if groups else None)
+    )
+    if parent is None:
+        raise ValueError("rekordbox has no MyTag group to put the tag in")
+    if group_id and str(parent.ID) != str(group_id):
+        sys.stderr.write(f"mytag_ensure: group {group_id!r} not live — {name!r} goes to {parent.Name!r}\n")
+
+    seq = 1 + max(
+        (int(getattr(r, "Seq", 0) or 0) for r in rows
+         if _is_live(r) and str(getattr(r, "ParentID", "")) == str(parent.ID)),
+        default=0,
+    )
+    new_row = DjmdMyTag.create(
+        ID=str(db.generate_unused_id(DjmdMyTag, is_28_bit=False)),
+        Seq=seq,
+        Name=name,
+        Attribute=0,
+        ParentID=str(parent.ID),
+        UUID=str(uuid4()),
+        rb_data_status=0,
+        rb_local_data_status=0,
+        rb_local_deleted=0,
+        rb_local_synced=0,
+    )
+    db.add(new_row)
+    db.flush()
+    return {**out, "rb_tag_id": str(new_row.ID), "created": True}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1225,6 +1309,7 @@ _HANDLERS = {
     "track": apply_track_metadata,
     "cues": apply_cues,
     "tags": apply_tags,
+    "mytag_ensure": apply_mytag_ensure,
     "playlist_merge": apply_playlist_merge,
     "playlist_rename": apply_playlist_rename,
     "content_delete": apply_content_delete,

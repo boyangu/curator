@@ -1,6 +1,6 @@
 import type { Track, Playlist, PlaylistFolder, PinnedSearch, TrackOverrides, LibraryFolder, Tag, TrackAnalysis, Cue, CueKind, AnalysisJob, PlayRecordUpsert } from '@curator/shared';
 import type { ZTrackFilterT, ZTrackSortT, ZTrackPageReqT, TrackPage, ZStateCountsT, StreamingSource, SourceSyncSettings, DjSyncProvider, SyncConflictChoice, ArtistSummary, ArtistListOpts, ArtistLink, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, ArtistCreditFormat, AlbumSummary, EntityHeader, EntityRef, EntityTracksPage, EntityWorkEvent, StreamingService, WorldSearchPart, WorldSearchResult } from '@curator/shared';
-import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalyzerHealth, AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedItemActivity, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, FeedLens, FeedLensRule, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, ProductionProfile, ProductionPair, ProductionWinner, ProductionStats, ProductionModelInfo, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction, CatalogClientStatus, CatalogWorkerStatus, CatalogReadCadence, CatalogReadSources, CatalogReadSourcesPatch, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit, CatalogWatch, CatalogFollowManyReport, CatalogEnrichReport, TrackCatalogRefs, FollowCandidate, FollowCandidateKind, ConnectQueue, ConnectSearch, ConnectSubject } from '@curator/core';
+import type { SetSourceLinksResult, RemovableTrackSource, RemoveTrackSourcesResult, TrackMergePreview, TrackMergeOutcome, UpstreamPushOutcome, PlaylistUpstreamDrift, AuthStatus, SyncProgress, DownloadProgress, DownloadJob, QueueSummary, QueueEvent, ScanProgress, AnalysisJobEvent, AnalyzerHealth, AnalysisFlags, AutoAnalyzeSettings, AnalyzerResources, AnalyzerResourcesSettings, RekordboxImportEvent, RekordboxFlags, RekordboxImportTotals, RekordboxExportEvent, ExportFlags, RekordboxExportResult, RekordboxSyncOutcome, RekordboxPullOutcome, RekordboxBackupSummary, RekordboxClearBackupsResult, RekordboxMyTagGroup, RekordboxMissingFile, DeletedTrack, CuePaletteEntry, WavSettings, WavPreview, WavConvertEvent, ClearableTrackField, FeedPage, FeedItem, FeedItemDetail, FeedAction, FeedActionResult, FeedItemActivity, FeedRefreshResult, FeedRefreshScope, FeedRefreshStatus, FeedRole, FeedLens, FeedLensRule, JourneyDetail, JourneyNode, JourneySeed, JourneySummary, KbAspect, KbEntity, KbEntityDetail, KbEntityKind, KbEvent, KbExpansion, AgentEvent, AgentProvider, AgentStatus, AgentSessionSummary, AgentSessionDetail, AgentResultSet, AgentViewContext, MirEvent, MirSettings, MirStatus, SimilarQuery, SimilarResult, ProductionProfile, ProductionPair, ProductionWinner, ProductionStats, ProductionModelInfo, BackupSettings, BackupStatus, BackupSnapshotSummary, BackupRestorePreview, BackupRestoreRequest, BackupTargetStat, BackupEvent, CloudSyncStatusReport, CloudUnlinkResult, AccountLibraryInfo, SyncPollPolicy, SyncPollSettings, CloudSyncApplied, CatalogueStatus, CatalogueSettingsPatch, CatalogueBackfillAction, CatalogClientStatus, CatalogWorkerStatus, CatalogReadCadence, CatalogReadSources, CatalogReadSourcesPatch, CatalogFollowTarget, CatalogImportReport, CatalogSearchHit, CatalogWatch, CatalogFollowManyReport, CatalogEnrichReport, TrackCatalogRefs, FollowCandidate, FollowCandidateKind, ConnectQueue, ConnectSearch, ConnectSubject } from '@curator/core';
 import type { CatalogBrowseResult, CatalogConnectAnswer, CatalogConnectAnswerResult, CatalogProvider, DeviceInfo } from '@curator/protocol';
 import type { LogRecord } from '@curator/shared/log';
 
@@ -172,6 +172,13 @@ export interface IpcChannels {
 	// rethrow SpotifyTrackUnavailableError for the Discover auto-skip path.
 	'spotify:rpc': { args: [method: string, params?: unknown]; ret: unknown };
 
+	// Cloud Admin — the cloud's back office in a tab, for the operator only,
+	// from the repo (main/cloud-admin.ts). `bounds`: where to show it, in the
+	// window's coordinates.
+	'cloud-admin:available': { args: []; ret: boolean };
+	'cloud-admin:open':      { args: [bounds: CloudAdminBounds]; ret: CloudAdminStatus };
+	'cloud-admin:bounds':    { args: [bounds: CloudAdminBounds]; ret: void };
+	'cloud-admin:hide':      { args: []; ret: void };
 	// FlareSolverr — Beatport's way past Cloudflare (main/flaresolverr-host.ts).
 	'flaresolverr:status':         { args: [refresh?: boolean]; ret: FlareSolverrStatus };
 	'flaresolverr:start':          { args: []; ret: FlareSolverrStatus };
@@ -271,6 +278,9 @@ export interface IpcChannels {
 	'rekordbox:remove-missing-files': { args: [trackIds: string[]]; ret: { removed: number } };
 	'rekordbox:list-backups':   { args: [dbPathOverride?: string]; ret: RekordboxBackupSummary[] };
 	'rekordbox:clear-backups':  { args: [dbPathOverride?: string]; ret: RekordboxClearBackupsResult };
+	// Settings → Rekordbox: where the push creates MyTags for Curator-made tags.
+	'rekordbox:mytag-groups':    { args: [dbPathOverride?: string, key?: string]; ret: { groups: RekordboxMyTagGroup[]; selectedId: string | null } };
+	'rekordbox:set-mytag-group': { args: [group: RekordboxMyTagGroup | null]; ret: void };
 	'rekordbox:restore-backup': { args: [backupPath: string, dbPathOverride?: string]; ret: void };
 	// Cue palette surfaced from the rb sidecar. Static for the rb version;
 	// core caches the result process-life. Renderer fetches once at boot
@@ -403,7 +413,6 @@ export interface IpcChannels {
 	'catalog:set-read-sources': { args: [patch: CatalogReadSourcesPatch | null]; ret: CatalogReadSources };
 	// How often one kind of follow is read (Settings → Discover): weekly in
 	// the Friday window (the default), daily, or as often as the source allows.
-	'catalog:set-read-cadence': { args: [kind: CatalogReadSources[number]['kind'], cadence: CatalogReadCadence]; ret: CatalogReadSources };
 	'catalog:watches':  { args: []; ret: CatalogWatch[] };
 	'catalog:search':    { args: [q: string]; ret: CatalogSearchHit[] };
 	'catalog:follow':    { args: [target: CatalogFollowTarget]; ret: CatalogWatch };
@@ -486,6 +495,11 @@ export interface AccountStatus {
 export interface AccountDevice extends DeviceInfo {
 	current: boolean;
 }
+
+// Where the Cloud Admin view sits, in the window's coordinates (CSS pixels
+// times the page's zoom), and what became of opening it.
+export type CloudAdminBounds = { x: number; y: number; width: number; height: number };
+export type CloudAdminStatus = { state: 'ready' | 'starting' | 'failed' | 'unavailable'; reason: string | null };
 
 // The FlareSolverr service that carries Beatport lookups past Cloudflare
 // (main/flaresolverr-host.ts). `reason` says why it is stopped/failed;
@@ -880,6 +894,10 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'player:tidal:token': { description: 'Return the sniffed Tidal bearer + countryCode + clientId for the renderer player.' },
 	'audio:rpc': { description: 'Forward a JSON-RPC call to the native audio engine sidecar. Methods: load, play, pause, seek, seek_with_xfade, arm_trigger, set_beatgrid, jump_beats, set_volume, set_loop, position, stop, scrub_begin, scrub_to, scrub_end.' },
 	'spotify:rpc': { description: 'Forward a JSON-RPC call to the Spotify playback sidecar. Methods: ensure, play, pause, resume, toggle, seek, set_volume, stop.' },
+	'cloud-admin:available': { description: 'Whether this app shows the Cloud Admin tab: the operator’s machine, running from the repo, with the owner credential in the repo .env.' },
+	'cloud-admin:open': { description: 'Start the cloud back office (on first open) and show it over the given area of the window. Returns whether it is ready, or why not.' },
+	'cloud-admin:bounds': { description: 'Move the Cloud Admin view to the given area of the window.' },
+	'cloud-admin:hide': { description: 'Hide the Cloud Admin view (another tab was chosen).' },
 	'flaresolverr:status': { description: 'State of the FlareSolverr service (a Docker container in WSL) that loads Beatport pages past Cloudflare: running / starting / stopped / failed with the reason, version, whether Curator starts it at launch. `refresh` probes the service first.' },
 	'flaresolverr:start': { description: 'Start the FlareSolverr container (creates it on first run) and wait until it answers. Returns the resulting state, with the reason when it fails.' },
 	'flaresolverr:stop': { description: 'Stop the FlareSolverr container. Beatport lookups then pause with "FlareSolverr unavailable" until it is started again.' },
@@ -929,6 +947,8 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'rekordbox:missing-files': { description: 'List orphaned Rekordbox tracks whose local file is gone: a rekordbox_link exists but the track has no source=\'local\' source_link and the link\'s recorded file path no longer exists on disk. These still show in the Rekordbox tab (a rekordbox_link join) despite being unplayable. Read-only preview for the sync modal\'s cleanup step.' },
 	'rekordbox:remove-missing-files': { description: 'Delete missing-file orphans as Curator deletes that propagate to Rekordbox on the next Sync to Rekordbox: tombstones each (content_delete emitted on the next push), drops the rekordbox_link (leaves the tab immediately), and soft-deletes the track. Ids are re-validated as genuine orphans server-side, so a track whose file reappeared can\'t be deleted. Never writes to streaming accounts.' },
 	'rekordbox:list-backups': { description: 'List Curator-created master.db backups in the rekordbox directory. Returns path/size/timestamp for each. Rekordbox\'s own .bak files are not included.' },
+	'rekordbox:mytag-groups': { description: 'The MyTag group folders in rekordbox (Genre, Components, Situation, …) and selectedId: the group a Sync to Rekordbox creates MyTags in for tags made in Curator.' },
+	'rekordbox:set-mytag-group': { description: 'Choose the rekordbox MyTag group that tags made in Curator are created in on the next Sync to Rekordbox ({id, name}), or null for the default ("attributes"). Device-local.' },
 	'rekordbox:clear-backups': { description: 'Delete every Curator-created master.db backup. Returns the deleted count and bytes freed. Rekordbox\'s own .bak files are not touched.' },
 	'rekordbox:restore-backup': { description: 'Restore a backup over master.db. Called from the verify-failed modal when the user picks "Restore previous version." Caller must ensure Rekordbox is not running.' },
 	'rekordbox:cue-palette': { description: 'Return rekordbox\'s cue color palette as opaque `{id, hex, label}` entries. `id` is the token Curator stores in cue.color (format "cti:N"); `hex` is renderable for swatches + waveform markers; `label` is the picker label. Source of truth lives in the Python sidecar — high-level layers store and pass these ids opaquely.' },
@@ -996,7 +1016,6 @@ export const TOOL_CATALOG: Record<keyof IpcChannels, ToolCatalogEntry> = {
 	'catalog:worker-status': { description: 'Whether this desktop reads the Global Catalog’s sources for the account’s follows this week (one device per account per week; the cloud reads the rest): signed in and offered, active or idle, the sources it can read and the trackers the user checked, its last ask and report, what it has polled and the events raised, sources it paused after a rate limit, the last error, and the check in progress (queued vs read).' },
 	'catalog:read-sources': { description: 'The user’s tracking choices, per kind (artist, label, playlist, genre): each source with whether it is checked and whether only the cloud can read it. Unchecked means nobody reads that source for the user’s follows, the cloud included.' },
 	'catalog:set-read-sources': { description: 'Change the tracking choices: a patch of "kind/provider" → boolean (unknown keys ignored), or null to restore everything on. Device-local; the catalogue worker sends them with its next ask.' },
-	'catalog:set-read-cadence': { description: 'Set how often one kind of follow (artist, label, playlist, genre) is read: "weekly" (once a week in the Friday window, the default), "daily", or "source" (as often as the source allows). Device-local; the catalogue worker sends it with its next ask and the master times the reads by it.' },
 	'catalog:status': { description: 'Whether this device can follow artists and labels for Discover: signed in to Curator Cloud, and the server offers the Global Catalog. reason is ok, signed_out or server_off.' },
 	'catalog:watches': { description: 'The artists and labels this account follows, each with its providers (Spotify, Deezer…), mute state and the cloud trackers following it (last run, next due, failing).' },
 	'catalog:search': { description: 'Search for artists and labels to follow: the shared catalogue matches first (most followed first), then Spotify and Deezer artists it does not hold yet. Each hit says whether this account already follows it.' },

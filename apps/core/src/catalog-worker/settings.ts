@@ -14,12 +14,14 @@
 // desktops of one user say the same thing or the holder's wins.
 
 import type Database from 'better-sqlite3';
-import { CATALOG_READ_CADENCE_DEFAULT, CATALOG_READ_CADENCES, CATALOG_TRACKERS, CATALOG_TRACKING_KINDS, trackerKey, type CatalogProvider, type CatalogReadCadence, type CatalogTracker, type CatalogTrackingKind } from '@curator/protocol';
+import { CATALOG_TRACKERS, cloudConfigOr, trackerKey, type CatalogProvider, type CatalogReadCadence, type CatalogTracker, type CatalogTrackingKind, type CloudConfigEnvelope } from '@curator/protocol';
 
 type Raw = Database.Database;
 
 export const READ_SOURCES_KEY = 'catalog.read_sources';
-export const READ_CADENCE_KEY = 'catalog.read_cadence';
+// The cloud's scheduling values as it last told this desktop (protocol
+// cloud-config.ts), kept across restarts.
+export const CLOUD_CONFIG_KEY = 'cloud.config';
 
 export type { CatalogReadCadence };
 
@@ -43,18 +45,29 @@ function readStored<T>(raw: Raw, key: string): Record<string, T> {
 	}
 }
 
-function writeStored(raw: Raw, key: string, value: Record<string, unknown>): void {
+function writeStored(raw: Raw, key: string, value: object): void {
 	raw.prepare(`INSERT INTO app_setting (key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
 		.run(key, JSON.stringify(value), Date.now());
 }
 
-// Every kind's cadence, as the worker sends it: an unknown or missing value
-// is the default.
+// The cloud's config this desktop holds: the defaults until the cloud said.
+export function readCloudConfig(raw: Raw): CloudConfigEnvelope {
+	const row = raw.prepare(`SELECT value FROM app_setting WHERE key = ?`).get(CLOUD_CONFIG_KEY) as { value: string } | undefined;
+	try {
+		return cloudConfigOr(row ? JSON.parse(row.value) : null);
+	} catch {
+		return cloudConfigOr(null);
+	}
+}
+
+export function writeCloudConfig(raw: Raw, config: CloudConfigEnvelope): void {
+	writeStored(raw, CLOUD_CONFIG_KEY, cloudConfigOr(config));
+}
+
+// How often each kind of follow is read: the cloud's, one for everyone.
 export function readCadence(raw: Raw): Record<CatalogTrackingKind, CatalogReadCadence> {
-	const stored = readStored<string>(raw, READ_CADENCE_KEY);
-	const of = (kind: CatalogTrackingKind): CatalogReadCadence => CATALOG_READ_CADENCES.find((c) => c === stored[kind]) ?? CATALOG_READ_CADENCE_DEFAULT;
-	return Object.fromEntries(CATALOG_TRACKING_KINDS.map((kind) => [kind, of(kind)])) as Record<CatalogTrackingKind, CatalogReadCadence>;
+	return readCloudConfig(raw).values.readCadence;
 }
 
 // Unknown keys are ignored, missing ones are on.
@@ -91,10 +104,3 @@ export function writeReadSources(raw: Raw, patch: CatalogReadSourcesPatch | null
 	return readReadSources(raw);
 }
 
-// One kind's cadence. An unknown kind or value changes nothing.
-export function writeReadCadence(raw: Raw, kind: CatalogTrackingKind, cadence: CatalogReadCadence): CatalogReadSources {
-	if (CATALOG_TRACKING_KINDS.includes(kind) && CATALOG_READ_CADENCES.includes(cadence)) {
-		writeStored(raw, READ_CADENCE_KEY, { ...readStored<string>(raw, READ_CADENCE_KEY), [kind]: cadence });
-	}
-	return readReadSources(raw);
-}

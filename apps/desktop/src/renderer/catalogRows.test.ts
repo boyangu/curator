@@ -55,6 +55,14 @@ describe('toRows', () => {
 		]);
 		// The library's facts stay; the catalogue only places it on its release.
 		expect(rows[1]).toMatchObject({ title: 'Lailonie (my edit)', rating: 5, sources: ['local'], trackNumber: 1, albumTitle: 'Lailonie' });
+		// A synced row nobody analysed shows the catalogue's BPM, key and genre;
+		// the library's own, once it has them, stand.
+		const facts = { bpm: 122, keyCamelot: '8A', genre: 'Progressive House' };
+		const bare = toRows(page([album('rel-1', 'Lailonie', '2026-03-01')], [rec('rec-1', 'rel-1', 'Lailonie', { libraryTrackId: 't1', libraryPrimary: true, ...facts })]), new Map([['t1', own]]));
+		expect(bare[0]).toMatchObject({ id: 't1', ...facts, label: 'Anjunadeep' });
+		const analysed = { ...own, bpm: 124, keyCamelot: '9A', genre: 'Deep House', label: 'Mine' } as Track;
+		const mine = toRows(page([album('rel-1', 'Lailonie', '2026-03-01')], [rec('rec-1', 'rel-1', 'Lailonie', { libraryTrackId: 't1', libraryPrimary: true, ...facts })]), new Map([['t1', analysed]]));
+		expect(mine[0]).toMatchObject({ bpm: 124, keyCamelot: '9A', genre: 'Deep House', label: 'Mine' });
 		// The repeat keeps the catalogue's facts and shows the track's sources.
 		expect(rows[0]).toMatchObject({ title: 'Lailonie', rating: null, sources: ['local'], albumTitle: 'Lailonie (Deluxe)' });
 		expect(heldTrackIds(pg)).toEqual(['t1']);

@@ -22,6 +22,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import * as mut from '@curator/sync-core/library/mutators';
+import { curatorTagIdForRb, rbTagIdsFor } from './tag-link.js';
 import {
 	track,
 	sourceLink,
@@ -270,6 +271,9 @@ interface MyTagDeltaRow {
 	name: string;
 	color: string | null;
 	tracks: string[];
+	// A group folder (Genre / Components / …), not a tag — see pruneMyTagGroup.
+	// Absent from readers older than 0.7.0.
+	is_group?: boolean;
 }
 
 interface WaveformDeltaRow {
@@ -727,7 +731,8 @@ export class RekordboxImporter extends EventEmitter {
 					playlistIndex = row as unknown as PlaylistIndexRow;
 				} else if (event === 'mytag') {
 					const mt = row as unknown as MyTagDeltaRow;
-					if (mt.rb_local_deleted) deadMyTags.push(mt);
+					if (mt.is_group) this.pruneMyTagGroup(mt, totals);
+					else if (mt.rb_local_deleted) deadMyTags.push(mt);
 					else this.applyMyTagDelta(mt, opts.flags, trackIdByRbId, totals);
 				} else if (event === 'waveform') {
 					const wf = row as unknown as WaveformDeltaRow;
@@ -2178,7 +2183,9 @@ export class RekordboxImporter extends EventEmitter {
 		idMap: Map<string, string>,
 		totals: ImportTotals,
 	): void {
-		const tagId = `rb_${row.rb_tag_id}`;
+		// A Curator-made tag the push created in rekordbox keeps its own id
+		// (tag-link.ts) — its MyTag must land on it, not mint an `rb_` twin.
+		const tagId = curatorTagIdForRb(this.db, row.rb_tag_id);
 		const tagRow: NewTag = {
 			id: tagId,
 			name: row.name,
@@ -2260,6 +2267,23 @@ export class RekordboxImporter extends EventEmitter {
 		return side === 'account';
 	}
 
+	// A MyTag group folder (Genre / Components / Situation / …). Readers before
+	// 0.7.0 emitted group rows like tags, so Curator holds an empty `rb_<ID>`
+	// tag per group; the reader now flags them on every pass and this drops
+	// them. A group can't hold tracks — one with assignments is left alone
+	// rather than guessed at.
+	private pruneMyTagGroup(row: MyTagDeltaRow, totals: ImportTotals): void {
+		const tagId = `rb_${row.rb_tag_id}`;
+		if (!this.db.select({ id: tagTable.id }).from(tagTable).where(eq(tagTable.id, tagId)).get()) return;
+		if (this.db.select({ trackId: trackTag.trackId }).from(trackTag).where(eq(trackTag.tagId, tagId)).get()) {
+			ilog.warn('rb MyTag group has assignments in Curator — kept', { tag: tagId, name: row.name });
+			return;
+		}
+		mut.deleteTag(this.db, tagId);
+		ilog.info('rb MyTag group pruned from tags', { tag: tagId, name: row.name });
+		totals.myTagsPruned++;
+	}
+
 	// rekordbox soft-deleted these MyTags (rb_local_deleted=1) — they are gone
 	// from its tag pane, and any DjmdSongMyTag row pointing at them is
 	// invisible. Curator used to import them as live tags and kept pushing
@@ -2274,18 +2298,22 @@ export class RekordboxImporter extends EventEmitter {
 	//      it and writer.apply_tags revives the rb row (same id, same group).
 	// Idempotent — runs on every import over the full tombstone set.
 	private reconcileDeadMyTags(dead: MyTagDeltaRow[], totals: ImportTotals): void {
-		const deadIds = new Set(dead.map((d) => `rb_${d.rb_tag_id}`));
+		// Curator ids through tag-link.ts: a linked Curator-made tag is as
+		// much an rb tag here as an imported `rb_` one.
+		const curatorIdOf = new Map(dead.map((d) => [d.rb_tag_id, curatorTagIdForRb(this.db, d.rb_tag_id)]));
+		const deadIds = new Set(curatorIdOf.values());
 		const allTags = this.db.select({ id: tagTable.id, name: tagTable.name }).from(tagTable).all();
+		const rbIdentity = rbTagIdsFor(this.db, allTags.map((t) => t.id));
 		const liveByName = new Map<string, string>();
 		for (const t of allTags) {
-			if (!t.id.startsWith('rb_') || deadIds.has(t.id)) continue;
+			if (!rbIdentity.has(t.id) || deadIds.has(t.id)) continue;
 			const k = t.name.trim().toLowerCase();
 			if (!liveByName.has(k)) liveByName.set(k, t.id);
 		}
 		const present = new Set(allTags.map((t) => t.id));
 		const now = new Date();
 		for (const d of dead) {
-			const deadId = `rb_${d.rb_tag_id}`;
+			const deadId = curatorIdOf.get(d.rb_tag_id)!;
 			if (!present.has(deadId)) continue;
 			const members = this.db.select({ trackId: trackTag.trackId }).from(trackTag).where(eq(trackTag.tagId, deadId)).all();
 			const liveId = liveByName.get(d.name.trim().toLowerCase());

@@ -15,7 +15,7 @@ export { probeWsl } from './analyzer/wsl.js';
 export type { RekordboxImportEvent, RekordboxFlags, ImportTotals as RekordboxImportTotals } from './rekordbox/importer.js';
 export { DEFAULT_REKORDBOX_FLAGS } from './rekordbox/importer.js';
 export type { RekordboxExportEvent, ExportFlags, ExportResult as RekordboxExportResult, RemovalHold as RekordboxRemovalHold } from './rekordbox/exporter.js';
-export type { BackupSummary as RekordboxBackupSummary, ClearBackupsResult as RekordboxClearBackupsResult, VerifyFailure as RekordboxVerifyFailure, WriteFailure as RekordboxWriteFailure, CuePaletteEntry } from './rekordbox/sidecar.js';
+export type { BackupSummary as RekordboxBackupSummary, ClearBackupsResult as RekordboxClearBackupsResult, VerifyFailure as RekordboxVerifyFailure, WriteFailure as RekordboxWriteFailure, CuePaletteEntry, RekordboxMyTagGroup } from './rekordbox/sidecar.js';
 export { defaultRekordboxDbPath, defaultRekordboxSettingsDir } from './rekordbox/paths.js';
 export { setCoreLogger } from '@curator/sync-core/log';
 export * from './backup/types.js';

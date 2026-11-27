@@ -16,6 +16,7 @@ import type { DownloadJob, QueueSummary, AutoAnalyzeSettings, AnalyzerResourcesS
 import type { AlbumSummary, ArtistCreditFormat, ArtistLink, ArtistListOpts, ArtistPages, ArtistPagesTarget, ArtistMergeSuggestion, ArtistScope, ArtistSummary } from '@curator/shared';
 import type { StreamingSource, SourceSyncSettings, PlayRecordUpsert } from '@curator/shared';
 import { trpc } from './trpc.js';
+import type { CloudAdminBounds } from '../../ipc.js';
 
 // window.api is typed via the preload global declaration; route the remaining
 // (event-subscription) accesses through this helper so the boundary script has
@@ -211,7 +212,6 @@ export const catalogApi = {
 	workerStatus: () => api()['catalog:worker-status'](),
 	readSources: () => api()['catalog:read-sources'](),
 	setReadSources: (patch: Parameters<typeof window.api['catalog:set-read-sources']>[0]) => api()['catalog:set-read-sources'](patch),
-	setReadCadence: (...args: Parameters<typeof window.api['catalog:set-read-cadence']>) => api()['catalog:set-read-cadence'](...args),
 	onWorkerStatus: (cb: Parameters<typeof window.api.onCatalogWorkerStatus>[0]) => api().onCatalogWorkerStatus(cb),
 	watches: () => api()['catalog:watches'](),
 	search: (q: string) => api()['catalog:search'](q),
@@ -223,6 +223,18 @@ export const catalogApi = {
 	enrichLabels: () => api()['catalog:enrich-labels'](),
 	candidates: (...args: Parameters<typeof window.api['catalog:candidates']>) => api()['catalog:candidates'](...args),
 	followMany: (...args: Parameters<typeof window.api['catalog:follow-many']>) => api()['catalog:follow-many'](...args),
+};
+
+// Cloud Admin — the cloud's back office in a tab, the operator's only
+// (main/cloud-admin.ts; features/cloudAdmin.ts drives it).
+export const cloudAdminApi = {
+	available: () => api()['cloud-admin:available'](),
+	open: (bounds: CloudAdminBounds) => api()['cloud-admin:open'](bounds),
+	bounds: (bounds: CloudAdminBounds) => api()['cloud-admin:bounds'](bounds),
+	hide: () => api()['cloud-admin:hide'](),
+	// The page's zoom factor (Chromium's 1.2 ^ level): main places the view in
+	// the window's own pixels.
+	zoomFactor: (): number => Math.pow(1.2, api().zoom.get()),
 };
 
 // FlareSolverr — the browser service Beatport lookups go through (Settings →
@@ -307,6 +319,8 @@ export const rekordboxApi = {
 		trpc.rekordbox.read.mutate([opts]),
 	listBackups: (dbPathOverride?: string) => trpc.rekordbox.listBackups.mutate([dbPathOverride]),
 	clearBackups: (dbPathOverride?: string) => trpc.rekordbox.clearBackups.mutate([dbPathOverride]),
+	myTagGroups: (dbPathOverride?: string, key?: string) => trpc.rekordbox.myTagGroups.mutate([dbPathOverride, key]),
+	setMyTagGroup: (group: { id: string; name: string } | null) => trpc.rekordbox.setMyTagGroup.mutate([group]),
 	sync: (opts: Parameters<typeof window.api['rekordbox:sync']>[0]): ReturnType<typeof window.api['rekordbox:sync']> =>
 		trpc.rekordbox.sync.mutate([opts]) as ReturnType<typeof window.api['rekordbox:sync']>,
 	createPreview: (playlistId: string): ReturnType<typeof window.api['rekordbox:create-preview']> =>

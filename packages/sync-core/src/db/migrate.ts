@@ -387,6 +387,12 @@ CREATE TABLE IF NOT EXISTS rekordbox_link (
 CREATE UNIQUE INDEX IF NOT EXISTS rekordbox_link_content_uniq ON rekordbox_link(rb_content_id);
 CREATE INDEX IF NOT EXISTS rekordbox_link_path_idx ON rekordbox_link(rb_file_path);
 
+CREATE TABLE IF NOT EXISTS rekordbox_tag_link (
+	tag_id TEXT PRIMARY KEY REFERENCES tag(id) ON DELETE CASCADE,
+	rb_tag_id TEXT NOT NULL UNIQUE,
+	linked_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_conflict (
 	id TEXT PRIMARY KEY,
 	provider TEXT NOT NULL,

@@ -12,9 +12,12 @@ import { createBackofficeHandler } from '../backoffice/handler.js';
 import { stamped } from '../backoffice/operator.js';
 import { adminOps, type AdminOps } from '../catalog/admin-ops.js';
 import { assertConnectionString, createPostgresDb } from '../db/db.js';
-import { fromThisMachinesPages } from './loopback.js';
+import { carriesAdminToken, fromThisMachinesPages } from './loopback.js';
 
 const PORT = Number(process.env.CURATOR_BACKOFFICE_PORT ?? 8790);
+// Set by the desktop app's Cloud Admin tab (loopback.ts carriesAdminToken):
+// then every request must carry it.
+const ADMIN_TOKEN = process.env.CURATOR_ADMIN_TOKEN?.trim() || undefined;
 const localPort = process.env.CURATOR_LOCAL_CLOUD_PORT ?? '8787';
 
 const url = process.env.DATABASE_URL?.trim();
@@ -50,7 +53,7 @@ const handler = async (req: Request): Promise<Response> => {
 
 const server = createServer((req, res) => {
 	void (async () => {
-		if (!fromThisMachinesPages({ method: req.method ?? 'GET', host: req.headers.host, contentType: req.headers['content-type'] }, PORT)) {
+		if (!fromThisMachinesPages({ method: req.method ?? 'GET', host: req.headers.host, contentType: req.headers['content-type'] }, PORT) || !carriesAdminToken(req.headers['x-curator-admin'], ADMIN_TOKEN)) {
 			res.writeHead(403).end();
 			return;
 		}

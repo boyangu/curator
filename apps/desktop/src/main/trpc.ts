@@ -147,6 +147,8 @@ export function buildAppRouter(h: Handlers) {
 			read: proc('rekordbox:read'),
 			listBackups: proc('rekordbox:list-backups'),
 			clearBackups: proc('rekordbox:clear-backups'),
+			myTagGroups: proc('rekordbox:mytag-groups'),
+			setMyTagGroup: proc('rekordbox:set-mytag-group'),
 			sync: proc('rekordbox:sync'),
 			createPreview: proc('rekordbox:create-preview'),
 			createPreviewTracks: proc('rekordbox:create-preview-tracks'),

@@ -37,7 +37,28 @@ import { type FlatClaim, IngestBatch, type Obj } from './ingest-batch.js';
 import { slotMatch, type HeldTrack } from './slots.js';
 import { ensureCursors } from './watches.js';
 
-export type IngestContext = { reason: CatalogIngestReason };
+// `rules`: the credit rules and blocked store ids, when the caller read them
+// already (loadIngestRules) — a report applying many releases reads them once.
+export type IngestContext = { reason: CatalogIngestReason; rules?: IngestRules };
+
+export type IngestRules = Promise<{ credits: Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>; blocked: Set<string> }>;
+
+// What the reasoner or the operator ruled about credits and store ids
+// (catalog_credit_rule, catalog_source_block; migration 0024). Both tables are small.
+export function loadIngestRules(tx: Queryable): IngestRules {
+	return (async () => {
+		const credits = new Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>();
+		const blocked = new Set<string>();
+		for (const r of await tx.query<{ k: string; name: string | null; kind: 'compound' | 'split' | null; pieces: string | null }>(
+			`select name_fold as k, name, kind, pieces::text as pieces from curator.catalog_credit_rule
+			union all select provider || '|' || kind || '|' || provider_id, null, null, null from curator.catalog_source_block`,
+		)) {
+			if (r.kind === null) blocked.add(r.k);
+			else credits.set(r.k, { name: r.name!, kind: r.kind, pieces: !r.pieces || r.pieces === '{}' ? [] : r.pieces.slice(1, -1).split(',').map((p) => p.replace(/^"|"$/g, '')) });
+		}
+		return { credits, blocked };
+	})();
+}
 
 export type IngestOutcome = { objectId: string; kind: CatalogKind; created: boolean };
 
@@ -259,23 +280,11 @@ export class Ingester {
 		return p;
 	}
 
-	// What the reasoner or the operator ruled about credits and store ids
-	// (catalog_credit_rule, catalog_source_block; migration 0024), read once
-	// per ingest. Both tables are small.
-	private rulesMemo: Promise<{ credits: Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>; blocked: Set<string> }> | null = null;
-	private rules() {
-		this.rulesMemo ??= (async () => {
-			const credits = new Map<string, { name: string; kind: 'compound' | 'split'; pieces: string[] }>();
-			const blocked = new Set<string>();
-			for (const r of await this.tx.query<{ k: string; name: string | null; kind: 'compound' | 'split' | null; pieces: string | null }>(
-				`select name_fold as k, name, kind, pieces::text as pieces from curator.catalog_credit_rule
-				union all select provider || '|' || kind || '|' || provider_id, null, null, null from curator.catalog_source_block`,
-			)) {
-				if (r.kind === null) blocked.add(r.k);
-				else credits.set(r.k, { name: r.name!, kind: r.kind, pieces: !r.pieces || r.pieces === '{}' ? [] : r.pieces.slice(1, -1).split(',').map((p) => p.replace(/^"|"$/g, '')) });
-			}
-			return { credits, blocked };
-		})();
+	// The credit rules and blocked store ids (loadIngestRules), read once per
+	// ingest — or once for many, when the caller hands them in.
+	private rulesMemo: IngestRules | null = null;
+	private rules(): IngestRules {
+		this.rulesMemo ??= this.ctx.rules ?? loadIngestRules(this.tx);
 		return this.rulesMemo;
 	}
 

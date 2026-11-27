@@ -151,6 +151,10 @@ class MyTagDelta:
     # Track membership — DjmdSongMyTag rows. The importer translates to
     # Curator's track_tag table after resolving rb_content_id → trackId.
     tracks: list[str] = field(default_factory=list)  # rb_content_ids
+    # A group folder (Attribute=1: Genre / Components / Situation / …), not a
+    # tag. Emitted so the importer can drop the empty tags older readers made
+    # of them; it never becomes a Curator tag.
+    is_group: bool = False
 
 
 @dataclass

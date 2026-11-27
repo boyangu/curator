@@ -66,7 +66,7 @@ import { attachFacts, gated, type CatalogDeps } from '../catalog.js';
 import { raiseReleaseEvents } from '../events.js';
 import { findRepresentation, findRepresentations, follow } from '../identity.js';
 import { raise } from '../inbox.js';
-import { ingestClaims } from '../ingest.js';
+import { ingestClaims, loadIngestRules, type IngestRules } from '../ingest.js';
 import { pageTracks } from '../pages.js';
 import { applyReleaseClaims } from '../store-links.js';
 import { deviceHolder } from '../trackers/sweep.js';
@@ -109,7 +109,24 @@ type Ctx = {
 	changed: Set<string>;
 	// Objects whose listing was read: their page is planned again for the follow-up.
 	listed: Set<string>;
+	// The ingest's credit rules, read by the first result that needs them and
+	// kept for the rest of the report (ingest.ts loadIngestRules). A holder:
+	// each result runs on a copy of the context.
+	rules: { memo: IngestRules | null };
 };
+
+// The report's credit rules, read once; a read that failed is read again by
+// the next result rather than failing every one after it.
+function rulesOf(c: Ctx): IngestRules {
+	if (!c.rules.memo) {
+		const p = loadIngestRules(c.tx);
+		c.rules.memo = p;
+		p.catch(() => {
+			if (c.rules.memo === p) c.rules.memo = null;
+		});
+	}
+	return c.rules.memo;
+}
 
 const WORK_STORES: ReadonlySet<string> = new Set(CATALOG_WORK_STORES);
 
@@ -129,6 +146,8 @@ async function remember(c: Ctx, rows: readonly StateRow[]): Promise<void> {
 }
 
 // One at a time per page or release, to the end of the report's transaction.
+// The report takes every result's turn up front (workReport); this is for a
+// release found merged into another since its job was handed out.
 const turn = (tx: Queryable, key: string): Promise<unknown> => tx.query(`select pg_advisory_xact_lock(hashtext($1))`, [key]);
 
 async function objectOf(tx: Queryable, id: string): Promise<{ id: string; kind: string; name: string } | null> {
@@ -165,7 +184,6 @@ async function applyFind(c: Ctx, ref: Extract<JobRef, { kind: 'find' }>, r: Extr
 	const poll = r.poll;
 	if (!poll) return { jobId, outcome: 'refused', note: 'no listing' };
 	const { tx } = c;
-	await turn(tx, `work.page:${pageKey(ref)}`);
 	// A listing is of the page it was read from, or of nothing.
 	const says = namedBy(poll, ref);
 	if (poll.self && !says) return { jobId, outcome: 'refused', note: 'the listing is of another page' };
@@ -273,15 +291,18 @@ async function applyFind(c: Ctx, ref: Extract<JobRef, { kind: 'find' }>, r: Extr
 // ── release ─────────────────────────────────────────────────────────────────
 
 type Held = { title: string; durationSec: number | null; isrc: string | null };
+// The release's tracks as the comparison reads them and as the store links'
+// join does (store-links.ts joinTracks): one read for both.
+type HeldRow = Held & { id: string; position: number | null };
 
-async function heldWithCodes(tx: Queryable, releaseId: string): Promise<Held[]> {
-	const rows = await tx.query<{ name: string; duration_sec: unknown; isrc: string | null }>(
-		`select o.name, o.duration_sec, (select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc
+async function heldWithCodes(tx: Queryable, releaseId: string): Promise<HeldRow[]> {
+	const rows = await tx.query<{ id: string; name: string; duration_sec: unknown; position: unknown; isrc: string | null }>(
+		`select o.id, o.name, o.duration_sec, e.position, (select i.value from curator.catalog_identifier i where i.object_id = o.id and i.namespace = 'isrc' limit 1) as isrc
 		from curator.catalog_edge e join curator.catalog_object o on o.id = e.dst and o.merged_into is null
 		where e.src = $1 and e.kind = 'release-recording' order by e.position nulls last, o.id`,
 		[releaseId],
 	);
-	return rows.map((r) => ({ title: r.name, durationSec: numOrNull(r.duration_sec), isrc: r.isrc }));
+	return rows.map((r) => ({ id: r.id, title: r.name, durationSec: numOrNull(r.duration_sec), position: numOrNull(r.position), isrc: r.isrc }));
 }
 
 // Who a release is by is not Deezer's to say: its artist pages file every act
@@ -305,7 +326,7 @@ async function applyRelease(c: Ctx, ref: Extract<JobRef, { kind: 'release' }>, r
 	const release = await objectOf(tx, ref.releaseId);
 	if (release?.kind !== 'release') return { jobId, outcome: 'refused', note: 'not a release' };
 	const releaseId = release.id;
-	await turn(tx, `work.release:${releaseId}`);
+	if (releaseId !== ref.releaseId) await turn(tx, `work.release:${releaseId}`);
 	const pages = await tx.query<{ provider: string; provider_id: string }>(`select provider, provider_id from curator.catalog_source_object where object_id = $1 and kind = 'release'`, [releaseId]);
 	const on = new Set(pages.map((p) => p.provider));
 	const notes: string[] = [];
@@ -365,7 +386,16 @@ async function applyRelease(c: Ctx, ref: Extract<JobRef, { kind: 'release' }>, r
 				continue;
 			}
 		}
-		const applied = await applyReleaseClaims(tx, releaseId, [claim], (x) => `a device found ${x.provider} release ${x.providerId} for this one (${f.how}); it is held by the other`);
+		const key = `${claim.provider}|${claim.kind}|${claim.providerId}`;
+		// Read within this result's savepoint, not left in flight past it.
+		const rules = rulesOf(c);
+		await rules;
+		const applied = await applyReleaseClaims(tx, releaseId, [claim], (x) => `a device found ${x.provider} release ${x.providerId} for this one (${f.how}); it is held by the other`, {
+			holders: new Map([[key, holders.get(key) ?? null]]),
+			held: held.map((h) => ({ id: h.id, name: h.title, durationSec: h.durationSec, position: h.position })),
+			rules,
+			count: false,
+		});
 		if (applied.conflicts.length) {
 			notes.push(`${claim.provider}: held by another release, sent for review`);
 			state.push({ objectId: releaseId, job: 'release', provider: claim.provider, outcome: 'conflict', evidence: { page: claim.providerId, heldBy: applied.conflicts[0]!.heldBy } });
@@ -569,7 +599,7 @@ export async function workReport(deps: CatalogDeps, userId: string, caller: Call
 		const turns = [...new Set(valid.flatMap(({ r, ref }) => (r.kind === 'error' ? [] : ref.kind === 'find' ? [`work.page:${pageKey(ref)}`] : ref.kind === 'release' ? [`work.release:${ref.releaseId}`] : [])))];
 		if (turns.length) await tx.query(`select pg_advisory_xact_lock(hashtext(s.k)) from (select t.k from jsonb_array_elements_text($1::text::jsonb) as t(k) order by t.k) s`, [JSON.stringify(turns)]);
 
-		const c: Ctx = { tx, userId, deviceId: input.deviceId, hints: input.hints ?? [], items: [], changed: new Set(), listed: new Set() };
+		const c: Ctx = { tx, userId, deviceId: input.deviceId, hints: input.hints ?? [], items: [], changed: new Set(), listed: new Set(), rules: { memo: null } };
 		let allowance = CALLS_BASE;
 		const apply = async (r: CatalogWorkResult, ref: JobRef): Promise<Outcome> => {
 			const judged = await isolated(deps, c, r.jobId, (cx) => {

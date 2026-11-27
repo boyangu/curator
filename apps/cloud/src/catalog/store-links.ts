@@ -21,8 +21,8 @@ import { withSystemTx } from '../db/system-tx.js';
 import type { Logger } from '../log.js';
 import { openReview } from './admin.js';
 import { findRepresentation } from './identity.js';
-import { alone, Ingester } from './ingest.js';
-import { heldTracks, slotMatch } from './slots.js';
+import { alone, Ingester, type IngestRules } from './ingest.js';
+import { heldTracks, slotMatch, type HeldTrack } from './slots.js';
 import type { AppleLookup } from './trackers/apple.js';
 import { fetchAlbums, type SpotifyTracker } from '@curator/catalog-readers';
 import type { TidalApp } from './trackers/tidal-app.js';
@@ -109,11 +109,19 @@ export type ApplyResult = { conflicts: { provider: string; id: string; heldBy: s
 // Store claims onto one release, in the caller's transaction. A store id
 // that already belongs to another release is not moved: a `duplicate`
 // review opens with `why` as its reason.
-export async function applyReleaseClaims(tx: Queryable, releaseId: string, claims: CatalogClaim[], why: (c: CatalogClaim) => string): Promise<ApplyResult> {
+// What a caller that already looked can hand in, so it is not looked up
+// again (catalog/work/report.ts, one release after another in one report):
+// `holders` — each claim's current holder by `provider|kind|providerId`,
+// null for one nobody holds; `held` — the release's tracklist as it stands;
+// `rules` — the ingest's credit rules; `count: false` — no track count after.
+export type ApplyKnown = { holders?: ReadonlyMap<string, string | null>; held?: HeldTrack[]; rules?: IngestRules; count?: boolean };
+
+export async function applyReleaseClaims(tx: Queryable, releaseId: string, claims: CatalogClaim[], why: (c: CatalogClaim) => string, known: ApplyKnown = {}): Promise<ApplyResult> {
 	const result: ApplyResult = { conflicts: [], tracks: 0 };
-	const ingester = new Ingester(tx, { reason: 'enrichment' });
+	const ingester = new Ingester(tx, { reason: 'enrichment', ...(known.rules ? { rules: known.rules } : {}) });
 	for (const c of claims) {
-		const holder = await findRepresentation(tx, c);
+		const key = `${c.provider}|${c.kind}|${c.providerId}`;
+		const holder = known.holders?.has(key) ? known.holders.get(key)! : await findRepresentation(tx, c);
 		if (holder && holder !== releaseId) {
 			result.conflicts.push({ provider: c.provider, id: c.providerId, heldBy: holder });
 			await openReview(tx, { kind: 'duplicate', objectId: releaseId, candidates: [{ objectId: holder, name: c.name }], evidence: { reason: why(c) } });
@@ -122,9 +130,12 @@ export async function applyReleaseClaims(tx: Queryable, releaseId: string, claim
 		// On the release first, so the claim below resolves to it and brings
 		// its tracklist, label and facts along.
 		if (!holder) await ingester.attachTo(releaseId, c);
-		await joinTracks(tx, ingester, releaseId, c);
+		// The tracklist handed in stands for the first claim only: each claim
+		// may add to it.
+		await joinTracks(tx, ingester, releaseId, c, c === claims[0] ? known.held : undefined);
 		await ingester.claim(c);
 	}
+	if (known.count === false) return result;
 	const [after] = await tx.query<{ n: unknown }>(`select count(*) as n from curator.catalog_edge where src = $1 and kind = 'release-recording'`, [releaseId]);
 	result.tracks = num(after!.n);
 	return result;
@@ -135,9 +146,9 @@ export async function applyReleaseClaims(tx: Queryable, releaseId: string, claim
 // slot within two seconds whatever the title, because this store page was
 // keyed to the release by UPC and is known to be the same release. One match
 // only; anything less clear is left to the identity rules.
-export async function joinTracks(tx: Queryable, ingester: Ingester, releaseId: string, c: CatalogClaim): Promise<void> {
+export async function joinTracks(tx: Queryable, ingester: Ingester, releaseId: string, c: CatalogClaim, known?: HeldTrack[]): Promise<void> {
 	if (!c.recordings?.length) return;
-	const held = await heldTracks(tx, releaseId);
+	const held = known ?? (await heldTracks(tx, releaseId));
 	if (!held.length) return;
 	const artists = (c.artists ?? []).map((a) => nameFold(a.name)).filter(Boolean);
 	const recordings = c.recordings;

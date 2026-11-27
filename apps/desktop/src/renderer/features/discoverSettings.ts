@@ -56,12 +56,8 @@ export function updateDiscoverSettings(patch: Partial<DiscoverSettings>): void {
 const KIND_TITLES: Record<CatalogReadSources[number]['kind'], string> = { artist: 'Artists', label: 'Labels', playlist: 'Playlists', genre: 'Genres' };
 
 type ReadCadence = CatalogReadSources[number]['cadence'];
-const CADENCE_OPTIONS: { value: ReadCadence; label: string }[] = [
-	{ value: 'weekly', label: 'Every week (Friday morning)' },
-	{ value: 'daily', label: 'Every day' },
-	{ value: 'source', label: 'As often as the source allows' },
-];
-const CADENCE_HINT = 'How often these follows are read for new music. Weekly reads once, on Friday morning (UTC), when releases land; "as often as the source allows" is hourly for playlists and daily for artists, more on Fridays.';
+const CADENCE_LABELS: Record<ReadCadence, string> = { weekly: 'Every week (Friday morning)', daily: 'Every day', source: 'As often as the source allows' };
+const CADENCE_HINT = 'How often these follows are read for new music, set by Curator for everyone. Weekly reads once, on Friday morning (UTC), when releases land.';
 
 const CLOUD_ONLY_HINT ='Only the cloud can read this source (its keys are the cloud’s). Unchecked, nobody reads it for your follows.';
 const ANYWHERE_HINT = 'Unchecked, nobody reads this source for your follows — not this computer, not the cloud.';
@@ -147,7 +143,7 @@ export async function renderSettingsDiscover(): Promise<void> {
 		? sources.map((r) => `
 			<div class="settings-discover__kind">
 				<div class="settings-discover__kind-label">${escapeHtml(KIND_TITLES[r.kind])}</div>
-				<select class="settings-ui__select settings-discover__cadence" data-read-cadence="${escapeHtml(r.kind)}" title="${escapeHtml(CADENCE_HINT)}">${CADENCE_OPTIONS.map((o) => `<option value="${o.value}" ${o.value === r.cadence ? 'selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}</select>
+				<span class="settings-toggle__hint settings-discover__cadence" title="${escapeHtml(CADENCE_HINT)}">${escapeHtml(CADENCE_LABELS[r.cadence])}</span>
 				${sourceRows(r)}
 			</div>`).join('')
 		: `<div class="settings-toggle__hint">Could not read your tracking choices${sourcesError ? ` — ${escapeHtml(sourcesError)}` : ''}.</div>`;
@@ -163,7 +159,7 @@ export async function renderSettingsDiscover(): Promise<void> {
 		</div>
 		<div class="settings-ui__section">
 			<div class="settings-ui__section-label">Sources read for your follows</div>
-			<div class="settings-toggle__hint" style="margin-bottom: 6px;">Which services are checked for what you follow, and how often. Unchecked sources are read by nobody — not this computer, not the cloud. The same checkboxes sit in the feed's Refresh menu, whose “check now” reads at once whatever is set here.</div>
+			<div class="settings-toggle__hint" style="margin-bottom: 6px;">Which services are checked for what you follow, and how often Curator reads each kind. Unchecked sources are read by nobody — not this computer, not the cloud. The same checkboxes sit in the feed's Refresh menu, whose “check now” reads at once whatever is set here.</div>
 			<div class="settings-discover__sources">${sourcesBlock}</div>
 		</div>
 		<div class="settings-ui__section">
@@ -181,21 +177,6 @@ export async function renderSettingsDiscover(): Promise<void> {
 	wrap.querySelector<HTMLInputElement>('[data-discover-source-logos]')?.addEventListener('change', (e) => {
 		updateDiscoverSettings({ showSourceLogos: (e.target as HTMLInputElement).checked });
 	});
-	for (const select of wrap.querySelectorAll<HTMLSelectElement>('[data-read-cadence]')) {
-		let current = select.value as ReadCadence;
-		select.addEventListener('change', async () => {
-			const kind = select.dataset.readCadence as CatalogReadSources[number]['kind'];
-			const next = select.value as ReadCadence;
-			try {
-				await catalogApi.setReadCadence(kind, next);
-				current = next;
-			} catch (err) {
-				select.value = current;
-				dlog.warn('set read cadence failed', { kind, next }, err);
-				showToast('Could not save that choice', { kind: 'error', sub: err instanceof Error ? err.message : String(err) });
-			}
-		});
-	}
 	for (const input of wrap.querySelectorAll<HTMLInputElement>('[data-read-source]')) {
 		input.addEventListener('change', async () => {
 			const key = input.dataset.readSource!;

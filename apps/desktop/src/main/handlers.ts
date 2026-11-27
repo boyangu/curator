@@ -27,6 +27,7 @@ import type { CoreSidecarHost } from './core-sidecar/host.js';
 import type { AudioSidecarHost } from './audio-sidecar.js';
 import type { SpotifySidecarHost } from './spotify-sidecar.js';
 import type { FlareSolverrHost } from './flaresolverr-host.js';
+import type { CloudAdmin } from './cloud-admin.js';
 import type { McpConfirmBroker } from './mcp/confirm.js';
 
 export interface HandlerContext {
@@ -62,6 +63,7 @@ export interface HandlerContext {
 	// FlareSolverr supervisor (Beatport past Cloudflare). Always present; it
 	// reports enabled:false when turned off.
 	flareSolverr: FlareSolverrHost;
+	cloudAdmin: CloudAdmin;
 }
 
 export type Handlers = {
@@ -177,7 +179,6 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'catalog:worker-status': async () => svc.getCatalogWorkerStatus(),
 		'catalog:read-sources': async () => svc.getCatalogReadSources(),
 		'catalog:set-read-sources': async (patch) => svc.setCatalogReadSources(patch),
-		'catalog:set-read-cadence': async (kind, cadence) => svc.setCatalogReadCadence(kind, cadence),
 		'catalog:watches': async () => svc.catalogWatches(),
 		'catalog:search': async (q) => svc.catalogSearch(q),
 		'catalog:follow': async (target) => svc.catalogFollow(target),
@@ -387,6 +388,10 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 			return ctx.spotifySidecar.request(method, params);
 		},
 
+		'cloud-admin:available':       async ()        => ctx.cloudAdmin.available(),
+		'cloud-admin:open':            async (bounds)  => ctx.cloudAdmin.open(bounds),
+		'cloud-admin:bounds':          async (bounds)  => ctx.cloudAdmin.bounds(bounds),
+		'cloud-admin:hide':            async ()        => ctx.cloudAdmin.hide(),
 		'flaresolverr:status':         async (refresh) => ctx.flareSolverr.status(refresh),
 		'flaresolverr:start':          async ()        => ctx.flareSolverr.start(),
 		'flaresolverr:stop':           async ()        => ctx.flareSolverr.stop(),
@@ -623,6 +628,8 @@ export function buildHandlers(svc: CoreService, ctx: HandlerContext): Handlers {
 		'sync:resolve-conflicts':   async (args)                       => svc.resolveSyncConflicts(args),
 		'rekordbox:list-backups':   async (dbPathOverride)             => svc.listRekordboxBackups(dbPathOverride),
 		'rekordbox:clear-backups':  async (dbPathOverride)             => svc.clearRekordboxBackups(dbPathOverride),
+		'rekordbox:mytag-groups':    async (dbPathOverride, key)       => svc.getRekordboxMyTagGroups(dbPathOverride, key),
+		'rekordbox:set-mytag-group': async (group)                     => svc.setRekordboxMyTagGroup(group),
 		'rekordbox:restore-backup': async (backupPath, dbPathOverride) => svc.restoreRekordboxBackup(backupPath, dbPathOverride),
 		'rekordbox:cue-palette':    async ()                            => svc.listCuePalette(),
 	};

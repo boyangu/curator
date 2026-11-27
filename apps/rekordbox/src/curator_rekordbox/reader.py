@@ -375,6 +375,30 @@ def list_stale_relations(db_path: str, key: Optional[str]) -> list[dict[str, Any
             pass
 
 
+def query_mytag_groups(session: Any) -> list[dict[str, Any]]:
+    """Live MyTag group folders (Attribute=1) in rekordbox's own order — what
+    Settings offers as the home for MyTags the push creates."""
+    from pyrekordbox.db6.tables import DjmdMyTag  # type: ignore
+    rows = [
+        r for r in session.query(DjmdMyTag).all()
+        if int(getattr(r, "Attribute", 0) or 0) == 1 and not bool(getattr(r, "rb_local_deleted", 0))
+    ]
+    rows.sort(key=lambda r: (int(getattr(r, "Seq", 0) or 0), str(r.ID)))
+    return [{"id": str(r.ID), "name": str(r.Name or "")} for r in rows]
+
+
+def list_mytag_groups(db_path: str, key: Optional[str]) -> list[dict[str, Any]]:
+    """Read-only, like list_stale_relations: opens master.db directly."""
+    db = open_db(db_path, key)
+    try:
+        return query_mytag_groups(db.session)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 def detect_default_db_path() -> Optional[str]:
     """OS-specific default master.db location. Returns None if missing."""
     if sys.platform == "darwin":
@@ -845,6 +869,19 @@ def scan(
                 if is_cancelled():
                     break
                 usn = int(getattr(row, "rb_local_usn", 0) or 0)
+                if usn > max_seen:
+                    max_seen = usn
+                # Group folders (Attribute=1) are not tags. Emitted on every
+                # pass, flagged, so the importer drops the empty `rb_<id>`
+                # tags earlier readers made of them — those rows sit below
+                # the watermark and would never come round again.
+                if int(getattr(row, "Attribute", 0) or 0) == 1:
+                    emit("mytag", asdict(MyTagDelta(
+                        rb_tag_id=str(row.ID), rb_local_usn=usn,
+                        rb_local_deleted=bool(getattr(row, "rb_local_deleted", 0)),
+                        name=str(getattr(row, "Name", "") or ""), color=None, is_group=True,
+                    )))
+                    continue
                 # Tombstoned MyTags are emitted on EVERY pass, watermark or
                 # not: the importer reconciles them against Curator's live
                 # tags each run (merge into a live same-name tag, prune when
@@ -854,8 +891,6 @@ def scan(
                 tombstoned = bool(getattr(row, "rb_local_deleted", 0))
                 if usn <= wm and not tombstoned:
                     continue
-                if usn > max_seen:
-                    max_seen = usn
                 delta = _row_to_mytag_delta(db, row, with_tracks=not tombstoned)
                 if delta is not None:
                     emit("mytag", asdict(delta))

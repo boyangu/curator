@@ -3,14 +3,13 @@
 // and the lookups are stand-ins; the engine is the real one.
 
 import { describe, expect, it } from 'vitest';
-import type { CatalogClaim, CatalogJob, CatalogPageRelease, CatalogPageTrack, CatalogTracker, CatalogTracksResult, CatalogWork, CatalogWorkReportInput, CatalogWorkReportResult } from '@curator/protocol';
+import type { CatalogClaim, CatalogJob, CatalogPageRelease, CatalogPageTrack, CatalogTracksResult, CatalogWork, CatalogWorkReportInput, CatalogWorkReportResult } from '@curator/protocol';
 import type { WorkReaders } from '@curator/catalog-work';
 import type { EntityHeader, EntityRef, EntityWorkEvent } from '@curator/shared';
 import type { Enricher, EnricherOutput } from '@curator/sync-core/enrich/contract';
 import type { StreamingCatalog } from './streaming.js';
 import { createEntityWork, type EntityWorkDeps } from './work.js';
 
-const ALL: CatalogTracker[] = ['artist/spotify', 'label/beatport', 'label/bandcamp'];
 const CAT = '11111111-1111-4111-8111-111111111111';
 const REL = '22222222-2222-4222-8222-222222222222';
 const T1 = '33333333-3333-4333-8333-333333333333';
@@ -55,7 +54,6 @@ function harness(over: {
 	header?: EntityHeader | (() => EntityHeader);
 	readers?: Partial<WorkReaders>;
 	enrichers?: Enricher[];
-	trackers?: CatalogTracker[];
 	offers?: boolean;
 	banUntil?: number;
 	loaded?: CatalogTracksResult[];
@@ -91,7 +89,6 @@ function harness(over: {
 			loaded: async () => over.loaded ?? [],
 			drop: (id) => void dropped.push(id),
 		},
-		trackers: () => over.trackers ?? ALL,
 		spotifyToken: async () => 'token',
 		spotifyBackoffUntil: () => over.banUntil ?? 0,
 		...(over.streaming ? { streaming: () => over.streaming! } : {}),
@@ -121,7 +118,7 @@ describe('the profile a read carries', () => {
 		const { w } = harness();
 		expect(w.profile(CAT)).toBeNull();
 		w.watch(ARTIST, 1);
-		expect(w.profile(CAT)).toMatchObject({ form: 'desktop', stores: ['spotify', 'beatport', 'bandcamp', 'traxsource'], visit: { round: 0, taken: 0 } });
+		expect(w.profile(CAT)).toMatchObject({ form: 'desktop', stores: ['spotify', 'deezer', 'beatport', 'bandcamp', 'traxsource'], visit: { round: 0, taken: 0 } });
 		expect(w.profile('99999999-9999-4999-8999-999999999999')).toBeNull();
 		w.watch(null, 2);
 		expect(w.profile(CAT)).toBeNull();
@@ -130,10 +127,10 @@ describe('the profile a read carries', () => {
 		expect(off.w.profile(CAT)).toBeNull();
 	});
 
-	it('says nothing of Spotify during its quota ban, and nothing of a source the user unchecked', () => {
-		const { w } = harness({ banUntil: Date.now() + 3_600_000, trackers: ['artist/spotify'] });
+	it("says nothing of Spotify during its quota ban — and reads every other store, whatever the Refresh menu's checkboxes say", () => {
+		const { w } = harness({ banUntil: Date.now() + 3_600_000 });
 		w.watch(ARTIST, 1);
-		expect(w.profile(CAT)!.stores).toEqual(['traxsource']);
+		expect(w.profile(CAT)!.stores).toEqual(['deezer', 'beatport', 'bandcamp', 'traxsource']);
 	});
 });
 
@@ -260,7 +257,6 @@ describe('rows looked up by hand', () => {
 		let block = false;
 		const { w, reports } = harness({
 			loaded: [page([pageRelease(REL, 'Hollow', [pageTrack(T1, 'Hollow')])])],
-			trackers: ['label/beatport'],
 			enrichers: [enricher('beatport', async () => ((block = true), null), () => (block ? until : null)), enricher('traxsource', async () => null)],
 		});
 		w.watch(ARTIST, 1);
@@ -269,5 +265,26 @@ describe('rows looked up by hand', () => {
 		expect(results.find((r) => r.kind === 'error')).toMatchObject({ store: 'beatport', rateLimitedSec: expect.any(Number) });
 		expect(results.some((r) => r.kind === 'facts' && r.notFound.some((n) => n.store === 'beatport'))).toBe(false);
 		expect(w.profile(CAT)!.stores).not.toContain('beatport');
+	});
+});
+
+describe('background work', () => {
+	it("runs on the page work's engine, and patches and reloads the page in front only for what is its own", async () => {
+		const bp = { provider: 'beatport' as const, kind: 'release' as const, providerId: 'bp1', name: 'Hollow', recordings: [recording('beatport', 'b1', 'Hollow', { bpm: 122, key: 'A Minor' })] };
+		const { w, reports, events, dropped } = harness({ readers: { release: async () => bp } });
+		expect(w.backgroundProfile()).toMatchObject({ form: 'desktop' });
+		w.watch(ARTIST, 1);
+		const rows = [pageTrack(T1, 'Hollow')];
+		w.read(CAT, page([pageRelease(REL, 'Hollow', rows)]), undefined, []);
+		const job: CatalogJob = { id: `release:${REL}`, kind: 'release', objectId: REL, release: { title: 'Hollow', artists: ['Northfold'], date: null, upcs: [], tracks: [{ id: T1, title: 'Hollow', artists: ['Northfold'], durationSec: 300, isrc: null, position: 1 }] }, read: [{ provider: 'beatport', id: 'bp1', url: null }], find: [], check: [] };
+		await w.runBackground(work([job]));
+		expect(reports).toHaveLength(1);
+		expect(w.patchOf(T1)).toMatchObject({ bpm: 122, keyCamelot: '8A' });
+		await settled(events, (e) => e.some((x) => x.changed === 'tracks'));
+		expect(dropped).toContain(CAT);
+	});
+
+	it('asks with nothing while the server hands out no work', () => {
+		expect(harness({ offers: false }).w.backgroundProfile()).toBeNull();
 	});
 });

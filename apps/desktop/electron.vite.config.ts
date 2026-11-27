@@ -33,7 +33,10 @@ const OPTIONAL_ENV = ['CURATOR_CLOUD_API_URL'] as const;
 // (`pnpm --filter @curator/cloud local`) while library sync stays on the real
 // cloud. Dev and packaged builds both honour it (main/index.ts); a release
 // build must be made without the line.
-const DEV_ENV = ['CURATOR_CATALOG_API_URL'] as const;
+// CURATOR_OPERATOR=1: this machine is the operator's — the Cloud Admin tab
+// (src/main/cloud-admin.ts), which runs only unpackaged, from the repo, with
+// the owner credential the repo's .env holds (read at run time, never baked).
+const DEV_ENV = ['CURATOR_CATALOG_API_URL', 'CURATOR_OPERATOR'] as const;
 
 // The endpoints among them. Each carries the account's token (the Supabase
 // one the password too), so a build is refused unless it is https; plain http

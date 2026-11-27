@@ -16,15 +16,13 @@
 // library/album-enrich.ts — the Spotify rate gate and Electron's net.fetch
 // for Beatport live there. Nothing here writes the library.
 
-import type { CatalogCheckReport, CatalogProvider, CatalogProviderPause, CatalogReadCadenceChoices, CatalogTracker, CatalogTrackingKind, CatalogWorkerDueResult, CatalogWorkerTask, CloudService } from '@curator/protocol';
+import { CLOUD_CONFIG_DEFAULTS, type CatalogCheckReport, type CatalogProvider, type CatalogProviderPause, type CatalogTracker, type CatalogTrackingKind, type CatalogWorkerDueResult, type CatalogWorkerTask, type CloudConfigEnvelope, type CloudService, type CatalogDeviceProfile, type CatalogWork } from '@curator/protocol';
 import { BandcampTracker, BeatportTracker, DeezerTracker, SpotifyTracker, SpotifyUserPlaylistTracker, TrackerRateLimitedError, type FetchLike, type TrackerAdapter } from '@curator/catalog-readers';
 import { gatedFetch, isSpotifyQuotaBackoff, spotifyBackoffUntil } from '@curator/spotify';
 import { log } from '@curator/sync-core/log';
 
 const wlog = log.for('catalog-worker');
 
-// The master's cadence; the sync client's active poll is the same minute.
-export const CATALOG_WORKER_TICK_MS = 60_000;
 // The first ask after start: let the window and the first sync come up.
 const FIRST_TICK_MS = 5_000;
 // After the transport failed (offline, the server erroring, signed out mid-call).
@@ -72,10 +70,23 @@ export type CatalogWorkerDeps = {
 	// The user's checked trackers (settings.ts checkedTrackers), read on every
 	// ask so a change in the Refresh menu applies at the next one.
 	trackers: () => CatalogTracker[];
-	// How often the user wants each kind read (settings.ts readCadence), read
-	// on every ask like the trackers. Null while the server does not list
-	// 'catalog_read_cadence': it would refuse the key.
-	cadence?: () => CatalogReadCadenceChoices | null;
+	// The cloud's scheduling values ('cloud_config'): whether the server says
+	// them, the copy this desktop holds (its tick comes from there), and where
+	// a newer one is kept. Absent: the defaults, and none is asked for.
+	config?: {
+		offered(): boolean;
+		read(): CloudConfigEnvelope;
+		write(config: CloudConfigEnvelope): void;
+	};
+	// Background work ('catalog_background_work'): whether the server hands
+	// it out, what this desktop asks with (null: it reads nothing now), and
+	// the engine that runs it (entity/work.ts runBackground). Asked for only
+	// while none is in hand; run beside the reads, not before the next ask.
+	background?: {
+		offered(): boolean;
+		profile(): CatalogDeviceProfile | null;
+		run(work: CatalogWork): Promise<void>;
+	};
 	// Electron's net.fetch for Beatport (apps/desktop main/index.ts); plain
 	// fetch otherwise.
 	beatportFetch?: FetchLike;
@@ -147,8 +158,13 @@ export function createCatalogWorker(deps: CatalogWorkerDeps): CatalogWorker {
 		return [...pausedUntil].map(([provider, until]) => ({ provider, until }));
 	};
 
+	// The cloud's tick (its config), but for a test's own.
+	const tickMs = (): number => deps.tickMs ?? (deps.config?.read().values.workerTickSec ?? CLOUD_CONFIG_DEFAULTS.workerTickSec) * 1000;
+
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let stopped = true;
+	// Background work in hand: no more is asked for until it is done.
+	let inBackground = false;
 	let inFlight: Promise<unknown> | null = null;
 	let aborter = new AbortController();
 
@@ -186,10 +202,10 @@ export function createCatalogWorker(deps: CatalogWorkerDeps): CatalogWorker {
 			status.inHand = 0;
 			status.check = null;
 			emit();
-			schedule(deps.tickMs ?? CATALOG_WORKER_TICK_MS);
+			schedule(tickMs());
 			return null;
 		}
-		let next = deps.tickMs ?? CATALOG_WORKER_TICK_MS;
+		let next = tickMs();
 		let report: CatalogCheckReport | null = null;
 		try {
 			// A provider that rate-limited this machine is not one it can read
@@ -201,8 +217,23 @@ export function createCatalogWorker(deps: CatalogWorkerDeps): CatalogWorker {
 			const trackers = deps.trackers();
 			status.providers = providers;
 			status.trackers = trackers;
-			const cadence = deps.cadence?.() ?? null;
-			const due = await procs.workerDue({ deviceId: deps.deviceId(), providers, trackers, paused, ...(check ? { check } : {}), ...(cadence ? { cadence } : {}) });
+			const asksConfig = deps.config?.offered() ?? false;
+			const profile = !inBackground && deps.background?.offered() ? deps.background.profile() : null;
+			const due = await procs.workerDue({ deviceId: deps.deviceId(), providers, trackers, paused, ...(check ? { check } : {}), ...(asksConfig ? { configVersion: deps.config!.read().version } : {}), ...(profile ? { profile } : {}) });
+			if (due.work?.jobs.length && deps.background) {
+				inBackground = true;
+				void deps.background
+					.run(due.work)
+					.catch((err: unknown) => wlog.warn('background work failed', undefined, err))
+					.finally(() => {
+						inBackground = false;
+					});
+			}
+			if (due.config) {
+				deps.config?.write(due.config);
+				wlog.info('the cloud changed its scheduling values', { version: due.config.version, workerTickSec: due.config.values.workerTickSec });
+				next = tickMs();
+			}
 			status.lastAskedAt = now();
 			status.reason = 'ok';
 			status.active = due.active;

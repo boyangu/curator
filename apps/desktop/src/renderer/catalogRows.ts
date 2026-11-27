@@ -143,8 +143,21 @@ export function toRows(page: EntityTracksPage, library: ReadonlyMap<string, Trac
 		const held = t.libraryTrackId ? library.get(t.libraryTrackId) : undefined;
 		out.push(
 			held && t.libraryPrimary
-				// The catalogue's place for it on this release; everything else is the library's.
-				? { ...held, trackNumber: t.position ?? held.trackNumber, discNumber: t.disc ?? held.discNumber, albumTitle: album.title, catalog: decoration(t, album) }
+				// The catalogue's place for it on this release; everything else is the
+				// library's — but where the library has no BPM, key, genre or label
+				// (a synced row nobody analysed yet), the catalogue's fills it: the
+				// library's own value, once it has one, always stands.
+				? {
+						...held,
+						trackNumber: t.position ?? held.trackNumber,
+						discNumber: t.disc ?? held.discNumber,
+						albumTitle: album.title,
+						bpm: held.bpm ?? t.bpm,
+						keyCamelot: held.keyCamelot ?? t.keyCamelot,
+						genre: held.genre ?? t.genre,
+						label: held.label ?? album.label?.name ?? t.label ?? null,
+						catalog: decoration(t, album),
+					}
 				: syntheticRow(page.template, t, album, held),
 		);
 	}

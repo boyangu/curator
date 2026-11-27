@@ -16,6 +16,7 @@ import { isLogLevel } from '@curator/shared/log';
 import { TOOL_CATALOG, LOG_BATCH_CHANNEL, type IpcChannels } from '../ipc.js';
 import { broadcastEvent, sendEvent } from './events.js';
 import { buildHandlers } from './handlers.js';
+import { createCloudAdmin } from './cloud-admin.js';
 import { buildAppRouter } from './trpc.js';
 import { IngestPool, defaultPoolSize } from './ingest/pool.js';
 import { loadAgentConfig } from './agent-config.js';
@@ -713,6 +714,10 @@ let cloudTransport: CloudTransport | null = null;
 // confirm-response channel before the bridge host exists.
 const mcpConfirm = new McpConfirmBroker();
 let mainWindow: BrowserWindow | null = null;
+// The operator's Cloud Admin tab (main/cloud-admin.ts): nothing runs until the
+// tab is first opened; its back office stops with the app.
+const cloudAdmin = createCloudAdmin({ getMainWindow: () => mainWindow });
+app.on('will-quit', () => cloudAdmin.stop());
 
 // Two instances would open the same better-sqlite3 file (and both spawn
 // sidecars + library watchers fighting over the same rows) — a corruption
@@ -924,6 +929,7 @@ function registerIpc(svc: CoreService): void {
 	const handlers = buildHandlers(svc, {
 		getMainWindow: () => mainWindow, coreSidecar, audioSidecar, spotifySidecar, mcpConfirm, cloudAccount, cloudTransport,
 		flareSolverr: flareSolverr!,
+		cloudAdmin,
 		profileBlocks: {
 			downloads: rails.downloadsBlocked,
 			googleBackup: rails.backup ? null : `Backup is off in profile "${PROFILE}".`,

@@ -1209,6 +1209,21 @@ export const rekordboxLink = sqliteTable(
 	})
 );
 
+// ─── REKORDBOX_TAG_LINK ──────────────────────────────────────────────────────
+// A Curator-made tag the push created (or found by name) in rekordbox as a
+// DjmdMyTag. Tags imported FROM rekordbox carry their identity in the id
+// (`rb_<DjmdMyTag.ID>`); a Curator tag can't be re-keyed that way — its id is
+// an account-wide identity on the op log, and a re-key would reach every
+// device as a delete + create with all its assignments. Device-local like
+// rekordbox_link: the rb id belongs to this machine's master.db.
+export const rekordboxTagLink = sqliteTable('rekordbox_tag_link', {
+	tagId: text('tag_id')
+		.primaryKey()
+		.references(() => tag.id, { onDelete: 'cascade' }),
+	rbTagId: text('rb_tag_id').notNull().unique(),          // DjmdMyTag.ID
+	linkedAt: integer('linked_at', { mode: 'timestamp_ms' }).notNull(),
+});
+
 // ─── SYNC_CONFLICT ───────────────────────────────────────────────────────────
 // Pending both-sides-changed conflicts from DJ-app sync (provider-keyed —
 // shared across Rekordbox and future Traktor/Serato providers). Rows are

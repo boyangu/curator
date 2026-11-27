@@ -17,7 +17,8 @@
 //     through the process-wide gate the player and the feed share (and not
 //     during its quota ban), Beatport and Traxsource lookups through the
 //     feed's own enrichers, so the two share one lane and one Cloudflare
-//     cool-down; a source the user unchecked in the Refresh menu is not read.
+//     cool-down. Every store is read: the Refresh menu's checkboxes are
+//     about the weekly reads of the user's follows, not about pages.
 //
 // Two things stay here, outside the engine:
 //   - an entity the catalogue does not know, shown from the user's streaming
@@ -33,7 +34,7 @@ import { createWorkEngine, type WorkEngine, type WorkEngineDeps, type WorkEvent,
 import type { FetchLike } from '@curator/catalog-readers';
 import { isDistributor } from '@curator/library-logic';
 import { ProviderBlockedError } from '@curator/matcher';
-import type { CatalogClaim, CatalogDeviceProfile, CatalogFactsJob, CatalogFactsStore, CatalogPageRelease, CatalogRef, CatalogTracker, CatalogTracksResult, CatalogWork, CatalogWorkStore } from '@curator/protocol';
+import type { CatalogClaim, CatalogDeviceProfile, CatalogFactsJob, CatalogFactsStore, CatalogPageRelease, CatalogRef, CatalogTracksResult, CatalogWork, CatalogWorkStore } from '@curator/protocol';
 import { CATALOG_MAX_NESTED } from '@curator/protocol';
 import { gatedFetch, isSpotifyQuotaBackoff } from '@curator/spotify';
 import { searchFold, type EntityHeader, type EntityRef, type EntityRowPatch, type EntityWorkEvent, type EntityWorkPhase, type EntityWorkStatus } from '@curator/shared';
@@ -64,9 +65,6 @@ export type EntityWorkPages = {
 export type EntityWorkDeps = {
 	catalog(): Pick<CatalogClient, 'status' | 'offersWork' | 'register' | 'enrichLabels' | 'workReport'> | null;
 	pages: EntityWorkPages;
-	// The user's checked sources (catalog-worker/settings.ts): unchecked
-	// means nobody reads it, a page included.
-	trackers(): CatalogTracker[];
 	spotifyToken(): Promise<string | null>;
 	// When Spotify's quota ban ends (past: none).
 	spotifyBackoffUntil(): number;
@@ -105,6 +103,14 @@ export interface EntityWork {
 	// when they have been: `asked` is how many of the rows the page holds,
 	// `found` how many a store had something for.
 	enrich(recordingIds: readonly string[]): Promise<{ asked: number; found: number }>;
+	// Background work ('catalog_background_work'): what this desktop, as its
+	// account's main one, is handed on the catalogue worker's check
+	// (catalog-worker/service.ts) — the releases its weekly reads created, to
+	// complete. Run on this same engine, so the pages and the background share
+	// the stores' lanes and cool-downs. `backgroundProfile`: what to ask with,
+	// null while device work is not offered.
+	backgroundProfile(): CatalogDeviceProfile | null;
+	runBackground(work: CatalogWork): Promise<void>;
 	subscribe(cb: (e: EntityWorkEvent) => void): () => void;
 }
 
@@ -190,16 +196,19 @@ export function createEntityWork(deps: EntityWorkDeps): EntityWork {
 	// Entities registered this session: a page reopened is not registered twice.
 	const registered = new Set<string>();
 	let front: Front | null = null;
+	// Background runs end when the app does, not when a page is left.
+	const backgroundAbort = new AbortController();
 
-	// A store is read unless the user unchecked it everywhere; Traxsource is
-	// no source of the Refresh menu, only of a row's facts.
-	const storeAllowed = (store: CatalogWorkStore): boolean => store === 'traxsource' || deps.trackers().some((t) => t.endsWith(`/${store}`));
 	const offered = (): boolean => deps.catalog()?.offersWork() ?? false;
 
 	const engine: WorkEngine = createWorkEngine({
 		form: 'desktop',
 		enabled: offered,
-		allowed: (store) => storeAllowed(store) && (store !== 'spotify' || deps.spotifyBackoffUntil() <= now()),
+		// Every store: the Refresh menu's checkboxes say which sources read the
+		// user's follows each week, not what a page or the background may read
+		// (Guy, 2026-11-27) — those the stores' own rests and the cloud's daily
+		// counts hold back.
+		allowed: (store) => store !== 'spotify' || deps.spotifyBackoffUntil() <= now(),
 		fetch: deps.fetch ?? ((u, i) => fetch(u, i)),
 		spotifyFetch: deps.spotifyFetch ?? ((u, i) => gatedFetch(u, i, 'entity:page')),
 		...(deps.beatportFetch ? { beatportFetch: deps.beatportFetch, traxsourceFetch: deps.beatportFetch } : {}),
@@ -350,7 +359,7 @@ export function createEntityWork(deps: EntityWorkDeps): EntityWork {
 		} else {
 			const stream = deps.streaming?.() ?? null;
 			const spotifyId = header.links.find((l) => l.source === 'spotify' && l.sourceId && !l.sourceId.includes('/'))?.sourceId ?? header.ref.spotifyId ?? null;
-			if (stream?.service !== 'spotify' || !spotifyId || !storeAllowed('spotify')) return;
+			if (stream?.service !== 'spotify' || !spotifyId) return;
 			say(f, { phase: 'discover', source: 'spotify' });
 			if (kind === 'artist') {
 				const self: CatalogClaim = { provider: 'spotify', kind: 'artist', providerId: spotifyId, name, url: `https://open.spotify.com/artist/${spotifyId}` };
@@ -381,7 +390,7 @@ export function createEntityWork(deps: EntityWorkDeps): EntityWork {
 	async function enrichRows(f: Front, ids: readonly string[]): Promise<{ asked: number; found: number }> {
 		if (!f.catalogId || !offered()) return { asked: 0, found: 0 };
 		const want = new Set(ids);
-		const stores = FACTS_STORES.filter(storeAllowed);
+		const stores = FACTS_STORES;
 		const byRelease = new Map<string, { r: CatalogPageRelease; tracks: CatalogFactsJob['tracks'] }>();
 		const seen = new Set<string>();
 		for (const result of await deps.pages.loaded(f.catalogId)) {
@@ -462,6 +471,28 @@ export function createEntityWork(deps: EntityWorkDeps): EntityWork {
 		},
 
 		patchOf: (recordingId) => found.get(recordingId),
+
+		backgroundProfile: () => (offered() ? engine.profile() : null),
+
+		async runBackground(work) {
+			let changed = false;
+			await engine.run(work, {
+				visit: engine.visit(),
+				signal: backgroundAbort.signal,
+				onEvent: (e) => {
+					// What it finds shows on the page in front only where it is that
+					// page's: its rows patched, and read again once the cloud kept it.
+					const f = front;
+					if (e.type === 'rows' && f) remember(f, e.rows.filter((r) => f.ownGenre.has(r.recordingId)));
+					if (e.type === 'saved' && f && e.changed.some((id) => id === f.catalogId || f.ownGenre.has(id))) changed = true;
+					if (e.type === 'unsent') wlog.warn('background work not reported', { results: e.results, error: e.error });
+					if (e.type === 'refused') wlog.info('the catalogue did not take some background work', { results: e.results.length });
+				},
+			});
+			const f = front;
+			if (changed && f) reload(f, 'save');
+			wlog.info('background work done', { jobs: work.jobs.length });
+		},
 
 		async enrich(recordingIds) {
 			const f = front;

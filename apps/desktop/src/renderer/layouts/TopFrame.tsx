@@ -17,6 +17,7 @@ import { render } from 'solid-js/web';
 import { VolumeControl } from '../components/VolumeControl.jsx';
 import { VUMeter } from '../components/VUMeter.jsx';
 import type { SourceTab } from '../viewmodel/shell.js';
+import { cloudAdminAvailable, cloudAdminFailure, cloudAdminShowing, initCloudAdmin, toggleCloudAdmin } from '../features/cloudAdmin.js';
 import type { AnalyzerHealth } from '@curator/core';
 
 // Includes 'soundcloud' for visibility-toggle purposes only — soundcloud is
@@ -222,6 +223,7 @@ export interface TopFrameProps {
 
 export function TopFrame(props: TopFrameProps) {
 	let rootRef!: HTMLDivElement;
+	void initCloudAdmin();
 
 	// Counter-zoom the topframe to keep its content at 100% even when the
 	// rest of the UI is scaled. Chromium's zoom factor = 1.2 ^ level; we
@@ -420,6 +422,27 @@ export function TopFrame(props: TopFrameProps) {
 					}}
 				</For>
 			</div>
+
+			{/* The operator's Cloud Admin (features/cloudAdmin.ts): only where main
+			    says this app has it. */}
+			<Show when={cloudAdminAvailable()}>
+				<div class="tf-group-sep" aria-hidden="true"></div>
+				<div class="tf-tabs tf-states">
+					<button
+						class="tf-tab top-nav-item"
+						classList={{ active: cloudAdminShowing() }}
+						data-cloud-admin-tab
+						title={cloudAdminFailure() ?? 'Cloud Admin — the cloud back office, against production'}
+						onClick={() => toggleCloudAdmin()}
+					>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M7 18.5h10.5a4 4 0 0 0 .6-7.95A6 6 0 0 0 6.6 9.1 4.75 4.75 0 0 0 7 18.5z"/>
+							<circle cx="12" cy="13.5" r="2"/>
+						</svg>
+						<span>Cloud Admin</span>
+					</button>
+				</div>
+			</Show>
 
 			<Show when={props.pageTabs().length > 0}>
 				<div class="tf-group-sep" aria-hidden="true"></div>

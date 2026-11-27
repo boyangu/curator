@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CatalogWorkerDueInput, CatalogWorkerDueResult, CatalogWorkerReportInput, CatalogWorkerReportResult, CatalogWorkerTask } from '@curator/protocol';
+import { CLOUD_CONFIG_DEFAULTS, type CatalogWorkerDueInput, type CatalogWorkerDueResult, type CatalogWorkerReportInput, type CatalogWorkerReportResult, type CatalogWorkerTask, type CloudConfigEnvelope } from '@curator/protocol';
 import { TrackerRateLimitedError, type TrackerAdapter, type TrackerPoll } from '@curator/catalog-readers';
 import { createCatalogWorker, type CatalogWorkerPort, type CatalogWorkerStatus } from './service.js';
 
@@ -108,18 +108,64 @@ describe('catalog worker', () => {
 		w.stop();
 	});
 
-	// How often each kind is read rides every ask, once the server reads the key.
-	it('sends the user’s read cadence only to a server that takes it', async () => {
+	// The cloud's scheduling values: asked for by the version held, kept when
+	// the cloud says they moved, and the tick follows them.
+	it("keeps the cloud's config when it moved, and asks at the cloud's interval", async () => {
 		vi.useFakeTimers();
 		const master = fakeMaster();
+		const due = master.port.workerDue.bind(master.port);
+		master.port.workerDue = async (input) => ({ ...(await due(input)), ...(input.configVersion !== undefined && input.configVersion < 5 ? { config: { version: 5, values: { ...CLOUD_CONFIG_DEFAULTS, workerTickSec: 120 } } } : {}) });
 		let offered = false;
-		const w = worker(master, [reader('spotify', okPoll)], { cadence: () => (offered ? { artist: 'weekly', playlist: 'daily' } : null) });
+		let held: CloudConfigEnvelope = { version: 0, values: CLOUD_CONFIG_DEFAULTS };
+		const w = worker(master, [reader('spotify', okPoll)], { tickMs: undefined, config: { offered: () => offered, read: () => held, write: (c) => void (held = c) } });
+		w.start();
+		await vi.advanceTimersByTimeAsync(10);
+		// A server that does not say: nothing asked, nothing kept, the default minute.
+		expect(master.dues[0]).not.toHaveProperty('configVersion');
+		offered = true;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(master.dues[1]).toMatchObject({ configVersion: 0 });
+		expect(held).toMatchObject({ version: 5, values: { workerTickSec: 120 } });
+		// Now every two minutes, and the version held goes with each ask.
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(master.dues).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(master.dues[2]).toMatchObject({ configVersion: 5 });
+		w.stop();
+	});
+
+	// Background work: asked for with the desktop's profile only while none is
+	// in hand, run beside the reads, and asked for again once it is done.
+	it('asks for background work only with none in hand, and runs what it is handed', async () => {
+		vi.useFakeTimers();
+		const master = fakeMaster();
+		const due = master.port.workerDue.bind(master.port);
+		const job = { id: 'facts:x', kind: 'facts' as const, stores: ['beatport' as const], tracks: [] };
+		master.port.workerDue = async (input) => ({ ...(await due(input)), ...(input.profile ? { work: { jobs: [job], limits: { rounds: 1, releases: 1 } } } : {}) });
+		let finish!: () => void;
+		const runs: string[][] = [];
+		const w = worker(master, [reader('spotify', okPoll)], {
+			background: {
+				offered: () => true,
+				profile: () => ({ form: 'desktop', reader: 1, stores: ['spotify'] }),
+				run: (work) => {
+					runs.push(work.jobs.map((j) => j.id));
+					return new Promise<void>((r) => (finish = r));
+				},
+			},
+		});
 		w.start();
 		await vi.advanceTimersByTimeAsync(20);
-		expect(master.dues[0]).not.toHaveProperty('cadence');
-		offered = true;
+		expect(master.dues[0]).toMatchObject({ profile: { form: 'desktop' } });
+		expect(runs).toEqual([['facts:x']]);
+		// Still running: the next ask carries no profile, and nothing more is run.
 		await vi.advanceTimersByTimeAsync(1000);
-		expect(master.dues[1]).toMatchObject({ cadence: { artist: 'weekly', playlist: 'daily' } });
+		expect(master.dues[1]).not.toHaveProperty('profile');
+		expect(runs).toHaveLength(1);
+		finish();
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(master.dues[2]).toHaveProperty('profile');
+		expect(runs).toHaveLength(2);
 		w.stop();
 	});
 

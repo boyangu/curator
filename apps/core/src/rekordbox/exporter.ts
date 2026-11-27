@@ -78,6 +78,8 @@ import {
 } from './sidecar.js';
 import { eqArr } from './order-util.js';
 import { planCreateForTracks, planCreatePhase, runCreatePhase, type CreatePhaseSummary } from './create-phase.js';
+import { DEFAULT_MYTAG_GROUP_NAME, planMyTagPhase, runMyTagPhase, type MyTagGroupChoice, type MyTagPhaseSummary } from './mytag-phase.js';
+import { rbTagIdsFor } from './tag-link.js';
 import { buildTagComment, tagCommentMatches } from '@curator/sync-core/rekordbox/tag-comment';
 import { log } from '@curator/sync-core/log';
 import { deletePlaylist } from '@curator/sync-core/library/mutators';
@@ -266,6 +268,9 @@ export class RekordboxExporter extends EventEmitter {
 		// Title + Artist strings follow — core's app_setting value, read at
 		// push time so a Settings change applies to the next sync.
 		private readonly creditFormat: () => ArtistCreditFormat = () => DEFAULT_ARTIST_CREDIT_FORMAT,
+		// The rekordbox group new MyTags go into (Settings → Rekordbox),
+		// read at push time like creditFormat.
+		private readonly myTagGroup: () => MyTagGroupChoice = () => ({ id: null, name: DEFAULT_MYTAG_GROUP_NAME }),
 	) { super(); }
 
 	isRunning(): boolean { return this.running; }
@@ -360,6 +365,41 @@ export class RekordboxExporter extends EventEmitter {
 			// 1. Resolve target → (curatorTrackId, rbContentId) pairs.
 			const targets = this.resolveTargets(opts);
 			xlog.info('push: targets resolved', { linked: targets.linked.length, skipped: targets.skipped, playlists: targets.playlistOrders?.length ?? 0, ms: Date.now() - t0 });
+
+			// 1b. MyTag phase — Curator-made tags on these tracks get a
+			//     DjmdMyTag (own write session) before any op is built, so the
+			//     tags pass and comment block below treat them as rb tags.
+			let myTags: MyTagPhaseSummary | null = null;
+			if (opts.flags.syncTags) {
+				const plan = planMyTagPhase(this.db, opts.targetKind === 'updates' ? 'all' : targets.linked, this.myTagGroup());
+				if (plan) {
+					xlog.info('push: mytag phase', { tags: plan.ops.length });
+					myTags = await runMyTagPhase(
+						{
+							db: this.db,
+							sidecar: this.sidecar,
+							writeAudit: this.writeAudit,
+							progress: (phase, done, total) => emit({ kind: 'progress', phase, done, total }),
+						},
+						plan,
+						{ dbPath: opts.dbPath, key: opts.key },
+						backupInfo?.path ?? null,
+					);
+					backupInfo ??= { path: myTags.backupPath!, sizeBytes: 0, takenAtMs: Date.now() };
+					// "Sync updates" planned over every linked track — the tagged
+					// ones join the push so their membership goes out this run.
+					if (opts.targetKind === 'updates') {
+						const seen = new Set(targets.linked.map((l) => l.rbContentId));
+						for (const tagId of myTags.resolvedTagIds) {
+							for (const p of plan.tracks.get(tagId) ?? []) {
+								if (seen.has(p.rbContentId)) continue;
+								targets.linked.push(p);
+								seen.add(p.rbContentId);
+							}
+						}
+					}
+				}
+			}
 			const swept = await this.sweepStaleRelations(opts, targets.linked);
 			xlog.info('push: stale sweep done', { added: swept, ms: Date.now() - t0 });
 			emit({ kind: 'progress', phase: 'resolve', done: targets.linked.length, total: targets.linked.length + targets.skipped });
@@ -437,7 +477,7 @@ export class RekordboxExporter extends EventEmitter {
 					verifyOk: true,
 					verifyPragmaError: null,
 					verifyFailures: created?.verifyFailures ?? [],
-					writeFailures: created?.writeFailures ?? [],
+					writeFailures: [...(created?.writeFailures ?? []), ...(myTags?.writeFailures ?? [])],
 					created,
 				};
 				emit({ kind: 'completed', result });
@@ -445,8 +485,9 @@ export class RekordboxExporter extends EventEmitter {
 				return result;
 			}
 
-			// 3. Backup BEFORE any write (the create phase already took one).
-			if (!created) {
+			// 3. Backup BEFORE any write (the create or MyTag phase may
+			//    already have taken one — it stands for the whole sync).
+			if (!backupInfo) {
 				emit({ kind: 'progress', phase: 'backup', done: 0, total: 1 });
 				backupInfo = await this.sidecar.backup(opts.dbPath);
 				emit({ kind: 'progress', phase: 'backup', done: 1, total: 1 });
@@ -642,7 +683,7 @@ export class RekordboxExporter extends EventEmitter {
 				verifyFailures: verifyResult.failures,
 				// Create-phase ops that didn't apply (e.g. a member whose file
 				// rekordbox can't stat) surface alongside the update push's.
-				writeFailures: [...(created?.writeFailures ?? []), ...writeFailures],
+				writeFailures: [...(created?.writeFailures ?? []), ...(myTags?.writeFailures ?? []), ...writeFailures],
 				created,
 			};
 			emit({ kind: 'completed', result });
@@ -1134,13 +1175,14 @@ export class RekordboxExporter extends EventEmitter {
 	// ──────────────────────────────────────────────────────────────────
 	// Op construction — produces the wire payload from Curator state.
 
-	// rb-identity tags per track (`rb_<DjmdMyTag.ID>` ids, minted by the
-	// importer — importer.ts applyMyTagDelta), in track_tag.added_at order so
-	// the comment block's token order follows rekordbox's own append order.
-	// Curator-only tags have no rb-side identity and are excluded here —
-	// they are neither pushed as DjmdSongMyTag rows nor written into the
-	// comment block (rekordbox would drop them the next time it regenerates
-	// the block from its MyTag set, and the pull/push merge would ping-pong).
+	// rb-identity tags per track (tag-link.ts: an imported `rb_<ID>` tag, or
+	// a Curator-made tag the MyTag phase linked), in track_tag.added_at order
+	// so the comment block's token order follows rekordbox's own append order.
+	// Tags without rb identity — not on any linked track yet, or their ensure
+	// failed — are excluded: they are neither pushed as DjmdSongMyTag rows nor
+	// written into the comment block (rekordbox would drop them the next time
+	// it regenerates the block from its MyTag set, and the pull/push merge
+	// would ping-pong).
 	private loadRbTagsByTrack(trackIds: string[]): Map<string, Array<{ rbTagId: string; name: string }>> {
 		const out = new Map<string, Array<{ rbTagId: string; name: string }>>();
 		for (let i = 0; i < trackIds.length; i += 500) {
@@ -1151,10 +1193,12 @@ export class RekordboxExporter extends EventEmitter {
 				.where(inArray(trackTag.trackId, trackIds.slice(i, i + 500)))
 				.orderBy(trackTag.addedAt)
 				.all();
+			const rbIds = rbTagIdsFor(this.db, Array.from(new Set(rows.map((r) => r.tagId))));
 			for (const r of rows) {
-				if (!r.tagId.startsWith('rb_')) continue;
+				const rbTagId = rbIds.get(r.tagId);
+				if (!rbTagId) continue;
 				const list = out.get(r.trackId) ?? [];
-				list.push({ rbTagId: r.tagId.slice(3), name: r.name });
+				list.push({ rbTagId, name: r.name });
 				out.set(r.trackId, list);
 			}
 		}
@@ -1329,7 +1373,7 @@ export class RekordboxExporter extends EventEmitter {
 		}
 
 		// Tags pass — per linked track. Only tags with rb identity (see
-		// loadRbTagsByTrack); Curator-only tags are out of v1 scope.
+		// loadRbTagsByTrack); the MyTag phase gave Curator-made ones theirs.
 		if (opts.flags.syncTags) {
 			for (const pair of linked) {
 				const rbTagIds = (rbTagsByTrack.get(pair.curatorTrackId) ?? []).map((x) => x.rbTagId);

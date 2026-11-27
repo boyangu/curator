@@ -3,7 +3,8 @@
 
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
-import { checkedTrackers, readCadence, readReadSources, writeReadCadence, writeReadSources } from './settings.js';
+import { checkedTrackers, readCadence, readCloudConfig, readReadSources, writeCloudConfig, writeReadSources } from './settings.js';
+import { CLOUD_CONFIG_DEFAULTS } from '@curator/protocol';
 
 function db(): Database.Database {
 	const raw = new Database(':memory:');
@@ -41,17 +42,14 @@ describe('catalog read sources', () => {
 		expect(checkedTrackers(raw)).toContain('label/beatport');
 	});
 
-	it('reads every kind weekly until said otherwise, one kind at a time', () => {
+	it("reads every kind as the cloud last said — weekly until it said — and keeps what it said", () => {
 		const raw = db();
 		expect(readCadence(raw)).toEqual({ artist: 'weekly', label: 'weekly', playlist: 'weekly', genre: 'weekly' });
-		const rs = writeReadCadence(raw, 'playlist', 'daily');
-		expect(rs.map((r) => [r.kind, r.cadence])).toEqual([['artist', 'weekly'], ['label', 'weekly'], ['playlist', 'daily'], ['genre', 'weekly']]);
-		writeReadCadence(raw, 'artist', 'source');
-		expect(readCadence(raw)).toEqual({ artist: 'source', label: 'weekly', playlist: 'daily', genre: 'weekly' });
-		// An unknown value or kind changes nothing, and forgetting the sources leaves the cadence.
-		writeReadCadence(raw, 'artist', 'hourly' as never);
-		writeReadCadence(raw, 'album' as never, 'daily');
-		writeReadSources(raw, null);
-		expect(readCadence(raw)).toEqual({ artist: 'source', label: 'weekly', playlist: 'daily', genre: 'weekly' });
+		writeCloudConfig(raw, { version: 7, values: { ...CLOUD_CONFIG_DEFAULTS, readCadence: { ...CLOUD_CONFIG_DEFAULTS.readCadence, playlist: 'daily' } } });
+		expect(readReadSources(raw).map((r) => [r.kind, r.cadence])).toEqual([['artist', 'weekly'], ['label', 'weekly'], ['playlist', 'daily'], ['genre', 'weekly']]);
+		expect(readCloudConfig(raw).version).toBe(7);
+		// A stored copy it cannot read is the defaults, not half of one.
+		raw.prepare(`UPDATE app_setting SET value = ? WHERE key = 'cloud.config'`).run(JSON.stringify({ version: 9, values: { workerTickSec: 5 } }));
+		expect(readCloudConfig(raw)).toEqual({ version: 0, values: CLOUD_CONFIG_DEFAULTS });
 	});
 });

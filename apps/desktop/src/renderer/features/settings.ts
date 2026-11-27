@@ -531,6 +531,10 @@ async function renderSettingsRekordbox(): Promise<void> {
 			${checkbox('syncTracks', 'Tracks', 'Title, artist, album, BPM, key, comment, rating, color, play count, last-played, added-at.')}
 			${checkbox('syncPlaylists', 'Playlists & folders', 'Rekordbox playlist hierarchy + track membership + smart-playlist definitions.')}
 			${checkbox('syncMyTags', 'MyTags', "Rekordbox's MyTag user tags + their track membership.")}
+			<label class="settings-ui__field settings-rekordbox__mytag-group"><span class="settings-ui__field-label">New MyTags go into</span>
+				<select class="settings-ui__select" id="rekordbox-mytag-group" disabled><option>Loading…</option></select>
+				<span class="settings-ui__field-suffix">Tags you make in Curator get a MyTag in this group the first time they sync to rekordbox.</span>
+			</label>
 			${checkbox('syncCuesGridsPhrases', 'Cues, beatgrid + downbeats, song phrases', 'Hot cues, memory cues, loops, beatgrid, downbeats, and PSSI song-structure phrases (Intro/Verse/Chorus/etc.).')}
 			${checkbox('syncWaveformPeaks', 'Waveform peaks (.cpk files)', "Pre-decoded 3-band waveform bands from Rekordbox's ANLZ files. Skip this if you only care about Curator's own analyzer-produced peaks.")}
 		</div>
@@ -563,12 +567,47 @@ async function renderSettingsRekordbox(): Promise<void> {
 		});
 	});
 
+	// MyTag group — where the push creates MyTags for tags made in Curator.
+	// Painted after the panel: the list comes from master.db via the sidecar,
+	// so it follows the path field and may be unavailable.
+	const groupSelect = wrap.querySelector<HTMLSelectElement>('#rekordbox-mytag-group');
+	const paintMyTagGroups = async (): Promise<void> => {
+		if (!groupSelect) return;
+		const unavailable = (text: string): void => {
+			groupSelect.innerHTML = `<option>${escapeHtml(text)}</option>`;
+			groupSelect.disabled = true;
+		};
+		try {
+			const { groups, selectedId } = await rekordboxApi.myTagGroups(settings.dbPathOverride ?? undefined, settings.key ?? undefined);
+			if (groups.length === 0) { unavailable('No MyTag groups in rekordbox'); return; }
+			groupSelect.innerHTML = groups
+				.map((g) => `<option value="${escapeHtml(g.id)}" ${g.id === selectedId ? 'selected' : ''}>${escapeHtml(g.name)}</option>`)
+				.join('');
+			groupSelect.disabled = false;
+			groupSelect.onchange = () => {
+				const g = groups.find((x) => x.id === groupSelect.value);
+				if (!g) return;
+				rekordboxApi.setMyTagGroup(g).catch((err) => {
+					log.for('rekordbox-settings').warn('mytag group save failed', undefined, err);
+					showToast('Could not save the MyTag group', { sub: err instanceof Error ? err.message : String(err), kind: 'error' });
+				});
+			};
+		} catch (err) {
+			log.for('rekordbox-settings').warn('mytag groups failed', undefined, err);
+			unavailable("Can't read master.db");
+		}
+	};
+	void paintMyTagGroups();
+
 	// Path input — persist on blur (saves typing every keystroke).
 	const pathInput = wrap.querySelector<HTMLInputElement>('#rekordbox-path');
 	pathInput?.addEventListener('blur', () => {
 		const v = pathInput.value.trim();
-		settings.dbPathOverride = v.length ? v : null;
+		const next = v.length ? v : null;
+		if (next === settings.dbPathOverride) return;
+		settings.dbPathOverride = next;
 		saveRekordboxSettings(settings);
+		void paintMyTagGroups();
 	});
 	wrap.querySelector<HTMLButtonElement>('#rekordbox-path-browse')?.addEventListener('click', async () => {
 		const picked = await dialogApi.pickFolder();
@@ -579,6 +618,7 @@ async function renderSettingsRekordbox(): Promise<void> {
 			pathInput.value = picked;
 			settings.dbPathOverride = picked;
 			saveRekordboxSettings(settings);
+			void paintMyTagGroups();
 		}
 	});
 

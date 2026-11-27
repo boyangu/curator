@@ -20,6 +20,7 @@ Protocol (one JSON object per line):
         {"id": 9, "method": "verify",          "params": {"dbPath": "...", "key": "...", "expectedWrites": [...]}}
         {"id": 10, "method": "list_backups",   "params": {"dbDir": "..."}}
         {"id": 15, "method": "list_stale_relations", "params": {"dbPath": "...", "key": "..."}}  # → {"stale": [{"rbContentId", "fields": [artist|album|label|genre], "myTags": [name]}]} — tombstoned relations / MyTag memberships per content
+        {"id": 16, "method": "list_mytag_groups", "params": {"dbPath": "...", "key": "..."}}  # → {"groups": [{"id", "name"}]} — live MyTag group folders, rekordbox order (Settings: where pushed MyTags go)
         {"id": 11, "method": "clear_backups",  "params": {"dbDir": "..."}}
         {"id": 12, "method": "restore_backup", "params": {"backupPath": "...", "dbPath": "..."}}
       Palette (static, no db needed):
@@ -530,6 +531,21 @@ def _handle_list_stale_relations(req_id: int, params: dict[str, Any]) -> None:
     _write({"id": req_id, "result": {"stale": stale}})
 
 
+def _handle_list_mytag_groups(req_id: int, params: dict[str, Any]) -> None:
+    db_path = params.get("dbPath")
+    key = params.get("key")
+    if not db_path:
+        _write({"id": req_id, "error": {"kind": "internal", "message": "missing dbPath"}})
+        return
+    try:
+        groups = reader_mod.list_mytag_groups(db_path, key)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(traceback.format_exc())
+        _write({"id": req_id, "error": {"kind": _classify(exc), "message": str(exc)}})
+        return
+    _write({"id": req_id, "result": {"groups": groups}})
+
+
 def _handle_list_backups(req_id: int, params: dict[str, Any]) -> None:
     db_dir = params.get("dbDir")
     if not db_dir:
@@ -704,6 +720,8 @@ def _dispatch(msg: dict[str, Any]) -> None:
         _handle_list_backups(req_id, params)
     elif method == "list_stale_relations":
         _handle_list_stale_relations(req_id, params)
+    elif method == "list_mytag_groups":
+        _handle_list_mytag_groups(req_id, params)
     elif method == "clear_backups":
         _handle_clear_backups(req_id, params)
     elif method == "restore_backup":
