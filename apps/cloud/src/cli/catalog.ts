@@ -28,6 +28,7 @@
 //   pnpm --filter @curator/cloud catalog repair previews [--label <q>] [--dry]   (SoundCloud 0:30 preview copies → their store recordings)
 //   pnpm --filter @curator/cloud catalog repair dj-sets [--dry] [--limit 500]   (long mixed sessions only SoundCloud holds, and releases of nothing else: removed, not undoable)
 //   pnpm --filter @curator/cloud catalog repair credits [--dry]   (artists the SoundCloud/Bandcamp splitter cut out of a credit → the artists they were cut from)
+//   pnpm --filter @curator/cloud catalog repair compound-artists --apply --from rows.json --approved   (the renames of a reviewed --dry list, each an audit item with its undo)
 //   pnpm --filter @curator/cloud catalog repair compound-artists --dry [--lookup] [--stores musicbrainz,spotify] [--max 800] [--class <c>] [--show 15] [--out rows.json]   (--stores asks outside for the whole name, Spotify for at most --max names a run;artists named like several, "A & B", each decided by what the stores say: keep one act, rename an artist a credit line was written on, split a store's page for a credit, or ask; reads only)
 //   pnpm --filter @curator/cloud catalog repair artist-twins [--dry] [--all] [--merge-only]   (same-name artists on one release merged; one store holding both under two ids → an artist.twins inbox item)
 //   pnpm --filter @curator/cloud catalog artist merge <from id> <into id> --note "…" [--approved]   (held for the operator unless approved)
@@ -66,7 +67,7 @@ import { adminOps, type AdminOps, type LabelView, type ReviewView } from '../cat
 import { coreSet } from '../catalog/agent/evals.js';
 import type { AgentCase } from '../catalog/agent/cases.js';
 import type { ArtistPairView } from '../catalog/artist-twins.js';
-import { COMPOUND_CLASSES, type CompoundRow } from '../catalog/compound-artists.js';
+import { COMPOUND_CLASSES, type CompoundReport, type CompoundRow } from '../catalog/compound-artists.js';
 import { nameFold } from '@curator/library-logic';
 import { NAME_LOOKUP_BATCH, NAME_SOURCES } from '../catalog/name-lookup.js';
 import type { AgentImport } from '../catalog/agent-import.js';
@@ -154,6 +155,7 @@ async function ops(): Promise<AdminOps> {
 		repairDjSets: (a) => call('repairDjSets', a),
 		repairCredits: (a) => call('repairCredits', a),
 		compoundArtists: (a) => call('compoundArtists', a),
+		compoundRename: (a) => call('compoundRename', a),
 		nameLookup: (a) => call('nameLookup', a),
 		labelTexts: (a) => call('labelTexts', a),
 		repairArtistTwins: (a) => call('repairArtistTwins', a),
@@ -538,8 +540,29 @@ try {
 			}
 			if (!r.more || !flag('--all') || r.dry) break;
 		}
+	} else if (group === 'repair' && sub === 'compound-artists' && flag('--apply')) {
+		// The renames of a list the owner reviewed (a --dry run's --out file),
+		// exactly that list: a fresh scan could differ from what was looked at.
+		// Splits and questions stay for the reasoner.
+		const from = arg('--from');
+		if (!from) throw new Error('repair compound-artists --apply --from <rows.json from a --dry run> --approved');
+		if (!flag('--approved')) throw new Error('--apply writes the catalogue: pass --approved once the list was reviewed');
+		const rows = (JSON.parse(readFileSync(from, 'utf8')) as CompoundRow[]).filter((r) => r.decision === 'rename' && r.to);
+		const renamed: { id: string; from: string; to: string }[] = [];
+		const skipped: { id: string; name: string | null; why: string }[] = [];
+		for (let i = 0; i < rows.length; i += 100) {
+			const r = await api.compoundRename({ renames: rows.slice(i, i + 100).map((x) => ({ id: x.id, from: x.name, to: x.to!, why: x.why })), approved: true, by: arg('--by') ?? 'claude-code' });
+			renamed.push(...r.renamed);
+			skipped.push(...r.skipped);
+			if (!json) console.error(`  ${Math.min(i + 100, rows.length)} of ${rows.length}`);
+		}
+		if (json) console.log(JSON.stringify({ renamed, skipped }, null, 2));
+		else {
+			console.log(`${renamed.length} artist(s) renamed back, ${skipped.length} skipped — each an audit item in the inbox, with its undo`);
+			for (const s of skipped) console.log(`  skipped: "${s.name ?? '?'}" ${s.id} — ${s.why}`);
+		}
 	} else if (group === 'repair' && sub === 'compound-artists') {
-		if (!flag('--dry')) throw new Error('repair compound-artists reads only so far: run it with --dry (the repair itself is not built)');
+		if (!flag('--dry')) throw new Error('repair compound-artists: --dry to read and list, then --apply --from <that list> --approved');
 		const wait = (ms: number) => new Promise((res) => setTimeout(res, ms));
 		// Page after page, each a short read: the whole catalogue in one report.
 		const scan = async (lookup: boolean): Promise<{ rows: CompoundRow[]; asked: number }> => {
@@ -547,7 +570,19 @@ try {
 			let after: string | null = null;
 			let asked = 0;
 			for (;;) {
-				const r = await api.compoundArtists({ after, lookup });
+				// A page is one short read: asked again when the connection was
+				// dropped under it (the cloud's pooler closes one that sat while
+				// Apple was paced), at most twice.
+				let r: CompoundReport | undefined;
+				for (let tries = 0; !r; tries++) {
+					try {
+						r = await api.compoundArtists({ after, lookup });
+					} catch (e) {
+						if (tries >= 2 || !/CONNECTION_CLOSED|ECONNRESET|terminat/i.test(String(e))) throw e;
+						console.error(`  page after ${after ?? 'start'}: connection dropped, asking again`);
+						await wait(5_000);
+					}
+				}
 				rows.push(...r.rows);
 				asked += r.appleAsked;
 				if (!r.next) return { rows, asked };

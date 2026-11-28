@@ -149,13 +149,20 @@ export function splitInto(name: string, lead?: string): string[] {
 	return creditPieces(name);
 }
 
-export function decideCompound(name: string, c: { class: CompoundClass; to?: string }): { decision: CompoundDecision; into?: string[]; also?: string[] } {
+export function decideCompound(name: string, c: { class: CompoundClass; to?: string }): { decision: CompoundDecision; into?: string[]; also?: string[]; held?: string } {
 	if (c.class === 'act') return { decision: 'keep' };
 	if (c.class === 'renamed' || c.class === 'apple_line') {
 		// Apple did not answer for the id: nothing says whose it is.
 		if (!c.to) return { decision: 'ask' };
 		const lead = nameFold(c.to);
-		const also = splitInto(name, c.to).filter((p) => nameFold(p) !== lead);
+		const line = splitInto(name, c.to);
+		// The name it takes is one the line names. Another is no rename but a
+		// page of someone else's on the object: a Bandcamp account that is a
+		// label's ("Prommer & Barck" → "Derwin Recordings"), Apple's name in
+		// its storefront's script ("Subliminal & The Shadow" → "סאבלימינל"),
+		// a namesake's page (production scan, 2026-11-28).
+		if (!line.some((p) => nameFold(p) === lead)) return { decision: 'ask', held: `"${c.to}" is not a name the line lists` };
+		const also = line.filter((p) => nameFold(p) !== lead);
 		return { decision: 'rename', ...(also.length ? { also } : {}) };
 	}
 	if (c.class === 'alias' || c.class === 'tokens') {
@@ -386,13 +393,14 @@ export async function compoundArtists(db: Db, opts: CompoundOptions = {}): Promi
 	const rows: CompoundRow[] = [];
 	for (const [id, e] of evidence) {
 		const c = classifyCompound(e);
+		const { held, ...decided } = decideCompound(e.name, c);
 		rows.push({
 			id,
 			name: e.name,
 			class: c.class,
-			...decideCompound(e.name, c),
+			...decided,
 			...(c.to ? { to: c.to } : {}),
-			why: c.why,
+			why: held ? `${c.why}; held: ${held}` : c.why,
 			pieces: piecesOf(e.name),
 			tokens: e.tokens,
 			asked: NAME_SOURCES.filter((s) => e.asked?.[s] !== undefined),

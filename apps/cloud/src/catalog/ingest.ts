@@ -78,6 +78,13 @@ const textLabel = (text: unknown): CatalogClaim | null => {
 // A release claim's label: the store's own label object, else its text.
 const labelOf = (c: CatalogClaim): CatalogClaim | null => c.label ?? textLabel(c.facts?.labelText);
 const isNameKey = (c: Pick<CatalogClaim, 'provider' | 'providerId'>): boolean => c.provider === 'user' && c.providerId.startsWith('name:');
+// Apple's lookup names one artist's id with the song's whole credit line
+// (trackers/apple.ts): "MODBIT, Pay May & Sokko" on MODBIT's page. Not the
+// page's own name, so like a name key it names a new object and renames none
+// (2026-11-28: such claims had renamed some 2,200 real artists;
+// compound-artists.ts finds them, `catalog repair compound-artists` renames
+// them back).
+const isCreditLine = (c: Pick<CatalogClaim, 'provider' | 'kind'>): boolean => c.provider === 'apple' && c.kind === 'artist';
 
 export class Ingester {
 	readonly stats = { created: 0, attached: 0 };
@@ -430,7 +437,7 @@ export class Ingester {
 		// A name key is someone's spelling of the name (a store's text, a
 		// file's tag, an upload's title), not a store's word on what the object
 		// is called: it names a new object and never renames one.
-		const rename = live && c.name !== o.name && !(isNameKey(c) && !o.fresh);
+		const rename = live && c.name !== o.name && !((isNameKey(c) || isCreditLine(c)) && !o.fresh);
 		if (JSON.stringify(next) === JSON.stringify(o.attrs) && !rename) return;
 		this.b!.fold(o, next, c, rename);
 	}

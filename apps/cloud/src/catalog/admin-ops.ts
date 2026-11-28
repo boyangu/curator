@@ -187,6 +187,11 @@ export type AdminOps = {
 	// name (compound-artists.ts). Reads only; one bounded page per call, paged
 	// by `next`. `lookup`: ask Apple for the own name of Apple-only ids.
 	compoundArtists(args: { after?: string | null; limit?: number; lookup?: boolean }): Promise<CompoundReport>;
+	// The `rename` decisions of a scan, as reviewed: each artist takes its own
+	// name back — only while it still has the name the scan read (a claim
+	// since may have changed it), each an audit item with its undo. Writes
+	// only with `approved` (the owner looked at the list); a short batch a call.
+	compoundRename(args: { renames: { id: string; from: string; to: string; why: string }[]; approved: boolean; by?: string }): Promise<{ renamed: { id: string; from: string; to: string }[]; skipped: { id: string; name: string | null; why: string }[] }>;
 	// Asks a source outside the catalogue whether it holds an artist of each
 	// whole name (name-lookup.ts): one call a name not yet answered, kept. A
 	// short batch per call; `stopped` says why it ended early.
@@ -320,6 +325,8 @@ async function labelView(tx: Queryable, id: string): Promise<LabelView> {
 
 // Artist ids in one Apple lookup (compoundArtists).
 const APPLE_IDS_PER_CALL = 150;
+// Renames in one compoundRename call: one short transaction each.
+const COMPOUND_RENAME_BATCH = 100;
 
 export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => Promise<void>; kick?: () => void; agent?: { model: ModelCall; cfg: AgentReasonerConfig } | null } = {}): AdminOps {
 	async function view(r: Review, withEvidence: boolean): Promise<ReviewView> {
@@ -573,7 +580,7 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 			return r;
 		},
 		async compoundArtists(args) {
-			const apple = args.lookup ? evidence.apple : null;
+			const apple = args.lookup ? fetchers.apple : null;
 			return compoundArtists(db, {
 				after: args.after,
 				limit: args.limit,
@@ -590,6 +597,36 @@ export function adminOps(db: Db, evidence: EvidenceDeps, hooks: { pass?: () => P
 						},
 					}
 					: {}),
+			});
+		},
+		async compoundRename(args) {
+			if (!args.approved) throw new Error('compoundRename writes only a reviewed list: pass approved');
+			if (args.renames.length > COMPOUND_RENAME_BATCH) throw new Error(`compoundRename: at most ${COMPOUND_RENAME_BATCH} a call`);
+			const by = args.by ?? 'claude-code';
+			return withSystemTx(db, async (tx) => {
+				const renamed: { id: string; from: string; to: string }[] = [];
+				const skipped: { id: string; name: string | null; why: string }[] = [];
+				for (const r of args.renames) {
+					const to = r.to.trim();
+					const [o] = await tx.query<{ name: string; kind: string }>(`select name, kind from curator.catalog_object where id = $1 and merged_into is null`, [r.id]);
+					if (!o || o.kind !== 'artist') { skipped.push({ id: r.id, name: o?.name ?? null, why: 'not a live artist' }); continue; }
+					if (o.name !== r.from) { skipped.push({ id: r.id, name: o.name, why: 'renamed since the scan' }); continue; }
+					if (!to || to === o.name) { skipped.push({ id: r.id, name: o.name, why: 'nothing to rename to' }); continue; }
+					await renameObject(tx, r.id, to);
+					await raise(tx, {
+						kind: 'artist.rename',
+						severity: 'audit',
+						title: `Renamed «${r.from}» to «${to}»`,
+						subjects: [r.id],
+						evidence: { from: r.from, to, why: r.why, found: 'compound-artists' },
+						undo: { op: 'rename', args: { objectId: r.id, name: r.from } },
+						actor: by,
+						approvedBy: OPERATOR,
+						key: `compound:${r.from}>${to}`,
+					});
+					renamed.push({ id: r.id, from: r.from, to });
+				}
+				return { renamed, skipped };
 			});
 		},
 		async nameLookup(args) {

@@ -8,7 +8,7 @@ import type { CatalogClaim } from '@curator/protocol';
 import { withSystemTx } from '../db/system-tx.js';
 import { createTestApp } from '../test/harness.js';
 import { adminOps } from './admin-ops.js';
-import { classifyCompound, compoundArtists, splitInto, type CompoundRow } from './compound-artists.js';
+import { classifyCompound, compoundArtists, decideCompound, splitInto, type CompoundRow } from './compound-artists.js';
 import { ingestClaims } from './ingest.js';
 import { lookUpNames } from './name-lookup.js';
 import { AppleLookup } from './trackers/apple.js';
@@ -47,8 +47,8 @@ async function seed() {
 		release('tidal', 'td-al-1', 'Longshore', [artist('tidal', '950', 'Quiet Harbour')], [rec('tidal', 'td-10', 'Longshore', 10, [artist('tidal', '950', 'Quiet Harbour')])]),
 	]);
 	await ingest([
-		// …then under another's: the latest line is the object's name, the first
-		// stays on the page.
+		// …then under another's: an Apple line renames nothing (ingest.ts
+		// isCreditLine), so the first stays the object's name.
 		release('apple', 'ap-al-2', 'Ebb', [artist('apple', '555', 'Ilka Rane & Kaske')], [rec('apple', 'ap-5', 'Ebb', 5, [artist('apple', '555', 'Ilka Rane & Kaske')])]),
 		// A claim naming Quiet Harbour's id with a credit line renames the artist.
 		release('tidal', 'td-al-2', 'Rip Current', [artist('tidal', '950', 'Quiet Harbour & Kaske')], [rec('tidal', 'td-11', 'Rip Current', 11, [artist('tidal', '950', 'Quiet Harbour & Kaske')])]),
@@ -82,8 +82,8 @@ describe('compound artists', () => {
 		// "&Or" lists nobody: not a candidate.
 		expect(all.some((r) => r.name === '&Or')).toBe(false);
 		expect(by('Quiet Harbour & Kaske')).toEqual([['renamed', 'rename', 'Quiet Harbour']]);
-		// Apple names the id, not the line its page was first stored under.
-		expect(by('Ilka Rane & Kaske')).toEqual([['apple_line', 'rename', 'Ilka Rane']]);
+		// Apple names the id, not the line its page was stored under.
+		expect(by('Ilka Rane & Lowtide')).toEqual([['apple_line', 'rename', 'Ilka Rane']]);
 		expect(by('Lowtide & Glass Rivers')).toEqual([['apple_line', 'rename', 'Lowtide']]);
 		// The line's other names are told, not credited: the id was one artist's.
 		expect(all.find((r) => r.name === 'Lowtide & Glass Rivers')).toMatchObject({ also: ['Glass Rivers'] });
@@ -108,6 +108,29 @@ describe('compound artists', () => {
 		expect(find(asked.rows)).toMatchObject({ class: 'apple_line', decision: 'rename', to: 'Lowtide', credits: { tracks: 1, releases: 1 } });
 		expect(asked.appleAsked).toBe(2);
 		expect(asked.next).toBeNull();
+	});
+
+	it('renames back what a reviewed list says, only while the name is still the one read, each with its undo', async () => {
+		const app = await seed();
+		const ops = adminOps(app.db, { apple });
+		const rows = (await ops.compoundArtists({ lookup: true })).rows.filter((r) => r.decision === 'rename');
+		expect(rows.map((r) => [r.name, r.to]).sort()).toEqual([['Ilka Rane & Lowtide', 'Ilka Rane'], ['Lowtide & Glass Rivers', 'Lowtide'], ['Quiet Harbour & Kaske', 'Quiet Harbour']]);
+		const renames = rows.map((r) => ({ id: r.id, from: r.name, to: r.to!, why: r.why }));
+		await expect(ops.compoundRename({ renames, approved: false })).rejects.toThrow(/approved/);
+		// A claim since renamed one: it is left as it is now.
+		const quiet = rows.find((r) => r.name === 'Quiet Harbour & Kaske')!;
+		await app.db.query(`update curator.catalog_object set name = 'Quiet Harbour (live)' where id = $1`, [quiet.id]);
+		const r = await ops.compoundRename({ renames, approved: true, by: 'test' });
+		expect(r.renamed.map((x) => x.to).sort()).toEqual(['Ilka Rane', 'Lowtide']);
+		expect(r.skipped).toEqual([{ id: quiet.id, name: 'Quiet Harbour (live)', why: 'renamed since the scan' }]);
+		const now = await app.db.query<{ name: string; name_fold: string }>(`select name, name_fold from curator.catalog_object where id = $1`, [rows.find((x) => x.to === 'Ilka Rane')!.id]);
+		expect(now[0]).toEqual({ name: 'Ilka Rane', name_fold: 'ilka rane' });
+		const items = await app.db.query<{ kind: string; status: string; undo: { op: string; args: { name: string } } }>(`select kind, status, undo from curator.catalog_inbox where kind = 'artist.rename' order by id`);
+		expect(items).toHaveLength(2);
+		expect(items.every((i) => i.status === 'logged' && i.undo.op === 'rename')).toBe(true);
+		expect(items.map((i) => i.undo.args.name).sort()).toEqual(['Ilka Rane & Lowtide', 'Lowtide & Glass Rivers']);
+		// Run again: nothing left to do.
+		expect((await ops.compoundRename({ renames, approved: true })).renamed).toEqual([]);
 	});
 
 	it('asks for the whole name before its pieces decide', async () => {
@@ -182,5 +205,33 @@ describe('compound artists', () => {
 		expect(classifyCompound({ ...none, name: 'Sun & Moon', pages: [page('apple', 'Sun & Moon')], appleName: 'Sun & Moon' }).class).toBe('unsure');
 		// Members beside it on a release only, never on one track.
 		expect(classifyCompound({ ...none, name: 'Sun & Moon', pages: [page('deezer', 'Sun & Moon')], releases: { all: 1, some: 0 } }).class).toBe('unsure');
+	});
+
+	it('renames only to a name the line lists: another is someone else’s page, and a question', () => {
+		// The line's lead, written with its dots, keeps them; the others are told.
+		expect(decideCompound('S.E.T., Paper Mill & Kaske', { class: 'apple_line', to: 'S.E.T.' })).toEqual({ decision: 'rename', also: ['Paper Mill', 'Kaske'] });
+		expect(decideCompound('Lowtide & Glass Rivers', { class: 'renamed', to: 'Glass Rivers' })).toEqual({ decision: 'rename', also: ['Lowtide'] });
+		// A Bandcamp account that is a label's, Apple's name in another script.
+		expect(decideCompound('Paper Mill & Kaske', { class: 'renamed', to: 'Harbour Recordings' })).toMatchObject({ decision: 'ask', held: expect.stringContaining('Harbour Recordings') });
+		expect(decideCompound('Lowtide & Kaske', { class: 'apple_line', to: 'לואוטייד' })).toMatchObject({ decision: 'ask' });
+	});
+});
+
+describe('a credit line from Apple', () => {
+	const names = async (app: Awaited<ReturnType<typeof createTestApp>>, provider: string, id: string) =>
+		(await app.db.query<{ name: string }>(`select o.name from curator.catalog_object o join curator.catalog_source_object s on s.object_id = o.id where s.provider = $1 and s.provider_id = $2`, [provider, id]))[0]?.name;
+
+	it('names a new artist but renames none: a real store still renames its own', async () => {
+		const app = await createTestApp();
+		const ingest = (claims: CatalogClaim[]) => withSystemTx(app.db, (tx) => ingestClaims(tx, claims, { reason: 'library_import' }));
+		await ingest([artist('apple', '901', 'Ilka Rane')]);
+		await ingest([artist('apple', '901', 'Ilka Rane, Lowtide & Sokko')]);
+		expect(await names(app, 'apple', '901')).toBe('Ilka Rane');
+		// Apple alone, first seen under a line: the line it is, until a store says otherwise.
+		await ingest([artist('apple', '902', 'Marsh & Northfold')]);
+		expect(await names(app, 'apple', '902')).toBe('Marsh & Northfold');
+		await ingest([sp('Northfold')]);
+		await ingest([artist('spotify', 'sp-Northfold', 'Northfold Collective')]);
+		expect(await names(app, 'spotify', 'sp-Northfold')).toBe('Northfold Collective');
 	});
 });
