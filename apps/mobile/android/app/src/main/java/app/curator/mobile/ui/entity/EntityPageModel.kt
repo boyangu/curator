@@ -16,6 +16,8 @@ import app.curator.mobile.model.Pick
 import app.curator.mobile.model.RowPatch
 import app.curator.mobile.model.Scope
 import app.curator.mobile.model.EntitySection
+import app.curator.mobile.model.EntityTab
+import app.curator.mobile.model.EntityView
 import app.curator.mobile.model.StreamingService
 import app.curator.mobile.model.WorkEvent
 import app.curator.mobile.model.WorkStatus
@@ -25,6 +27,7 @@ import app.curator.mobile.model.scopedReleases
 import app.curator.mobile.model.ownedReleases
 import app.curator.mobile.model.toggled
 import app.curator.mobile.model.merged
+import app.curator.mobile.model.tabTracks
 import app.curator.mobile.model.worldReleases
 import app.curator.mobile.player.PlayerTrack
 import app.curator.mobile.ui.AppModel
@@ -37,8 +40,6 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
-
-enum class EntityTab { RELEASES, TRACKS }
 
 /** What covers the page: the hamburger's sheet, a name's or bar's menu, Reach, About. */
 sealed interface EntitySheet {
@@ -92,6 +93,7 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 	// The page was left with stores still being read for it: the reading ended there.
 	private var cutOff = false
 	private var reloading = false
+	private var relocating = false
 	private var reloadQueued = false
 	private var moreAfterReload = false
 
@@ -100,10 +102,14 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 
 	var scope by mutableStateOf(Scope.WORLD)
 		private set
-	var tab by mutableStateOf(EntityTab.RELEASES)
+	// The list and the charts open as the last page of this kind was left;
+	// what is picked here is how the next one opens.
+	private val view = model.entityView(asked.kind)
+	var tab by mutableStateOf(view.tabFor(asked.kind))
+		private set
 	var filters by mutableStateOf<Filters>(emptyMap())
 		private set
-	var charts by mutableStateOf<Set<EntitySection>>(emptySet())
+	var charts by mutableStateOf(view.chartsFor(asked.kind))
 		private set
 	var steps by mutableStateOf<Map<EntitySection, Int>>(emptyMap())
 		private set
@@ -129,14 +135,16 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 		load()
 	}
 
+	private suspend fun readHeader(): EntityHeader? = runCatching {
+		model.ask(
+			"entityPage",
+			"kind" to JsonPrimitive(asked.kind), "name" to JsonPrimitive(asked.name),
+			"libraryId" to asked.libraryId.json(), "catalogId" to asked.catalogId.json(),
+		)?.let { json.decodeFromJsonElement<EntityHeader>(it) }
+	}.onFailure { DiagLog.w("ui", "entity page failed", it) }.getOrNull()
+
 	private fun load() = model.app.scope.launch(Dispatchers.Main) {
-		val h = runCatching {
-			model.ask(
-				"entityPage",
-				"kind" to JsonPrimitive(asked.kind), "name" to JsonPrimitive(asked.name),
-				"libraryId" to asked.libraryId.json(), "catalogId" to asked.catalogId.json(),
-			)?.let { json.decodeFromJsonElement<EntityHeader>(it) }
-		}.onFailure { DiagLog.w("ui", "entity page failed", it) }.getOrNull()
+		val h = readHeader()
 		if (h == null) { failed = true; return@launch }
 		header = h
 		// Before the first World page is asked for: a read of a page the core
@@ -275,7 +283,36 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 		if (e.watch != watch) return
 		work = e.status.takeIf { it.phase != null }
 		patches = patches.merged(e.rows)
-		if (e.changed) reload()
+		if (e.changed) if (header?.world?.via != null) relocate() else reload()
+	}
+
+	/**
+	 * A page shown from Spotify (`world.via`) whose artist the catalogue now
+	 * keeps: the header is read again and, once it names the catalogue's
+	 * object, the page moves there, its World list read from the top under
+	 * the new id. Not there yet: the next change tries again.
+	 */
+	private fun relocate() {
+		if (relocating) return
+		relocating = true
+		model.app.scope.launch(Dispatchers.Main) {
+			moreJob?.join()
+			val h = readHeader()
+			relocating = false
+			if (h == null || h.world.via != null) return@launch
+			// The stand-in id's showing ends; the catalogue's is watched.
+			if (watch != 0) {
+				watch = 0
+				work = null
+				model.unwatch(this@EntityPageModel)
+			}
+			header = h
+			pages = emptyList()
+			cursor = null
+			worldDone = false
+			watchNow()
+			if (h.world.available && h.ref.catalogId != null) more()
+		}
 	}
 
 	val hasMore: Boolean get() = !worldDone && header?.world?.available == true
@@ -287,7 +324,15 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 
 	fun releases(): List<EntityRelease> = scopedReleases(scope, pages, owned, filters, patches)
 
-	fun tracks(releases: List<EntityRelease>): List<EntityRow> = releases.flatMap { it.tracks }
+	fun tracks(releases: List<EntityRelease>): List<EntityRow> = tabTracks(releases)
+
+	fun pickTab(t: EntityTab) {
+		if (t == tab) return
+		tab = t
+		keepView()
+	}
+
+	private fun keepView() = model.setEntityView(asked.kind, EntityView(tab, charts))
 
 	fun isOpen(index: Int, id: String): Boolean = opened[id] ?: (index == 0)
 
@@ -308,6 +353,7 @@ class EntityPageModel(private val model: AppModel, private val asked: EntityRef)
 			charts = charts - s
 			filters = filters.chartOff(s)
 		} else charts = charts + s
+		keepView()
 	}
 
 	fun toggleFilter(s: EntitySection, p: Pick) {

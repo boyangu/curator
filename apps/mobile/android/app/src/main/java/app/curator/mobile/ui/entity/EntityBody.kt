@@ -61,6 +61,7 @@ import app.curator.mobile.model.Item
 import app.curator.mobile.model.Pick
 import app.curator.mobile.model.Scope
 import app.curator.mobile.model.EntitySection
+import app.curator.mobile.model.EntityTab
 import app.curator.mobile.model.activeRange
 import app.curator.mobile.model.bars
 import app.curator.mobile.model.coverageText
@@ -330,13 +331,13 @@ private fun Status(page: EntityPageModel, h: EntityHeader, push: (Screen) -> Uni
 
 @Composable
 private fun ListSwitch(page: EntityPageModel, h: EntityHeader) {
-	val counts = tabCounts(page.scope, h.world, page.owned)
+	val counts = tabCounts(page.scope, h.world, page.owned, page.worldReleases)
 	Column(Modifier.padding(top = 16.dp)) {
 		Rule()
 		Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
 			Row(Modifier.weight(1f).height(36.dp).border(1.dp, C.line)) {
-				Segment("Releases", counts.first, page.tab == EntityTab.RELEASES, first = true) { page.tab = EntityTab.RELEASES }
-				Segment("Tracks", counts.second, page.tab == EntityTab.TRACKS, first = false) { page.tab = EntityTab.TRACKS }
+				Segment("Releases", counts.first, page.tab == EntityTab.RELEASES, first = true) { page.pickTab(EntityTab.RELEASES) }
+				Segment("Tracks", counts.second, page.tab == EntityTab.TRACKS, first = false) { page.pickTab(EntityTab.TRACKS) }
 			}
 			// The one order for now: released, newest first.
 			Row(

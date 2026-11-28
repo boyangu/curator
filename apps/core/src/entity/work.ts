@@ -22,7 +22,7 @@
 //
 // Two things stay here, outside the engine:
 //   - an entity the catalogue does not know, shown from the user's streaming
-//     service (entity/streaming.ts, `world.via`): registered as that same
+//     service (@curator/catalog-work streaming, `world.via`): registered as that same
 //     read, so the page becomes the catalogue's (a label known only by name
 //     is handed to the catalogue's own label lookups);
 //   - rows the user asks to have looked up now (`enrich`): one facts job a
@@ -30,7 +30,7 @@
 //
 // Nothing here touches the library.
 
-import { createWorkEngine, type WorkEngine, type WorkEngineDeps, type WorkEvent, type WorkPhase, type WorkReaders, type WorkRowPatch, type WorkVisit } from '@curator/catalog-work';
+import { createWorkEngine, type WorkEngine, type WorkEngineDeps, type WorkEvent, type WorkPhase, type WorkReaders, type WorkRowPatch, type WorkVisit, type StreamingCatalog } from '@curator/catalog-work';
 import type { FetchLike } from '@curator/catalog-readers';
 import { isDistributor } from '@curator/library-logic';
 import { ProviderBlockedError } from '@curator/matcher';
@@ -41,7 +41,7 @@ import { searchFold, type EntityHeader, type EntityRef, type EntityRowPatch, typ
 import type { Enricher } from '@curator/sync-core/enrich/contract';
 import { log } from '@curator/sync-core/log';
 import type { CatalogClient } from '../catalog-client/service.js';
-import { normalizeEntityRef, type StreamingCatalog } from './streaming.js';
+import { normalizeEntityRef } from './service.js';
 
 const wlog = log.for('entity-work');
 
@@ -69,7 +69,7 @@ export type EntityWorkDeps = {
 	// When Spotify's quota ban ends (past: none).
 	spotifyBackoffUntil(): number;
 	// The streaming service read as a catalogue, when the pages show unknown
-	// entities from it (entity/streaming.ts): what a discovery registers.
+	// entities from it (@curator/catalog-work streaming): what a discovery registers.
 	streaming?(): StreamingCatalog | null;
 	// The store lookups for a row's DJ facts, the feed's (service.ts
 	// storeEnrichers, each in its lane).

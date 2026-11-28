@@ -4,25 +4,25 @@
 // Kotlin's own query over the library (data/ListQuery.kt), from the owned
 // filter this hands back.
 //
-// Who a page is about is found only through ids, never through a name alone
-// (namesakes): a catalogue id the surface holds, a catalog_ref row an earlier
-// page wrote, an object the surface holds whose credits name it (`within`),
-// the library import's `user local:<id>` claim, or a recording of one of the
-// artist's own tracks whose credits name it. The phone holds no artist_link
-// rows (they stay on the desktop), so it has no Spotify id of an artist; its
-// tracks' claims are the way in, as js/track-pictures.ts finds pictures.
-// Labels are the exception the library forces: a label IS its folded name.
+// Who a page is about is found by the ladder the desktop's pages use
+// (@curator/sync-core/entity/identify): ids first — a catalogue id the
+// surface holds, a catalog_ref row an earlier page wrote, the artist's own
+// Spotify id (artist_link, derived here from the account's provider
+// listings), the library import's `user local:<id>` claim — and a name only
+// among one object's own credits. Labels are the exception the library
+// forces: a label IS its folded name.
 //
 // Read-only on the catalogue, except a follow (catalog.watch / unwatch: the
 // account's watch list in the cloud, nothing at Spotify — decided
 // 2026-11-26). Writes catalog_ref rows, the phone's own cache.
 
 import type Database from 'better-sqlite3';
-import type { CatalogBrowseResult, CloudService } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogTracksResult, CloudService } from '@curator/protocol';
+import { parseStreamObjectId, streamObjectId, streamPage, type StreamingCatalog } from '@curator/catalog-work';
 import { nameFold } from '@curator/library-logic';
 import { searchFold, type EntityChip, type EntityHeader, type EntityKind, type EntityRef, type EntityTracksPage, type EntityWorldReason } from '@curator/shared';
-import { applyBrowse, worldPage, worldProbes } from '@curator/sync-core/entity/catalog-page';
-import { writeRefs } from '@curator/sync-core/entity/catalog-ref';
+import { applyBrowse, GENRES_MAX, mergeLinks, worldPage, worldProbes } from '@curator/sync-core/entity/catalog-page';
+import { hintsOf, identifyLocal, identifyRemote, rememberObject, settleIds, type EntityIds, type IdentifyCatalog } from '@curator/sync-core/entity/identify';
 import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
 import type { PhoneWork } from './work.js';
 
@@ -35,6 +35,9 @@ export type EntityDeps = {
 	// The phone's store reading for the page in front (js/work.ts): asked what
 	// to say with a page read, and handed the work the answer carried.
 	work?: Pick<PhoneWork, 'ready' | 'profile' | 'read' | 'patchOf'>;
+	// The account's Spotify read as a catalogue (@curator/catalog-work
+	// streaming): an artist the catalogue does not know is shown from there.
+	streaming?: StreamingCatalog | null;
 	now: number;
 };
 
@@ -44,79 +47,18 @@ export type PageAsk = { kind: PageKind; name: string; libraryId?: string | null;
 // The phone's Owned: a file on some device of the account (its track rows'
 // remote_source). Kotlin reads the filter's ids / folds, not this list.
 const OWNED_SOURCES = ['local'];
-// The artist's own tracks tried for a recording whose credits name it.
-const EVIDENCE_TRACKS = 2;
 
-const cachedObject = (raw: Database.Database, kind: PageKind, entityId: string): string | null =>
-	(raw.prepare(`select object_id from catalog_ref where entity_kind = ? and entity_id = ?`).get(kind, entityId) as { object_id: string } | undefined)?.object_id ?? null;
-
-const cachedArtist = (raw: Database.Database, objectId: string): string | null =>
-	(raw.prepare(`select r.entity_id from catalog_ref r join artist a on a.id = r.entity_id and a.merged_into is null where r.entity_kind = 'artist' and r.object_id = ? limit 1`).get(objectId) as { entity_id: string } | undefined)?.entity_id ?? null;
-
-function remember(raw: Database.Database, kind: PageKind, entityId: string, objectId: string, now: number): void {
-	writeRefs(raw, [{ entityKind: kind, entityId, objectKind: kind, objectId, provider: null, providerId: null }], now);
-}
-
-// The credit an object names by this name (the one place a name is safe:
-// inside an object the surface already holds).
-function creditWithin(b: CatalogBrowseResult, kind: PageKind, name: string): string | null {
-	const fold = nameFold(name);
-	if (!fold) return null;
-	const pool = kind === 'artist' ? (b.artists ?? []) : [...(b.labels ?? []), ...(b.releases ?? []).flatMap((r) => r.labels)];
-	return pool.find((c) => nameFold(c.name) === fold)?.id ?? null;
-}
-
-type Found = { catalogId: string } | { reason: 'unknown' | 'ambiguous'; candidates?: EntityChip[] };
-
-async function identify(d: EntityDeps, c: { client: EntityCatalog; deviceId: string }, ask: PageAsk): Promise<Found> {
-	const { raw } = d;
-	const { client, deviceId } = c;
-	if (ask.catalogId) return { catalogId: ask.catalogId };
-	const fold = nameFold(ask.name);
-	const cacheKey = ask.kind === 'label' ? fold : (ask.libraryId ?? null);
-	const cached = cacheKey ? cachedObject(raw, ask.kind, cacheKey) : null;
-	if (cached) return { catalogId: cached };
-	const found = (id: string): Found => {
-		if (cacheKey) remember(raw, ask.kind, cacheKey, id, d.now);
-		return { catalogId: id };
+// The ladder's catalogue (identify.ts) over the cloud API. A brief read
+// only where the server offers pages (an older one refuses the key).
+function identifyCatalog(c: { client: EntityCatalog; deviceId: string; pages: boolean }): IdentifyCatalog {
+	return {
+		resolve: async (refs) => (await c.client.resolve({ deviceId: c.deviceId, refs })).objects,
+		browse: (id, opts) => c.client.browse({ deviceId: c.deviceId, id, ...(opts?.brief && c.pages ? { brief: true } : {}) }),
+		find: async (q, kind, limit) => (await c.client.search({ deviceId: c.deviceId, q, kind, ...(limit ? { limit } : {}) })).objects,
 	};
-	if (ask.within?.catalogId) {
-		const hit = creditWithin(await client.browse({ deviceId, id: ask.within.catalogId, brief: true }), ask.kind, ask.name);
-		if (hit) return found(hit);
-	}
-	if (ask.kind === 'label') {
-		if (!fold) return { reason: 'unknown' };
-		const [byName] = (await client.resolve({ deviceId, refs: [{ provider: 'user', kind: 'label', providerId: `name:${fold}` }] })).objects;
-		if (byName) return found(byName.id);
-		// A label no one followed by name: the catalogue's own labels of
-		// exactly that fold. One is it; several are namesakes to choose from.
-		const same = (await client.search({ deviceId, q: ask.name, kind: 'label', limit: 10 })).objects.filter((o) => nameFold(o.name) === fold);
-		if (same.length === 1) return found(same[0]!.id);
-		return same.length > 1 ? { reason: 'ambiguous', candidates: same.map((o) => ({ ref: { kind: 'label', name: o.name, catalogId: o.id } })) } : { reason: 'unknown' };
-	}
-	if (!ask.libraryId) return { reason: 'unknown' };
-	// What a desktop's library import registered for the artist; its ids are
-	// this phone's too for the artists the replica brought.
-	const [imported] = (await client.resolve({ deviceId, refs: [{ provider: 'user', kind: 'artist', providerId: `local:${ask.libraryId}` }] })).objects;
-	if (imported) return found(imported.id);
-	const spotify = raw
-		.prepare(
-			`select c.source_track_id as id from track_artist ta
-			join track t on t.id = ta.track_id and t.deleted_at is null
-			join claim_link c on c.track_id = ta.track_id and c.source = 'spotify'
-			where ta.artist_id = ? and ta.role is null
-			group by ta.track_id order by min(c.rank) limit ?`,
-		)
-		.all(ask.libraryId, EVIDENCE_TRACKS) as { id: string }[];
-	if (spotify.length === 0) return { reason: 'unknown' };
-	const { objects } = await client.resolve({ deviceId, refs: spotify.map((s) => ({ provider: 'spotify' as const, kind: 'recording' as const, providerId: s.id })) });
-	for (const rec of objects) {
-		if (!rec) continue;
-		const hit = creditWithin(await client.browse({ deviceId, id: rec.id, brief: true }), 'artist', ask.name);
-		if (hit) return found(hit);
-	}
-	return { reason: 'unknown' };
 }
+
+const refOf = (ids: EntityIds): EntityRef => ({ kind: ids.kind, name: ids.name, libraryId: ids.libraryId, catalogId: ids.catalogId, spotifyId: ids.spotifyId });
 
 function baseHeader(ref: EntityRef, world: EntityHeader['world']): EntityHeader {
 	return {
@@ -152,31 +94,41 @@ function ownedFilter(ref: EntityRef, extraFolds: string[] = []): EntityHeader['o
 const off = (reason: EntityWorldReason, candidates?: EntityChip[]): EntityHeader['world'] => ({ available: false, reason, releaseCount: null, trackCount: null, ...(candidates ? { candidates } : {}) });
 
 export async function entityPage(d: EntityDeps, ask: PageAsk): Promise<EntityHeader> {
-	const ref: EntityRef = { kind: ask.kind, name: ask.name, libraryId: ask.libraryId ?? null, catalogId: ask.catalogId ?? null };
-	if (ref.kind === 'artist' && !ref.libraryId && ref.catalogId) ref.libraryId = cachedArtist(d.raw, ref.catalogId);
-	if ('reason' in d.catalog) return baseHeader(ref, off(d.catalog.reason));
+	const asked: EntityRef = { kind: ask.kind, name: ask.name, libraryId: ask.libraryId ?? null, catalogId: ask.catalogId ?? null, within: ask.within ?? null };
+	let ids = identifyLocal(d.raw, asked);
+	if ('reason' in d.catalog) return baseHeader(refOf(ids), off(d.catalog.reason));
 	const c = d.catalog;
-	let found: Found;
-	let b: CatalogBrowseResult;
+	const client = identifyCatalog(c);
+	let b: CatalogBrowseResult | null = null;
+	let found: Awaited<ReturnType<typeof identifyRemote>>;
 	try {
-		found = await identify(d, c, ask);
-		if ('reason' in found) {
-			const header = baseHeader(ref, off(found.reason, found.candidates));
-			// Followable once the catalogue has an object; it has none yet.
-			return header;
+		found = await identifyRemote(d.raw, client, ids, asked);
+		if (!('reason' in found)) {
+			try {
+				b = await client.browse(found.catalogId, { brief: true });
+			} catch (e) {
+				// The object a catalog_ref row remembered is gone (the id was the
+				// library's memory, not the surface's): ask again by the ids the
+				// library holds, instead of failing on a stale row.
+				if (asked.catalogId || !ids.catalogId) throw e;
+				ids = { ...ids, catalogId: null };
+				found = await identifyRemote(d.raw, client, ids, asked);
+				if (!('reason' in found)) b = await client.browse(found.catalogId, { brief: true });
+			}
 		}
-		b = await c.client.browse({ deviceId: c.deviceId, id: found.catalogId, brief: c.pages });
 	} catch (e) {
 		console.warn('entity page: the catalogue did not answer', e instanceof Error ? e.message : String(e));
-		return baseHeader(ref, off('server_off'));
+		return baseHeader(refOf(ids), off('server_off'));
 	}
-	ref.catalogId = b.object.id;
-	if (ref.kind === 'artist') {
-		ref.libraryId ??= cachedArtist(d.raw, b.object.id);
-		// The library's spelling where the library has the artist.
-		const lib = ref.libraryId ? (d.raw.prepare(`select name from artist where id = ?`).get(ref.libraryId) as { name: string } | undefined) : undefined;
-		ref.name = lib?.name ?? b.object.name;
-	} else if (!ref.name) ref.name = b.object.name;
+	if ('reason' in found || !b) {
+		const miss = 'reason' in found ? found : { reason: 'unknown' as const };
+		// Nobody followed it: shown from Spotify meanwhile, and read for the
+		// catalogue by the page's work (entityTracks).
+		const streamed = miss.reason === 'unknown' ? await streamedHeader(d, ids) : null;
+		// Followable once the catalogue has an object; it has none yet.
+		return streamed ?? baseHeader(refOf(ids), off(miss.reason, miss.candidates));
+	}
+	const ref = refOf(settleIds(d.raw, ids, b, d.now));
 	const header = baseHeader(ref, { available: c.pages, reason: c.pages ? 'ok' : 'old_server', releaseCount: b.releaseCount ?? null, trackCount: b.trackCount ?? null });
 	// The catalogue's spelling may fold differently from the library's.
 	if (ref.kind === 'label') header.owned.filter = ownedFilter(ref, [searchFold(b.object.name)]);
@@ -196,8 +148,30 @@ export async function entityTracks(d: EntityDeps, ask: { kind: PageKind; catalog
 	// What this phone can read now goes with the read, when it is the page in
 	// front; the answer's work is the engine's, not the page's.
 	const profile = d.work?.profile(ask.catalogId) ?? null;
-	const { work, ...result } = await c.client.tracks({ deviceId: c.deviceId, id: ask.catalogId, ...(ask.cursor ? { cursor: ask.cursor } : {}), ...(profile ? { profile } : {}) });
-	d.work?.read(result.object.id, result, work);
+	const streamed = parseStreamObjectId(ask.catalogId);
+	let result: CatalogTracksResult;
+	if (streamed) {
+		// A page shown from Spotify (streamedHeader): its releases as Spotify
+		// lists them. Its first read asks the catalogue about the artist's page
+		// with what this phone can read: the answer's work reads the page for
+		// the catalogue, and the page moves there once it is kept.
+		if (!d.streaming) throw new Error('Spotify is not connected');
+		const page = await streamPage(d.streaming, { kind: 'artist', id: streamed.id, name: '', cursor: ask.cursor ?? null });
+		if (!page) throw new Error('Spotify has no such artist');
+		result = page;
+		if (profile && !ask.cursor) {
+			const self = { provider: 'spotify' as const, kind: 'artist' as const, providerId: streamed.id };
+			const { work } = await c.client.resolve({ deviceId: c.deviceId, refs: [self], profile, hints: [self] });
+			d.work?.read(ask.catalogId, { releases: [] }, work, [self]);
+		}
+	} else {
+		// The Spotify page the library knows the artist by: the one the cloud
+		// names for the work, among namesakes' pages.
+		const hints = hintsOf(identifyLocal(d.raw, { kind: ask.kind, name: '', libraryId: ask.libraryId ?? null, catalogId: ask.catalogId }));
+		const { work, ...read } = await c.client.tracks({ deviceId: c.deviceId, id: ask.catalogId, ...(ask.cursor ? { cursor: ask.cursor } : {}), ...(profile ? { profile, ...(hints.length ? { hints } : {}) } : {}) });
+		result = read;
+		d.work?.read(result.object.id, result, work, hints);
+	}
 	const probes = worldProbes(result);
 	// A row the work already found facts for shows them before the catalogue does.
 	const page = worldPage(result, probes, matchLibraryTracks(d.raw, probes), (id) => {
@@ -205,11 +179,35 @@ export async function entityTracks(d: EntityDeps, ask: { kind: PageKind; catalog
 		return p ? { recordingId: p.recordingId, ...(p.bpm ? { bpm: p.bpm } : {}), ...(p.keyCamelot ? { keyCamelot: p.keyCamelot } : {}), ...(p.genre ? { genre: p.genre } : {}), ...(p.label ? { label: p.label } : {}), ...(p.spotifyId ? { streamIds: { spotify: p.spotifyId } } : {}) } : undefined;
 	});
 	let libraryId: string | null = null;
-	if (ask.kind === 'artist' && !ask.libraryId) {
+	if (ask.kind === 'artist' && !ask.libraryId && !streamed) {
 		libraryId = artistAmongOwned(d.raw, page, result.object.id);
-		if (libraryId) remember(d.raw, 'artist', libraryId, result.object.id, d.now);
+		if (libraryId) rememberObject(d.raw, { kind: 'artist', name: '', libraryId, spotifyId: null, catalogId: null }, result.object.id, d.now);
 	}
 	return { ...page, libraryId };
+}
+
+// The header of an artist the catalogue does not know, from Spotify (the
+// desktop's streamingHeader): it stands under its Spotify id where a
+// catalogue id would be. Null when there is no Spotify id or no answer.
+// Not followable: a follow names a catalogue object, and there is none yet.
+async function streamedHeader(d: EntityDeps, ids: EntityIds): Promise<EntityHeader | null> {
+	const stream = d.streaming;
+	const id = ids.spotifyId;
+	if (!stream || ids.kind !== 'artist' || !id) return null;
+	try {
+		const [artist, listing] = await Promise.all([stream.artist(id), stream.listing(id)]);
+		if (!artist) return null;
+		// The library's spelling where the library has the artist.
+		const ref = refOf({ ...ids, name: ids.libraryId ? ids.name : artist.name, catalogId: streamObjectId(stream.service, id) });
+		const header = baseHeader(ref, { available: true, reason: 'ok', releaseCount: listing.total, trackCount: null, via: stream.service });
+		header.imageUrl = artist.imageUrl;
+		header.genres = artist.genres.slice(0, GENRES_MAX).map((name) => ({ name }));
+		header.links = mergeLinks(header.links, [{ source: stream.service, sourceId: id, url: artist.url }]);
+		return header;
+	} catch (e) {
+		console.info('entity page: Spotify did not answer', e instanceof Error ? e.message : String(e));
+		return null;
+	}
 }
 
 // The library artist a catalogue artist is, read off recordings the library

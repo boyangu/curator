@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import app.curator.mobile.model.EntityView
 import app.curator.mobile.model.ListView
 import app.curator.mobile.model.GridShow
 import app.curator.mobile.model.StreamingService
@@ -37,6 +38,7 @@ class ViewState(private val context: Context) {
 	private val diagnosticsKey = booleanPreferencesKey("diagnostics")
 	private val readStoresKey = booleanPreferencesKey("read-stores")
 	private fun listKey(list: String) = stringPreferencesKey("list:$list")
+	private fun entityKey(kind: String) = stringPreferencesKey("entity-view:$kind")
 
 	@Serializable
 	data class Recent(val kind: String, val id: String, val at: Long)
@@ -109,6 +111,15 @@ class ViewState(private val context: Context) {
 
 	suspend fun setReadStores(on: Boolean) {
 		context.viewStore.edit { it[readStoresKey] = on }
+	}
+
+	/** How an artist (or a label, by [kind]) page opens: the list and charts last chosen on one. */
+	fun entityView(kind: String): Flow<EntityView> = context.viewStore.data.map { p ->
+		p[entityKey(kind)]?.let { runCatching { json.decodeFromString<EntityView>(it) }.getOrNull() } ?: EntityView()
+	}
+
+	suspend fun setEntityView(kind: String, v: EntityView) {
+		context.viewStore.edit { it[entityKey(kind)] = json.encodeToString(v) }
 	}
 
 	/** What was seen of a library that is gone from this phone; the phone's own choices stay. */

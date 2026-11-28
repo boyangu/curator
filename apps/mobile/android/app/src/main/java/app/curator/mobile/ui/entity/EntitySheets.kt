@@ -51,6 +51,7 @@ import app.curator.mobile.model.EntityChip
 import app.curator.mobile.model.EntityHeader
 import app.curator.mobile.model.EntityRef
 import app.curator.mobile.model.EntitySection
+import app.curator.mobile.model.EntityTab
 import app.curator.mobile.model.audience
 import app.curator.mobile.ui.common.BrandMark
 import app.curator.mobile.ui.common.Icon

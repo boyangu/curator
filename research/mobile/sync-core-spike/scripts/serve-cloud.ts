@@ -7,7 +7,8 @@
 //
 //   cd apps/cloud && npx tsx ../../research/mobile/sync-core-spike/scripts/serve-cloud.ts
 //       [--port 8799] [--name main] [--work c:/tmp/curator-mobile-spike] [--ops <ops.json>] [--feed <feed.json>]
-//       [--token-ttl 120] [--device-work] [--deezer <object id>=<Deezer id>] [--local-artists <object id>] [--spotify-grant]
+//       [--token-ttl 120] [--device-work] [--deezer <object id>=<Deezer id>] [--local-artists <object id>] [--spotify-grant] [--twice <artist object id>] [--named <Spotify artist id>=<name>]
+//       [--spotify-artist <Spotify artist id>=<name>]
 //
 // (Run from apps/cloud so tsx and the server's dependencies resolve there.)
 //
@@ -35,6 +36,8 @@ import { gunzipSync } from 'node:zlib';
 import { join, resolve } from 'node:path';
 import { createFakeGotrue } from './fake-gotrue.js';
 import { createTestApp, entitle, masterOp, uploadBlob } from '../../../../apps/cloud/src/test/harness.js';
+import { ingestClaims } from '../../../../apps/cloud/src/catalog/ingest.js';
+import { withSystemTx } from '../../../../apps/cloud/src/db/system-tx.js';
 import { CATALOGUE_UNIT_SCHEMA, catalogueBlobPath, MAX_CATALOGUE_PUT_ITEMS, MAX_PUSH_BYTES, MAX_PUSH_OPS, snapshotPartPath, type CatalogueItem, type Op, type ReplicaManifest, type SnapshotManifest } from '../../../../packages/protocol/src/index.js';
 
 const args = process.argv.slice(2);
@@ -209,6 +212,61 @@ if (arg('deezer')) {
 	await app.pg.query(`update curator.catalog_source_object set url = 'https://open.spotify.com/artist/' || provider_id where object_id = $1 and provider = 'spotify' and url is null`, [objectId]);
 	await app.pg.query(`insert into curator.catalog_source_object (object_id, provider, kind, provider_id, url) values ($1, 'deezer', 'artist', $2, $3) on conflict do nothing`, [objectId, deezerId, `https://www.deezer.com/artist/${deezerId}`]);
 }
+// --twice <artist object id>: the artist gets two releases, an EP and a
+// newer compilation holding one of the EP's recordings again.
+if (arg('twice')) {
+	const [sp] = (await app.pg.query<{ provider_id: string; name: string }>(
+		`select s.provider_id, o.name from curator.catalog_source_object s join curator.catalog_object o on o.id = s.object_id where s.object_id = $1 and s.provider = 'spotify' and s.kind = 'artist'`,
+		[arg('twice')],
+	)).rows;
+	if (!sp) throw new Error('--twice: the artist needs a Spotify page');
+	const artist = { provider: 'spotify' as const, kind: 'artist' as const, providerId: sp.provider_id, name: sp.name };
+	const rec = (id: string, name: string) => ({ provider: 'spotify' as const, kind: 'recording' as const, providerId: id, name, artists: [artist], facts: { durationSec: 300 } });
+	const release = (id: string, name: string, date: string, recordings: ReturnType<typeof rec>[]) => ({ provider: 'spotify' as const, kind: 'release' as const, providerId: id, name, facts: { releaseDate: date }, artists: [artist], recordings });
+	const shared = rec('twice-shared', 'Twice Over');
+	await withSystemTx(app.db, (tx) => ingestClaims(tx, [
+		release('twice-ep', 'Twice EP', '2024-05-01', [shared, rec('twice-b', 'Second Light')]),
+		release('twice-comp', 'Twice Compilation', '2026-02-01', [rec('twice-c', 'Third Way'), shared]),
+	], { reason: 'library_import' }));
+	console.log('--twice: "Twice Over" is on the EP and the compilation');
+}
+// --named <Spotify artist id>=<name>: the catalogue holds that Spotify
+// artist under another name than the library's (a credit line written on
+// its id), with one release: a page must find it by the id, not the name.
+if (arg('named')) {
+	const [spotifyId, name] = arg('named')!.split('=');
+	const artist = { provider: 'spotify' as const, kind: 'artist' as const, providerId: spotifyId!, name: name! };
+	await withSystemTx(app.db, (tx) => ingestClaims(tx, [{
+		provider: 'spotify', kind: 'release', providerId: `named-${spotifyId}`, name: 'Named Release', facts: { releaseDate: '2025-09-01' }, artists: [artist],
+		recordings: [{ provider: 'spotify', kind: 'recording', providerId: `named-${spotifyId}-1`, name: 'Named One', artists: [artist], facts: { durationSec: 300 } }],
+	}], { reason: 'library_import' }));
+	console.log(`--named: Spotify artist ${spotifyId} is "${name}" in the catalogue`);
+}
+// --spotify-artist <Spotify artist id>=<name>: Spotify knows an artist the
+// catalogue does not, with two releases. The development build reads
+// Spotify here instead (server.json `stores`, core/CloudConfig.kt): a page
+// of the artist is shown from Spotify, its work reads it for the catalogue,
+// and the page moves there. Any bearer is taken (the grant is the fake's).
+const standIn = arg('spotify-artist')?.split('=') as [string, string] | undefined;
+const SPOTIFY_STAND_IN = '/spotify-api/v1';
+function spotifyStandIn(path: string): { status: number; body: unknown } {
+	const [id, name] = standIn!;
+	const ref = { id, name, type: 'artist', uri: `spotify:artist:${id}`, external_urls: { spotify: `https://open.spotify.com/artist/${id}` } };
+	const track = (n: number, k: number) => ({ id: `${id}t${n}${k}`, name: `Stand-in ${n}.${k}`, duration_ms: 300_000, track_number: k, disc_number: 1, artists: [ref], type: 'track', uri: `spotify:track:${id}t${n}${k}`, external_urls: { spotify: `https://open.spotify.com/track/${id}t${n}${k}` } });
+	const album = (n: number) => ({
+		id: `${id}a${n}`, name: `Stand-in Release ${n}`, album_type: n === 1 ? 'album' : 'single', release_date: n === 1 ? '2025-06-01' : '2026-01-15', release_date_precision: 'day', total_tracks: 2, images: [],
+		artists: [ref], type: 'album', uri: `spotify:album:${id}a${n}`, external_urls: { spotify: `https://open.spotify.com/album/${id}a${n}` },
+		external_ids: { upc: `00000000000${n}` }, label: 'Stand-in Records', tracks: { items: [track(n, 1), track(n, 2)], total: 2, next: null },
+	});
+	const u = new URL(path, 'http://x');
+	const p = u.pathname.slice(SPOTIFY_STAND_IN.length);
+	if (p === `/artists/${id}`) return { status: 200, body: { ...ref, images: [], genres: ['melodic house'], followers: { total: 1200 } } };
+	if (p === `/artists/${id}/albums`) return { status: 200, body: { items: [album(2), album(1)].map(({ tracks: _, external_ids: __, label: ___, ...a }) => a), total: 2, next: null } };
+	const one = /^\/albums\/(.+)$/.exec(p);
+	if (one) return [1, 2].some((n) => one[1] === `${id}a${n}`) ? { status: 200, body: album(one[1]!.endsWith('1') ? 1 : 2) } : { status: 404, body: { error: { status: 404 } } };
+	if (p === '/albums') return { status: 200, body: { albums: (u.searchParams.get('ids') ?? '').split(',').map((x) => (x === `${id}a1` ? album(1) : x === `${id}a2` ? album(2) : null)) } };
+	return { status: 404, body: { error: { status: 404, message: 'not in the stand-in' } } };
+}
 async function raiseLater(): Promise<{ raised: string | null; left: number }> {
 	const e = feed?.later.shift();
 	if (e) await raise(e);
@@ -229,6 +287,11 @@ const server = createServer((req, res) => {
 				res.end(buf);
 			};
 			try {
+				if (standIn && url.startsWith(SPOTIFY_STAND_IN)) {
+					const r = spotifyStandIn(url);
+					console.log(`spotify stand-in ${url} ${r.status}`);
+					return send(r.status, JSON.stringify(r.body));
+				}
 				if (url.startsWith('/storage/') && !url.startsWith('/storage/v1/')) {
 					if (req.headers.authorization !== `Bearer ${token}`) return send(401, '{"error":"unauthorized"}');
 					const blob = blobs.get(decodeURIComponent(url.slice('/storage/'.length)));
@@ -294,6 +357,7 @@ const server = createServer((req, res) => {
 	});
 });
 server.listen(port, '127.0.0.1', () => {
-	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, supabaseUrl: `http://127.0.0.1:${port}`, publishableKey: 'test', userId, token, snapshotSeq }, null, 1));
+	const stores = standIn ? { stores: { 'https://api.spotify.com/v1': `http://127.0.0.1:${port}${SPOTIFY_STAND_IN}` } } : {};
+	writeFileSync(join(dir, 'server.json'), JSON.stringify({ apiUrl: `http://127.0.0.1:${port}`, supabaseUrl: `http://127.0.0.1:${port}`, publishableKey: 'test', userId, token, snapshotSeq, ...stores }, null, 1));
 	console.log(`ready: http://127.0.0.1:${port}, snapshot at seq ${snapshotSeq} (${parts.length} parts)${replicaSeq !== null ? `, replica at seq ${replicaSeq}` : ''}${opsFile ? ', later ops on request' : ''}${peaksCount ? `, waveforms for ${peaksCount} recordings` : ''}${feed ? `, ${feed.events.length} feed events` : ''}`);
 });

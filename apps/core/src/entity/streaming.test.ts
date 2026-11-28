@@ -3,7 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import type { CatalogClaim } from '@curator/protocol';
-import { createSpotifyStreaming, normalizeEntityRef, parseStreamObjectId, provisionalRelease, streamObjectId } from './streaming.js';
+import { createSpotifyStreaming, parseStreamObjectId, provisionalRelease, streamObjectId } from '@curator/catalog-work';
+import { normalizeEntityRef } from './service.js';
 
 type Answer = { status?: number; body?: unknown };
 

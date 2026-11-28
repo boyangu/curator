@@ -91,6 +91,7 @@ import app.curator.mobile.model.releasesLine
 import app.curator.mobile.ui.AppModel
 import app.curator.mobile.ui.common.Covers
 import app.curator.mobile.ui.common.Icon
+import app.curator.mobile.ui.common.brandName
 import app.curator.mobile.ui.common.IconGlyph
 import app.curator.mobile.ui.nav.Screen
 import app.curator.mobile.ui.theme.C
@@ -231,7 +232,7 @@ internal fun Hero(page: EntityPageModel, h: EntityHeader, y: State<Float>) {
 				}
 				Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
 					val count = if (page.scope == Scope.OWNED) page.owned?.let { page.ownedReleases.size } else h.world.releaseCount
-					releasesLine(page.scope, count)?.let {
+					releasesLine(page.scope, count, h.world.via?.let(::brandName))?.let {
 						BasicText(it, Modifier.background(BAND).padding(horizontal = 8.dp, vertical = 3.dp), style = T.of(13.sp, color = C.fg1).copy(lineHeight = 17.sp), maxLines = 1)
 					}
 					h.follow?.let { f -> FollowButton(f.following, page::toggleFollow) }

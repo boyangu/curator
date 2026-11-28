@@ -4,10 +4,9 @@
 
 import { describe, expect, it } from 'vitest';
 import type { CatalogClaim, CatalogJob, CatalogPageRelease, CatalogPageTrack, CatalogTracksResult, CatalogWork, CatalogWorkReportInput, CatalogWorkReportResult } from '@curator/protocol';
-import type { WorkReaders } from '@curator/catalog-work';
+import type { StreamingCatalog, WorkReaders } from '@curator/catalog-work';
 import type { EntityHeader, EntityRef, EntityWorkEvent } from '@curator/shared';
 import type { Enricher, EnricherOutput } from '@curator/sync-core/enrich/contract';
-import type { StreamingCatalog } from './streaming.js';
 import { createEntityWork, type EntityWorkDeps } from './work.js';
 
 const CAT = '11111111-1111-4111-8111-111111111111';

@@ -38,6 +38,11 @@ class EntityPageTest {
 		assertEquals(43 to 124, tabCounts(Scope.WORLD, world, mine))
 		assertEquals(2 to 3, tabCounts(Scope.OWNED, world, mine))
 		assertEquals(null to null, tabCounts(Scope.OWNED, world, null))
+		// Tracklists filled since the header was read count, the catalogue's figure never less.
+		val filled = worldReleases(pages)
+		assertEquals(3 to 4, tabCounts(Scope.WORLD, EntityWorld(available = true, reason = "ok", releaseCount = 2, trackCount = 0), mine, filled))
+		assertEquals(43 to 124, tabCounts(Scope.WORLD, world, mine, filled))
+		assertEquals(null to null, tabCounts(Scope.WORLD, EntityWorld(available = true, reason = "ok"), mine))
 	}
 
 	@Test fun `World lists every catalogue release, My Library only releases holding an owned track`() {
@@ -46,6 +51,38 @@ class EntityPageTest {
 		assertEquals(listOf("t2", "t3"), all[1].tracks.map { it.id })
 		assertTrue(all[0].tracks.single().inLibrary)
 		assertTrue(scopedReleases(Scope.OWNED, pages, emptyList(), emptyMap()).isEmpty())
+	}
+
+	@Test fun `a recording on two releases is one Tracks row, at the release it first came out on`() {
+		// r9 is the newest (a compilation holding t1 again); r1 the original.
+		val twice = listOf(
+			WorldPage(
+				albums = listOf(album("r9", "2026-01-01"), album("r1", "2025-03-01")),
+				tracks = listOf(track("t9", "r9"), track("t1", "r9"), track("t1", "r1"), track("t2", "r1")),
+				nextCursor = "c1",
+			),
+			// A page read again after the catalogue moved: t2 on r1 comes twice.
+			WorldPage(albums = listOf(album("r1", "2025-03-01")), tracks = listOf(track("t2", "r1"))),
+		)
+		val releases = worldReleases(twice)
+		assertEquals(listOf("t9", "t1"), releases[0].tracks.map { it.id })
+		assertEquals(listOf("t1", "t2"), releases[1].tracks.map { it.id })
+		val rows = tabTracks(releases)
+		assertEquals(listOf("t9", "t1", "t2"), rows.map { it.id })
+		assertEquals(rows.size, rows.distinctBy { it.id }.size)
+	}
+
+	@Test fun `an artist opens on Tracks and a label on Releases until one is picked, then as picked`() {
+		assertEquals(EntityTab.TRACKS, EntityView().tabFor("artist"))
+		assertEquals(EntityTab.RELEASES, EntityView().tabFor("label"))
+		assertEquals(EntityTab.RELEASES, EntityView(tab = EntityTab.RELEASES).tabFor("artist"))
+		// A label's charts never carry an artist's sections, nor the other way round.
+		val v = EntityView(charts = setOf(EntitySection.LABELS, EntitySection.ACTIVE))
+		assertEquals(setOf(EntitySection.LABELS, EntitySection.ACTIVE), v.chartsFor("artist"))
+		assertEquals(setOf(EntitySection.ACTIVE), v.chartsFor("label"))
+		// Kept as JSON on the device (ViewState).
+		val json = Json { ignoreUnknownKeys = true }
+		assertEquals(v, json.decodeFromString<EntityView>(json.encodeToString(v)))
 	}
 
 	@Test fun `owned tracks group by album row, else folded album title, no album stands alone, newest first`() {
@@ -68,6 +105,9 @@ class EntityPageTest {
 		assertEquals("1 release in library", releasesLine(Scope.OWNED, 1))
 		assertEquals("3 releases in library", releasesLine(Scope.OWNED, 3))
 		assertNull(releasesLine(Scope.WORLD, null))
+		// World read from Spotify while the catalogue does not know the artist; My Library stays the library's.
+		assertEquals("12 releases on Spotify", releasesLine(Scope.WORLD, 12, "Spotify"))
+		assertEquals("2 releases in library", releasesLine(Scope.OWNED, 2, "Spotify"))
 	}
 
 	// ── filters ─────────────────────────────────────────────────────────────

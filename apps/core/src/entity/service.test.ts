@@ -11,7 +11,7 @@ import type { CatalogBrowseResult, CatalogObjectSummary, CatalogRef, CatalogTrac
 import type { ZTrackFilterT } from '@curator/shared';
 import { migrate } from '@curator/sync-core/db/migrate';
 import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
-import type { EntityCatalog } from './resolve.js';
+import type { EntityCatalog } from './service.js';
 import { createEntityPages, OWNED_SOURCES } from './service.js';
 
 let dir: string;

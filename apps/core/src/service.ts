@@ -49,7 +49,7 @@ import type { CoverFn, ParseFn } from './ingest/types.js';
 import { createArtistPages } from './library/artist-pages.js';
 import { createEntityPages } from './entity/service.js';
 import { createEntityWork, type EntityWork } from './entity/work.js';
-import { createSpotifyStreaming, type StreamingCatalog } from './entity/streaming.js';
+import { createSpotifyStreaming, type StreamingCatalog } from '@curator/catalog-work';
 import { createWorldSearch } from './entity/world-search.js';
 import { inLane } from './enrich/lane.js';
 import { BeatportEnricher } from './enrich/enrichers/beatport.js';
@@ -233,7 +233,7 @@ import type {
 	KbExpansion,
 } from './knowledge/types.js';
 import type { SpotifyTrack } from '@curator/spotify';
-import { SpotifyClient, configureSpotifyBackoffStore, spotifyBackoffUntil } from '@curator/spotify';
+import { SpotifyClient, configureSpotifyBackoffStore, gatedFetch, spotifyBackoffUntil } from '@curator/spotify';
 import { spotifyBackoffStore } from './sources/spotify-backoff.js';
 import { SqliteAgentStore, type AgentSessionDetail, type AgentSessionSummary } from './agent/store.js';
 import { AgentSidecarManager, type AgentSidecarSpec } from './agent/sidecar.js';
@@ -2795,12 +2795,13 @@ export function createCoreService(dbPath: string, opts: CoreServiceOptions = {})
 		const token = await auth.getSpotifyAccessToken().catch(() => null);
 		return token ? new SpotifyClient(token, 'entity:page') : null;
 	};
-	// The streaming service read as a catalogue (entity/streaming.ts): where
+	// The streaming service read as a catalogue (@curator/catalog-work streaming): where
 	// a page of an artist or an album the catalogue does not know is shown
 	// from, and what the omnibar's World scope searches first. The user's
 	// primary service — Spotify only for now (Tidal's artist and album reads
 	// are not built).
-	const spotifyStreaming = createSpotifyStreaming({ token: () => auth.getSpotifyAccessToken().catch(() => null) });
+	// Through the process-wide gate the player and the feed share.
+	const spotifyStreaming = createSpotifyStreaming({ token: () => auth.getSpotifyAccessToken().catch(() => null), fetch: (u, i) => gatedFetch(u, i, 'entity:streaming') });
 	const streamingCatalog = (): StreamingCatalog | null =>
 		primaryStreaming().service === 'spotify' && auth.getStatus().spotify.connected && spotifyBackoffUntil() <= Date.now() ? spotifyStreaming : null;
 	// The page work reads through the pages and the pages tell it what was

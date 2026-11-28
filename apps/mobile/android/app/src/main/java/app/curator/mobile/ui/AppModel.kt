@@ -23,6 +23,7 @@ import app.curator.mobile.player.AppPlayer
 import app.curator.mobile.ui.feed.FeedModel
 import app.curator.mobile.ui.entity.EntityPageModel
 import app.curator.mobile.model.EntityRef
+import app.curator.mobile.model.EntityView
 import app.curator.mobile.ui.list.Metrics
 import app.curator.mobile.ui.list.TrackPager
 import app.curator.mobile.ui.list.playFrom
@@ -112,6 +113,15 @@ class AppModel(val app: CuratorApp) {
 
 	fun setDiagnostics(on: Boolean) {
 		app.scope.launch { viewState.setDiagnostics(on) }
+	}
+
+	// How artist and label pages open on this phone, each kind its own.
+	private val entityViews = listOf("artist", "label").associateWith { viewState.entityView(it).stateIn(app.scope, SharingStarted.Eagerly, EntityView()) }
+
+	fun entityView(kind: String): EntityView = entityViews[kind]?.value ?: EntityView()
+
+	fun setEntityView(kind: String, v: EntityView) {
+		app.scope.launch { viewState.setEntityView(kind, v) }
 	}
 
 	/** Whether this phone reads the stores for the artist or label page in front (js/work.ts). */

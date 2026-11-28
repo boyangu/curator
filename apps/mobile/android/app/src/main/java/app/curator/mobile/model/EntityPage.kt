@@ -56,6 +56,8 @@ data class EntityWorld(
 	val releaseCount: Int? = null,
 	val trackCount: Int? = null,
 	val candidates: List<EntityChip> = emptyList(),
+	/** The streaming service World is read from while the catalogue does not know the entity ("spotify"); null: the catalogue. */
+	val via: String? = null,
 )
 
 @Serializable
@@ -166,13 +168,30 @@ data class EntityRelease(
 
 enum class Scope { OWNED, WORLD }
 
+enum class EntityTab { RELEASES, TRACKS }
+
+/**
+ * How this phone opens an artist's (or a label's) page: the list and the
+ * sections drawn as charts last chosen on one of that kind. View state, kept
+ * per device (ViewState); a page opened before the choice keeps its own.
+ */
+@Serializable
+data class EntityView(val tab: EntityTab? = null, val charts: Set<EntitySection> = emptySet()) {
+	/** An artist opens on its tracks, a label on its releases, until one is picked. */
+	fun tabFor(kind: String): EntityTab = tab ?: if (kind == "label") EntityTab.RELEASES else EntityTab.TRACKS
+
+	fun chartsFor(kind: String): Set<EntitySection> = charts intersect EntitySection.of(kind).toSet()
+}
+
 /**
  * The catalogue's releases with their tracklists, in the order the pages came.
  * [patches]: what the page's store reading found since, by recording
  * (model PageWork): shown at once, before the catalogue says it too.
  */
 fun worldReleases(pages: List<WorldPage>, patches: Map<String, RowPatch> = emptyMap()): List<EntityRelease> {
-	val tracksOf = pages.flatMap { it.tracks }.map { it.filled(patches[it.recordingId]) }.groupBy { it.releaseId }
+	// A row is a recording on a release: pages read again while the catalogue
+	// changes can overlap, and a recording counts once per release.
+	val tracksOf = pages.flatMap { it.tracks }.distinctBy { it.releaseId to it.recordingId }.map { it.filled(patches[it.recordingId]) }.groupBy { it.releaseId }
 	return pages.flatMap { it.albums }.distinctBy { it.id }.map { a ->
 		EntityRelease(
 			id = a.id, title = a.title, artists = a.artists, date = a.date, label = a.label,
@@ -227,10 +246,24 @@ fun ownedReleases(tracks: List<OwnedTrack>): List<EntityRelease> =
 fun scopedReleases(scope: Scope, pages: List<WorldPage>, owned: List<OwnedTrack>?, filters: Filters, patches: Map<String, RowPatch> = emptyMap()): List<EntityRelease> =
 	(if (scope == Scope.WORLD) worldReleases(pages, patches) else ownedReleases(owned ?: emptyList())).filter { it.matches(filters) }
 
+/**
+ * The Tracks tab: each recording once, at the release it first came out on
+ * (the releases are newest first). One on an album and a compilation, or on
+ * a release the catalogue holds twice, is one row; the list keys rows by
+ * recording, and a repeated key ends the app.
+ */
+fun tabTracks(releases: List<EntityRelease>): List<EntityRow> =
+	releases.flatMap { it.tracks }.asReversed().distinctBy { it.id }.asReversed()
+
 /** The Releases and Tracks tabs' counts: the catalogue's in World, the library's own in My Library (null until read). */
-fun tabCounts(scope: Scope, world: EntityWorld, owned: List<OwnedTrack>?): Pair<Int?, Int?> =
-	if (scope == Scope.WORLD) world.releaseCount to world.trackCount
-	else owned?.let { ownedReleases(it).size to it.size } ?: (null to null)
+fun tabCounts(scope: Scope, world: EntityWorld, owned: List<OwnedTrack>?, loaded: List<EntityRelease> = emptyList()): Pair<Int?, Int?> =
+	if (scope == Scope.WORLD) {
+		// The catalogue's counts as the header read them; tracklists the page's
+		// work fills since show more than that before the header is read again.
+		val releases = loaded.size
+		val tracks = tabTracks(loaded).size
+		(world.releaseCount?.let { maxOf(it, releases) } ?: releases.takeIf { it > 0 }) to (world.trackCount?.let { maxOf(it, tracks) } ?: tracks.takeIf { it > 0 })
+	} else owned?.let { ownedReleases(it).size to it.size } ?: (null to null)
 
 // ── the attribute sections ──────────────────────────────────────────────────
 
@@ -322,10 +355,15 @@ fun EntityRelease.matches(f: Filters): Boolean = f.all { (s, p) ->
 // ── the header's words ──────────────────────────────────────────────────────
 
 /** Row 2's band: "26 releases", or in My Library "3 releases in library". */
-fun releasesLine(scope: Scope, count: Int?): String? {
+/** [from]: the streaming service's name World is read from while the catalogue does not know the entity (the desktop's words). */
+fun releasesLine(scope: Scope, count: Int?, from: String? = null): String? {
 	if (count == null) return null
 	val word = if (count == 1) "release" else "releases"
-	return if (scope == Scope.OWNED) "$count $word in library" else "$count $word"
+	return when {
+		scope == Scope.OWNED -> "$count $word in library"
+		from != null -> "$count $word on $from"
+		else -> "$count $word"
+	}
 }
 
 /** Why the World side can't be read, in the desktop's words (EntityHeader.tsx worldOffText). */

@@ -74,7 +74,7 @@ class CoreRuntime(private val context: Context, private val onSession: (Account?
 	val work: SharedFlow<WorkEvent> = _work
 
 	/** The stores' side of that reading: the HTTP the core's readers ask for (js/shim/store-fetch.ts). */
-	val stores = StoreFetch { tell("fetchDone", it) }
+	val stores = StoreFetch(CloudConfig.read(context)?.stores.orEmpty()) { tell("fetchDone", it) }
 
 	private val runner = Runnable { runLoop() }
 

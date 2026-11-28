@@ -12,9 +12,9 @@ import type { CatalogBrowseResult, CatalogClaim, CatalogObjectSummary, CatalogRe
 import type { SpotifyTrack } from '@curator/spotify';
 import { migrate } from '@curator/sync-core/db/migrate';
 import type { SpotifyMatchClient } from '../feed/spotify-match.js';
-import type { EntityCatalog } from './resolve.js';
+import type { EntityCatalog } from './service.js';
 import { createEntityPages } from './service.js';
-import type { StreamingCatalog, StreamingHit } from './streaming.js';
+import type { StreamingCatalog, StreamingHit } from '@curator/catalog-work';
 
 let dir: string;
 let db: Database.Database;

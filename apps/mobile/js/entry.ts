@@ -43,6 +43,7 @@ import { trackPictures } from './track-pictures.js';
 import { entityFollow, entityPage, entityTracks, type EntityDeps, type PageAsk } from './entity.js';
 import { createStoreFetch, type StoreAnswer } from './shim/store-fetch.js';
 import { createPhoneWork, type PhoneWork } from './work.js';
+import { createSpotifyStreaming, type StreamingCatalog } from '@curator/catalog-work';
 import type Database from 'better-sqlite3';
 
 type BootConfig = {
@@ -417,7 +418,16 @@ function entityDeps(): EntityDeps {
 			: features === null ? { reason: 'server_off' }
 				: !features.includes('global_catalog') || !transport.catalog ? { reason: 'old_server' }
 					: { client: transport.catalog, deviceId: client.deviceId(), pages: features.includes('catalog_pages') };
-	return { raw, catalog, work: phoneWork(), now: Date.now() };
+	return { raw, catalog, work: phoneWork(), streaming: spotifyStreaming(), now: Date.now() };
+}
+
+// The account's Spotify as a catalogue, for artists the catalogue does not
+// know (js/entity.ts). Its reads are cached for the session; with no grant
+// it answers nothing and the page says the catalogue does not know them.
+let streaming: StreamingCatalog | null = null;
+function spotifyStreaming(): StreamingCatalog {
+	streaming ??= createSpotifyStreaming({ token: gatewayToken, fetch: storeFetch.via('http') });
+	return streaming;
 }
 
 // ── store reading for the page in front ──────────────────────────────────────

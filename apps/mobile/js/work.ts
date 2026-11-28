@@ -21,7 +21,7 @@
 // the catalogue does not know: only what a page it opened asks for.
 
 import { createWorkEngine, type WorkEngine, type WorkEngineDeps, type WorkEvent, type WorkPhase, type WorkRowPatch, type WorkVisit } from '@curator/catalog-work';
-import type { CatalogDeviceProfile, CatalogTracksResult, CatalogWork, CatalogWorkReportInput, CatalogWorkReportResult } from '@curator/protocol';
+import type { CatalogDeviceProfile, CatalogRef, CatalogTracksResult, CatalogWork, CatalogWorkReportInput, CatalogWorkReportResult } from '@curator/protocol';
 import type { StoreVia } from './shim/store-fetch.js';
 
 // Saves the cloud reports in a burst are one reload of the page.
@@ -66,8 +66,9 @@ export interface PhoneWork {
 	// What to say with a read of this object's page: null unless it is the
 	// page in front and work is on.
 	profile(catalogId: string): CatalogDeviceProfile | null;
-	// A page the catalogue answered, with the work it carried.
-	read(catalogId: string, result: Pick<CatalogTracksResult, 'releases'>, work: CatalogWork | undefined): void;
+	// A page the catalogue answered, with the work it carried and the store
+	// pages the library knows the object by (the reports carry them too).
+	read(catalogId: string, result: Pick<CatalogTracksResult, 'releases'>, work: CatalogWork | undefined, hints?: CatalogRef[]): void;
 	patchOf(recordingId: string): PhoneRowPatch | undefined;
 }
 
@@ -229,14 +230,14 @@ export function createPhoneWork(deps: PhoneWorkDeps): PhoneWork {
 			return engine.profile(f.visit);
 		},
 
-		read(catalogId, result, work) {
+		read(catalogId, result, work, hints = []) {
 			const f = front;
 			if (!f || f.catalogId !== catalogId) return;
 			for (const r of result.releases) for (const t of r.tracks) f.ownGenre.set(t.id, t.genres.length > 0);
 			if (!work?.jobs.length) return;
 			f.running++;
 			void engine
-				.run(work, { visit: f.visit, signal: f.abort.signal, onEvent: onEvent(f) })
+				.run(work, { visit: f.visit, hints, signal: f.abort.signal, onEvent: onEvent(f) })
 				.catch((err: unknown) => console.warn('page work failed', err instanceof Error ? err.message : String(err)))
 				.finally(() => {
 					f.running--;

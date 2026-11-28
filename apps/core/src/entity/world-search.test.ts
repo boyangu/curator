@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CatalogClaim, CatalogKind, CatalogObjectSummary, CatalogTracksResult } from '@curator/protocol';
 import type { EntityTracksPage } from '@curator/shared';
-import type { StreamingCatalog, StreamingHit } from './streaming.js';
+import type { StreamingCatalog, StreamingHit } from '@curator/catalog-work';
 import { createWorldSearch, type WorldSearchDeps } from './world-search.js';
 
 const hit = (kind: StreamingHit['kind'], id: string, name: string, over: Partial<StreamingHit> = {}): StreamingHit => ({ kind, id, name, url: '', imageUrl: null, artists: [], detail: null, date: null, album: null, release: null, ...over });

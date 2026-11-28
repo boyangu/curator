@@ -1,5 +1,7 @@
 // Who an entity page is about, on both sides: the library's artist / album
-// (labels are text there) and the Global Catalog's object.
+// (labels are text there) and the Global Catalog's object. One ladder for
+// the desktop (apps/core entity/service.ts) and the phone (apps/mobile
+// js/entity.ts): the same library rows name the same object on both.
 //
 // The two are joined only through an id one side already holds of the other
 // — the Spotify id on the library's artist_link / album_link rows and on the
@@ -7,21 +9,33 @@
 // through a name: an artist a surface knows by id is not swapped for the
 // library's namesake (artist-pages.ts states the same rule). Labels are the
 // exception the library forces — a label IS its folded name here — and a
-// credit named inside one catalogue object (`within`) is read among that
-// object's own credits.
+// credit named inside one catalogue object (`within`, or a recording of the
+// artist's own tracks) is read among that object's own credits.
 //
-// Reads curator.db; writes catalog_ref rows only (never artist_link: those
+// artist_link rows reach a phone too: derived from the account's provider
+// listings (track_provider_ref, sync-log/remote-rows.ts) where the desktop
+// derives them from its own payloads. The catalogue's name for an artist can
+// differ from the library's (a credit line written on its id), so the id
+// comes first and the name is the last resort.
+//
+// Reads the library; writes catalog_ref rows only (never artist_link: those
 // feed identity, and a catalogue artist can hold a namesake's page).
 
 import type Database from 'better-sqlite3';
-import type { CatalogBrowseResult, CatalogObjectSummary } from '@curator/protocol';
+import type { CatalogBrowseResult, CatalogKind, CatalogObjectSummary, CatalogRef } from '@curator/protocol';
 import { nameFold } from '@curator/library-logic';
 import type { EntityChip, EntityKind, EntityRef, EntityWorldReason } from '@curator/shared';
-import type { CatalogClient } from '../catalog-client/service.js';
-import { writeRefs, type CatalogRefKind, type CatalogRefObjectKind } from '@curator/sync-core/entity/catalog-ref';
+import { writeRefs, type CatalogRefKind, type CatalogRefObjectKind } from './catalog-ref.js';
 
 type Raw = Database.Database;
-export type EntityCatalog = Pick<CatalogClient, 'status' | 'resolve' | 'browse' | 'find' | 'offersPages' | 'tracks' | 'reportEnrichment'>;
+
+// What the ladder asks of the catalogue (the desktop's CatalogClient; a
+// small adapter over the cloud API on the phone).
+export type IdentifyCatalog = {
+	resolve(refs: CatalogRef[]): Promise<(CatalogObjectSummary | null)[]>;
+	browse(objectId: string, opts?: { brief?: boolean }): Promise<CatalogBrowseResult>;
+	find(q: string, kind: CatalogKind, limit?: number): Promise<CatalogObjectSummary[]>;
+};
 
 export type EntityIds = {
 	kind: EntityKind;
@@ -35,6 +49,8 @@ export type EntityIds = {
 export type RemoteMiss = { reason: Extract<EntityWorldReason, 'unknown' | 'ambiguous'>; candidates?: EntityChip[] };
 
 const MAX_HOPS = 8;
+// The artist's own tracks tried for a recording whose credits name it.
+const EVIDENCE_TRACKS = 2;
 
 export function liveArtist(raw: Raw, id: string): { id: string; name: string } | null {
 	let cur = raw.prepare(`select id, name, merged_into from artist where id = ?`).get(id) as { id: string; name: string; merged_into: string | null } | undefined;
@@ -120,9 +136,27 @@ function creditWithin(b: CatalogBrowseResult, kind: EntityKind, name: string): s
 
 const chipOf = (o: CatalogObjectSummary, kind: EntityKind): EntityChip => ({ ref: { kind, name: o.name, catalogId: o.id } });
 
+// Spotify ids of the artist's own tracks (not a remix it is credited on):
+// the device's own links or, where it holds none, what the account's claims
+// name (claim_link: a phone's rows, a file another device bound).
+function ownSpotifyRecordings(raw: Raw, artistId: string): string[] {
+	return raw
+		.prepare(
+			// The bare l.id comes from the row min(l.rank) picked (SQLite).
+			`select l.id, min(l.rank) as best from track_artist ta
+			join track t on t.id = ta.track_id and t.deleted_at is null
+			join (select track_id, source_track_id as id, 0 as rank from source_link where source = 'spotify'
+				union all select track_id, source_track_id, 1 + rank from claim_link where source = 'spotify') l on l.track_id = ta.track_id
+			where ta.artist_id = ? and ta.role is null
+			group by ta.track_id order by best limit ?`,
+		)
+		.pluck()
+		.all(artistId, EVIDENCE_TRACKS) as string[];
+}
+
 // The catalogue's object for the entity, asked through an id the library
 // holds; null with the reason when nothing safe names it.
-export async function identifyRemote(client: EntityCatalog, ids: EntityIds, ref: EntityRef): Promise<{ catalogId: string } | RemoteMiss> {
+export async function identifyRemote(raw: Raw, client: IdentifyCatalog, ids: EntityIds, ref: Pick<EntityRef, 'within'>): Promise<{ catalogId: string } | RemoteMiss> {
 	if (ids.catalogId) return { catalogId: ids.catalogId };
 	if (ref.within?.catalogId && ids.kind !== 'album') {
 		const hit = creditWithin(await client.browse(ref.within.catalogId), ids.kind, ids.name);
@@ -143,12 +177,24 @@ export async function identifyRemote(client: EntityCatalog, ids: EntityIds, ref:
 	const refs = [
 		...(ids.spotifyId ? [{ provider: 'spotify' as const, kind, providerId: ids.spotifyId }] : []),
 		// What a library import registered for an entity without a Spotify id
-		// (catalog-client/library-claims.ts).
+		// (apps/core catalog-client/library-claims.ts).
 		...(ids.libraryId ? [{ provider: 'user' as const, kind, providerId: ids.kind === 'artist' ? `local:${ids.libraryId}` : `album:${ids.libraryId}` }] : []),
 	];
-	if (!refs.length) return { reason: 'unknown' };
-	const hit = (await client.resolve(refs)).find((o) => o !== null);
-	return hit ? { catalogId: hit.id } : { reason: 'unknown' };
+	const hit = refs.length ? (await client.resolve(refs)).find((o) => o !== null) : undefined;
+	if (hit) return { catalogId: hit.id };
+	// An artist the catalogue holds under no id the library has: a recording
+	// of its own tracks, and its credit there by the library's name.
+	if (ids.kind === 'artist' && ids.libraryId) {
+		const recordings = ownSpotifyRecordings(raw, ids.libraryId);
+		if (recordings.length) {
+			for (const rec of await client.resolve(recordings.map((id) => ({ provider: 'spotify' as const, kind: 'recording' as const, providerId: id })))) {
+				if (!rec) continue;
+				const credit = creditWithin(await client.browse(rec.id, { brief: true }), 'artist', ids.name);
+				if (credit) return { catalogId: credit };
+			}
+		}
+	}
+	return { reason: 'unknown' };
 }
 
 // The library's entity for a catalogue object the page reached first (a feed
@@ -169,4 +215,28 @@ export function rememberObject(raw: Raw, ids: EntityIds, objectId: string, now =
 	const entityId = ids.kind === 'label' ? nameFold(ids.name) : ids.libraryId;
 	if (!entityId) return;
 	writeRefs(raw, [{ entityKind: refEntity(ids.kind), entityId, objectId, objectKind: refObject(ids.kind), provider: null, providerId: null }], now);
+}
+
+// The ids once the catalogue answered with its object, remembered for the
+// next page. A catalogue entity the library holds under a Spotify id it did
+// not name is found now that the object's handles are known. The name shown
+// is the library's where the library has the entity (a label keeps the
+// spelling the surface used: it is what Owned matches), else the catalogue's.
+export function settleIds(raw: Raw, ids: EntityIds, b: CatalogBrowseResult, now = Date.now()): EntityIds {
+	const full: EntityIds = { ...ids, catalogId: b.object.id };
+	if (!full.libraryId && full.kind !== 'label') {
+		const lib = libraryForObject(raw, full.kind, b.object);
+		if (lib) Object.assign(full, { libraryId: lib.id, name: lib.name });
+		else full.name = b.object.name;
+	}
+	if (!full.name) full.name = b.object.name;
+	full.spotifyId ??= b.object.handles.find((h) => h.provider === 'spotify' && !h.id.includes('/'))?.id ?? null;
+	rememberObject(raw, full, b.object.id, now);
+	return full;
+}
+
+// The Spotify page the library knows an artist by: what the catalogue's
+// planner names the artist's one page by (catalog-work.ts hints).
+export function hintsOf(ids: Pick<EntityIds, 'kind' | 'spotifyId'>): CatalogRef[] {
+	return ids.kind === 'artist' && ids.spotifyId ? [{ provider: 'spotify', kind: 'artist', providerId: ids.spotifyId }] : [];
 }

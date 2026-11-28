@@ -66,7 +66,11 @@ object FrontWindow {
  *    ([FrontWindow]), one page at a time, and answered as the page a plain
  *    client would have got: the page's data in its `__NEXT_DATA__` tag.
  */
-class StoreFetch(private val answer: (JsonObject) -> Unit) {
+class StoreFetch(
+	/** A development build's stand-ins for stores, by URL prefix ([CloudConfig.stores]); empty in a release. */
+	private val standIns: Map<String, String> = emptyMap(),
+	private val answer: (JsonObject) -> Unit,
+) {
 	/** A `fetch` event: what to ask, and the id to answer with. */
 	data class Ask(val id: Int, val via: String, val method: String, val url: String, val headers: Map<String, String>, val body: String?) {
 		companion object {
@@ -167,8 +171,9 @@ class StoreFetch(private val answer: (JsonObject) -> Unit) {
 	private fun get(ask: Ask, call: HttpCall): Answer {
 		// The stores are all read over TLS; nothing else leaves from here.
 		if (!ask.url.startsWith("https://", ignoreCase = true)) return Answer(ask.id, error = "only https is read")
+		val target = standIns.entries.firstOrNull { ask.url.startsWith(it.key) }?.let { it.value + ask.url.removePrefix(it.key) } ?: ask.url
 		return try {
-			val conn = URL(ask.url).openConnection() as HttpURLConnection
+			val conn = URL(target).openConnection() as HttpURLConnection
 			call.conn = conn
 			if (call.aborted) return Answer(ask.id, error = "aborted")
 			conn.requestMethod = ask.method

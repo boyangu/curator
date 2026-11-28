@@ -15,7 +15,17 @@ import java.io.File
  * could have the sign-in send its password anywhere.
  */
 @Serializable
-data class CloudConfig(val apiUrl: String, val supabaseUrl: String, val publishableKey: String) {
+data class CloudConfig(
+	val apiUrl: String,
+	val supabaseUrl: String,
+	val publishableKey: String,
+	/**
+	 * Development only, from dev-server.json: a store's address (as a URL
+	 * prefix, "https://api.spotify.com/v1") read at the test server's stand-in
+	 * instead ([StoreFetch]), so page work runs end to end on the emulator.
+	 */
+	val stores: Map<String, String> = emptyMap(),
+) {
 	companion object {
 		private val json = Json { ignoreUnknownKeys = true }
 

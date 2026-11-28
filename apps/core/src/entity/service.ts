@@ -16,7 +16,7 @@
 //
 // An artist or an album the catalogue does not know (nobody followed it), or
 // cannot be asked about (signed out), is shown from the user's streaming
-// service instead (entity/streaming.ts): its header and its releases, read
+// service instead (@curator/catalog-work streaming): its header and its releases, read
 // in a call or two and laid out as the catalogue's would be. `world.via`
 // says so. Where the catalogue can be reached the page work registers what
 // was read (entity/work.ts) and the page becomes the catalogue's.
@@ -36,8 +36,9 @@ import { findSpotifyAlbum, findSpotifyTrack, type SpotifyMatchClient } from '../
 import { log } from '@curator/sync-core/log';
 import { matchLibraryTracks } from '@curator/sync-core/entity/ownership';
 import { findArtistPicture, type ArtistPicture, type FetchLike } from './artist-picture.js';
-import { identifyLocal, identifyRemote, libraryForObject, rememberObject, type EntityCatalog, type EntityIds } from './resolve.js';
-import { normalizeEntityRef, provisionalRelease, streamObjectId, type StreamingCatalog } from './streaming.js';
+import { hintsOf, identifyLocal, identifyRemote, settleIds, type EntityIds } from '@curator/sync-core/entity/identify';
+import type { CatalogClient } from '../catalog-client/service.js';
+import { parseStreamObjectId, STREAM_CURSOR, STREAM_PAGE, streamPage as readStreamPage, type StreamingCatalog } from '@curator/catalog-work';
 
 const elog = log.for('entity');
 
@@ -61,14 +62,11 @@ const PAGE_CACHE_MAX = 60;
 // How long a header waits for an artist's picture lookup at a store. Past it
 // the page opens without one; the lookup finishes for the next ask.
 const PICTURE_WAIT_MS = 2500;
-// A page of the streaming service's releases: one call for their tracklists.
-const STREAM_PAGE = 20;
-// What a page cursor of the streaming service's listing starts with (the
-// catalogue's own are opaque, and never this).
-const STREAM_CURSOR = 's:';
 // Library tracks tried, to find the Spotify id of a library artist that has none.
 const EVIDENCE_TRACKS = 2;
 const CANDIDATES_MAX = 5;
+
+export type EntityCatalog = Pick<CatalogClient, 'status' | 'resolve' | 'browse' | 'find' | 'offersPages' | 'tracks' | 'reportEnrichment'>;
 
 export type EntityPagesDeps = {
 	raw: Database.Database;
@@ -87,7 +85,7 @@ export type EntityPagesDeps = {
 	workProfile?(catalogId: string): CatalogDeviceProfile | null;
 	onRead?(catalogId: string, result: CatalogTracksResult, work: CatalogWork | undefined, hints: CatalogRef[]): void;
 	patchOf?(recordingId: string): EntityRowPatch | undefined;
-	// The user's streaming service read as a catalogue (entity/streaming.ts);
+	// The user's streaming service read as a catalogue (@curator/catalog-work streaming);
 	// null while none is connected, or while it is resting.
 	streaming?(): StreamingCatalog | null;
 	// The feed's Spotify match client: by a track the library holds, it finds
@@ -130,6 +128,15 @@ function blankTrack(): Track {
 	}
 	blank = { ...out, state: 'unsorted' } as Track;
 	return blank;
+}
+
+// A ref built off a row the streaming service stood in for names the entity
+// by that stand-in id in the catalogue's slot (the list knows one kind of
+// row): read as what it is.
+export function normalizeEntityRef(ref: EntityRef): EntityRef {
+	const s = parseStreamObjectId(ref.catalogId);
+	if (!s) return ref;
+	return { ...ref, catalogId: null, ...(s.service === 'spotify' ? { spotifyId: ref.spotifyId ?? s.id } : {}) };
 }
 
 // The library's id first: it is what a lookup cannot change (a catalogue id
@@ -228,20 +235,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 	// The catalogue's account of the entity, beside what only the library
 	// knows (which of its own entities this is, the files, its own store ids).
 	function withCatalog(ids: EntityIds, b: CatalogBrowseResult, pagesOffered: boolean): EntityHeader {
-		const full: EntityIds = { ...ids, catalogId: b.object.id };
-		// A catalogue entity the library holds under a Spotify id it did not
-		// name: found now that the object's handles are known.
-		// The name shown is the library's where the library has the entity
-		// (a label keeps the spelling the surface used: it is what Owned
-		// matches), else the catalogue's.
-		if (!full.libraryId && full.kind !== 'label') {
-			const lib = libraryForObject(raw, full.kind, b.object);
-			if (lib) Object.assign(full, { libraryId: lib.id, name: lib.name });
-			else full.name = b.object.name;
-		}
-		if (!full.name) full.name = b.object.name;
-		full.spotifyId ??= b.object.handles.find((h) => h.provider === 'spotify' && !h.id.includes('/'))?.id ?? null;
-		rememberObject(raw, full, b.object.id, now());
+		const full = settleIds(raw, ids, b, now());
 
 		const header = localHeader(full, { available: pagesOffered, reason: pagesOffered ? 'ok' : 'old_server', releaseCount: b.releaseCount ?? (full.kind === 'album' ? 1 : null), trackCount: b.trackCount ?? null });
 		if (full.kind === 'label') {
@@ -303,7 +297,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 			return streamed ?? { header: localHeader(ids, off(reason)), keep: 'none' };
 		}
 		try {
-			let found = await identifyRemote(client, ids, ref);
+			let found = await identifyRemote(raw, client, ids, ref);
 			let b: CatalogBrowseResult | null = null;
 			if (!('reason' in found)) {
 				try {
@@ -314,7 +308,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 					// ids the library holds, instead of failing on a stale row.
 					if (ref.catalogId || !ids.catalogId) throw e;
 					ids = { ...ids, catalogId: null };
-					found = await identifyRemote(client, ids, ref);
+					found = await identifyRemote(raw, client, ids, ref);
 					if (!('reason' in found)) b = await client.browse(found.catalogId, { brief: true });
 				}
 			}
@@ -458,30 +452,11 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 	// in the catalogue's page shape. Null: nothing to read it from.
 	async function streamPage(ids: EntityIds, cursor: string | undefined): Promise<CatalogTracksResult | null> {
 		const on = await onStream(ids);
-		if (!on) return null;
-		const { stream, id } = on;
-		if (ids.kind === 'album') {
-			const claim = (await stream.releases([id])).get(id);
-			return claim ? { object: { id: streamObjectId(stream.service, id), kind: 'release', name: claim.name }, redirectedFrom: null, releases: [provisionalRelease(claim)], nextCursor: null } : null;
-		}
-		const listing = await stream.listing(id);
-		const offset = cursor?.startsWith(STREAM_CURSOR) ? Number(cursor.slice(STREAM_CURSOR.length)) || 0 : 0;
-		const slice = listing.releases.slice(offset, offset + STREAM_PAGE);
-		const full = await stream.releases(slice.map((c) => c.providerId));
-		const next = offset + STREAM_PAGE;
-		return {
-			object: { id: streamObjectId(stream.service, id), kind: 'artist', name: ids.name },
-			redirectedFrom: null,
-			// A release the service no longer hands out in full keeps its place, without rows.
-			releases: slice.map((c) => provisionalRelease(full.get(c.providerId) ?? c)),
-			nextCursor: next < listing.releases.length ? `${STREAM_CURSOR}${next}` : null,
-		};
+		if (!on || ids.kind === 'label') return null;
+		return readStreamPage(on.stream, { kind: ids.kind, id: on.id, name: ids.name, cursor });
 	}
 
 	// ── World tracks ──────────────────────────────────────────────────────
-	// The pages the library knows an entity by: the cloud names the store page
-	// it is read at from these (an artist's own Spotify page, among namesakes').
-	const hintsOf = (ids: EntityIds): CatalogRef[] => (ids.kind === 'artist' && ids.spotifyId ? [{ provider: 'spotify', kind: 'artist', providerId: ids.spotifyId }] : []);
 
 	// The work an answer carried is handed on once, as it lands, and not kept
 	// with the page: a page read again from here is not work again.
@@ -556,7 +531,7 @@ export function createEntityPages(deps: EntityPagesDeps): EntityPages {
 			const streamed = opts?.cursor?.startsWith(STREAM_CURSOR) ?? false;
 			let unknown = false;
 			if (client && !down && !streamed) {
-				const found = await identifyRemote(client, ids, ref);
+				const found = await identifyRemote(raw, client, ids, ref);
 				if (!('reason' in found)) {
 					return toPage(await cloudPage(found.catalogId, opts?.cursor, hintsOf(ids)));
 				}

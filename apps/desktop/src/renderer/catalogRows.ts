@@ -34,7 +34,7 @@ export const catalogArtistId = (artistId: string | null | undefined): string | n
 	artistId?.startsWith(CATALOG_ARTIST_PREFIX) ? artistId.slice(CATALOG_ARTIST_PREFIX.length) : null;
 
 // A row read from the streaming service, before the catalogue has an object
-// for it (core entity/streaming.ts), carries the service's own ids where a
+// for it (@curator/catalog-work streaming), carries the service's own ids where a
 // catalogue row carries the catalogue's, as "spotify_<id>". A ref built off
 // such a row names the entity by Spotify, not by a catalogue object.
 const STREAM_REF = /^spotify_(.+)$/;

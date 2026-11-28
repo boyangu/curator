@@ -5,10 +5,11 @@
 // nobody followed is not in it, and getting it there (read the store, register
 // it, read the catalogue's answer back) takes a while. The streaming service
 // the user plays through answers in a call or two — so an entity the catalogue
-// does not know is shown from there at once (entity/service.ts), and the same
-// read is what the page work registers in the catalogue (entity/work.ts):
-// nothing is asked of the service twice. The omnibar's World scope searches
-// through here too (entity/world-search.ts).
+// does not know is shown from there at once, on the desktop (apps/core
+// entity/service.ts, whose page work registers the same read: nothing is
+// asked of the service twice) and on the phone (apps/mobile js/entity.ts,
+// whose page work the cloud names: catalog.resolve's find job). The
+// desktop's omnibar World scope searches through here too.
 //
 // What it hands out is the catalogue's own vocabulary: a release is the claim
 // a reader would send up (`CatalogClaim`, with its tracklist), so a page built
@@ -23,10 +24,10 @@
 // its artist and album reads are not built, so with Tidal as the primary
 // service there is no streaming catalogue and pages behave as before.
 
-import type { CatalogClaim, CatalogHandle, CatalogPageRelease, CatalogPageTrack } from '@curator/protocol';
+import type { CatalogClaim, CatalogHandle, CatalogPageRelease, CatalogPageTrack, CatalogTracksResult } from '@curator/protocol';
 import { fetchAlbums, ProviderHttpError, releaseClaimFromTrack, spotifyReleaseClaim, SpotifyTracker, type FetchLike, type SpPlaylistTrack } from '@curator/catalog-readers';
-import { gatedFetch } from '@curator/spotify';
-import type { EntityRef, StreamingService } from '@curator/shared';
+
+export type StreamingService = 'spotify' | 'tidal';
 
 export type StreamingArtist = { id: string; name: string; imageUrl: string | null; genres: string[]; url: string };
 
@@ -74,14 +75,6 @@ export const streamObjectId = (service: string, id: string): string => `${servic
 export function parseStreamObjectId(id: string | null | undefined): { service: StreamingService; id: string } | null {
 	const m = id ? STREAM_ID.exec(id) : null;
 	return m ? { service: m[1] as StreamingService, id: m[2]! } : null;
-}
-
-// A ref built off such a row names the entity by that stand-in id in the
-// catalogue's slot (the list knows one kind of row): read as what it is.
-export function normalizeEntityRef(ref: EntityRef): EntityRef {
-	const s = parseStreamObjectId(ref.catalogId);
-	if (!s) return ref;
-	return { ...ref, catalogId: null, ...(s.service === 'spotify' ? { spotifyId: ref.spotifyId ?? s.id } : {}) };
 }
 
 const sid = (c: Pick<CatalogClaim, 'provider' | 'providerId'>): string => streamObjectId(c.provider, c.providerId);
@@ -142,11 +135,22 @@ type SpSearch = { artists?: SpPage<SpArtist>; albums?: SpPage<SpAlbumRef>; track
 
 type Held<T> = { at: number; value: Promise<T> };
 
+// A signal that aborts after `ms`: AbortSignal.timeout, which the phone's
+// runtime lacks (its shim brings an AbortController, apps/mobile
+// js/shim/store-fetch.ts).
+function timeout(ms: number): AbortSignal {
+	const ctl = new AbortController();
+	const timer = setTimeout(() => ctl.abort(), ms);
+	(timer as { unref?: () => void }).unref?.();
+	return ctl.signal;
+}
+
 export function createSpotifyStreaming(deps: {
 	// The user's Spotify token; null while Spotify is not connected.
 	token(): Promise<string | null>;
-	// Default: the process-wide gate the player and the feed share.
-	fetch?: FetchLike;
+	// The desktop's process-wide gate the player and the feed share; the
+	// phone's store-fetch seam.
+	fetch: FetchLike;
 	now?: () => number;
 }): StreamingCatalog {
 	const now = deps.now ?? Date.now;
@@ -158,9 +162,9 @@ export function createSpotifyStreaming(deps: {
 				return t;
 			},
 		},
-		deps.fetch ?? ((u, i) => gatedFetch(u, i, 'entity:streaming')),
+		deps.fetch,
 	);
-	const get = <T>(path: string): Promise<T> => reader.get<T>(path, AbortSignal.timeout(READ_TIMEOUT_MS));
+	const get = <T>(path: string): Promise<T> => reader.get<T>(path, timeout(READ_TIMEOUT_MS));
 
 	const artists = new Map<string, Held<StreamingArtist | null>>();
 	const listings = new Map<string, Held<{ total: number; releases: CatalogClaim[] }>>();
@@ -272,7 +276,7 @@ export function createSpotifyStreaming(deps: {
 			}
 			if (missing.length) {
 				// Twenty a call (the reader's batches): one read shared by every id in it.
-				const batch = fetchAlbums(reader, missing, AbortSignal.timeout(READ_TIMEOUT_MS)).then((r) => r.claims);
+				const batch = fetchAlbums(reader, missing, timeout(READ_TIMEOUT_MS)).then((r) => r.claims);
 				for (const id of missing) {
 					const value = batch.then((m) => m.get(id) ?? null);
 					full.delete(id);
@@ -291,5 +295,35 @@ export function createSpotifyStreaming(deps: {
 		},
 
 		search: (q) => held(searches, q.trim().toLowerCase(), SEARCH_TTL_MS, SEARCHES_HELD, () => readSearch(q.trim())),
+	};
+}
+
+// ── a page of an entity's releases from the service ─────────────────────────
+
+// Releases a page of the list holds, and the mark of a cursor into a list
+// read from the service (never a catalogue cursor: the two are not mixed up).
+export const STREAM_PAGE = 20;
+export const STREAM_CURSOR = 's:';
+
+// A page of an artist's releases (or the one album) as the service lists
+// them, in the catalogue's page shape, under the service's ids. Null: the
+// service has no such album.
+export async function streamPage(stream: StreamingCatalog, ask: { kind: 'artist' | 'album'; id: string; name: string; cursor?: string | null }): Promise<CatalogTracksResult | null> {
+	const { id } = ask;
+	if (ask.kind === 'album') {
+		const claim = (await stream.releases([id])).get(id);
+		return claim ? { object: { id: streamObjectId(stream.service, id), kind: 'release', name: claim.name }, redirectedFrom: null, releases: [provisionalRelease(claim)], nextCursor: null } : null;
+	}
+	const listing = await stream.listing(id);
+	const offset = ask.cursor?.startsWith(STREAM_CURSOR) ? Number(ask.cursor.slice(STREAM_CURSOR.length)) || 0 : 0;
+	const slice = listing.releases.slice(offset, offset + STREAM_PAGE);
+	const full = await stream.releases(slice.map((c) => c.providerId));
+	const next = offset + STREAM_PAGE;
+	return {
+		object: { id: streamObjectId(stream.service, id), kind: 'artist', name: ask.name },
+		redirectedFrom: null,
+		// A release the service no longer hands out in full keeps its place, without rows.
+		releases: slice.map((c) => provisionalRelease(full.get(c.providerId) ?? c)),
+		nextCursor: next < listing.releases.length ? `${STREAM_CURSOR}${next}` : null,
 	};
 }
